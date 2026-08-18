@@ -1,98 +1,16 @@
 import {
-  Fragment,
-  memo,
-  startTransition,
   useCallback,
   useEffect,
-  useImperativeHandle,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
-  type ClipboardEvent as ReactClipboardEvent,
+  useSyncExternalStore,
   type CSSProperties,
-  type DragEvent as ReactDragEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
-  type ReactNode,
 } from "react";
-import { createPortal } from "react-dom";
-import {
-  Activity,
-  AlertCircle,
-  Archive,
-  ArrowLeft,
-  ArrowRight,
-  ArrowDown,
-  ArrowUp,
-  Bot,
-  Box,
-  BriefcaseBusiness,
-  Check,
-  CircleAlert,
-  CirclePlus,
-  ChevronDown,
-  ChevronLeft,
-  ChevronRight,
-  Circle,
-  CircleHelp,
-  Cloud,
-  Clock3,
-  Code2,
-  Copy,
-  Download,
-  ExternalLink,
-  FileCode2,
-  FileImage,
-  FileText,
-  Folder,
-  FolderOpen,
-  GitBranch,
-  GitPullRequest,
-  GitFork,
-  Globe2,
-  Hand,
-  Laptop,
-  Library,
-  Lightbulb,
-  ListTodo,
-  Loader2,
-  Maximize2,
-  Minimize2,
-  Monitor,
-  MessageCircle,
-  MoreHorizontal,
-  PanelRight,
-  PanelRightClose,
-  PanelRightOpen,
-  PanelLeftClose,
-  PanelLeftOpen,
-  Paperclip,
-  Pause,
-  Pencil,
-  Pin,
-  Plug,
-  Plus,
-  Presentation,
-  RotateCcw,
-  Quote,
-  Search,
-  Settings,
-  ShieldAlert,
-  ShieldCheck,
-  SlidersHorizontal,
-  Square,
-  SquarePen,
-  Target,
-  Table2,
-  TerminalSquare,
-  Trash2,
-  Workflow,
-  X,
-  Zap,
-  ZoomIn,
-  ZoomOut,
-} from "lucide-react";
+import { Cable, Inbox, Library, X } from "lucide-react";
 import { ApiClient } from "./api/client";
 import type { StreamHandle } from "./api/client";
 import type {
@@ -100,82 +18,34 @@ import type {
   DiffReviewGitAction,
 } from "./components/DiffReviewPanel";
 import { LogViewer } from "./components/LogViewer";
-import { MarkdownContent } from "./components/MarkdownContent";
-import { FileTypeIcon } from "./components/FileTypeIcon";
-import { ModelSelector } from "./components/ModelSelector";
 import {
   ApprovalDialog,
   type ApprovalRequest,
 } from "./components/ApprovalDialog";
 import { PlanChoiceCard } from "./components/PlanChoiceCard";
-import {
-  InlineImagePreview,
-  type ImagePreviewSource,
-  type PreviewDocumentSession,
-  PreviewHost,
-} from "./components/PreviewHost";
-import { FlowWorkspacePanel } from "./components/FlowWorkspacePanel";
+import type { ImagePreviewSource } from "./components/PreviewHost";
+import { FlowLibraryPanel } from "./components/FlowLibraryPanel";
+import { HumanTaskInboxPanel } from "./components/HumanTaskInboxPanel";
 import { LibraryPanel } from "./components/LibraryPanel";
-import { RightContextRail } from "./components/RightContextRail";
 import {
   SettingsPanel as RedesignedSettingsPanel,
   type SettingsTab,
 } from "./components/SettingsPanel";
 import { TaskSearchDialog } from "./components/TaskSearchDialog";
-import { UsageLogDashboard } from "./components/UsageLogDashboard";
 import {
-  PendingTurnStatus,
-  TurnActivityTimeline,
-  TurnChangeCard,
-} from "./components/TurnActivityTimeline";
-import { WebPreviewSurface } from "./components/WebPreviewSurface";
-import { ComputerPanel } from "./components/ComputerPanel";
-import {
-  terminalShellName,
-  WorkbenchPanel,
-  type WorkbenchTab,
-} from "./components/WorkbenchPanel";
-import { Button, IconButton, Popover, Tooltip } from "./components/ui";
-import { normalizeCopiedText } from "./clipboardText";
-import { resolveSidebarDestination } from "./workspaceNavigation";
+  resolveSidebarDestination,
+  type FlowPrimaryView,
+} from "./workspaceNavigation";
 import {
   resolveFlowLibraryProvider,
   updateFlowLibraryBindings,
 } from "./flowLibraryBinding";
 import {
-  conversationMessageCopyText,
-  formatConversationMessageTimestamp,
-} from "./conversationMessageMeta";
-import { attachmentsByAssistantMessage } from "./conversationAttachmentReferences";
-import { formatPathForDisplay } from "./pathDisplay";
-import { hasFileDragPayload } from "./fileDrop";
-import {
-  composerContentText,
-  composerExternalValueSyncAction,
-  composerInputCommitPending,
-  composerTextLength,
-  composerUndoEntries,
-  composerVisibleText,
-  normalizeComposerContentParts,
-  normalizeComposerImageDeletionSnapshot,
-  referencedImageIds,
-  splitComposerText,
-  type ComposerHistorySnapshot,
-} from "./composerContent";
-import {
   newTaskComposerDraftKey,
   threadComposerDraftKey,
 } from "./composerDrafts";
 import { useComposerDraft } from "./useComposerDraft";
-import { isConversationScrollNearEnd } from "./conversationScroll";
-import {
-  cacheConversation,
-  mergeConversationEvents,
-  mergeConversationMessages,
-  type ConversationCacheEntry,
-} from "./conversationCache";
-import { resolveRuntimeWorkForm } from "./conversationWorkForm";
-import { shouldShowRecordedTurnChanges } from "./turnChangeOwnership";
+import { resolveComposerWorkForm } from "./conversationWorkForm";
 import {
   conversationStreamEventTrace,
   rendererTraceTime,
@@ -184,14 +54,7 @@ import {
 import { threadTitleRetryDelay } from "./threadTitleRetry";
 import { closeToolTabState } from "./toolTabState";
 import { resolveMarkdownLink } from "./markdownLinks";
-import {
-  conversationMetrics as deriveConversationMetrics,
-  formatMetricDuration,
-  formatMetricPercent,
-  formatMetricTokenCount,
-  formatMetricTokenRate,
-  type ConversationMetrics,
-} from "./conversationMetrics";
+import { conversationMetrics as deriveConversationMetrics } from "./conversationMetrics";
 import {
   useWorkspacePathIndex,
   WorkspacePathIndexContext,
@@ -214,7 +77,6 @@ import {
   selectWorkspace,
   setProviderApiKey,
   showSystemNotification,
-  writeClipboardImage,
 } from "./platform";
 import {
   playCompletionChime,
@@ -230,9 +92,12 @@ import {
 } from "./threadActivityRead";
 import {
   isThreadActivityProcessing,
-  threadActivityStatusLabel,
+  resolveThreadActivityStatus,
   type ThreadActivityStatus,
 } from "./threadActivityStatus";
+import { errorMessage, isAbortError } from "./errorMessage";
+import { threadTitleFromPrompt, threadTitleNeedsSummary } from "./threadTitle";
+import { workspaceRootKey } from "./workspaceRootKey";
 import { shouldPromptForWindowsSandboxSetup } from "./windowsSandboxSetup";
 import {
   applyAppearance,
@@ -246,15 +111,7 @@ import {
   readPersonalizationSettings,
   writePersonalizationSettings,
 } from "./personalization";
-import {
-  activeTurnIdFromEvents,
-  canCancelTurn,
-  hasPendingProviderRequest,
-  hasPendingToolCall,
-  inactiveTurnIdFromEvent,
-  inactiveTurnIdsFromEvents,
-  resolveActiveTurnId,
-} from "./turnActivityStatus";
+import { canCancelTurn } from "./turnActivityStatus";
 import {
   readEditorPreferences,
   writeEditorPreferences,
@@ -278,8 +135,6 @@ import type {
   CodexAccountStatus,
   CodexLoginStart,
   ContextStatus,
-  ContextSourceFile,
-  ContextSourceRef,
   ExperienceMode,
   GoalSnapshot,
   GoalStatus,
@@ -289,7 +144,6 @@ import type {
   McpServerInput,
   McpServerView,
   Message,
-  MessagePart,
   PlatformInfo,
   PluginView,
   Project,
@@ -301,23 +155,16 @@ import type {
   ProviderSettings,
   PreviewTarget,
   RecentWorkspace,
-  ReviewFileRequest,
   SandboxDescriptor,
   SecretSources,
   SkillDescriptor,
   AgentListItem,
-  WorkForm,
   TerminalEvent,
   TerminalSession,
   Thread,
   ThreadMcpServerView,
   ThreadModelSelection,
-  TurnStatus,
-  TurnChangeSet,
   TurnFileChange,
-  TurnFileDiffPreview,
-  TurnUndoPreview,
-  UserInputRecord,
   UserInputResponse,
   WorkspaceDiff,
   WorkspaceDiffHunk,
@@ -328,24 +175,55 @@ import type {
   WindowsSandboxSetupStatus,
 } from "./types";
 import { reuseUnchangedAgentList } from "./agentListState";
+import { PreviewSessionStore } from "./previewSessionStore";
+import { ConversationSessionRegistry } from "./conversationSessionController";
+import { useConversationSession } from "./useConversationSession";
+import { Sidebar } from "./features/sidebar/Sidebar";
+import { toolTabTitle, type ToolTab, type ToolTabKind } from "./toolTabs";
+import {
+  artifactReferencesFromText,
+  type ArtifactReference,
+} from "./artifactReferences";
+import { friendlyProviderError } from "./providerErrors";
+import {
+  ConversationLoadErrorState,
+  ConversationLoadingState,
+  GoalStrip,
+  ThreadHeader,
+} from "./features/conversation/ConversationHeader";
+import { MessageList } from "./features/conversation/MessageList";
+import { TopBar } from "./features/shell/TopBar";
+import {
+  AboutDialog,
+  KeyboardShortcutsDialog,
+  RenameDialog,
+  TurnUndoDialog,
+  WindowsSandboxSetupDialog,
+  type RenameTarget,
+  type TurnUndoDialogState,
+} from "./features/shell/AppDialogs";
+import {
+  Composer,
+  ConversationFileDropTarget,
+  useConversationFileDrop,
+  type ComposerFileDropHandle,
+  type NewTaskLaunchMode,
+} from "./features/composer/Composer";
+import { workspaceName } from "./workspaceName";
+import { RightPanel } from "./features/workbench/RightPanel";
+import {
+  NewTaskState,
+  OfflineState,
+} from "./features/conversation/ConversationEmptyStates";
 
 type ServerStatus = "checking" | "online" | "offline";
+
+const emptyConversationMessages: Message[] = [];
+const emptyConversationEvents: AgentEvent[] = [];
 
 type LoadedThreadActivityStatus = {
   status: ThreadActivityStatus;
   updatedAt: string | null;
-};
-
-type ConversationLoadState = {
-  threadId: string | null;
-  status: "idle" | "loading" | "ready" | "error";
-  error: string | null;
-};
-
-type PendingTurnFeedback = {
-  threadId: string;
-  turnId: string | null;
-  startedAt: string;
 };
 
 type PendingThreadTitleRetry = {
@@ -355,28 +233,6 @@ type PendingThreadTitleRetry = {
   failureCount: number;
   retryAt: number;
 };
-
-function resolveThreadActivityStatus(
-  turnStatus: TurnStatus | null,
-): ThreadActivityStatus | null {
-  switch (turnStatus?.status) {
-    case "running":
-    case "cancelling":
-      return "processing";
-    case "waiting_approval":
-      return "approval";
-    case "waiting_user_input":
-      return "user_action";
-    case "waiting_user_action":
-      return "user_action";
-    case "succeeded":
-      return "succeeded";
-    case "failed":
-      return "failed";
-    default:
-      return null;
-  }
-}
 
 async function loadThreadActivityStatuses(
   client: ApiClient,
@@ -412,32 +268,8 @@ async function loadThreadActivityStatuses(
   );
 }
 
-type ToolTabKind =
-  | WorkbenchTab
-  | "flow"
-  | "browser"
-  | "computer"
-  | "image"
-  | "preview"
-  | "side-task"
-  | "usage";
-
-type ToolTab = {
-  id: string;
-  kind: ToolTabKind;
-  title: string;
-  imagePreview?: ImagePreviewSource;
-  sideTaskThreadId?: string;
-  previewTarget?: PreviewTarget;
-  previewSession?: PreviewDocumentSession;
-  browserNavigation?: BrowserNavigationRequest;
-};
-
 type DirectToolCommand =
   { kind: "run"; command: string } | { kind: "read"; path: string };
-
-type ExecutionPermissionMode = "auto" | "approve" | "full_access";
-type NewTaskLaunchMode = "local" | "new_worktree";
 
 type WorkspaceResizeSide = "left" | "right";
 
@@ -465,14 +297,6 @@ type WorkspaceResizeDrag = {
   latestSize: number;
   min: number;
   max: number;
-};
-
-type TurnUndoDialogState = {
-  turnId: string;
-  preview: TurnUndoPreview | null;
-  loading: boolean;
-  applying: boolean;
-  error: string | null;
 };
 
 const workspaceLayoutStorageKey = "opentopia.workspace-layout.v1";
@@ -530,21 +354,6 @@ function reusableGoalId(
     return undefined;
   }
   return snapshot.goal.id;
-}
-
-function resolveComposerWorkForm(
-  events: AgentEvent[],
-  snapshot: GoalSnapshot | null,
-): WorkForm | null {
-  const latestRuntimeForm = resolveRuntimeWorkForm(events);
-  const goalForm = snapshot?.workForm ?? null;
-  if (
-    goalForm &&
-    (!latestRuntimeForm || latestRuntimeForm.id === goalForm.id)
-  ) {
-    return goalForm;
-  }
-  return latestRuntimeForm ?? goalForm;
 }
 
 function readWorkspaceLayoutPreferences(): WorkspaceLayoutPreferences {
@@ -628,30 +437,6 @@ function resolveWorkspaceLayout(
   };
 }
 
-function useDismissiblePopover(open: boolean, onClose: () => void) {
-  const containerRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-
-    const handlePointerDown = (event: PointerEvent) => {
-      if (!containerRef.current?.contains(event.target as Node)) onClose();
-    };
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-
-    document.addEventListener("pointerdown", handlePointerDown, true);
-    document.addEventListener("keydown", handleKeyDown);
-    return () => {
-      document.removeEventListener("pointerdown", handlePointerDown, true);
-      document.removeEventListener("keydown", handleKeyDown);
-    };
-  }, [onClose, open]);
-
-  return containerRef;
-}
-
 function emptyContextUsage(): ContextStatus["usage"] {
   return {
     modelRequests: 0,
@@ -689,6 +474,16 @@ function emptyContextUsage(): ContextStatus["usage"] {
 export function App() {
   const [platform, setPlatform] = useState<PlatformInfo | null>(null);
   const [client, setClient] = useState<ApiClient | null>(null);
+  const conversationRegistry = useMemo(
+    () => (client ? new ConversationSessionRegistry(client) : null),
+    [client],
+  );
+  useEffect(
+    () => () => {
+      conversationRegistry?.dispose();
+    },
+    [conversationRegistry],
+  );
   const [serverStatus, setServerStatus] = useState<ServerStatus>("checking");
   const [serverError, setServerError] = useState<string | null>(null);
   const [bootstrapAttempt, setBootstrapAttempt] = useState(0);
@@ -698,6 +493,20 @@ export function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
+  const conversationEventEffectRef = useRef<(event: AgentEvent) => void>(
+    () => {},
+  );
+  const forwardConversationEvent = useCallback((event: AgentEvent) => {
+    conversationEventEffectRef.current(event);
+  }, []);
+  const {
+    controller: activeConversationController,
+    state: activeConversationState,
+  } = useConversationSession(
+    conversationRegistry,
+    activeThreadId,
+    forwardConversationEvent,
+  );
   const [draftProjectId, setDraftProjectId] = useState<string | null>(null);
   // Model picked on the new-task screen, before a thread exists to pin it to.
   // Carried into the thread the draft creates.
@@ -705,9 +514,8 @@ export function App() {
     useState<ThreadModelSelection | null>(readDraftModelSelection);
   const [experienceMode, setExperienceMode] =
     useState<ExperienceMode>(readExperienceMode);
-  const [flowPrimaryView, setFlowPrimaryView] = useState<
-    "conversation" | "library"
-  >("conversation");
+  const [flowPrimaryView, setFlowPrimaryView] =
+    useState<FlowPrimaryView>("conversation");
   const [flowLibraryBindings, setFlowLibraryBindings] = useState<
     Record<string, LibraryProviderId>
   >(readFlowLibraryBindings);
@@ -723,20 +531,14 @@ export function App() {
   >(null);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [isPickingWorkspace, setIsPickingWorkspace] = useState(false);
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [events, setEvents] = useState<AgentEvent[]>([]);
-  const [conversationLoadState, setConversationLoadState] =
-    useState<ConversationLoadState>({
-      threadId: null,
-      status: "idle",
-      error: null,
-    });
-  const [conversationLoadAttempt, setConversationLoadAttempt] = useState(0);
-  const conversationCacheRef = useRef(
-    new Map<string, ConversationCacheEntry>(),
-  );
-  const conversationCacheClientRef = useRef<ApiClient | null>(null);
-  const inactiveTurnIdsRef = useRef<ReadonlySet<string>>(new Set());
+  const messages =
+    activeConversationState?.messages ?? emptyConversationMessages;
+  const events = activeConversationState?.events ?? emptyConversationEvents;
+  const conversationLoadState = activeConversationState?.loadState ?? {
+    threadId: null,
+    status: "idle" as const,
+    error: null,
+  };
   const [agentItems, setAgentItems] = useState<AgentListItem[]>([]);
   const [terminalEvents, setTerminalEvents] = useState<TerminalEvent[]>([]);
   const [terminalSession, setTerminalSession] =
@@ -762,40 +564,25 @@ export function App() {
   const [skills, setSkills] = useState<SkillDescriptor[]>([]);
   const [skillsRevision, setSkillsRevision] = useState(0);
   const [isCreatingThread, setIsCreatingThread] = useState(false);
-  const [sendingThreadIds, setSendingThreadIds] = useState<ReadonlySet<string>>(
-    () => new Set(),
-  );
-  const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
+  const activeTurnId = activeConversationState?.activeTurnId ?? null;
   const pendingThreadTitleRetriesRef = useRef(
     new Map<string, PendingThreadTitleRetry>(),
   );
   const threadTitleRetryInFlightRef = useRef(new Set<string>());
   const threadTitleRetryTimerRef = useRef<number | null>(null);
   const [threadTitleRetryRevision, setThreadTitleRetryRevision] = useState(0);
-  const [pendingTurnFeedbackByThread, setPendingTurnFeedbackByThread] =
-    useState<Record<string, PendingTurnFeedback>>({});
   const [threadActivityStatuses, setThreadActivityStatuses] = useState<
     Record<string, ThreadActivityStatus>
   >({});
-  const [queuedMessageCount, setQueuedMessageCount] = useState(0);
-  const [cancellingThreadIds, setCancellingThreadIds] = useState<
-    ReadonlySet<string>
-  >(() => new Set());
-  const requestedTurnCancellationThreadIdsRef = useRef(new Set<string>());
-  const [pendingApprovalIds, setPendingApprovalIds] = useState<string[]>([]);
-  const [decidingApprovalId, setDecidingApprovalId] = useState<string | null>(
-    null,
-  );
-  const [approvalDecisionError, setApprovalDecisionError] = useState<
-    string | null
-  >(null);
-  const [pendingUserInput, setPendingUserInput] = useState<UserInputRecord[]>(
-    [],
-  );
-  const [submittingUserInputId, setSubmittingUserInputId] = useState<
-    string | null
-  >(null);
-  const [userInputError, setUserInputError] = useState<string | null>(null);
+  const queuedMessageCount = activeConversationState?.queuedMessageCount ?? 0;
+  const pendingApprovalIds = activeConversationState?.pendingApprovalIds ?? [];
+  const decidingApprovalId =
+    activeConversationState?.decidingApprovalId ?? null;
+  const approvalDecisionError = activeConversationState?.approvalError ?? null;
+  const pendingUserInput = activeConversationState?.pendingUserInput ?? [];
+  const submittingUserInputId =
+    activeConversationState?.submittingUserInputId ?? null;
+  const userInputError = activeConversationState?.userInputError ?? null;
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsInitialTab, setSettingsInitialTab] =
     useState<SettingsTab>("general");
@@ -971,6 +758,12 @@ export function App() {
     nonce: number;
   } | null>(null);
   const [toolTabs, setToolTabs] = useState<ToolTab[]>([]);
+  const [previewSessionStore] = useState(() => new PreviewSessionStore());
+  const hasDirtyPreviewSessions = useSyncExternalStore(
+    previewSessionStore.subscribeToDirtySessions,
+    previewSessionStore.hasDirtySessions,
+    previewSessionStore.hasDirtySessions,
+  );
   const [activeToolTabId, setActiveToolTabId] = useState<string | null>(null);
   const [toolStageOpen, setToolStageOpen] = useState(false);
   const [conversationCollapsed, setConversationCollapsed] = useState(false);
@@ -983,13 +776,13 @@ export function App() {
   const [keyboardShortcutsOpen, setKeyboardShortcutsOpen] = useState(false);
 
   useEffect(() => {
-    if (!toolTabs.some((tab) => tab.previewSession?.dirty)) return;
+    if (!hasDirtyPreviewSessions) return;
     const confirmUnload = (event: BeforeUnloadEvent) => {
       event.preventDefault();
     };
     window.addEventListener("beforeunload", confirmUnload);
     return () => window.removeEventListener("beforeunload", confirmUnload);
-  }, [toolTabs]);
+  }, [hasDirtyPreviewSessions]);
   const [aboutOpen, setAboutOpen] = useState(false);
   const [renameTarget, setRenameTarget] = useState<RenameTarget | null>(null);
   const [turnUndoDialog, setTurnUndoDialog] =
@@ -1010,27 +803,24 @@ export function App() {
   const workspaceResizeFrameRef = useRef<number | null>(null);
   const markdownNavigationIdRef = useRef(0);
   const taskNotificationPreferencesRef = useRef(taskNotificationPreferences);
-  const ingestedEventIdsRef = useRef(new Set<string>());
-  const pendingEventRenderRef = useRef<AgentEvent[]>([]);
-  const eventRenderTimerRef = useRef<number | null>(null);
   const pendingEventCommitTraceRef = useRef(
     new Map<
       string,
       {
         eventTrace: ConversationStreamEventTrace;
+        eventSeq: number;
         receivedClockMs: number;
       }
     >(),
   );
   const activeThreadIdRef = useRef<string | null>(null);
-  const sendingThreadIdsRef = useRef(sendingThreadIds);
+  const agentRefreshRequestRef = useRef<(() => void) | null>(null);
   const threadActivityStatusesRef = useRef(threadActivityStatuses);
   const threadActivityReadAtRef = useRef<ThreadActivityReadAt>(
     readThreadActivityReadAt(),
   );
 
   activeThreadIdRef.current = activeThreadId;
-  sendingThreadIdsRef.current = sendingThreadIds;
   threadActivityStatusesRef.current = threadActivityStatuses;
 
   const setThreadActivityStatus = useCallback(
@@ -1133,99 +923,6 @@ export function App() {
     };
   }, [client, processingThreadIds]);
 
-  const setThreadSending = useCallback((threadId: string, sending: boolean) => {
-    setSendingThreadIds((current) => {
-      const alreadySending = current.has(threadId);
-      if (alreadySending === sending) return current;
-      const next = new Set(current);
-      if (sending) next.add(threadId);
-      else next.delete(threadId);
-      return next;
-    });
-  }, []);
-
-  const updatePendingTurnFeedback = useCallback(
-    (
-      threadId: string,
-      update:
-        | PendingTurnFeedback
-        | null
-        | ((current: PendingTurnFeedback | null) => PendingTurnFeedback | null),
-    ) => {
-      setPendingTurnFeedbackByThread((current) => {
-        const previous = current[threadId] ?? null;
-        const next = typeof update === "function" ? update(previous) : update;
-        if (next === previous) return current;
-        if (!next) {
-          if (!previous) return current;
-          const remaining = { ...current };
-          delete remaining[threadId];
-          return remaining;
-        }
-        return { ...current, [threadId]: next };
-      });
-    },
-    [],
-  );
-
-  const clearTurnCancellationRequest = useCallback((threadId: string) => {
-    requestedTurnCancellationThreadIdsRef.current.delete(threadId);
-    setCancellingThreadIds((current) => {
-      if (!current.has(threadId)) return current;
-      const next = new Set(current);
-      next.delete(threadId);
-      return next;
-    });
-  }, []);
-
-  const markTurnCancellationRequested = useCallback((threadId: string) => {
-    requestedTurnCancellationThreadIdsRef.current.add(threadId);
-    setCancellingThreadIds((current) =>
-      current.has(threadId) ? current : new Set([...current, threadId]),
-    );
-  }, []);
-
-  const cancelResolvedTurnIfRequested = useCallback(
-    async (threadId: string, turnId: string | null) => {
-      if (
-        !client ||
-        !turnId ||
-        !requestedTurnCancellationThreadIdsRef.current.has(threadId)
-      ) {
-        return;
-      }
-      try {
-        const result = await client.cancelTurn(threadId, turnId);
-        if (!result.cancelled) {
-          const turnStatus = await client.getTurnStatus(threadId);
-          if (!resolveActiveTurnId(turnStatus, inactiveTurnIdsRef.current)) {
-            clearTurnCancellationRequest(threadId);
-          }
-        }
-      } catch (error) {
-        clearTurnCancellationRequest(threadId);
-        if (activeThreadIdRef.current === threadId) {
-          setActionError(`中断执行失败：${errorMessage(error)}`);
-        }
-      }
-    },
-    [clearTurnCancellationRequest, client],
-  );
-
-  const mergeMessagesForThread = useCallback(
-    (threadId: string, incoming: Message[]) => {
-      const cached = conversationCacheRef.current.get(threadId);
-      cacheConversation(conversationCacheRef.current, threadId, {
-        messages: mergeConversationMessages(cached?.messages ?? [], incoming),
-        events: cached?.events ?? [],
-      });
-      if (activeThreadIdRef.current === threadId) {
-        setMessages((current) => mergeConversationMessages(current, incoming));
-      }
-    },
-    [],
-  );
-
   const activeThread = useMemo(
     () => threads.find((thread) => thread.id === activeThreadId) ?? null,
     [threads, activeThreadId],
@@ -1263,11 +960,10 @@ export function App() {
     writeLastActiveThreadId(activeThread.experienceMode, activeThread.id);
   }, [activeThread]);
   const isSending = activeThreadId
-    ? sendingThreadIds.has(activeThreadId)
+    ? (activeConversationState?.sending ?? false)
     : isCreatingThread;
-  const pendingTurnFeedback = activeThreadId
-    ? (pendingTurnFeedbackByThread[activeThreadId] ?? null)
-    : null;
+  const pendingTurnFeedback =
+    activeConversationState?.pendingTurnFeedback ?? null;
   const isConversationReady =
     activeThreadId !== null &&
     conversationLoadState.threadId === activeThreadId &&
@@ -1305,7 +1001,7 @@ export function App() {
       isThreadActivityProcessing(threadActivityStatuses[activeThreadId]),
   );
   const conversationTurnIsCancelling =
-    activeThreadId !== null && cancellingThreadIds.has(activeThreadId);
+    activeConversationState?.cancelling ?? false;
   const draftProject = useMemo(
     () => projects.find((project) => project.id === draftProjectId) ?? null,
     [draftProjectId, projects],
@@ -1328,8 +1024,8 @@ export function App() {
     () => toolTabs.find((tab) => tab.id === activeToolTabId) ?? null,
     [activeToolTabId, toolTabs],
   );
-  const flowLibraryView =
-    experienceMode === "flow" && flowPrimaryView === "library";
+  const flowPrimarySurface =
+    experienceMode === "flow" && flowPrimaryView !== "conversation";
   const sidebarDestination = resolveSidebarDestination({
     experienceMode,
     flowPrimaryView,
@@ -1362,42 +1058,9 @@ export function App() {
   );
 
   useEffect(() => {
-    setQueuedMessageCount(0);
     setTurnUndoDialog(null);
+    pendingEventCommitTraceRef.current.clear();
   }, [activeThreadId]);
-
-  useEffect(
-    () => () => {
-      if (eventRenderTimerRef.current !== null) {
-        window.clearTimeout(eventRenderTimerRef.current);
-        eventRenderTimerRef.current = null;
-      }
-      pendingEventRenderRef.current = [];
-      pendingEventCommitTraceRef.current.clear();
-    },
-    [activeThreadId],
-  );
-
-  useEffect(() => {
-    if (!pendingTurnFeedback) return;
-    const feedbackHasResolved = events.some((event) => {
-      const feedbackEvent =
-        event.payload.type === "turn_started" ||
-        event.payload.type === "turn_finished" ||
-        event.payload.type === "turn_suspended" ||
-        event.payload.type === "turn_cancelled" ||
-        event.payload.type === "turn_awaiting_input" ||
-        event.payload.type === "error";
-      if (!feedbackEvent) return false;
-      return pendingTurnFeedback.turnId
-        ? event.turnId === pendingTurnFeedback.turnId
-        : event.createdAt >= pendingTurnFeedback.startedAt;
-    });
-    if (!feedbackHasResolved) return;
-    updatePendingTurnFeedback(pendingTurnFeedback.threadId, (current) =>
-      current?.startedAt === pendingTurnFeedback.startedAt ? null : current,
-    );
-  }, [events, pendingTurnFeedback, updatePendingTurnFeedback]);
 
   useEffect(() => {
     if (!activeApproval) return;
@@ -1441,12 +1104,12 @@ export function App() {
     ],
   );
   const contextRailAutoVisible =
-    !flowLibraryView &&
+    !flowPrimarySurface &&
     !toolStageOpen &&
     workspaceWidth - (sidebarCollapsed ? 0 : workspaceLayout.left) >=
       contextRailInlineMinWidth;
   const contextRailVisible =
-    !flowLibraryView &&
+    !flowPrimarySurface &&
     !toolStageOpen &&
     (contextRailOpen || (contextRailAutoVisible && !contextRailCollapsed));
   const workspaceStyle = {
@@ -1668,25 +1331,13 @@ export function App() {
   const ingestEvent = useCallback(
     (event: AgentEvent) => {
       if (event.threadId !== activeThreadIdRef.current) return;
-      if (ingestedEventIdsRef.current.has(event.id)) return;
-      ingestedEventIdsRef.current.add(event.id);
-      const inactiveTurnId = inactiveTurnIdFromEvent(event);
-      if (inactiveTurnId) {
-        inactiveTurnIdsRef.current = new Set([
-          ...inactiveTurnIdsRef.current,
-          inactiveTurnId,
-        ]);
-      }
-      if (ingestedEventIdsRef.current.size > 4096) {
-        const oldestId = ingestedEventIdsRef.current.values().next().value;
-        if (oldestId) ingestedEventIdsRef.current.delete(oldestId);
-      }
 
       const eventTrace = conversationStreamEventTrace(event);
       if (eventTrace) {
         const traceTime = rendererTraceTime();
         pendingEventCommitTraceRef.current.set(event.id, {
           eventTrace,
+          eventSeq: event.seq,
           receivedClockMs: traceTime.rendererClockMs,
         });
         recordConversationRenderTrace({
@@ -1698,50 +1349,14 @@ export function App() {
         });
       }
 
-      pendingEventRenderRef.current.push(event);
-      if (eventRenderTimerRef.current === null) {
-        eventRenderTimerRef.current = window.setTimeout(() => {
-          eventRenderTimerRef.current = null;
-          const pending = pendingEventRenderRef.current.filter(
-            (queuedEvent) => queuedEvent.threadId === activeThreadIdRef.current,
-          );
-          pendingEventRenderRef.current = [];
-          if (pending.length === 0) return;
-
-          // Streaming events can arrive faster than the renderer can paint.
-          startTransition(() => {
-            setEvents((current) => {
-              const merged = mergeConversationEvents(current, pending);
-              const retainedIds = new Set(merged.map((event) => event.id));
-              for (const queuedEvent of pending) {
-                if (!retainedIds.has(queuedEvent.id)) {
-                  pendingEventCommitTraceRef.current.delete(queuedEvent.id);
-                }
-              }
-              return merged;
-            });
-          });
-        }, 32);
-      }
-
-      if (event.payload.type === "assistant_message") {
-        const assistantMessage = event.payload.message;
-        mergeMessagesForThread(event.threadId, [assistantMessage]);
-      }
-
       if (event.payload.type === "goal_updated") {
         setGoalSnapshot(event.payload.snapshot);
       }
 
       if (event.payload.type === "approval_requested") {
-        const approvalId = event.payload.approval_id;
         setThreadActivityStatus(event.threadId, "approval");
         markThreadActivityRead(event.threadId);
-        setApprovalDecisionError(null);
         setConversationCollapsed(false);
-        setPendingApprovalIds((current) =>
-          current.includes(approvalId) ? current : [...current, approvalId],
-        );
       }
 
       if (
@@ -1758,27 +1373,8 @@ export function App() {
       }
 
       if (event.payload.type === "user_input_requested") {
-        const request = event.payload.request;
         setThreadActivityStatus(event.threadId, "user_action");
-        setUserInputError(null);
         setConversationCollapsed(false);
-        setPendingUserInput((current) =>
-          current.some(
-            (record) => record.request.requestId === request.requestId,
-          )
-            ? current
-            : [
-                ...current,
-                {
-                  threadId: event.threadId,
-                  request,
-                  status: "pending",
-                  response: null,
-                  createdAt: event.createdAt,
-                  answeredAt: null,
-                },
-              ],
-        );
       }
 
       if (event.payload.type === "error") {
@@ -1792,39 +1388,16 @@ export function App() {
       if (event.payload.type === "turn_started" && event.turnId) {
         setThreadActivityStatus(event.threadId, "processing");
         markThreadActivityRead(event.threadId);
-        setActiveTurnId(event.turnId);
-        if (
-          !requestedTurnCancellationThreadIdsRef.current.has(event.threadId)
-        ) {
-          clearTurnCancellationRequest(event.threadId);
-        }
-        setQueuedMessageCount((current) => Math.max(0, current - 1));
+        agentRefreshRequestRef.current?.();
       } else if (event.payload.type === "turn_finished") {
         // This task is already open, so its completion has been seen.
         setThreadActivityStatus(event.threadId, "succeeded");
         markThreadActivityRead(event.threadId);
-        setActiveTurnId((current) =>
-          !event.turnId || current === event.turnId ? null : current,
-        );
-        clearTurnCancellationRequest(event.threadId);
       } else if (event.payload.type === "turn_suspended") {
         setThreadActivityStatus(event.threadId, "approval");
         markThreadActivityRead(event.threadId);
-        setActiveTurnId((current) =>
-          !event.turnId || current === event.turnId ? null : current,
-        );
-        clearTurnCancellationRequest(event.threadId);
-      } else if (event.payload.type === "browser_handoff_required") {
-        setActiveTurnId((current) =>
-          !event.turnId || current === event.turnId ? null : current,
-        );
-        clearTurnCancellationRequest(event.threadId);
       } else if (event.payload.type === "turn_cancelled") {
         setThreadActivityStatus(event.threadId, null);
-        setActiveTurnId((current) =>
-          !event.turnId || current === event.turnId ? null : current,
-        );
-        clearTurnCancellationRequest(event.threadId);
       } else if (
         event.payload.type === "turn_awaiting_input" ||
         event.payload.type === "error"
@@ -1832,10 +1405,6 @@ export function App() {
         if (event.payload.type === "turn_awaiting_input") {
           setThreadActivityStatus(event.threadId, "user_action");
         }
-        setActiveTurnId((current) =>
-          !event.turnId || current === event.turnId ? null : current,
-        );
-        clearTurnCancellationRequest(event.threadId);
       }
 
       if (event.payload.type === "turn_finished") {
@@ -1926,15 +1495,30 @@ export function App() {
       }
     },
     [
-      clearTurnCancellationRequest,
       deliverTaskCompletionNotification,
       markThreadActivityRead,
-      mergeMessagesForThread,
       setThreadActivityStatus,
     ],
   );
+  conversationEventEffectRef.current = ingestEvent;
 
   useLayoutEffect(() => {
+    const committedEventIds = new Set(events.map((event) => event.id));
+    const latestStreamSeq = events.reduce(
+      (latest, event) =>
+        event.seq === Number.MAX_SAFE_INTEGER
+          ? latest
+          : Math.max(latest, event.seq),
+      -1,
+    );
+    for (const [eventId, pendingTrace] of pendingEventCommitTraceRef.current) {
+      if (
+        !committedEventIds.has(eventId) &&
+        pendingTrace.eventSeq <= latestStreamSeq
+      ) {
+        pendingEventCommitTraceRef.current.delete(eventId);
+      }
+    }
     for (const event of events) {
       const pendingTrace = pendingEventCommitTraceRef.current.get(event.id);
       if (!pendingTrace) continue;
@@ -2188,58 +1772,40 @@ export function App() {
   }, [draftModelSelection]);
 
   useEffect(() => {
-    setPendingApprovalIds([]);
-    setDecidingApprovalId(null);
-    setApprovalDecisionError(null);
-    setPendingUserInput([]);
-    setSubmittingUserInputId(null);
-    setUserInputError(null);
-    if (
-      activeThreadId &&
-      requestedTurnCancellationThreadIdsRef.current.has(activeThreadId)
-    ) {
-      markTurnCancellationRequested(activeThreadId);
-    }
-    inactiveTurnIdsRef.current = new Set();
     setGoalSnapshot(null);
-    if (!client || !activeThreadId) {
-      setActiveTurnId(null);
-      setMessages([]);
-      setEvents([]);
-      setConversationLoadState({
-        threadId: null,
-        status: "idle",
-        error: null,
-      });
-      return;
-    }
+    setAgentItems([]);
+    agentRefreshRequestRef.current = null;
+    if (!client || !activeThreadId) return;
+
+    const sessionClient = client;
     const threadId = activeThreadId;
+    const controller = new AbortController();
     let cancelled = false;
-    let source: StreamHandle | null = null;
     let agentSource: StreamHandle | null = null;
     let agentRefreshTimer: ReturnType<typeof setTimeout> | null = null;
     let agentRefreshInFlight = false;
     let agentRefreshQueued = false;
-    const controller = new AbortController();
-    const openAgentStream = (items: AgentListItem[]) => {
+
+    function openAgentStream(items: AgentListItem[]) {
       if (agentSource || items.length === 0) return;
       const cursor = items.reduce(
         (latest, item) => Math.max(latest, item.activity?.cursor ?? 0),
         0,
       );
-      agentSource = client.openAgentEventStream(
+      agentSource = sessionClient.openAgentEventStream(
         threadId,
         cursor || undefined,
-        () => scheduleAgentRefresh(),
+        scheduleAgentRefresh,
       );
-    };
-    const refreshAgents = () => {
+    }
+
+    function refreshAgents() {
       if (agentRefreshInFlight) {
         agentRefreshQueued = true;
         return;
       }
       agentRefreshInFlight = true;
-      void client
+      void sessionClient
         .listAgents(threadId, controller.signal)
         .then((items) => {
           if (cancelled) return;
@@ -2248,9 +1814,7 @@ export function App() {
         })
         .catch((error) => {
           if (!cancelled && !isAbortError(error)) {
-            setServerError(
-              error instanceof Error ? error.message : String(error),
-            );
+            setServerError(errorMessage(error));
           }
         })
         .finally(() => {
@@ -2260,185 +1824,57 @@ export function App() {
             scheduleAgentRefresh();
           }
         });
-    };
-    const scheduleAgentRefresh = () => {
+    }
+
+    function scheduleAgentRefresh() {
       if (agentRefreshTimer) return;
       agentRefreshTimer = setTimeout(() => {
         agentRefreshTimer = null;
         refreshAgents();
       }, 150);
-    };
-    if (conversationCacheClientRef.current !== client) {
-      conversationCacheRef.current.clear();
-      conversationCacheClientRef.current = client;
-    }
-    const cached = conversationCacheRef.current.get(threadId) ?? null;
-    inactiveTurnIdsRef.current = inactiveTurnIdsFromEvents(
-      cached?.events ?? [],
-    );
-    // The cached lifecycle is available synchronously and is the best source
-    // for the first paint when returning to a task. The turn-status request
-    // below still reconciles stale caches, but it must not gate the visible
-    // running state behind a network round trip.
-    const cachedActivityStatus = threadActivityStatusesRef.current[threadId];
-    setActiveTurnId(
-      cachedActivityStatus && !isThreadActivityProcessing(cachedActivityStatus)
-        ? null
-        : activeTurnIdFromEvents(cached?.events ?? []),
-    );
-    if (cached) {
-      cacheConversation(conversationCacheRef.current, threadId, cached);
-      setMessages(cached.messages);
-      setEvents(cached.events);
-      setConversationLoadState({ threadId, status: "ready", error: null });
-    } else {
-      setMessages([]);
-      setEvents([]);
-      setConversationLoadState({ threadId, status: "loading", error: null });
     }
 
-    const messagesRequest = client.listMessages(threadId, controller.signal);
-    const eventsRequest = client.listConversationEvents(
-      threadId,
-      cached?.events.at(-1)?.seq,
-      controller.signal,
-    );
-
-    void Promise.all([messagesRequest, eventsRequest])
-      .then(([loadedMessages, loadedEvents]) => {
-        if (cancelled) return;
-        setMessages((current) =>
-          mergeConversationMessages(current, loadedMessages),
-        );
-        const nextEvents = mergeConversationEvents(
-          cached?.events ?? [],
-          loadedEvents,
-        );
-        const inactiveTurnIds = inactiveTurnIdsFromEvents(nextEvents);
-        const restoredActiveTurnId = activeTurnIdFromEvents(nextEvents);
-        inactiveTurnIdsRef.current = inactiveTurnIds;
-        setEvents(nextEvents);
-        setActiveTurnId(
-          (current) =>
-            restoredActiveTurnId ??
-            (current && !inactiveTurnIds.has(current) ? current : null),
-        );
-        setConversationLoadState({ threadId, status: "ready", error: null });
-        source = client.openEventStream(
-          threadId,
-          nextEvents.at(-1)?.seq,
-          (event) => {
-            ingestEvent(event);
-            if (!agentSource && event.payload.type === "turn_started") {
-              scheduleAgentRefresh();
-            }
-          },
-        );
+    agentRefreshRequestRef.current = scheduleAgentRefresh;
+    refreshAgents();
+    void sessionClient
+      .getGoal(threadId, controller.signal)
+      .then((snapshot) => {
+        if (!cancelled) setGoalSnapshot(snapshot);
       })
       .catch((error) => {
-        if (cancelled || isAbortError(error)) return;
-        const message = error instanceof Error ? error.message : String(error);
-        if (!cached) {
-          setConversationLoadState({
-            threadId,
-            status: "error",
-            error: message,
-          });
-        }
-        setServerError(message);
-      });
-
-    void Promise.all([
-      client.getTurnStatus(threadId, controller.signal),
-      client.listPendingApprovals(threadId, controller.signal),
-      client.listPendingUserInput(threadId, controller.signal),
-      client.listAgents(threadId, controller.signal),
-      client.getGoal(threadId, controller.signal),
-    ])
-      .then(
-        ([
-          turnStatus,
-          pendingApprovals,
-          pendingPlanningInput,
-          loadedAgents,
-          loadedGoal,
-        ]) => {
-          if (cancelled) return;
-          const resolvedActiveTurnId = resolveActiveTurnId(
-            turnStatus,
-            inactiveTurnIdsRef.current,
-          );
-          setActiveTurnId(resolvedActiveTurnId);
-          if (turnStatus?.status === "cancelling") {
-            markTurnCancellationRequested(threadId);
-          } else if (
-            !resolvedActiveTurnId &&
-            !sendingThreadIdsRef.current.has(threadId)
-          ) {
-            clearTurnCancellationRequest(threadId);
-          }
-          const activityStatus =
-            pendingApprovals.length > 0
-              ? "approval"
-              : resolveThreadActivityStatus(turnStatus);
-          if (activityStatus) {
-            setThreadActivityStatus(threadId, activityStatus);
-          }
-          if (activityStatus) markThreadActivityRead(threadId);
-          setPendingApprovalIds(
-            pendingApprovals.map((approval) => approval.approvalId),
-          );
-          setPendingUserInput(pendingPlanningInput);
-          setAgentItems((current) =>
-            reuseUnchangedAgentList(current, loadedAgents),
-          );
-          openAgentStream(loadedAgents);
-          setGoalSnapshot(loadedGoal);
-        },
-      )
-      .catch((error) => {
         if (!cancelled && !isAbortError(error))
-          setServerError(
-            error instanceof Error ? error.message : String(error),
-          );
+          setServerError(errorMessage(error));
       });
 
     return () => {
       cancelled = true;
       controller.abort();
-      source?.close();
       agentSource?.close();
       if (agentRefreshTimer) clearTimeout(agentRefreshTimer);
+      if (agentRefreshRequestRef.current === scheduleAgentRefresh) {
+        agentRefreshRequestRef.current = null;
+      }
     };
-  }, [
-    activeThreadId,
-    client,
-    clearTurnCancellationRequest,
-    conversationLoadAttempt,
-    ingestEvent,
-    markThreadActivityRead,
-    markTurnCancellationRequested,
-    setThreadActivityStatus,
-  ]);
+  }, [activeThreadId, client]);
 
   useEffect(() => {
-    if (
-      !activeThreadId ||
-      conversationLoadState.threadId !== activeThreadId ||
-      conversationLoadState.status !== "ready"
-    ) {
-      return;
-    }
-    cacheConversation(conversationCacheRef.current, activeThreadId, {
-      messages,
-      events,
-    });
+    if (!activeThreadId || !activeConversationState) return;
+    const activityStatus =
+      activeConversationState.pendingApprovalIds.length > 0
+        ? "approval"
+        : activeConversationState.pendingUserInput.length > 0
+          ? "user_action"
+          : resolveThreadActivityStatus(activeConversationState.turnStatus);
+    if (!activityStatus) return;
+    setThreadActivityStatus(activeThreadId, activityStatus);
+    markThreadActivityRead(activeThreadId);
   }, [
+    activeConversationState?.pendingApprovalIds.length,
+    activeConversationState?.pendingUserInput.length,
+    activeConversationState?.turnStatus,
     activeThreadId,
-    conversationLoadState.status,
-    conversationLoadState.threadId,
-    events,
-    messages,
+    markThreadActivityRead,
+    setThreadActivityStatus,
   ]);
 
   useEffect(() => {
@@ -2559,26 +1995,11 @@ export function App() {
 
   function selectThread(threadId: string) {
     const thread = threads.find((item) => item.id === threadId);
-    const cached =
-      conversationCacheClientRef.current === client
-        ? (conversationCacheRef.current.get(threadId) ?? null)
-        : null;
-    const cachedActivityStatus = threadActivityStatusesRef.current[threadId];
-    const cachedActiveTurnId =
-      cachedActivityStatus && !isThreadActivityProcessing(cachedActivityStatus)
-        ? null
-        : activeTurnIdFromEvents(cached?.events ?? []);
     markThreadActivityRead(threadId);
     activeThreadIdRef.current = threadId;
     setActiveThreadId(threadId);
     setFlowPrimaryView("conversation");
     if (activeToolTab?.kind === "extensions") setToolStageOpen(false);
-    setActiveTurnId(cachedActiveTurnId);
-    if (cached) {
-      setMessages(cached.messages);
-      setEvents(cached.events);
-      setConversationLoadState({ threadId, status: "ready", error: null });
-    }
     if (thread) setExperienceMode(thread.experienceMode);
     setDraftProjectId(null);
     if (thread?.workspaceRoot) setSelectedWorkspaceRoot(thread.workspaceRoot);
@@ -2635,11 +2056,7 @@ export function App() {
     activeThreadIdRef.current = null;
     setActiveThreadId(null);
     setFlowPrimaryView("conversation");
-    setMessages([]);
-    setEvents([]);
     setNewTaskLaunchMode("local");
-    setActiveTurnId(null);
-    setPendingApprovalIds([]);
     setToolTabs([]);
     setActiveToolTabId(null);
     setToolStageOpen(false);
@@ -2653,6 +2070,7 @@ export function App() {
     if (nextMode === experienceMode) return;
     const project = activeProject ?? draftProject;
     setExperienceMode(nextMode);
+    if (nextMode !== "flow") setFlowPrimaryView("conversation");
     if (client) {
       void client
         .listThreads(true, nextMode)
@@ -2987,13 +2405,13 @@ export function App() {
   );
 
   function closeToolTab(tabId: string) {
-    const closingTab = toolTabs.find((tab) => tab.id === tabId);
     if (
-      closingTab?.previewSession?.dirty &&
+      previewSessionStore.isDirty(tabId) &&
       !window.confirm("关闭标签会丢弃尚未保存的 Markdown 更改，是否继续？")
     ) {
       return;
     }
+    previewSessionStore.delete(tabId);
     setToolTabs((current) => {
       const next = closeToolTabState(current, activeToolTabId, tabId);
       if (next.activeTabId !== activeToolTabId) {
@@ -3006,17 +2424,6 @@ export function App() {
       return next.tabs;
     });
   }
-
-  const updatePreviewSession = useCallback(
-    (tabId: string, session: PreviewDocumentSession) => {
-      setToolTabs((current) =>
-        current.map((tab) =>
-          tab.id === tabId ? { ...tab, previewSession: session } : tab,
-        ),
-      );
-    },
-    [],
-  );
 
   async function chooseWorkspace(
     bindDraftProject = false,
@@ -3518,7 +2925,6 @@ export function App() {
     const submittedModelSelection = draftModelSelection;
     let createdThreadId: string | null = null;
     setIsCreatingThread(true);
-    let pendingFeedbackStartedAt: string | null = null;
     setActionError(null);
     try {
       const prompt = initialPrompt?.trim() ?? "";
@@ -3533,7 +2939,6 @@ export function App() {
         updateFlowLibraryBindings(current, thread.id, submittedLibraryProvider),
       );
       setDraftFlowLibraryProvider(null);
-      if (shouldSendInitialPrompt) setThreadSending(thread.id, true);
       if (submittedModelSelection) {
         // Pin before the first turn runs, so the conversation starts on the
         // model picked in the draft composer rather than the connection default.
@@ -3567,39 +2972,24 @@ export function App() {
         await runDirectToolCommand(thread.id, directCommand);
         if (activeThreadIdRef.current === thread.id) setComposer("");
       } else if (shouldSendInitialPrompt) {
-        pendingFeedbackStartedAt = new Date().toISOString();
-        updatePendingTurnFeedback(thread.id, {
-          threadId: thread.id,
-          turnId: null,
-          startedAt: pendingFeedbackStartedAt,
-        });
         setThreadActivityStatus(thread.id, "processing");
-        const { message, turnId } = await client.sendMessage(
-          thread.id,
-          initialPrompt?.trim() ?? "",
-          submittedContextPaths,
-          submittedSkillIds,
-          submittedCollaborationMode,
-          undefined,
+        const sessionController = conversationRegistry?.get(thread.id);
+        if (!sessionController) throw new Error("会话服务尚未就绪。");
+        const result = await sessionController.send({
+          content: initialPrompt?.trim() ?? "",
+          sourcePaths: submittedContextPaths,
+          skillIds: submittedSkillIds,
+          collaborationMode: submittedCollaborationMode,
           imageAttachments,
-          imageAttachments.length > 0 ? contentParts : [],
-          submittedLibraryProvider ?? undefined,
-        );
-        mergeMessagesForThread(thread.id, [message]);
-        markThreadActivityRead(thread.id);
-        if (
-          turnId &&
-          activeThreadIdRef.current === thread.id &&
-          !inactiveTurnIdsRef.current.has(turnId)
-        ) {
-          setActiveTurnId(turnId);
+          contentParts: imageAttachments.length > 0 ? contentParts : [],
+          libraryProvider: submittedLibraryProvider ?? undefined,
+        });
+        if (!result) {
+          throw new Error(
+            sessionController.getSnapshot().commandError ?? "消息发送失败。",
+          );
         }
-        await cancelResolvedTurnIfRequested(thread.id, turnId);
-        updatePendingTurnFeedback(thread.id, (current) =>
-          current?.startedAt === pendingFeedbackStartedAt
-            ? { ...current, turnId }
-            : current,
-        );
+        markThreadActivityRead(thread.id);
         if (activeThreadIdRef.current === thread.id) {
           setComposer("");
           setContextSources([]);
@@ -3610,12 +3000,6 @@ export function App() {
     } catch (error) {
       if (createdThreadId) {
         setThreadActivityStatus(createdThreadId, null);
-        clearTurnCancellationRequest(createdThreadId);
-      }
-      if (pendingFeedbackStartedAt && createdThreadId) {
-        updatePendingTurnFeedback(createdThreadId, (current) =>
-          current?.startedAt === pendingFeedbackStartedAt ? null : current,
-        );
       }
       if (
         createdThreadId === null ||
@@ -3626,7 +3010,6 @@ export function App() {
       return false;
     } finally {
       setIsCreatingThread(false);
-      if (createdThreadId) setThreadSending(createdThreadId, false);
     }
   }
 
@@ -3732,118 +3115,58 @@ export function App() {
     const submittedSkillIds = [...selectedSkillIds];
     const submittedCollaborationMode = collaborationMode;
     const submittedGoalId = reusableGoalId(collaborationMode, goalSnapshot);
-    setThreadSending(threadId, true);
-    let pendingFeedbackStartedAt: string | null = null;
+    setActionError(null);
+    activeConversationController?.clearCommandError();
     try {
       if (directCommand) {
         await runDirectToolCommand(threadId, directCommand);
         if (activeThreadIdRef.current === threadId) setComposer("");
         return activeThreadIdRef.current === threadId;
       }
-      pendingFeedbackStartedAt = new Date().toISOString();
-      updatePendingTurnFeedback(threadId, {
-        threadId,
-        turnId: null,
-        startedAt: pendingFeedbackStartedAt,
-      });
       setThreadActivityStatus(threadId, "processing");
-      const { message, turnId, queued } = await client.sendMessage(
-        threadId,
-        messageText,
-        submittedContextPaths,
-        submittedSkillIds,
-        submittedCollaborationMode,
-        submittedGoalId,
+      if (!activeConversationController) throw new Error("会话服务尚未就绪。");
+      const result = await activeConversationController.send({
+        content: messageText,
+        sourcePaths: submittedContextPaths,
+        skillIds: submittedSkillIds,
+        collaborationMode: submittedCollaborationMode,
+        goalId: submittedGoalId,
         imageAttachments,
-        imageAttachments.length > 0 ? contentParts : [],
-        activeThread.experienceMode === "flow"
-          ? (flowLibraryBindings[threadId] ?? undefined)
-          : undefined,
-      );
-      mergeMessagesForThread(threadId, [message]);
-      markThreadActivityRead(threadId);
-      if (
-        turnId &&
-        activeThreadIdRef.current === threadId &&
-        !inactiveTurnIdsRef.current.has(turnId)
-      ) {
-        setActiveTurnId(turnId);
+        contentParts: imageAttachments.length > 0 ? contentParts : [],
+        libraryProvider:
+          activeThread.experienceMode === "flow"
+            ? (flowLibraryBindings[threadId] ?? undefined)
+            : undefined,
+      });
+      if (!result) {
+        throw new Error(
+          activeConversationController.getSnapshot().commandError ??
+            "消息发送失败。",
+        );
       }
-      await cancelResolvedTurnIfRequested(threadId, turnId);
-      updatePendingTurnFeedback(threadId, (current) =>
-        current?.startedAt === pendingFeedbackStartedAt
-          ? {
-              ...current,
-              turnId,
-            }
-          : current,
-      );
+      markThreadActivityRead(threadId);
       if (activeThreadIdRef.current === threadId) {
-        if (queued) setQueuedMessageCount((current) => current + 1);
         setComposer("");
         setContextSources([]);
         setSelectedSkillIds([]);
       }
-      try {
-        const turnStatus = await client.getTurnStatus(threadId);
-        if (activeThreadIdRef.current === threadId) {
-          setActiveTurnId(
-            resolveActiveTurnId(turnStatus, inactiveTurnIdsRef.current),
-          );
-        }
-      } catch {
-        // The persisted event stream will reconcile Turn state after a successful send.
-      }
       return activeThreadIdRef.current === threadId;
     } catch (error) {
       setThreadActivityStatus(threadId, null);
-      clearTurnCancellationRequest(threadId);
-      if (pendingFeedbackStartedAt) {
-        updatePendingTurnFeedback(threadId, (current) =>
-          current?.startedAt === pendingFeedbackStartedAt ? null : current,
-        );
-      }
       if (activeThreadIdRef.current === threadId) {
         setActionError(errorMessage(error));
       }
       return false;
-    } finally {
-      setThreadSending(threadId, false);
     }
   }
 
   async function cancelTurn() {
-    if (!client || !activeThread || !conversationTurnCanBeCancelled) return;
-    const threadId = activeThread.id;
-    if (requestedTurnCancellationThreadIdsRef.current.has(threadId)) return;
-    const turnId = activeTurnId;
-    markTurnCancellationRequested(threadId);
+    if (!activeConversationController || !conversationTurnCanBeCancelled)
+      return;
     setActionError(null);
-    try {
-      const result = await client.cancelTurn(threadId, turnId ?? undefined);
-      if (!result.cancelled) {
-        let reconciledTurnId: string | null = turnId;
-        try {
-          const turnStatus = await client.getTurnStatus(threadId);
-          reconciledTurnId = resolveActiveTurnId(
-            turnStatus,
-            inactiveTurnIdsRef.current,
-          );
-        } catch {
-          // Keep the original cancellation response when status reconciliation fails.
-        }
-        if (!reconciledTurnId && !sendingThreadIdsRef.current.has(threadId)) {
-          clearTurnCancellationRequest(threadId);
-        }
-        if (activeThreadIdRef.current === threadId) {
-          setActiveTurnId(reconciledTurnId);
-          if (reconciledTurnId && turnId) setActionError(result.message);
-        }
-      }
-    } catch (error) {
-      clearTurnCancellationRequest(threadId);
-      setActionError(`中断执行失败：${errorMessage(error)}`);
-    }
+    await activeConversationController.cancel();
+    const error = activeConversationController.getSnapshot().commandError;
+    if (error) setActionError(error);
   }
 
   async function runGoal() {
@@ -3862,17 +3185,18 @@ export function App() {
         setGoalSnapshot(snapshot);
       }
       setCollaborationMode("goal");
-      const { message, turnId, queued } = await client.sendMessage(
-        activeThread.id,
-        "继续执行已确认的目标计划，直到完成或出现明确阻塞。",
-        [],
-        [],
-        "goal",
+      if (!activeConversationController) throw new Error("会话服务尚未就绪。");
+      const result = await activeConversationController.send({
+        content: "继续执行已确认的目标计划，直到完成或出现明确阻塞。",
+        collaborationMode: "goal",
         goalId,
-      );
-      setMessages((current) => [...current, message]);
-      if (turnId) setActiveTurnId(turnId);
-      if (queued) setQueuedMessageCount((current) => current + 1);
+      });
+      if (!result) {
+        throw new Error(
+          activeConversationController.getSnapshot().commandError ??
+            "无法启动目标。",
+        );
+      }
     } catch (error) {
       setActionError(`无法启动目标：${errorMessage(error)}`);
     } finally {
@@ -3886,8 +3210,12 @@ export function App() {
     setActionError(null);
     try {
       if (activeTurnId) {
-        const result = await client.cancelTurn(activeThread.id, activeTurnId);
-        if (!result.cancelled) throw new Error(result.message);
+        if (!activeConversationController)
+          throw new Error("会话服务尚未就绪。");
+        await activeConversationController.cancel();
+        const cancelError =
+          activeConversationController.getSnapshot().commandError;
+        if (cancelError) throw new Error(cancelError);
       }
       const snapshot = await client.updateGoalStatus(
         activeThread.id,
@@ -3903,54 +3231,16 @@ export function App() {
   }
 
   async function decideApproval(approvalId: string, approved: boolean) {
-    if (!client || !activeThread || decidingApprovalId) return;
-    setDecidingApprovalId(approvalId);
-    setApprovalDecisionError(null);
-    try {
-      const decision = await client.decideApproval(
-        activeThread.id,
-        approvalId,
-        approved,
-      );
-      if (!decision.accepted) {
-        throw new Error("服务端未接受该审批决定，请重试。");
-      }
-      setPendingApprovalIds((current) =>
-        current.filter((id) => id !== approvalId),
-      );
-    } catch (error) {
-      setApprovalDecisionError(
-        `审批决定提交失败：${error instanceof Error ? error.message : String(error)}`,
-      );
-    } finally {
-      setDecidingApprovalId(null);
-    }
+    if (!activeConversationController || decidingApprovalId) return;
+    await activeConversationController.decideApproval(approvalId, approved);
   }
 
   async function submitUserInput(
     requestId: string,
     response: UserInputResponse,
   ) {
-    if (!client || !activeThread || submittingUserInputId) return;
-    setSubmittingUserInputId(requestId);
-    setUserInputError(null);
-    try {
-      const result = await client.respondToUserInput(
-        activeThread.id,
-        requestId,
-        response,
-      );
-      if (!result.accepted || (!response.cancelled && !result.resumed)) {
-        throw new Error("服务端未恢复当前任务，请重试。");
-      }
-      setPendingUserInput((current) =>
-        current.filter((record) => record.request.requestId !== requestId),
-      );
-    } catch (error) {
-      setUserInputError(`无法提交选择：${errorMessage(error)}`);
-    } finally {
-      setSubmittingUserInputId(null);
-    }
+    if (!activeConversationController || submittingUserInputId) return;
+    await activeConversationController.respondToUserInput(requestId, response);
   }
 
   async function ensureTerminalSession(
@@ -4044,21 +3334,18 @@ export function App() {
       );
       setWorkspaceDiff(result.diff);
       setFilePreview(null);
-      setEvents((current) => [
-        ...current,
-        {
-          id: `local-revert-${Date.now()}`,
-          threadId: activeThread.id,
-          turnId: null,
-          seq: Number.MAX_SAFE_INTEGER,
-          createdAt: new Date().toISOString(),
-          payload: {
-            type: "file_changed",
-            path: result.path,
-            summary: "File reverted from the Diff Review panel.",
-          },
+      activeConversationController?.appendLocalEvent({
+        id: `local-revert-${Date.now()}`,
+        threadId: activeThread.id,
+        turnId: null,
+        seq: Number.MAX_SAFE_INTEGER,
+        createdAt: new Date().toISOString(),
+        payload: {
+          type: "file_changed",
+          path: result.path,
+          summary: "File reverted from the Diff Review panel.",
         },
-      ]);
+      });
     } catch (error) {
       setWorkbenchError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -4185,7 +3472,7 @@ export function App() {
         return;
       }
 
-      setEvents((current) => [
+      activeConversationController?.replaceEvents((current) => [
         ...current.map((event) =>
           event.turnId === turnId &&
           event.payload.type === "turn_changes_recorded"
@@ -4253,21 +3540,18 @@ export function App() {
       );
       setWorkspaceDiff(result.diff);
       setFilePreview(null);
-      setEvents((current) => [
-        ...current,
-        {
-          id: `local-hunk-${Date.now()}`,
-          threadId: activeThread.id,
-          turnId: null,
-          seq: Number.MAX_SAFE_INTEGER,
-          createdAt: new Date().toISOString(),
-          payload: {
-            type: "file_changed",
-            path: result.path,
-            summary: `${diffHunkActionLabel(action)} one diff hunk.`,
-          },
+      activeConversationController?.appendLocalEvent({
+        id: `local-hunk-${Date.now()}`,
+        threadId: activeThread.id,
+        turnId: null,
+        seq: Number.MAX_SAFE_INTEGER,
+        createdAt: new Date().toISOString(),
+        payload: {
+          type: "file_changed",
+          path: result.path,
+          summary: `${diffHunkActionLabel(action)} one diff hunk.`,
         },
-      ]);
+      });
     } catch (error) {
       setWorkbenchError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -4747,11 +4031,13 @@ export function App() {
             newTaskOpen={
               sidebarDestination === "conversation" && activeThreadId === null
             }
-            flowLibraryOpen={sidebarDestination === "flow-library"}
+            flowInboxOpen={sidebarDestination === "flow-inbox"}
+            flowConnectionsOpen={sidebarDestination === "flow-connections"}
+            flowKnowledgeOpen={sidebarDestination === "flow-knowledge"}
             pluginsOpen={sidebarDestination === "plugins"}
             onExperienceModeChange={changeExperienceMode}
-            onOpenFlowLibrary={() => {
-              setFlowPrimaryView("library");
+            onOpenFlowPrimaryView={(view) => {
+              setFlowPrimaryView(view);
               setToolStageOpen(false);
               setConversationCollapsed(false);
             }}
@@ -4829,14 +4115,26 @@ export function App() {
             onDrop={conversationFileDrop.onDrop}
           >
             <ThreadHeader
-              thread={flowLibraryView ? null : activeThread}
+              thread={flowPrimarySurface ? null : activeThread}
               headingIcon={
-                flowLibraryView ? (
+                flowPrimaryView === "inbox" ? (
+                  <Inbox aria-hidden="true" size={15} />
+                ) : flowPrimaryView === "connections" ? (
+                  <Cable aria-hidden="true" size={15} />
+                ) : flowPrimaryView === "knowledge" ? (
                   <Library aria-hidden="true" size={15} />
                 ) : undefined
               }
-              title={flowLibraryView ? "Library" : undefined}
-              showThreadControls={!flowLibraryView}
+              title={
+                flowPrimaryView === "inbox"
+                  ? "Inbox / 待处理"
+                  : flowPrimaryView === "connections"
+                    ? "Connections / 连接"
+                    : flowPrimaryView === "knowledge"
+                      ? "Knowledge / 知识库"
+                      : undefined
+              }
+              showThreadControls={!flowPrimarySurface}
               toolStageOpen={toolStageOpen}
               contextRailOpen={contextRailVisible}
               onOpenLocation={() =>
@@ -4880,7 +4178,11 @@ export function App() {
             {conversationFileDrop.isDraggingFiles ? (
               <ConversationFileDropTarget />
             ) : null}
-            {flowLibraryView ? (
+            {flowPrimaryView === "inbox" ? (
+              <HumanTaskInboxPanel client={client} />
+            ) : flowPrimaryView === "connections" ? (
+              <FlowLibraryPanel />
+            ) : flowPrimaryView === "knowledge" ? (
               <LibraryPanel client={client} />
             ) : serverStatus === "offline" ? (
               <OfflineState
@@ -4905,9 +4207,7 @@ export function App() {
                 {conversationLoadError ? (
                   <ConversationLoadErrorState
                     error={conversationLoadError}
-                    onRetry={() =>
-                      setConversationLoadAttempt((attempt) => attempt + 1)
-                    }
+                    onRetry={() => activeConversationController?.retry()}
                   />
                 ) : isConversationLoading ? (
                   <ConversationLoadingState />
@@ -5102,6 +4402,7 @@ export function App() {
           ) : null}
           <RightPanel
             client={client}
+            conversationRegistry={conversationRegistry}
             experienceMode={experienceMode}
             threads={threads}
             toolTabs={toolTabs}
@@ -5207,7 +4508,7 @@ export function App() {
             onOpenSettings={openModelSettings}
             onActivateToolTab={setActiveToolTabId}
             onCloseToolTab={closeToolTab}
-            onPreviewSessionChange={updatePreviewSession}
+            previewSessionStore={previewSessionStore}
             onToggleConversation={() =>
               setConversationCollapsed((current) => !current)
             }
@@ -5339,229 +4640,6 @@ export function App() {
   );
 }
 
-function TurnUndoDialog({
-  state,
-  onConfirm,
-  onClose,
-}: {
-  state: TurnUndoDialogState;
-  onConfirm(): void;
-  onClose(): void;
-}) {
-  const { preview } = state;
-  const files = preview?.changeSet.files ?? [];
-
-  useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !state.applying) onClose();
-    };
-    document.addEventListener("keydown", handleKeyDown);
-    return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [onClose, state.applying]);
-
-  return (
-    <div
-      className="modal-backdrop project-modal-backdrop"
-      role="presentation"
-      onClick={() => {
-        if (!state.applying) onClose();
-      }}
-    >
-      <section
-        className="turn-undo-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="turn-undo-dialog-title"
-        aria-describedby="turn-undo-dialog-description"
-        onClick={(event) => event.stopPropagation()}
-      >
-        <header>
-          <div>
-            <h2 id="turn-undo-dialog-title">撤销本轮修改</h2>
-            <p id="turn-undo-dialog-description">
-              使用当前工作区与该轮修改前后的快照进行三方合并。
-            </p>
-          </div>
-          <button
-            className="icon-button small"
-            type="button"
-            autoFocus
-            aria-label="关闭撤销对话框"
-            disabled={state.applying}
-            onClick={onClose}
-          >
-            <X size={14} />
-          </button>
-        </header>
-
-        {state.loading ? (
-          <div className="turn-undo-loading" role="status">
-            <Loader2 className="spin" size={16} />
-            <span>正在检查当前文件与历史快照…</span>
-          </div>
-        ) : state.error ? (
-          <div className="turn-undo-alert" role="alert">
-            <AlertCircle size={16} />
-            <span>{state.error}</span>
-          </div>
-        ) : preview ? (
-          <>
-            <div className="turn-undo-overview">
-              <strong>{preview.changeSet.files.length} 个文件</strong>
-              <span className="file-change-additions">
-                +{preview.changeSet.additions}
-              </span>
-              <span className="file-change-deletions">
-                -{preview.changeSet.deletions}
-              </span>
-            </div>
-
-            {preview.conflicts.length > 0 ? (
-              <div className="turn-undo-conflicts" role="alert">
-                <strong>无法自动撤销</strong>
-                <p>以下内容与该轮之后的修改发生冲突，工作区尚未更改。</p>
-                <ul>
-                  {preview.conflicts.map((conflict, index) => (
-                    <li key={`${conflict.path ?? conflict.kind}-${index}`}>
-                      <span>{conflict.path ?? "工作区"}</span>
-                      <small>{conflict.reason}</small>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            ) : (
-              <div className="turn-undo-file-list" aria-label="将撤销的文件">
-                {files.map((file, index) => {
-                  const path = file.newPath ?? file.oldPath ?? "未知文件";
-                  return (
-                    <div key={`${file.kind}-${path}-${index}`}>
-                      <span className="turn-undo-file-kind">
-                        {turnFileChangeLabel(file.kind)}
-                      </span>
-                      <span title={path}>{path}</span>
-                      <small>
-                        <span className="file-change-additions">
-                          +{file.additions ?? 0}
-                        </span>{" "}
-                        <span className="file-change-deletions">
-                          -{file.deletions ?? 0}
-                        </span>
-                      </small>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </>
-        ) : null}
-
-        <footer>
-          <button
-            className="secondary-button"
-            type="button"
-            disabled={state.applying}
-            onClick={onClose}
-          >
-            取消
-          </button>
-          {preview?.canUndo && (
-            <button
-              className="turn-undo-confirm"
-              type="button"
-              disabled={state.applying}
-              onClick={onConfirm}
-            >
-              {state.applying ? (
-                <Loader2 className="spin" size={14} />
-              ) : (
-                <RotateCcw size={14} />
-              )}
-              {state.applying ? "正在撤销" : "确认撤销"}
-            </button>
-          )}
-        </footer>
-      </section>
-    </div>
-  );
-}
-
-function turnFileChangeLabel(kind: string) {
-  if (kind === "added") return "新增";
-  if (kind === "deleted") return "删除";
-  if (kind === "renamed") return "重命名";
-  return "修改";
-}
-
-function RenameDialog({
-  target,
-  onSubmit,
-  onClose,
-}: {
-  target: RenameTarget;
-  onSubmit(name: string): Promise<boolean>;
-  onClose(): void;
-}) {
-  const [name, setName] = useState(target.name);
-  const [isSaving, setIsSaving] = useState(false);
-  const label = target.kind === "project" ? "项目" : "任务";
-
-  return (
-    <div
-      className="modal-backdrop project-modal-backdrop"
-      role="presentation"
-      onClick={onClose}
-    >
-      <form
-        className="project-name-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="rename-dialog-title"
-        onClick={(event) => event.stopPropagation()}
-        onSubmit={(event) => {
-          event.preventDefault();
-          if (!name.trim() || isSaving) return;
-          setIsSaving(true);
-          void onSubmit(name).finally(() => setIsSaving(false));
-        }}
-      >
-        <header>
-          <div>
-            <h2 id="rename-dialog-title">重命名{label}</h2>
-            <p>名称将在所有项目视图中同步更新。</p>
-          </div>
-          <button
-            className="icon-button small"
-            type="button"
-            aria-label="关闭重命名弹窗"
-            onClick={onClose}
-          >
-            <X size={14} />
-          </button>
-        </header>
-        <input
-          autoFocus
-          aria-label={`${label}名称`}
-          value={name}
-          onChange={(event) => setName(event.target.value)}
-          onFocus={(event) => event.currentTarget.select()}
-        />
-        <footer>
-          <button className="secondary-button" type="button" onClick={onClose}>
-            取消
-          </button>
-          <button
-            className="primary-button"
-            type="submit"
-            disabled={!name.trim() || isSaving}
-          >
-            {isSaving ? "保存中..." : "保存"}
-          </button>
-        </footer>
-      </form>
-    </div>
-  );
-}
-
 function diffHunkActionLabel(action: WorkspaceDiffHunkAction): string {
   switch (action) {
     case "stage":
@@ -5573,7379 +4651,9 @@ function diffHunkActionLabel(action: WorkspaceDiffHunkAction): string {
   }
 }
 
-type TopBarMenu = "file" | "edit" | "view" | "help";
-type NativeEditCommand =
-  "undo" | "redo" | "cut" | "copy" | "paste" | "delete" | "selectAll";
-
-function isEditableElement(value: EventTarget | null): value is HTMLElement {
-  if (value instanceof HTMLTextAreaElement)
-    return !value.disabled && !value.readOnly;
-  if (value instanceof HTMLInputElement)
-    return !value.disabled && !value.readOnly;
-  return value instanceof HTMLElement && value.isContentEditable;
-}
-
-function TopBar({
-  sidebarCollapsed,
-  onToggleSidebar,
-  onNewWindow,
-  onNewChat,
-  onOpenWorkspace,
-  onCloseWindow,
-  onLogout,
-  onQuit,
-  onToggleTool,
-  onOpenSettings,
-  onOpenLogs,
-  onShowKeyboardShortcuts,
-  onShowAbout,
-  menuSuppressed,
-}: {
-  sidebarCollapsed: boolean;
-  onToggleSidebar(): void;
-  onNewWindow(): void;
-  onNewChat(): void;
-  onOpenWorkspace(): void;
-  onCloseWindow(): void;
-  onLogout(): void;
-  onQuit(): void;
-  onToggleTool(kind: Exclude<ToolTabKind, "preview">): void;
-  onOpenSettings(): void;
-  onOpenLogs(): void;
-  onShowKeyboardShortcuts(): void;
-  onShowAbout(): void;
-  menuSuppressed: boolean;
-}) {
-  const [openMenu, setOpenMenu] = useState<TopBarMenu | null>(null);
-  const [hasEditableTarget, setHasEditableTarget] = useState(false);
-  const editableTargetRef = useRef<HTMLElement | null>(null);
-  const menuRef = useDismissiblePopover(Boolean(openMenu), () =>
-    setOpenMenu(null),
-  );
-
-  useEffect(() => {
-    const rememberEditableTarget = (event: FocusEvent) => {
-      if (!isEditableElement(event.target)) return;
-      editableTargetRef.current = event.target;
-      setHasEditableTarget(true);
-    };
-    document.addEventListener("focusin", rememberEditableTarget);
-    return () =>
-      document.removeEventListener("focusin", rememberEditableTarget);
-  }, []);
-
-  useEffect(() => {
-    if (menuSuppressed) setOpenMenu(null);
-  }, [menuSuppressed]);
-
-  useEffect(() => {
-    setOpenMenu(null);
-  }, [sidebarCollapsed]);
-
-  const toggleMenu = (menu: TopBarMenu) => {
-    setOpenMenu((current) => (current === menu ? null : menu));
-  };
-  const closeMenu = () => setOpenMenu(null);
-  const runAction = (action: () => void) => {
-    action();
-    closeMenu();
-  };
-  const runEditCommand = (command: NativeEditCommand) => {
-    const target = editableTargetRef.current;
-    if (!target || !target.isConnected || !isEditableElement(target)) {
-      setHasEditableTarget(false);
-      closeMenu();
-      return;
-    }
-    target.focus({ preventScroll: true });
-    if (command === "selectAll" && target instanceof HTMLInputElement) {
-      target.select();
-    } else if (
-      command === "selectAll" &&
-      target instanceof HTMLTextAreaElement
-    ) {
-      target.select();
-    } else {
-      document.execCommand(command);
-    }
-    closeMenu();
-  };
-  const preserveEditableFocus = (event: ReactPointerEvent<HTMLButtonElement>) =>
-    event.preventDefault();
-
-  const menuButton = (menu: TopBarMenu, label: string) => (
-    <button
-      className={`window-menu-item ${openMenu === menu ? "active" : ""}`}
-      type="button"
-      aria-haspopup="menu"
-      aria-expanded={openMenu === menu}
-      onClick={() => toggleMenu(menu)}
-    >
-      {label}
-    </button>
-  );
-
-  return (
-    <header className="topbar">
-      <div className="window-menu" ref={menuRef}>
-        <button
-          className="window-app-button sidebar-toggle-button"
-          type="button"
-          aria-label={sidebarCollapsed ? "展开侧栏" : "折叠侧栏"}
-          aria-pressed={sidebarCollapsed}
-          title={sidebarCollapsed ? "展开侧栏 (Ctrl+B)" : "折叠侧栏 (Ctrl+B)"}
-          onClick={() => runAction(onToggleSidebar)}
-        >
-          {sidebarCollapsed ? (
-            <PanelLeftOpen size={15} aria-hidden="true" />
-          ) : (
-            <PanelLeftClose size={15} aria-hidden="true" />
-          )}
-          {sidebarCollapsed ? <span className="sidebar-toggle-dot" /> : null}
-        </button>
-        <button className="window-nav-button" disabled title="后退不可用">
-          <ArrowLeft size={14} />
-        </button>
-        <button className="window-nav-button" disabled title="前进不可用">
-          <ArrowRight size={14} />
-        </button>
-
-        <div className="window-menu-entry">
-          {menuButton("file", "文件")}
-          {openMenu === "file" ? (
-            <div className="window-menu-popover" role="menu" aria-label="文件">
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => runAction(onNewWindow)}
-              >
-                <span>新建窗口</span>
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => runAction(onNewChat)}
-              >
-                <span>新聊天</span>
-                <kbd>Ctrl+N</kbd>
-              </button>
-              <div className="window-menu-divider" role="separator" />
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => runAction(onOpenWorkspace)}
-              >
-                <span>打开文件夹</span>
-                <kbd>Ctrl+O</kbd>
-              </button>
-              <div className="window-menu-divider" role="separator" />
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => runAction(onCloseWindow)}
-              >
-                <span>关闭</span>
-                <kbd>Ctrl+W</kbd>
-              </button>
-              <div className="window-menu-divider" role="separator" />
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => runAction(onLogout)}
-              >
-                <span>注销</span>
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => runAction(onQuit)}
-              >
-                <span>退出 ChatGPT</span>
-                <kbd>Ctrl+Q</kbd>
-              </button>
-            </div>
-          ) : null}
-        </div>
-
-        <div className="window-menu-entry">
-          {menuButton("edit", "编辑")}
-          {openMenu === "edit" ? (
-            <div className="window-menu-popover" role="menu" aria-label="编辑">
-              {(
-                [
-                  ["undo", "撤销", "Ctrl+Z"],
-                  ["redo", "重做", "Ctrl+Y"],
-                ] as const
-              ).map(([command, label, shortcut]) => (
-                <button
-                  key={command}
-                  type="button"
-                  role="menuitem"
-                  disabled={!hasEditableTarget}
-                  onPointerDown={preserveEditableFocus}
-                  onClick={() => runEditCommand(command)}
-                >
-                  <span>{label}</span>
-                  <kbd>{shortcut}</kbd>
-                </button>
-              ))}
-              <div className="window-menu-divider" role="separator" />
-              {(
-                [
-                  ["cut", "剪切", "Ctrl+X"],
-                  ["copy", "复制", "Ctrl+C"],
-                  ["paste", "粘贴", "Ctrl+V"],
-                  ["delete", "删除", ""],
-                ] as const
-              ).map(([command, label, shortcut]) => (
-                <button
-                  key={command}
-                  type="button"
-                  role="menuitem"
-                  disabled={!hasEditableTarget}
-                  onPointerDown={preserveEditableFocus}
-                  onClick={() => runEditCommand(command)}
-                >
-                  <span>{label}</span>
-                  <kbd>{shortcut}</kbd>
-                </button>
-              ))}
-              <div className="window-menu-divider" role="separator" />
-              <button
-                type="button"
-                role="menuitem"
-                disabled={!hasEditableTarget}
-                onPointerDown={preserveEditableFocus}
-                onClick={() => runEditCommand("selectAll")}
-              >
-                <span>全选</span>
-                <kbd>Ctrl+A</kbd>
-              </button>
-              <div className="window-menu-divider" role="separator" />
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => runAction(onOpenSettings)}
-              >
-                <span>设置</span>
-                <kbd>Ctrl+,</kbd>
-              </button>
-            </div>
-          ) : null}
-        </div>
-
-        <div className="window-menu-entry">
-          {menuButton("view", "视图")}
-          {openMenu === "view" ? (
-            <div
-              className="window-menu-popover window-menu-popover-wide"
-              role="menu"
-              aria-label="视图"
-            >
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => runAction(onToggleSidebar)}
-              >
-                <span>{sidebarCollapsed ? "展开侧栏" : "折叠侧栏"}</span>
-                <kbd>Ctrl+B</kbd>
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => runAction(() => onToggleTool("terminal"))}
-              >
-                <span>打开终端</span>
-                <kbd>Ctrl+`</kbd>
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => runAction(() => onToggleTool("files"))}
-              >
-                <span>切换文件树</span>
-                <kbd>Ctrl+Shift+E</kbd>
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => runAction(() => onToggleTool("diff"))}
-              >
-                <span>切换审查面板</span>
-                <kbd>Ctrl+Alt+B</kbd>
-              </button>
-              <div className="window-menu-divider" role="separator" />
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => runAction(() => onToggleTool("browser"))}
-              >
-                <span>浏览器</span>
-                <kbd />
-              </button>
-            </div>
-          ) : null}
-        </div>
-
-        <div className="window-menu-entry">
-          {menuButton("help", "帮助")}
-          {openMenu === "help" ? (
-            <div className="window-menu-popover" role="menu" aria-label="帮助">
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => runAction(onShowKeyboardShortcuts)}
-              >
-                <span>键盘快捷键</span>
-                <kbd>Ctrl+/</kbd>
-              </button>
-              <div className="window-menu-divider" role="separator" />
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => runAction(onOpenLogs)}
-              >
-                <span>故障排查（日志）</span>
-                <kbd />
-              </button>
-              <div className="window-menu-divider" role="separator" />
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => runAction(onShowAbout)}
-              >
-                <span>关于 OpenTopia</span>
-                <kbd />
-              </button>
-            </div>
-          ) : null}
-        </div>
-      </div>
-    </header>
-  );
-}
-
-function KeyboardShortcutsDialog({ onClose }: { onClose(): void }) {
-  useEffect(() => {
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      event.preventDefault();
-      onClose();
-    };
-    window.addEventListener("keydown", closeOnEscape);
-    return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [onClose]);
-
-  const shortcuts = [
-    ["新聊天", "Ctrl+N"],
-    ["打开文件夹", "Ctrl+O"],
-    ["关闭窗口", "Ctrl+W"],
-    ["退出 ChatGPT", "Ctrl+Q"],
-    ["搜索任务", "Ctrl+K"],
-    ["切换侧栏", "Ctrl+B"],
-    ["设置", "Ctrl+,"],
-    ["打开终端", "Ctrl+`"],
-    ["打开浏览器", "Ctrl+T"],
-    ["打开文件", "Ctrl+P"],
-    ["侧边任务", "Ctrl+Alt+S"],
-    ["切换文件树", "Ctrl+Shift+E"],
-  ];
-
-  return (
-    <div
-      className="modal-backdrop chrome-dialog-backdrop"
-      role="presentation"
-      onMouseDown={onClose}
-    >
-      <section
-        className="chrome-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="keyboard-shortcuts-title"
-        onMouseDown={(event) => event.stopPropagation()}
-      >
-        <header>
-          <h2 id="keyboard-shortcuts-title">键盘快捷键</h2>
-          <button
-            className="icon-button"
-            type="button"
-            aria-label="关闭键盘快捷键"
-            title="关闭"
-            onClick={onClose}
-          >
-            <X size={17} />
-          </button>
-        </header>
-        <dl className="chrome-shortcuts-list">
-          {shortcuts.map(([label, shortcut]) => (
-            <div key={shortcut}>
-              <dt>{label}</dt>
-              <dd>
-                <kbd>{shortcut}</kbd>
-              </dd>
-            </div>
-          ))}
-        </dl>
-      </section>
-    </div>
-  );
-}
-
-function AboutDialog({ onClose }: { onClose(): void }) {
-  useEffect(() => {
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      event.preventDefault();
-      onClose();
-    };
-    window.addEventListener("keydown", closeOnEscape);
-    return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [onClose]);
-
-  return (
-    <div
-      className="modal-backdrop chrome-dialog-backdrop"
-      role="presentation"
-      onMouseDown={onClose}
-    >
-      <section
-        className="chrome-dialog chrome-about-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="about-opentopia-title"
-        onMouseDown={(event) => event.stopPropagation()}
-      >
-        <header>
-          <h2 id="about-opentopia-title">OpenTopia</h2>
-          <button
-            className="icon-button"
-            type="button"
-            aria-label="关闭关于 OpenTopia"
-            title="关闭"
-            onClick={onClose}
-          >
-            <X size={17} />
-          </button>
-        </header>
-        <p>本地优先的 AI 编码与工作代理。</p>
-      </section>
-    </div>
-  );
-}
-
-function WindowsSandboxSetupDialog({
-  status,
-  busy,
-  error,
-  onSetup,
-  onOpenSettings,
-  onLater,
-}: {
-  status: WindowsSandboxSetupStatus;
-  busy: boolean;
-  error: string | null;
-  onSetup(): void;
-  onOpenSettings(): void;
-  onLater(): void;
-}) {
-  const dialogRef = useRef<HTMLElement>(null);
-  const primaryActionRef = useRef<HTMLButtonElement>(null);
-  const laterActionRef = useRef<HTMLButtonElement>(null);
-  const busyRef = useRef(busy);
-  const onLaterRef = useRef(onLater);
-
-  useEffect(() => {
-    busyRef.current = busy;
-    onLaterRef.current = onLater;
-  }, [busy, onLater]);
-
-  useEffect(() => {
-    const previousFocus =
-      document.activeElement instanceof HTMLElement
-        ? document.activeElement
-        : null;
-    const focusInitialAction = () => {
-      const primary = primaryActionRef.current;
-      if (primary && !primary.disabled) {
-        primary.focus();
-      } else {
-        laterActionRef.current?.focus();
-      }
-    };
-    focusInitialAction();
-
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !busyRef.current) {
-        event.preventDefault();
-        onLaterRef.current();
-        return;
-      }
-      if (event.key !== "Tab") return;
-      const focusable = dialogRef.current?.querySelectorAll<HTMLElement>(
-        'button:not([disabled]):not([tabindex="-1"]), [href], [tabindex]:not([tabindex="-1"])',
-      );
-      if (!focusable?.length) return;
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-
-    document.addEventListener("keydown", handleKeyDown);
-    return () => {
-      document.removeEventListener("keydown", handleKeyDown);
-      previousFocus?.focus();
-    };
-  }, []);
-
-  const unavailable = status.state === "unavailable";
-  const degraded = status.state === "degraded";
-
-  return (
-    <div className="modal-backdrop chrome-dialog-backdrop" role="presentation">
-      <section
-        ref={dialogRef}
-        className="chrome-dialog chrome-about-dialog sandbox-setup-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-busy={busy}
-        aria-labelledby="windows-sandbox-setup-title"
-        aria-describedby="windows-sandbox-setup-description"
-      >
-        <header>
-          <h2 id="windows-sandbox-setup-title">
-            {degraded ? "修复 Windows 安全沙箱" : "安装 Windows 安全沙箱"}
-          </h2>
-          <ShieldCheck size={20} aria-hidden="true" />
-        </header>
-        <p id="windows-sandbox-setup-description">
-          {unavailable
-            ? "OpenTopia 默认使用强制沙箱，但当前安装中没有可用的 Windows 沙箱组件。"
-            : degraded
-              ? "检测到专用账户、凭据或离线网络规则不完整，需要修复后才能安全运行工具。"
-              : "未检测到 OpenTopia Windows 安全沙箱。安装后，工具会在两个隔离的普通用户中运行，并由离线网络规则保护。"}
-        </p>
-        {!unavailable ? (
-          <p>
-            点击继续后，Windows 会弹出标准 UAC
-            窗口；普通任务运行时不会重复弹出。完成配置前，需要强制沙箱的工具会保持禁用。
-          </p>
-        ) : null}
-        {error ? (
-          <div className="settings-danger-notice" role="alert">
-            <ShieldAlert size={16} />
-            <span>{error}</span>
-          </div>
-        ) : null}
-        {!error && status.issues.length > 0 ? (
-          <div className="settings-warning-notice" role="status">
-            <ShieldAlert size={16} />
-            <span>{status.issues.join("；")}</span>
-          </div>
-        ) : null}
-        <div className="sandbox-setup-dialog__actions">
-          <Button
-            ref={laterActionRef}
-            variant="quiet"
-            disabled={busy}
-            onClick={onLater}
-          >
-            稍后
-          </Button>
-          {unavailable ? (
-            <Button
-              ref={primaryActionRef}
-              variant="primary"
-              onClick={onOpenSettings}
-            >
-              打开权限设置
-            </Button>
-          ) : (
-            <Button
-              ref={primaryActionRef}
-              variant="primary"
-              disabled={busy || !status.helperAvailable}
-              onClick={onSetup}
-            >
-              {busy ? (
-                <Loader2 className="spin" size={16} aria-hidden="true" />
-              ) : null}
-              {busy
-                ? "正在等待 Windows 授权…"
-                : error
-                  ? degraded
-                    ? "重试修复"
-                    : "重试安装"
-                  : degraded
-                    ? "修复配置"
-                    : "安装沙箱"}
-            </Button>
-          )}
-        </div>
-      </section>
-    </div>
-  );
-}
-
-function SettingsPanel({
-  platform,
-  settings,
-  providerHealth,
-  providerTest,
-  secretSources,
-  isSaving,
-  isSavingSecret,
-  onSave,
-  onTestProvider,
-  onStoreProviderApiKey,
-  onDeleteProviderApiKey,
-  onOpenLogs,
-  onClose,
-}: {
-  platform: PlatformInfo | null;
-  settings: AppSettings | null;
-  providerHealth: ProviderHealth[];
-  providerTest: {
-    providerId: string;
-    status: "testing" | "complete";
-    result?: ProviderHealthCheckResult;
-  } | null;
-  secretSources: SecretSources | null;
-  isSaving: boolean;
-  isSavingSecret: boolean;
-  onSave(input: {
-    providers?: ProviderSettings[];
-    activeProviderId?: string;
-    providerKind?: ProviderKind;
-    baseUrl?: string;
-    model?: string;
-    apiKeySource?: string;
-    permissionMode?: "chat" | "read_only" | "auto" | "approve" | "full_access";
-    sandbox?: AppSettings["sandbox"];
-  }): void;
-  onTestProvider(providerId: string, providers: ProviderSettings[]): void;
-  onStoreProviderApiKey(
-    providerId: string,
-    value: string,
-  ): Promise<ProviderSecretOutcome>;
-  onDeleteProviderApiKey(providerId: string): Promise<ProviderSecretOutcome>;
-  onOpenLogs(): void;
-  onClose(): void;
-}) {
-  const [providers, setProviders] = useState<ProviderSettings[]>(
-    settings?.providers ?? [],
-  );
-  const [activeProviderId, setActiveProviderId] = useState(
-    settings?.activeProviderId ?? providers[0]?.id ?? "default",
-  );
-  const [editingProviderId, setEditingProviderId] = useState<string | null>(
-    null,
-  );
-  const [permissionMode, setPermissionMode] = useState<
-    "chat" | "read_only" | "auto" | "approve" | "full_access"
-  >(settings?.permissionMode ?? "auto");
-  const [sandboxSettings, setSandboxSettings] = useState<
-    AppSettings["sandbox"]
-  >(
-    settings?.sandbox ?? {
-      sandboxMode: "workspace-write",
-      enforcement: "enforce",
-      network: "allow",
-      writableRoots: [],
-      readPaths: [],
-    },
-  );
-  const [providerApiKey, setProviderApiKey] = useState("");
-
-  const editingProvider =
-    providers.find((p) => p.id === editingProviderId) ?? providers[0] ?? null;
-  useEffect(() => {
-    if (settings) {
-      setProviders(settings.providers);
-      setActiveProviderId(settings.activeProviderId);
-      setPermissionMode(settings.permissionMode);
-      setSandboxSettings(settings.sandbox);
-    }
-  }, [settings]);
-
-  useEffect(() => {
-    setProviderApiKey("");
-  }, [editingProviderId]);
-
-  function updateProvider<K extends keyof ProviderSettings>(
-    id: string,
-    field: K,
-    value: ProviderSettings[K],
-  ) {
-    setProviders((current) =>
-      current.map((p) => (p.id === id ? { ...p, [field]: value } : p)),
-    );
-  }
-
-  function addProvider() {
-    const newId = `provider-${Date.now()}`;
-    setProviders((current) => [
-      ...current,
-      {
-        id: newId,
-        name: "Custom provider",
-        kind: "openai_compatible",
-        baseUrl: "https://api.openai.com/v1",
-        model: "gpt-4.1-mini",
-        enabledFamilies: [],
-        syncedModels: [],
-        modelsSyncedAt: null,
-        temperature: null,
-        maxOutputTokens: null,
-        contextWindowTokens: null,
-        reasoningEffort: null,
-        storeResponses: false,
-        parallelToolCalls: true,
-        promptCacheKey: null,
-        promptCachePolicy: null,
-        responsesCompactionThresholdTokens: null,
-        rolloutBudget: null,
-        apiKeySource: "OPENTOPIA_API_KEY",
-        apiKeyConfigured: false,
-        healthStatus: null,
-      },
-    ]);
-    setEditingProviderId(newId);
-  }
-
-  function removeProvider(id: string) {
-    setProviders((current) => {
-      const next = current.filter((p) => p.id !== id);
-      if (activeProviderId === id && next.length > 0) {
-        setActiveProviderId(next[0].id);
-      }
-      if (editingProviderId === id) {
-        setEditingProviderId(next[0]?.id ?? null);
-      }
-      return next;
-    });
-  }
-
-  return (
-    <div className="modal-backdrop" role="presentation" onClick={onClose}>
-      <section
-        className="settings-panel wide"
-        role="dialog"
-        aria-modal="true"
-        onClick={(event) => event.stopPropagation()}
-      >
-        <header>
-          <h2>Settings</h2>
-          <button className="secondary-button" onClick={onOpenLogs}>
-            <FileText size={16} />
-            Logs
-          </button>
-          <button className="secondary-button" onClick={onClose}>
-            Close
-          </button>
-        </header>
-        <form
-          className="settings-grid"
-          onSubmit={(event) => {
-            event.preventDefault();
-            onSave({
-              providers,
-              activeProviderId,
-              permissionMode,
-              sandbox: sandboxSettings,
-            });
-          }}
-        >
-          <label>
-            Backend URL
-            <code>{platform?.backendUrl ?? "http://127.0.0.1:8787"}</code>
-          </label>
-          <label>
-            Platform
-            <code>{platform?.os ?? "browser"}</code>
-          </label>
-          <label>
-            Permission
-            <select
-              value={permissionMode}
-              onChange={(event) => {
-                const nextMode = event.target.value as ExecutionPermissionMode;
-                setPermissionMode(nextMode);
-                setSandboxSettings((current) =>
-                  nextMode === "full_access"
-                    ? {
-                        ...current,
-                        sandboxMode: "danger-full-access",
-                        enforcement: "disabled",
-                        network: "allow",
-                      }
-                    : controlledSandboxSettings(current),
-                );
-              }}
-            >
-              <option value="approve">请求批准</option>
-              <option value="auto">替我审批</option>
-              <option value="full_access">完全访问权限</option>
-            </select>
-          </label>
-
-          <div className="settings-sandbox-section">
-            <div className="settings-providers-header">
-              <h3>Sandbox</h3>
-              <span>Applies to new tool calls immediately</span>
-            </div>
-            <div className="settings-sandbox-grid">
-              <label>
-                Access mode
-                <select
-                  value={sandboxSettings.sandboxMode}
-                  onChange={(event) => {
-                    const sandboxMode = event.target
-                      .value as AppSettings["sandbox"]["sandboxMode"];
-                    const danger = sandboxMode === "danger-full-access";
-                    setSandboxSettings((current) => ({
-                      ...current,
-                      sandboxMode,
-                      enforcement: danger
-                        ? "disabled"
-                        : current.enforcement === "disabled"
-                          ? "enforce"
-                          : current.enforcement,
-                      network: danger ? "allow" : current.network,
-                    }));
-                  }}
-                >
-                  <option value="read-only">Read only</option>
-                  <option value="workspace-write">Workspace write</option>
-                  <option value="danger-full-access">Full system access</option>
-                </select>
-              </label>
-              <label>
-                OS enforcement
-                <select
-                  value={sandboxSettings.enforcement}
-                  disabled={
-                    sandboxSettings.sandboxMode === "danger-full-access"
-                  }
-                  onChange={(event) =>
-                    setSandboxSettings((current) => ({
-                      ...current,
-                      enforcement: event.target
-                        .value as AppSettings["sandbox"]["enforcement"],
-                    }))
-                  }
-                >
-                  <option value="enforce">Enforce</option>
-                  <option value="best-effort">Best effort</option>
-                  <option value="disabled">Disabled</option>
-                </select>
-              </label>
-              <label>
-                Network
-                <select
-                  value={sandboxSettings.network}
-                  disabled={
-                    sandboxSettings.sandboxMode === "danger-full-access"
-                  }
-                  onChange={(event) =>
-                    setSandboxSettings((current) => ({
-                      ...current,
-                      network: event.target
-                        .value as AppSettings["sandbox"]["network"],
-                    }))
-                  }
-                >
-                  <option value="deny">Deny</option>
-                  <option value="inherit">Inherit</option>
-                  <option value="allow">Allow</option>
-                </select>
-              </label>
-              <label>
-                Extra writable roots
-                <textarea
-                  rows={3}
-                  placeholder="One absolute path per line"
-                  value={sandboxSettings.writableRoots.join("\n")}
-                  onChange={(event) =>
-                    setSandboxSettings((current) => ({
-                      ...current,
-                      writableRoots: parsePathList(event.target.value),
-                    }))
-                  }
-                />
-              </label>
-              <label>
-                Extra readable paths
-                <textarea
-                  rows={3}
-                  placeholder="One absolute path per line"
-                  value={sandboxSettings.readPaths.join("\n")}
-                  onChange={(event) =>
-                    setSandboxSettings((current) => ({
-                      ...current,
-                      readPaths: parsePathList(event.target.value),
-                    }))
-                  }
-                />
-              </label>
-            </div>
-            {sandboxSettings.sandboxMode !== "danger-full-access" &&
-              sandboxSettings.enforcement === "best-effort" && (
-                <p className="settings-security-warning" role="status">
-                  <ShieldAlert size={14} aria-hidden="true" />
-                  Best effort may run commands without OS isolation when the
-                  platform backend is unavailable. Use Enforce for security
-                  testing.
-                </p>
-              )}
-            {(sandboxSettings.sandboxMode === "danger-full-access" ||
-              sandboxSettings.enforcement === "disabled") && (
-              <p className="settings-security-warning" role="status">
-                <ShieldAlert size={14} aria-hidden="true" />
-                OS sandbox enforcement is disabled. Commands can access the full
-                system and network allowed by the current user account.
-              </p>
-            )}
-          </div>
-
-          <div className="settings-providers-section">
-            <div className="settings-providers-header">
-              <h3>Providers</h3>
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={addProvider}
-              >
-                <Plus size={14} /> Add Provider
-              </button>
-            </div>
-            <div className="settings-providers-body">
-              <div className="settings-provider-list">
-                {providers.map((provider) => {
-                  const health = providerHealth.find(
-                    (h) => h.id === provider.id,
-                  );
-                  return (
-                    <div
-                      key={provider.id}
-                      className={`settings-provider-item ${
-                        provider.id === activeProviderId ? "active" : ""
-                      } ${provider.id === editingProviderId ? "editing" : ""}`}
-                    >
-                      <div className="settings-provider-item-header">
-                        <button
-                          type="button"
-                          className="settings-provider-select"
-                          onClick={() => {
-                            setActiveProviderId(provider.id);
-                            setEditingProviderId(provider.id);
-                          }}
-                        >
-                          <span className="settings-provider-name">
-                            {provider.id === activeProviderId && (
-                              <Check size={12} />
-                            )}
-                            {provider.id}
-                          </span>
-                        </button>
-                        <span className="settings-provider-status">
-                          {health?.status ?? "unknown"}
-                        </span>
-                        <button
-                          type="button"
-                          className="icon-button small"
-                          disabled={providers.length <= 1}
-                          onClick={() => removeProvider(provider.id)}
-                        >
-                          <Trash2 size={13} />
-                        </button>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-              {editingProvider && (
-                <div className="settings-provider-form">
-                  <h4>Provider Details</h4>
-                  <label>
-                    ID
-                    <input
-                      value={editingProvider.id}
-                      disabled
-                      title="Provider ID 创建后保持稳定，用于关联安全存储中的凭据"
-                    />
-                  </label>
-                  <label>
-                    Provider Type
-                    <select
-                      value={editingProvider.kind}
-                      onChange={(e) =>
-                        updateProvider(
-                          editingProvider.id,
-                          "kind",
-                          e.target.value as ProviderKind,
-                        )
-                      }
-                    >
-                      <option
-                        value={
-                          editingProvider.kind === "openai_responses"
-                            ? "openai_responses"
-                            : "openai_compatible"
-                        }
-                      >
-                        OpenAI Compatible (auto)
-                      </option>
-                      <option value="anthropic">Anthropic Messages</option>
-                      <option value="mock">Mock</option>
-                    </select>
-                  </label>
-                  <label>
-                    Base URL
-                    <input
-                      value={editingProvider.baseUrl}
-                      onChange={(e) =>
-                        updateProvider(
-                          editingProvider.id,
-                          "baseUrl",
-                          e.target.value,
-                        )
-                      }
-                    />
-                  </label>
-                  <label>
-                    Model
-                    <input
-                      value={editingProvider.model}
-                      onChange={(e) =>
-                        updateProvider(
-                          editingProvider.id,
-                          "model",
-                          e.target.value,
-                        )
-                      }
-                    />
-                  </label>
-                  <div className="settings-provider-parameters">
-                    <label>
-                      Temperature
-                      <input
-                        type="number"
-                        min="0"
-                        max="2"
-                        step="0.1"
-                        value={editingProvider.temperature ?? ""}
-                        placeholder="默认"
-                        onChange={(event) =>
-                          updateProvider(
-                            editingProvider.id,
-                            "temperature",
-                            event.target.value
-                              ? Number(event.target.value)
-                              : null,
-                          )
-                        }
-                      />
-                    </label>
-                    <label>
-                      Max output tokens
-                      <input
-                        type="number"
-                        min="1"
-                        step="1"
-                        value={editingProvider.maxOutputTokens ?? ""}
-                        placeholder="Provider default"
-                        onChange={(event) =>
-                          updateProvider(
-                            editingProvider.id,
-                            "maxOutputTokens",
-                            event.target.value
-                              ? Number(event.target.value)
-                              : null,
-                          )
-                        }
-                      />
-                    </label>
-                    <label>
-                      Context window
-                      <input
-                        type="number"
-                        min="4096"
-                        step="1024"
-                        value={editingProvider.contextWindowTokens ?? ""}
-                        onChange={(event) =>
-                          updateProvider(
-                            editingProvider.id,
-                            "contextWindowTokens",
-                            event.target.value
-                              ? Number(event.target.value)
-                              : null,
-                          )
-                        }
-                      />
-                    </label>
-                    <label>
-                      Reasoning effort
-                      <select
-                        value={editingProvider.reasoningEffort ?? ""}
-                        onChange={(event) =>
-                          updateProvider(
-                            editingProvider.id,
-                            "reasoningEffort",
-                            (event.target.value || null) as
-                              | "none"
-                              | "minimal"
-                              | "low"
-                              | "medium"
-                              | "high"
-                              | "xhigh"
-                              | "max"
-                              | null,
-                          )
-                        }
-                      >
-                        <option value="">Provider default</option>
-                        <option value="none">None</option>
-                        <option value="minimal">Minimal</option>
-                        <option value="low">Low</option>
-                        <option value="medium">Medium</option>
-                        <option value="high">High</option>
-                        <option value="xhigh">Extra high</option>
-                        <option value="max">Max</option>
-                      </select>
-                    </label>
-                    <label>
-                      Prompt cache key
-                      <input
-                        value={editingProvider.promptCacheKey ?? ""}
-                        placeholder="Automatic per workspace"
-                        onChange={(event) =>
-                          updateProvider(
-                            editingProvider.id,
-                            "promptCacheKey",
-                            event.target.value || null,
-                          )
-                        }
-                      />
-                    </label>
-                    {editingProvider.kind === "openai_responses" && (
-                      <>
-                        <label>
-                          Prompt cache policy
-                          <select
-                            value={editingProvider.promptCachePolicy ?? ""}
-                            onChange={(event) =>
-                              updateProvider(
-                                editingProvider.id,
-                                "promptCachePolicy",
-                                (event.target.value || null) as NonNullable<
-                                  ProviderSettings["promptCachePolicy"]
-                                > | null,
-                              )
-                            }
-                          >
-                            <option value="">Automatic</option>
-                            <option value="explicit_30m">
-                              Explicit breakpoints (30m)
-                            </option>
-                            <option value="legacy_in_memory">
-                              Legacy in-memory
-                            </option>
-                            <option value="legacy_24h">Legacy 24h</option>
-                          </select>
-                        </label>
-                        <label>
-                          Native compaction threshold
-                          <input
-                            type="number"
-                            min="4096"
-                            step="1024"
-                            value={
-                              editingProvider.responsesCompactionThresholdTokens ??
-                              ""
-                            }
-                            placeholder="Disabled"
-                            onChange={(event) =>
-                              updateProvider(
-                                editingProvider.id,
-                                "responsesCompactionThresholdTokens",
-                                event.target.value
-                                  ? Number(event.target.value)
-                                  : null,
-                              )
-                            }
-                          />
-                        </label>
-                      </>
-                    )}
-                    <label>
-                      <span>Rollout token budget</span>
-                      <input
-                        type="checkbox"
-                        checked={Boolean(editingProvider.rolloutBudget)}
-                        onChange={(event) =>
-                          updateProvider(
-                            editingProvider.id,
-                            "rolloutBudget",
-                            event.target.checked
-                              ? {
-                                  limitTokens: 100000,
-                                  samplingTokenWeight: 1,
-                                  prefillTokenWeight: 1,
-                                }
-                              : null,
-                          )
-                        }
-                      />
-                    </label>
-                    {editingProvider.rolloutBudget ? (
-                      <>
-                        <label>
-                          Weighted token limit
-                          <input
-                            type="number"
-                            min="1"
-                            step="1000"
-                            value={editingProvider.rolloutBudget.limitTokens}
-                            onChange={(event) =>
-                              updateProvider(
-                                editingProvider.id,
-                                "rolloutBudget",
-                                {
-                                  ...editingProvider.rolloutBudget!,
-                                  limitTokens: Number(event.target.value),
-                                },
-                              )
-                            }
-                          />
-                        </label>
-                        <label>
-                          Output token weight
-                          <input
-                            type="number"
-                            min="0"
-                            step="0.1"
-                            value={
-                              editingProvider.rolloutBudget.samplingTokenWeight
-                            }
-                            onChange={(event) =>
-                              updateProvider(
-                                editingProvider.id,
-                                "rolloutBudget",
-                                {
-                                  ...editingProvider.rolloutBudget!,
-                                  samplingTokenWeight: Number(
-                                    event.target.value,
-                                  ),
-                                },
-                              )
-                            }
-                          />
-                        </label>
-                        <label>
-                          Uncached input weight
-                          <input
-                            type="number"
-                            min="0"
-                            step="0.1"
-                            value={
-                              editingProvider.rolloutBudget.prefillTokenWeight
-                            }
-                            onChange={(event) =>
-                              updateProvider(
-                                editingProvider.id,
-                                "rolloutBudget",
-                                {
-                                  ...editingProvider.rolloutBudget!,
-                                  prefillTokenWeight: Number(
-                                    event.target.value,
-                                  ),
-                                },
-                              )
-                            }
-                          />
-                        </label>
-                      </>
-                    ) : null}
-                    <label>
-                      <span>Parallel tool calls</span>
-                      <input
-                        type="checkbox"
-                        checked={editingProvider.parallelToolCalls}
-                        onChange={(event) =>
-                          updateProvider(
-                            editingProvider.id,
-                            "parallelToolCalls",
-                            event.target.checked,
-                          )
-                        }
-                      />
-                    </label>
-                    {editingProvider.kind === "openai_responses" && (
-                      <label>
-                        <span>Stateful response continuation</span>
-                        <input
-                          type="checkbox"
-                          checked={editingProvider.storeResponses}
-                          onChange={(event) =>
-                            updateProvider(
-                              editingProvider.id,
-                              "storeResponses",
-                              event.target.checked,
-                            )
-                          }
-                        />
-                      </label>
-                    )}
-                  </div>
-                  <div className="settings-provider-key-reference">
-                    Credential reference:{" "}
-                    <code>{editingProvider.apiKeySource}</code>
-                  </div>
-                  <div className="settings-provider-health-status">
-                    {(() => {
-                      const health = providerHealth.find(
-                        (h) => h.id === editingProvider.id,
-                      );
-                      return (
-                        <>
-                          <span>Status: {health?.status ?? "unknown"}</span>
-                          <span>
-                            {health?.apiKeyConfigured
-                              ? "key configured"
-                              : "no key"}
-                          </span>
-                          <span>
-                            {health?.usingMock
-                              ? "mock active"
-                              : "provider active"}
-                          </span>
-                        </>
-                      );
-                    })()}
-                  </div>
-                  <div className="settings-provider-actions">
-                    <button
-                      type="button"
-                      className="secondary-button"
-                      disabled={providerTest?.status === "testing"}
-                      onClick={() =>
-                        onTestProvider(editingProvider.id, providers)
-                      }
-                    >
-                      {providerTest?.providerId === editingProvider.id &&
-                      providerTest.status === "testing"
-                        ? "Testing..."
-                        : "Test connection"}
-                    </button>
-                    {providerTest?.providerId === editingProvider.id &&
-                      providerTest.status === "complete" && (
-                        <span className="settings-provider-test-result">
-                          {providerTest.result?.reachable &&
-                          providerTest.result.modelAvailable
-                            ? `Connected${providerTest.result.latencyMs ? ` (${providerTest.result.latencyMs} ms)` : ""}`
-                            : (providerTest.result?.error ??
-                              "Connection failed")}
-                        </span>
-                      )}
-                  </div>
-                  {platform?.platform === "desktop" &&
-                    secretSources?.keyring && (
-                      <div className="settings-secret-section">
-                        <label>
-                          API key for {editingProvider.id}
-                          <input
-                            type="password"
-                            autoComplete="off"
-                            value={providerApiKey}
-                            disabled={
-                              !secretSources.keyring.encryptionAvailable
-                            }
-                            onChange={(event) =>
-                              setProviderApiKey(event.target.value)
-                            }
-                          />
-                        </label>
-                        <div className="settings-provider-actions">
-                          <button
-                            type="button"
-                            className="secondary-button"
-                            disabled={
-                              isSavingSecret ||
-                              !secretSources.keyring.encryptionAvailable ||
-                              !providerApiKey.trim()
-                            }
-                            onClick={() => {
-                              const providerId = editingProvider.id;
-                              const value = providerApiKey;
-                              void onStoreProviderApiKey(
-                                providerId,
-                                value,
-                              ).then((outcome) => {
-                                if (!outcome.stored) return;
-                                const { metadata } = outcome;
-                                const nextProviders = providers.map(
-                                  (provider) =>
-                                    provider.id === providerId
-                                      ? {
-                                          ...provider,
-                                          apiKeySource: metadata.envTarget,
-                                          apiKeyConfigured: true,
-                                        }
-                                      : provider,
-                                );
-                                setProviders(nextProviders);
-                                setProviderApiKey("");
-                                onSave({
-                                  providers: nextProviders,
-                                  activeProviderId,
-                                  permissionMode,
-                                  sandbox: sandboxSettings,
-                                });
-                              });
-                            }}
-                          >
-                            Store key
-                          </button>
-                          <button
-                            type="button"
-                            className="secondary-button"
-                            disabled={
-                              isSavingSecret ||
-                              !editingProvider.apiKeyConfigured
-                            }
-                            onClick={() => {
-                              const providerId = editingProvider.id;
-                              void onDeleteProviderApiKey(providerId).then(
-                                (outcome) => {
-                                  if (!outcome.stored) return;
-                                  const nextProviders = providers.map(
-                                    (provider) =>
-                                      provider.id === providerId
-                                        ? {
-                                            ...provider,
-                                            apiKeyConfigured: false,
-                                          }
-                                        : provider,
-                                  );
-                                  setProviders(nextProviders);
-                                  onSave({
-                                    providers: nextProviders,
-                                    activeProviderId,
-                                    permissionMode,
-                                    sandbox: sandboxSettings,
-                                  });
-                                },
-                              );
-                            }}
-                          >
-                            Remove key
-                          </button>
-                          <span className="settings-provider-test-result">
-                            {editingProvider.apiKeyConfigured
-                              ? "Encrypted in safeStorage and active"
-                              : secretSources.keyring.status}
-                          </span>
-                        </div>
-                      </div>
-                    )}
-                </div>
-              )}
-            </div>
-          </div>
-
-          <button className="primary-button" disabled={isSaving} type="submit">
-            {isSaving ? "Saving..." : "Save"}
-          </button>
-        </form>
-      </section>
-    </div>
-  );
-}
-
-const PROJECT_THREAD_PREVIEW_LIMIT = 10;
-
-function Sidebar({
-  projects,
-  threads,
-  threadActivityStatuses,
-  activeThreadId,
-  activeProjectId,
-  workspaceError,
-  isPickingWorkspace,
-  experienceMode,
-  flowModeEnabled,
-  newTaskOpen,
-  flowLibraryOpen,
-  pluginsOpen,
-  onExperienceModeChange,
-  onOpenFlowLibrary,
-  onSelect,
-  onNew,
-  onPickWorkspace,
-  onCreateProject,
-  onRemoveProject,
-  onRenameProject,
-  onToggleProjectPinned,
-  onSelectProject,
-  onOpenThreadWorkspace,
-  onNewThreadForProject,
-  onRenameThread,
-  onOpenThreadUsage,
-  onRestoreThread,
-  onOpenExtensions,
-  onOpenTaskSearch,
-  onSettings,
-}: {
-  projects: Project[];
-  threads: Thread[];
-  threadActivityStatuses: Record<string, ThreadActivityStatus>;
-  activeThreadId: string | null;
-  activeProjectId: string | null;
-  workspaceError: string | null;
-  isPickingWorkspace: boolean;
-  experienceMode: ExperienceMode;
-  flowModeEnabled: boolean;
-  newTaskOpen: boolean;
-  flowLibraryOpen: boolean;
-  pluginsOpen: boolean;
-  onExperienceModeChange(mode: ExperienceMode): void;
-  onOpenFlowLibrary(): void;
-  onSelect(id: string): void;
-  onNew(): void;
-  onPickWorkspace(): void;
-  onCreateProject(name: string): Promise<Project | null>;
-  onRemoveProject(project: Project): void;
-  onRenameProject(project: Project): void;
-  onToggleProjectPinned(project: Project): void;
-  onSelectProject(project: Project): void;
-  onOpenThreadWorkspace(workspaceRoot: string): void;
-  onNewThreadForProject?(project: Project): void;
-  onRenameThread(thread: Thread): void;
-  onOpenThreadUsage(thread: Thread): void;
-  onRestoreThread(thread: Thread): void;
-  onOpenExtensions(): void;
-  onOpenTaskSearch(): void;
-  onSettings(): void;
-}) {
-  const initialNavigationState = useMemo(readSidebarNavigationState, []);
-  const [experienceMenuOpen, setExperienceMenuOpen] = useState(false);
-  const [projectMenuOpen, setProjectMenuOpen] = useState(false);
-  const [newProjectOpen, setNewProjectOpen] = useState(false);
-  const [newProjectName, setNewProjectName] = useState("New project");
-  const [isCreatingProject, setIsCreatingProject] = useState(false);
-  const [expandedProjects, setExpandedProjects] = useState<Set<string>>(
-    () => new Set(initialNavigationState.expandedProjectIds),
-  );
-  const [projectThreadDisplayLimits, setProjectThreadDisplayLimits] = useState<
-    Map<string, number>
-  >(() => new Map());
-  const [moreMenuProjectId, setMoreMenuProjectId] = useState<string | null>(
-    null,
-  );
-  const [unassignedExpanded, setUnassignedExpanded] = useState(
-    initialNavigationState.unassignedExpanded,
-  );
-  const [archivedExpanded, setArchivedExpanded] = useState(
-    initialNavigationState.archivedExpanded,
-  );
-  const [hoveredProject, setHoveredProject] =
-    useState<ProjectHoverState | null>(null);
-  const moreMenuRef = useDismissiblePopover(moreMenuProjectId !== null, () =>
-    setMoreMenuProjectId(null),
-  );
-  const projectMenuRef = useDismissiblePopover(projectMenuOpen, () =>
-    setProjectMenuOpen(false),
-  );
-  const experienceMenuRef = useDismissiblePopover(experienceMenuOpen, () =>
-    setExperienceMenuOpen(false),
-  );
-  const modeThreads = threads.filter(
-    (thread) => thread.experienceMode === experienceMode,
-  );
-  const unassignedThreads = modeThreads.filter(
-    (thread) => !thread.projectId && !thread.archivedAt,
-  );
-  const archivedThreads = modeThreads.filter((thread) => thread.archivedAt);
-  const experienceModeOptions = (
-    [
-      { id: "work", label: "Work", icon: BriefcaseBusiness },
-      { id: "code", label: "Code", icon: Code2 },
-      { id: "flow", label: "Flow", icon: Workflow },
-    ] as const
-  ).filter((option) => option.id !== "flow" || flowModeEnabled);
-  const activeExperienceMode =
-    experienceModeOptions.find((option) => option.id === experienceMode) ??
-    experienceModeOptions.find((option) => option.id === "code")!;
-  const ActiveExperienceModeIcon = activeExperienceMode.icon;
-  const activityStatusForThread = (threadId: string) =>
-    threadActivityStatuses[threadId];
-
-  function toggleExpandedProject(projectId: string) {
-    setExpandedProjects((prev) => {
-      const next = new Set(prev);
-      if (next.has(projectId)) {
-        next.delete(projectId);
-      } else {
-        next.add(projectId);
-      }
-      return next;
-    });
-  }
-
-  useEffect(() => {
-    updateSidebarNavigationState({
-      expandedProjectIds: [...expandedProjects],
-      unassignedExpanded,
-      archivedExpanded,
-    });
-  }, [archivedExpanded, expandedProjects, unassignedExpanded]);
-
-  useEffect(() => {
-    if (!newProjectOpen) return;
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setNewProjectOpen(false);
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [newProjectOpen]);
-
-  async function createProject() {
-    const name = newProjectName.trim();
-    if (!name || isCreatingProject) return;
-    setIsCreatingProject(true);
-    const project = await onCreateProject(name);
-    setIsCreatingProject(false);
-    if (!project) return;
-    setNewProjectOpen(false);
-    setProjectMenuOpen(false);
-    setNewProjectName("New project");
-    onSelectProject(project);
-  }
-
-  return (
-    <>
-      <aside className="sidebar" id="workspace-sidebar">
-        <div className="sidebar-brand-row">
-          <div className="experience-mode-menu" ref={experienceMenuRef}>
-            <button
-              type="button"
-              className="experience-mode-trigger"
-              aria-label={`当前模式：${activeExperienceMode.label}`}
-              aria-haspopup="menu"
-              aria-expanded={experienceMenuOpen}
-              onClick={() => setExperienceMenuOpen((current) => !current)}
-            >
-              <ActiveExperienceModeIcon size={15} aria-hidden="true" />
-              <span>{activeExperienceMode.label}</span>
-              <ChevronDown
-                className={experienceMenuOpen ? "open" : undefined}
-                size={14}
-                aria-hidden="true"
-              />
-            </button>
-            {experienceMenuOpen && (
-              <div className="tool-popover experience-mode-popover" role="menu">
-                {experienceModeOptions.map((option) => {
-                  const Icon = option.icon;
-                  const selected = option.id === experienceMode;
-                  return (
-                    <button
-                      key={option.id}
-                      type="button"
-                      role="menuitemradio"
-                      aria-checked={selected}
-                      className={selected ? "active" : undefined}
-                      onClick={() => {
-                        onExperienceModeChange(option.id);
-                        setExperienceMenuOpen(false);
-                      }}
-                    >
-                      <Icon size={14} aria-hidden="true" />
-                      <span>{option.label}</span>
-                      {selected && <Check size={13} aria-hidden="true" />}
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-          <IconButton
-            className="sidebar-icon-button"
-            size="compact"
-            title="搜索任务 (Ctrl+K)"
-            aria-label="搜索任务"
-            onClick={onOpenTaskSearch}
-          >
-            <Search size={15} aria-hidden="true" />
-          </IconButton>
-        </div>
-        <nav className="primary-nav" aria-label="主要导航">
-          <button
-            aria-current={newTaskOpen ? "page" : undefined}
-            onClick={onNew}
-          >
-            <FileText size={15} />
-            <span>新建任务</span>
-          </button>
-          {experienceMode === "flow" ? (
-            <button
-              aria-current={flowLibraryOpen ? "page" : undefined}
-              className="flow-library-nav-item"
-              onClick={onOpenFlowLibrary}
-            >
-              <Library aria-hidden="true" size={15} />
-              <span>Library</span>
-              <small>RAG / 数据 / CRM</small>
-            </button>
-          ) : null}
-          <button disabled title="拉取请求 · 未实现">
-            <GitPullRequest size={15} />
-            <span>拉取请求</span>
-            <small>未实现</small>
-          </button>
-          <button disabled title="已安排 · 未实现">
-            <Clock3 size={15} />
-            <span>已安排</span>
-            <small>未实现</small>
-          </button>
-          <button
-            aria-current={pluginsOpen ? "page" : undefined}
-            onClick={onOpenExtensions}
-            title="管理插件"
-          >
-            <Plug size={15} />
-            <span>插件</span>
-            <small>插件</small>
-          </button>
-        </nav>
-
-        <div className="project-heading">
-          <span>项目</span>
-          <div className="sidebar-project-menu-wrap" ref={projectMenuRef}>
-            <button
-              className="sidebar-icon-button"
-              disabled={isPickingWorkspace}
-              onClick={() => setProjectMenuOpen((current) => !current)}
-              title="添加项目"
-              aria-label="添加项目"
-              aria-expanded={projectMenuOpen}
-            >
-              {isPickingWorkspace ? (
-                <Loader2 size={14} className="spin" />
-              ) : (
-                <Plus size={14} />
-              )}
-            </button>
-            {projectMenuOpen && (
-              <div className="tool-popover sidebar-project-popover" role="menu">
-                <button
-                  role="menuitem"
-                  onClick={() => {
-                    setNewProjectOpen(true);
-                    setProjectMenuOpen(false);
-                  }}
-                >
-                  <Plus size={14} />
-                  <span>新建空白项目</span>
-                </button>
-                <button
-                  role="menuitem"
-                  onClick={() => {
-                    onPickWorkspace();
-                    setProjectMenuOpen(false);
-                  }}
-                >
-                  <FolderOpen size={14} />
-                  <span>使用现有文件夹</span>
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
-        <div className="project-tree">
-          {projects.map((project, projectIndex) => {
-            const projectThreads = modeThreads.filter(
-              (thread) => thread.projectId === project.id && !thread.archivedAt,
-            );
-            const isActive = project.id === activeProjectId;
-            const isExpanded = expandedProjects.has(project.id);
-            const threadDisplayLimit =
-              projectThreadDisplayLimits.get(project.id) ??
-              PROJECT_THREAD_PREVIEW_LIMIT;
-            const visibleProjectThreads = projectThreads.slice(
-              0,
-              threadDisplayLimit,
-            );
-            const isMoreMenuOpen = moreMenuProjectId === project.id;
-            const projectInfoId = `project-hover-card-${projectIndex}`;
-            return (
-              <section
-                className={`project-node ${isActive ? "active" : ""}`}
-                key={project.id}
-              >
-                <div className="project-row">
-                  <button
-                    className="project-select"
-                    title={
-                      project.workspaceRoot
-                        ? formatPathForDisplay(project.workspaceRoot)
-                        : project.name
-                    }
-                    aria-label={`项目 ${project.name}`}
-                    aria-describedby={projectInfoId}
-                    onMouseEnter={(event) => {
-                      const bounds =
-                        event.currentTarget.getBoundingClientRect();
-                      const cardWidth = 320;
-                      const left = Math.min(
-                        bounds.right + 8,
-                        window.innerWidth - cardWidth - 8,
-                      );
-                      setHoveredProject({
-                        id: projectInfoId,
-                        name: project.name,
-                        threadCount: projectThreads.length,
-                        workspaceRoot: project.workspaceRoot,
-                        pinned: project.pinned,
-                        left: Math.max(8, left),
-                        top: Math.max(
-                          36,
-                          Math.min(bounds.top, window.innerHeight - 174),
-                        ),
-                      });
-                    }}
-                    onMouseLeave={() => setHoveredProject(null)}
-                    onClick={() => {
-                      if (isExpanded) {
-                        setProjectThreadDisplayLimits((current) => {
-                          if (!current.has(project.id)) return current;
-                          const next = new Map(current);
-                          next.delete(project.id);
-                          return next;
-                        });
-                      }
-                      toggleExpandedProject(project.id);
-                      onSelectProject(project);
-                    }}
-                  >
-                    {isExpanded ? (
-                      <FolderOpen size={14} />
-                    ) : (
-                      <Folder size={14} />
-                    )}
-                    <span>{project.name}</span>
-                  </button>
-                  <div className="project-row-actions">
-                    <div
-                      className="project-menu-wrap"
-                      ref={isMoreMenuOpen ? moreMenuRef : undefined}
-                    >
-                      <button
-                        className="project-more"
-                        aria-label={`菜单 ${project.name}`}
-                        aria-expanded={isMoreMenuOpen}
-                        onClick={() =>
-                          setMoreMenuProjectId(
-                            isMoreMenuOpen ? null : project.id,
-                          )
-                        }
-                      >
-                        <MoreHorizontal size={13} />
-                      </button>
-                      {isMoreMenuOpen && (
-                        <div
-                          className="tool-popover project-row-popover"
-                          role="menu"
-                        >
-                          <button
-                            role="menuitem"
-                            disabled={!project.workspaceRoot}
-                            onClick={() => {
-                              if (project.workspaceRoot) {
-                                onOpenThreadWorkspace(project.workspaceRoot);
-                              }
-                              setMoreMenuProjectId(null);
-                            }}
-                          >
-                            <FolderOpen size={14} />
-                            <span>在文件管理器中打开</span>
-                          </button>
-                          <button
-                            role="menuitem"
-                            onClick={() => {
-                              onRenameProject(project);
-                              setMoreMenuProjectId(null);
-                            }}
-                          >
-                            <Pencil size={14} />
-                            <span>重命名</span>
-                          </button>
-                          <button disabled title="Git 工作树管理尚未实现">
-                            <GitFork size={14} />
-                            <span>创建工作树</span>
-                            <small>未实现</small>
-                          </button>
-                          <button
-                            role="menuitem"
-                            onClick={() => {
-                              onRemoveProject(project);
-                              setMoreMenuProjectId(null);
-                            }}
-                          >
-                            <Archive size={14} />
-                            <span>归档</span>
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                    <button
-                      className="project-new-thread"
-                      title="新建对话"
-                      aria-label={`在 ${project.name} 中新建对话`}
-                      onClick={() => {
-                        onNewThreadForProject?.(project);
-                      }}
-                    >
-                      <SquarePen size={13} />
-                    </button>
-                  </div>
-                </div>
-                {isExpanded && (
-                  <div className="project-tasks">
-                    {visibleProjectThreads.map((thread) => (
-                      <SidebarThreadRow
-                        active={thread.id === activeThreadId}
-                        activityStatus={activityStatusForThread(thread.id)}
-                        key={thread.id}
-                        project={project}
-                        thread={thread}
-                        onSelect={() => onSelect(thread.id)}
-                        onRename={() => onRenameThread(thread)}
-                        onOpenUsage={() => onOpenThreadUsage(thread)}
-                        onRemoveProject={onRemoveProject}
-                        onToggleProjectPinned={onToggleProjectPinned}
-                      />
-                    ))}
-                    {projectThreads.length > threadDisplayLimit && (
-                      <Button
-                        className="project-show-more"
-                        size="compact"
-                        variant="quiet"
-                        onClick={() =>
-                          setProjectThreadDisplayLimits((current) => {
-                            const next = new Map(current);
-                            next.set(
-                              project.id,
-                              (current.get(project.id) ??
-                                PROJECT_THREAD_PREVIEW_LIMIT) +
-                                PROJECT_THREAD_PREVIEW_LIMIT,
-                            );
-                            return next;
-                          })
-                        }
-                      >
-                        展开显示
-                      </Button>
-                    )}
-                    {projectThreads.length === 0 && (
-                      <span className="project-empty">无任务</span>
-                    )}
-                  </div>
-                )}
-              </section>
-            );
-          })}
-          {unassignedThreads.length > 0 && (
-            <section className="project-node">
-              <div className="project-row">
-                <button
-                  className="project-select"
-                  title="尚未归属到项目的任务"
-                  onClick={() => setUnassignedExpanded((current) => !current)}
-                >
-                  {unassignedExpanded ? (
-                    <FolderOpen size={14} />
-                  ) : (
-                    <Folder size={14} />
-                  )}
-                  <span>未归属任务 ({unassignedThreads.length})</span>
-                </button>
-              </div>
-              {unassignedExpanded && (
-                <div className="project-tasks">
-                  {unassignedThreads.map((thread) => (
-                    <SidebarThreadRow
-                      active={thread.id === activeThreadId}
-                      activityStatus={activityStatusForThread(thread.id)}
-                      key={thread.id}
-                      project={null}
-                      thread={thread}
-                      onSelect={() => onSelect(thread.id)}
-                      onRename={() => onRenameThread(thread)}
-                      onOpenUsage={() => onOpenThreadUsage(thread)}
-                      onRemoveProject={onRemoveProject}
-                      onToggleProjectPinned={onToggleProjectPinned}
-                    />
-                  ))}
-                </div>
-              )}
-            </section>
-          )}
-          {archivedThreads.length > 0 && (
-            <section className="project-node">
-              <div className="project-row">
-                <button
-                  className="project-select"
-                  title="查看可恢复的归档任务"
-                  onClick={() => setArchivedExpanded((current) => !current)}
-                >
-                  <Archive size={14} />
-                  <span>已归档 ({archivedThreads.length})</span>
-                </button>
-              </div>
-              {archivedExpanded && (
-                <div className="project-tasks">
-                  {archivedThreads.map((thread) => (
-                    <SidebarThreadRow
-                      archived
-                      active={false}
-                      activityStatus={activityStatusForThread(thread.id)}
-                      key={thread.id}
-                      project={
-                        projects.find(
-                          (project) => project.id === thread.projectId,
-                        ) ?? null
-                      }
-                      thread={thread}
-                      onSelect={() => onRestoreThread(thread)}
-                      onRename={() => onRenameThread(thread)}
-                      onOpenUsage={() => onOpenThreadUsage(thread)}
-                      onRemoveProject={onRemoveProject}
-                      onToggleProjectPinned={onToggleProjectPinned}
-                      onRestore={() => onRestoreThread(thread)}
-                    />
-                  ))}
-                </div>
-              )}
-            </section>
-          )}
-          {projects.length === 0 && (
-            <p className="workspace-empty">尚未打开项目</p>
-          )}
-          {workspaceError && (
-            <p className="workspace-error">{workspaceError}</p>
-          )}
-        </div>
-
-        <div className="sidebar-footer">
-          <button
-            className="sidebar-settings-button"
-            title="设置"
-            aria-label="设置"
-            onClick={onSettings}
-          >
-            <Settings size={15} />
-            <span className="opentopia-wordmark" aria-hidden="true">
-              <span className="brand-open">Open</span>
-              <span>Topia</span>
-            </span>
-          </button>
-          <button disabled title="帮助 · 未实现" aria-label="帮助">
-            <CircleHelp size={15} />
-          </button>
-        </div>
-      </aside>
-      {hoveredProject &&
-        createPortal(
-          <div
-            className="project-hover-card"
-            id={hoveredProject.id}
-            role="tooltip"
-            style={{ left: hoveredProject.left, top: hoveredProject.top }}
-          >
-            <header>
-              <span>
-                <Folder size={17} aria-hidden="true" />
-                <strong>{hoveredProject.name}</strong>
-              </span>
-              <button
-                disabled
-                className={hoveredProject.pinned ? "active" : undefined}
-                title={hoveredProject.pinned ? "已固定" : "未固定"}
-                aria-label={hoveredProject.pinned ? "已固定" : "未固定"}
-              >
-                <Pin
-                  size={14}
-                  fill={hoveredProject.pinned ? "currentColor" : "none"}
-                  aria-hidden="true"
-                />
-              </button>
-            </header>
-            <div className="project-hover-card__row">
-              <MessageCircle size={15} aria-hidden="true" />
-              <span>{hoveredProject.threadCount} 个对话串</span>
-            </div>
-            <div className="project-hover-card__divider" />
-            <div className="project-hover-card__row">
-              <Folder size={15} aria-hidden="true" />
-              <span
-                title={
-                  hoveredProject.workspaceRoot
-                    ? formatPathForDisplay(hoveredProject.workspaceRoot)
-                    : undefined
-                }
-              >
-                {hoveredProject.workspaceRoot
-                  ? formatPathForDisplay(hoveredProject.workspaceRoot)
-                  : "尚未选择工作区"}
-              </span>
-            </div>
-          </div>,
-          document.body,
-        )}
-      {newProjectOpen && (
-        <div
-          className="modal-backdrop project-modal-backdrop"
-          role="presentation"
-          onClick={() => setNewProjectOpen(false)}
-        >
-          <form
-            className="project-name-dialog"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="project-name-title"
-            onClick={(event) => event.stopPropagation()}
-            onSubmit={(event) => {
-              event.preventDefault();
-              void createProject();
-            }}
-          >
-            <header>
-              <div>
-                <h2 id="project-name-title">为项目命名</h2>
-                <p>项目可以稍后再选择工作区。</p>
-              </div>
-              <button
-                className="icon-button small"
-                type="button"
-                aria-label="关闭项目弹窗"
-                onClick={() => setNewProjectOpen(false)}
-              >
-                <X size={14} />
-              </button>
-            </header>
-            <input
-              autoFocus
-              aria-label="项目名称"
-              value={newProjectName}
-              onChange={(event) => setNewProjectName(event.target.value)}
-            />
-            <footer>
-              <button
-                className="secondary-button"
-                type="button"
-                onClick={() => setNewProjectOpen(false)}
-              >
-                取消
-              </button>
-              <button
-                className="primary-button"
-                type="submit"
-                disabled={!newProjectName.trim() || isCreatingProject}
-              >
-                {isCreatingProject ? "保存中..." : "保存"}
-              </button>
-            </footer>
-          </form>
-        </div>
-      )}
-    </>
-  );
-}
-
-function ThreadStatusIndicator({ status }: { status?: ThreadActivityStatus }) {
-  if (!status) {
-    return null;
-  }
-
-  const label = threadActivityStatusLabel(status);
-
-  return (
-    <span
-      className={`thread-row-status is-${status}`}
-      role="img"
-      aria-label={label}
-      title={label}
-    >
-      {status === "processing" ? (
-        <Loader2 size={14} className="spin" aria-hidden="true" />
-      ) : status === "failed" ? (
-        <CircleAlert size={14} aria-hidden="true" />
-      ) : (
-        <Circle size={9} fill="currentColor" aria-hidden="true" />
-      )}
-    </span>
-  );
-}
-
-function SidebarThreadRow({
-  thread,
-  project,
-  active,
-  activityStatus,
-  archived = false,
-  onSelect,
-  onRename,
-  onOpenUsage,
-  onRemoveProject,
-  onToggleProjectPinned,
-  onRestore,
-}: {
-  thread: Thread;
-  project: Project | null;
-  active: boolean;
-  activityStatus?: ThreadActivityStatus;
-  archived?: boolean;
-  onSelect(): void;
-  onRename(): void;
-  onOpenUsage(): void;
-  onRemoveProject(project: Project): void;
-  onToggleProjectPinned(project: Project): void;
-  onRestore?(): void;
-}) {
-  const [menuOpen, setMenuOpen] = useState(false);
-  const [titleOverflow, setTitleOverflow] = useState({
-    distance: 0,
-    durationMs: 0,
-  });
-  const titleViewportRef = useRef<HTMLSpanElement>(null);
-  const titleTextRef = useRef<HTMLSpanElement>(null);
-  const menuRef = useDismissiblePopover(menuOpen, () => setMenuOpen(false));
-
-  useEffect(() => {
-    const viewport = titleViewportRef.current;
-    const text = titleTextRef.current;
-    if (!viewport || !text) return;
-
-    const measure = () => {
-      const distance = Math.max(
-        0,
-        Math.ceil(text.scrollWidth - viewport.clientWidth),
-      );
-      const durationMs =
-        distance > 0 ? Math.min(8_000, 1_800 + distance * 24) : 0;
-      setTitleOverflow((current) =>
-        current.distance === distance && current.durationMs === durationMs
-          ? current
-          : { distance, durationMs },
-      );
-    };
-    const frame = window.requestAnimationFrame(measure);
-    const observer = new ResizeObserver(measure);
-    observer.observe(viewport);
-    observer.observe(text);
-    return () => {
-      window.cancelAnimationFrame(frame);
-      observer.disconnect();
-    };
-  }, [thread.title]);
-
-  const titleStyle =
-    titleOverflow.distance > 0
-      ? ({
-          "--thread-title-scroll-distance": `${titleOverflow.distance}px`,
-          "--thread-title-scroll-duration": `${titleOverflow.durationMs}ms`,
-        } as CSSProperties)
-      : undefined;
-
-  return (
-    <div
-      className={`thread-row-wrap ${active ? "active" : ""} ${
-        isThreadActivityProcessing(activityStatus) ? "is-processing" : ""
-      } ${activityStatus ? "has-status" : ""} ${menuOpen ? "menu-open" : ""}`}
-    >
-      <button
-        className={`thread-row ${active ? "active" : ""}`}
-        aria-current={active ? "page" : undefined}
-        onPointerDown={(event) => {
-          if (event.button !== 0) return;
-          onSelect();
-        }}
-        onClick={(event) => {
-          if (event.detail !== 0) return;
-          onSelect();
-        }}
-        aria-label={thread.title}
-        title={thread.title}
-      >
-        <span
-          className={`thread-title-viewport ${titleOverflow.distance > 0 ? "is-overflowing" : ""}`}
-          ref={titleViewportRef}
-        >
-          <span
-            className="thread-title-text"
-            ref={titleTextRef}
-            style={titleStyle}
-          >
-            {thread.title}
-          </span>
-        </span>
-      </button>
-      <ThreadStatusIndicator status={activityStatus} />
-      <div className="thread-row-menu-wrap" ref={menuRef}>
-        <button
-          className="thread-row-more"
-          type="button"
-          aria-label={`任务菜单 ${thread.title}`}
-          aria-expanded={menuOpen}
-          onClick={() => setMenuOpen((current) => !current)}
-        >
-          <MoreHorizontal size={13} />
-        </button>
-        {menuOpen && (
-          <div className="tool-popover thread-row-popover" role="menu">
-            <button
-              role="menuitem"
-              onClick={() => {
-                onRename();
-                setMenuOpen(false);
-              }}
-            >
-              <Pencil size={14} />
-              <span>重命名</span>
-            </button>
-            <button
-              role="menuitem"
-              onClick={() => {
-                onOpenUsage();
-                setMenuOpen(false);
-              }}
-            >
-              <Activity size={14} />
-              <span>使用日志看板</span>
-            </button>
-            {project ? (
-              <>
-                <button
-                  role="menuitem"
-                  onClick={() => {
-                    onToggleProjectPinned(project);
-                    setMenuOpen(false);
-                  }}
-                >
-                  <Pin size={14} />
-                  <span>{project.pinned ? "取消固定项目" : "固定项目"}</span>
-                </button>
-                <div className="tool-popover-separator" />
-                <button
-                  role="menuitem"
-                  onClick={() => {
-                    onRemoveProject(project);
-                    setMenuOpen(false);
-                  }}
-                >
-                  <X size={14} />
-                  <span>从最近项目移除</span>
-                </button>
-              </>
-            ) : (
-              <>
-                <button disabled title="此对话尚未归属到项目">
-                  <Pin size={14} />
-                  <span>固定项目</span>
-                </button>
-                <div className="tool-popover-separator" />
-                <button disabled title="此对话尚未归属到项目">
-                  <X size={14} />
-                  <span>从最近项目移除</span>
-                </button>
-              </>
-            )}
-            {archived && onRestore && (
-              <button
-                role="menuitem"
-                onClick={() => {
-                  onRestore();
-                  setMenuOpen(false);
-                }}
-              >
-                <RotateCcw size={14} />
-                <span>恢复到项目</span>
-              </button>
-            )}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function ThreadHeader({
-  thread,
-  title,
-  headingIcon,
-  showThreadControls = true,
-  toolStageOpen,
-  contextRailOpen,
-  onOpenLocation,
-  onOpenTool,
-  onToggleContextRail,
-  onToggleToolStage,
-  onRename,
-  onArchive,
-}: {
-  thread: Thread | null;
-  title?: string;
-  headingIcon?: ReactNode;
-  showThreadControls?: boolean;
-  toolStageOpen: boolean;
-  contextRailOpen: boolean;
-  onOpenLocation(): void;
-  onOpenTool(kind: ToolTabKind): void;
-  onToggleContextRail(): void;
-  onToggleToolStage(): void;
-  onRename(): void;
-  onArchive(): void;
-}) {
-  const [menuOpen, setMenuOpen] = useState(false);
-  const [taskMenuOpen, setTaskMenuOpen] = useState(false);
-  const menuRef = useDismissiblePopover(menuOpen, () => setMenuOpen(false));
-  const taskMenuRef = useDismissiblePopover(taskMenuOpen, () =>
-    setTaskMenuOpen(false),
-  );
-
-  useEffect(() => {
-    if (showThreadControls) return;
-    setMenuOpen(false);
-    setTaskMenuOpen(false);
-  }, [showThreadControls]);
-
-  function selectTool(kind: ToolTabKind) {
-    onOpenTool(kind);
-    setMenuOpen(false);
-  }
-
-  return (
-    <div className="thread-header">
-      <div className="thread-heading">
-        {headingIcon ?? <Folder size={15} />}
-        <h1>{title ?? thread?.title ?? "新任务"}</h1>
-        {showThreadControls ? (
-          <div className="thread-heading-menu-wrap" ref={taskMenuRef}>
-            <button
-              className="thread-more"
-              disabled={!thread}
-              aria-label="任务菜单"
-              aria-expanded={taskMenuOpen}
-              onClick={() => {
-                setTaskMenuOpen((current) => !current);
-                setMenuOpen(false);
-              }}
-            >
-              <MoreHorizontal size={15} />
-            </button>
-            {taskMenuOpen && thread && (
-              <div className="tool-popover thread-heading-popover" role="menu">
-                <button
-                  role="menuitem"
-                  onClick={() => {
-                    onOpenLocation();
-                    setTaskMenuOpen(false);
-                  }}
-                >
-                  <FolderOpen size={14} />
-                  <span>在文件管理器中打开</span>
-                </button>
-                <button
-                  role="menuitem"
-                  onClick={() => {
-                    onRename();
-                    setTaskMenuOpen(false);
-                  }}
-                >
-                  <Pencil size={14} />
-                  <span>重命名任务</span>
-                </button>
-                <button disabled title="Git 工作树管理尚未实现">
-                  <GitFork size={14} />
-                  <span>创建工作树</span>
-                  <small>未实现</small>
-                </button>
-                <button
-                  role="menuitem"
-                  onClick={() => {
-                    onArchive();
-                    setTaskMenuOpen(false);
-                  }}
-                >
-                  <Archive size={14} />
-                  <span>归档任务</span>
-                </button>
-              </div>
-            )}
-          </div>
-        ) : null}
-      </div>
-      {showThreadControls ? (
-        <div className="thread-actions">
-          <div className="thread-tool-menu-wrap" ref={menuRef}>
-            <button
-              className="thread-tool-button"
-              disabled={!thread}
-              aria-expanded={menuOpen}
-              aria-haspopup="menu"
-              onClick={() => {
-                setMenuOpen((current) => !current);
-                setTaskMenuOpen(false);
-              }}
-            >
-              <PanelRight size={14} />
-              <span>打开位置</span>
-              <ChevronDown size={12} />
-            </button>
-            {menuOpen && thread && (
-              <div className="tool-popover thread-tool-popover" role="menu">
-                <button
-                  role="menuitem"
-                  onClick={() => {
-                    onOpenLocation();
-                    setMenuOpen(false);
-                  }}
-                >
-                  <FolderOpen size={14} />
-                  <span>文件管理器</span>
-                </button>
-                <button role="menuitem" onClick={() => selectTool("terminal")}>
-                  <TerminalSquare size={14} />
-                  <span>终端</span>
-                </button>
-                <button disabled title="VS Code 启动集成尚未实现">
-                  <FileCode2 size={14} />
-                  <span>VS Code</span>
-                  <small>未实现</small>
-                </button>
-                <button disabled title="Git Bash 启动集成尚未实现">
-                  <GitBranch size={14} />
-                  <span>Git Bash</span>
-                  <small>未实现</small>
-                </button>
-                <button disabled title="WSL 启动集成尚未实现">
-                  <Cloud size={14} />
-                  <span>WSL</span>
-                  <small>未实现</small>
-                </button>
-                <div className="tool-popover-separator" />
-                <button role="menuitem" onClick={() => selectTool("files")}>
-                  <Folder size={14} />
-                  <span>文件工具</span>
-                </button>
-                <button role="menuitem" onClick={() => selectTool("diff")}>
-                  <GitBranch size={14} />
-                  <span>审查变更</span>
-                </button>
-              </div>
-            )}
-          </div>
-          <IconButton
-            className={`context-rail-toggle ${contextRailOpen ? "is-active" : ""}`}
-            size="compact"
-            variant="quiet"
-            aria-label={contextRailOpen ? "折叠环境信息" : "展开环境信息"}
-            aria-controls="workspace-context-rail"
-            aria-expanded={contextRailOpen}
-            disabled={!thread}
-            title={contextRailOpen ? "折叠环境信息" : "展开环境信息"}
-            onClick={onToggleContextRail}
-          >
-            <SlidersHorizontal size={15} aria-hidden="true" />
-          </IconButton>
-          {!toolStageOpen ? (
-            <IconButton
-              className="tool-stage-toggle"
-              size="compact"
-              variant="quiet"
-              aria-label="展开工具窗口"
-              aria-controls="workspace-right-panel"
-              aria-expanded={false}
-              title="展开工具窗口"
-              onClick={onToggleToolStage}
-            >
-              <PanelRightOpen size={15} aria-hidden="true" />
-            </IconButton>
-          ) : null}
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-function GoalStrip({
-  snapshot,
-  isRunning,
-  action,
-  onRun,
-  onPause,
-  onCancel,
-}: {
-  snapshot: GoalSnapshot;
-  isRunning: boolean;
-  action: GoalStatus | "run" | null;
-  onRun(): void;
-  onPause(): void;
-  onCancel(): void;
-}) {
-  const items = snapshot.workForm.items;
-  const status = snapshot.workForm.status;
-  const completed = items.filter((item) => item.status === "completed").length;
-  const resolved = items.filter((item) =>
-    ["completed", "deferred", "blocked", "cancelled"].includes(item.status),
-  ).length;
-  const total = items.length;
-  const progress = total ? Math.round((completed / total) * 100) : 0;
-  const succeededIds = new Set(
-    items.filter((item) => item.status === "completed").map((item) => item.id),
-  );
-  let currentTaskIndex = items.findIndex(
-    (item) => item.status === "in_progress",
-  );
-  if (currentTaskIndex < 0) {
-    currentTaskIndex = items.findIndex(
-      (item) =>
-        item.status === "pending" &&
-        item.dependsOn.every((dependency) => succeededIds.has(dependency)),
-    );
-  }
-  const terminal = ["completed", "cancelled"].includes(status);
-  const canRun = !isRunning && ["active", "paused", "blocked"].includes(status);
-  return (
-    <section className={`goal-strip is-${status}`}>
-      <details open>
-        <summary>
-          <span className="goal-strip-icon" aria-hidden="true">
-            <Target size={15} />
-          </span>
-          <span className="goal-strip-objective">
-            {snapshot.workForm.objective}
-          </span>
-          <span className={`goal-status is-${status}`}>
-            {goalStatusLabel(status)}
-          </span>
-          {total ? (
-            <span className="goal-count">
-              {currentTaskIndex >= 0
-                ? `第 ${currentTaskIndex + 1}/${total} 步`
-                : `${resolved}/${total} 已处理`}
-            </span>
-          ) : null}
-        </summary>
-        <div className="goal-strip-body">
-          <div
-            className="goal-progress"
-            role="progressbar"
-            aria-label="目标进度"
-            aria-valuemin={0}
-            aria-valuemax={100}
-            aria-valuenow={progress}
-          >
-            <span style={{ width: `${progress}%` }} />
-          </div>
-          {items.length ? (
-            <ol className="goal-task-list">
-              {items.map((item) => (
-                <li className={`is-${item.status}`} key={item.id}>
-                  <span className="goal-task-state" aria-hidden="true" />
-                  <span className="goal-task-content">
-                    <span>{item.title}</span>
-                    {item.note ? <small>{item.note}</small> : null}
-                  </span>
-                </li>
-              ))}
-            </ol>
-          ) : null}
-          {!terminal ? (
-            <div className="goal-actions">
-              {canRun ? (
-                <button
-                  type="button"
-                  disabled={Boolean(action)}
-                  onClick={onRun}
-                >
-                  {action === "run" ? (
-                    <Loader2 size={14} className="spin" />
-                  ) : (
-                    <Zap size={14} />
-                  )}
-                  <span>继续</span>
-                </button>
-              ) : null}
-              {status === "active" && isRunning ? (
-                <button
-                  type="button"
-                  disabled={Boolean(action)}
-                  onClick={onPause}
-                >
-                  {action === "paused" ? (
-                    <Loader2 size={14} className="spin" />
-                  ) : (
-                    <Pause size={14} />
-                  )}
-                  <span>暂停</span>
-                </button>
-              ) : null}
-              <button
-                className="goal-cancel-button"
-                type="button"
-                title="取消目标"
-                aria-label="取消目标"
-                disabled={Boolean(action)}
-                onClick={onCancel}
-              >
-                {action === "cancelled" ? (
-                  <Loader2 size={14} className="spin" />
-                ) : (
-                  <X size={14} />
-                )}
-              </button>
-            </div>
-          ) : null}
-        </div>
-      </details>
-    </section>
-  );
-}
-
-function goalStatusLabel(status: GoalStatus): string {
-  const labels: Record<GoalStatus, string> = {
-    active: "执行中",
-    paused: "已暂停",
-    completed: "已完成",
-    blocked: "受阻",
-    cancelled: "已取消",
-  };
-  return labels[status];
-}
-
-const initialRenderedMessageCount = 12;
-const messageRenderBatchSize = 12;
-
-function ConversationLoadingState() {
-  return (
-    <section
-      className="conversation-loading"
-      role="status"
-      aria-label="正在加载"
-      aria-live="polite"
-    >
-      <div className="conversation-loading__content">
-        <span className="conversation-loading__wordmark" aria-hidden="true">
-          <span className="conversation-loading__brand-open">Open</span>
-          <span>Topia</span>
-        </span>
-      </div>
-    </section>
-  );
-}
-
-function ConversationLoadErrorState({
-  error,
-  onRetry,
-}: {
-  error: string;
-  onRetry(): void;
-}) {
-  return (
-    <section className="conversation-load-error" role="alert">
-      <div className="conversation-load-error__content">
-        <strong>无法加载会话内容</strong>
-        <p>{error}</p>
-        <Button variant="secondary" size="compact" onClick={onRetry}>
-          重试
-        </Button>
-      </div>
-    </section>
-  );
-}
-
-function MessageList({
-  messages,
-  events,
-  activeTurnId,
-  pendingTurnFeedback,
-  undoingTurnId,
-  threadId,
-  artifacts,
-  onOpenArtifact,
-  onOpenImagePreview,
-  onOpenAttachmentPreview,
-  onOpenMarkdownLink,
-  onUndoTurn,
-  onReviewChanges,
-  onOpenFileReview,
-  onLoadTurnFilePreview,
-}: {
-  messages: Message[];
-  events: AgentEvent[];
-  activeTurnId: string | null;
-  pendingTurnFeedback: PendingTurnFeedback | null;
-  undoingTurnId: string | null;
-  threadId: string;
-  artifacts: ArtifactDescriptor[];
-  onOpenArtifact(artifactId: string): void;
-  onOpenImagePreview(sourceId: string, image: ImagePreviewSource): void;
-  onOpenAttachmentPreview(source: ContextSourceRef): void;
-  onOpenMarkdownLink(href: string, baseWorkspacePath?: string | null): void;
-  onUndoTurn(turnId: string): void;
-  onReviewChanges(): void;
-  onOpenFileReview(path: string, file: TurnFileChange): void;
-  onLoadTurnFilePreview(
-    turnId: string,
-    path: string,
-    offset?: number,
-  ): Promise<TurnFileDiffPreview>;
-}) {
-  const visibleMessages = useMemo(
-    () =>
-      messages.filter(
-        (message) => message.role === "user" || message.role === "assistant",
-      ),
-    [messages],
-  );
-  const attachmentSourcesByAssistantMessage = useMemo(
-    () => attachmentsByAssistantMessage(messages, events),
-    [events, messages],
-  );
-  const [renderedMessageCount, setRenderedMessageCount] = useState(
-    initialRenderedMessageCount,
-  );
-  const messageListRef = useRef<HTMLDivElement>(null);
-  const messageListContentRef = useRef<HTMLDivElement>(null);
-  const previousScrollHeightRef = useRef<number | null>(null);
-  const conversationPinnedToEndRef = useRef(true);
-  const [showScrollToEnd, setShowScrollToEnd] = useState(false);
-  const renderedMessages = visibleMessages.slice(-renderedMessageCount);
-  const hasPendingMessages = renderedMessages.length < visibleMessages.length;
-  const {
-    eventsByTurn,
-    turnIdsByUserMessage,
-    turnIdsByAssistantMessage,
-    changeSetsByTurn,
-    revertedTurnIds,
-    orphanTurnErrors,
-    turnsWithAssistantCards,
-  } = useMemo(() => {
-    const eventsByTurn = new Map<string, AgentEvent[]>();
-    const turnIdsByUserMessage = new Map<string, string[]>();
-    const turnIdsByAssistantMessage = new Map<string, string[]>();
-    const changeSetsByTurn = new Map<string, TurnChangeSet>();
-    const revertedTurnIds = new Set<string>();
-    for (const event of events) {
-      if (event.turnId) {
-        const current = eventsByTurn.get(event.turnId) ?? [];
-        current.push(event);
-        eventsByTurn.set(event.turnId, current);
-      }
-      if (event.turnId && event.payload.type === "turn_started") {
-        const turnIds =
-          turnIdsByUserMessage.get(event.payload.user_message_id) ?? [];
-        if (!turnIds.includes(event.turnId)) turnIds.push(event.turnId);
-        turnIdsByUserMessage.set(event.payload.user_message_id, turnIds);
-      }
-      if (event.turnId && event.payload.type === "assistant_message") {
-        const turnIds =
-          turnIdsByAssistantMessage.get(event.payload.message.id) ?? [];
-        if (!turnIds.includes(event.turnId)) turnIds.push(event.turnId);
-        turnIdsByAssistantMessage.set(event.payload.message.id, turnIds);
-      }
-      if (
-        event.turnId &&
-        event.payload.type === "turn_changes_recorded" &&
-        shouldShowRecordedTurnChanges(events, event.turnId)
-      ) {
-        changeSetsByTurn.set(event.turnId, event.payload.change_set);
-        if (event.payload.change_set.revertedAt) {
-          revertedTurnIds.add(event.turnId);
-        }
-      }
-      if (event.payload.type === "turn_undo_completed") {
-        revertedTurnIds.add(event.payload.target_turn_id);
-      }
-    }
-    const anchoredTurnIds = new Set(
-      [...turnIdsByUserMessage.values()].flatMap((turnIds) => turnIds),
-    );
-    const orphanTurnErrors = events.filter(
-      (event) =>
-        event.payload.type === "error" &&
-        (!event.turnId || !anchoredTurnIds.has(event.turnId)),
-    );
-    const turnsWithAssistantCards = new Set(
-      [...turnIdsByAssistantMessage.values()].flatMap((turnIds) => turnIds),
-    );
-    return {
-      eventsByTurn,
-      turnIdsByUserMessage,
-      turnIdsByAssistantMessage,
-      changeSetsByTurn,
-      revertedTurnIds,
-      orphanTurnErrors,
-      turnsWithAssistantCards,
-    };
-  }, [events]);
-  const pendingTurnIsAnchored = pendingTurnFeedback
-    ? events.some(
-        (event) =>
-          event.payload.type === "turn_started" &&
-          (pendingTurnFeedback.turnId
-            ? event.turnId === pendingTurnFeedback.turnId
-            : event.createdAt >= pendingTurnFeedback.startedAt),
-      )
-    : false;
-  const showPendingTurnStatus =
-    pendingTurnFeedback !== null && !pendingTurnIsAnchored;
-  const activeTurnEvents =
-    activeTurnId === null ? [] : (eventsByTurn.get(activeTurnId) ?? []);
-  const showModelThinkingStatus =
-    activeTurnId !== null &&
-    hasPendingProviderRequest(activeTurnEvents);
-  const showActiveProcessingStatus =
-    activeTurnId !== null &&
-    !showModelThinkingStatus &&
-    !hasPendingToolCall(activeTurnEvents);
-  const showTrailingTurnStatus =
-    showPendingTurnStatus ||
-    showModelThinkingStatus ||
-    showActiveProcessingStatus;
-
-  useEffect(() => {
-    if (!hasPendingMessages) return;
-    const frame = window.requestAnimationFrame(() => {
-      previousScrollHeightRef.current =
-        messageListRef.current?.scrollHeight ?? null;
-      setRenderedMessageCount((current) =>
-        Math.min(current + messageRenderBatchSize, visibleMessages.length),
-      );
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [hasPendingMessages, visibleMessages.length]);
-
-  useLayoutEffect(() => {
-    const previousScrollHeight = previousScrollHeightRef.current;
-    const list = messageListRef.current;
-    if (previousScrollHeight === null || !list) return;
-    list.scrollTop += list.scrollHeight - previousScrollHeight;
-    previousScrollHeightRef.current = null;
-  }, [renderedMessageCount]);
-
-  const updateScrollToEndVisibility = useCallback(() => {
-    const list = messageListRef.current;
-    if (!list) return;
-    const isNearEnd = isConversationScrollNearEnd(list);
-    conversationPinnedToEndRef.current = isNearEnd;
-    setShowScrollToEnd(!isNearEnd);
-  }, []);
-
-  useEffect(() => {
-    const list = messageListRef.current;
-    if (!list) return;
-    list.addEventListener("scroll", updateScrollToEndVisibility, {
-      passive: true,
-    });
-    window.addEventListener("resize", updateScrollToEndVisibility);
-    updateScrollToEndVisibility();
-    return () => {
-      list.removeEventListener("scroll", updateScrollToEndVisibility);
-      window.removeEventListener("resize", updateScrollToEndVisibility);
-    };
-  }, [updateScrollToEndVisibility]);
-
-  useLayoutEffect(() => {
-    const list = messageListRef.current;
-    if (list && conversationPinnedToEndRef.current) {
-      list.scrollTop = list.scrollHeight;
-    }
-    updateScrollToEndVisibility();
-  }, [events, messages, renderedMessageCount, updateScrollToEndVisibility]);
-
-  useEffect(() => {
-    const content = messageListContentRef.current;
-    if (!content) return;
-    const observer = new ResizeObserver(() => {
-      const list = messageListRef.current;
-      if (!list) return;
-      if (conversationPinnedToEndRef.current) {
-        list.scrollTop = list.scrollHeight;
-      }
-      updateScrollToEndVisibility();
-    });
-    observer.observe(content);
-    return () => observer.disconnect();
-  }, [updateScrollToEndVisibility]);
-
-  const scrollToEnd = useCallback(() => {
-    const list = messageListRef.current;
-    if (!list) return;
-    conversationPinnedToEndRef.current = true;
-    list.scrollTo({ top: list.scrollHeight, behavior: "smooth" });
-  }, []);
-
-  const renderTurnChangeCard = (turnId: string) => {
-    const changeSet = changeSetsByTurn.get(turnId);
-    if (!changeSet) return null;
-    return (
-      <TurnChangeCard
-        key={`turn-change-card-${turnId}`}
-        changeSet={changeSet}
-        isWorkspaceBusy={Boolean(activeTurnId)}
-        isUndoing={undoingTurnId === turnId}
-        isReverted={revertedTurnIds.has(turnId)}
-        onUndo={() => onUndoTurn(turnId)}
-        onReview={onReviewChanges}
-        onOpenFileReview={onOpenFileReview}
-        onLoadFilePreview={(path, offset) =>
-          onLoadTurnFilePreview(turnId, path, offset)
-        }
-      />
-    );
-  };
-  return (
-    <div className="conversation-scroll-shell">
-      <div
-        className="message-list"
-        ref={messageListRef}
-        aria-busy={hasPendingMessages || showTrailingTurnStatus}
-        onCopy={trimCopiedSelection}
-      >
-        <div
-          className={`message-list-content ${
-            visibleMessages.length === 0 && !showTrailingTurnStatus
-              ? "is-empty"
-              : ""
-          }`.trim()}
-          data-text-context-menu={
-            visibleMessages.length > 0 || showTrailingTurnStatus
-              ? "conversation-history"
-              : undefined
-          }
-          ref={messageListContentRef}
-        >
-          {visibleMessages.length === 0 && !showTrailingTurnStatus ? (
-            <div className="empty-thread">
-              <Bot size={42} />
-              <h2>等待第一个任务指令</h2>
-              <p>当前任务尚未产生消息。</p>
-            </div>
-          ) : (
-            renderedMessages.map((message) => {
-              const turnIds =
-                message.role === "user"
-                  ? (turnIdsByUserMessage.get(message.id) ?? [])
-                  : [];
-              const resultTurnIds =
-                message.role === "assistant"
-                  ? (turnIdsByAssistantMessage.get(message.id) ?? [])
-                  : [];
-              return (
-                <Fragment key={message.id}>
-                  <MessageBubble
-                    attachmentSources={
-                      attachmentSourcesByAssistantMessage.get(message.id) ?? []
-                    }
-                    message={message}
-                    threadId={threadId}
-                    artifacts={artifacts}
-                    onOpenArtifact={onOpenArtifact}
-                    onOpenImagePreview={onOpenImagePreview}
-                    onOpenAttachmentPreview={onOpenAttachmentPreview}
-                    onOpenMarkdownLink={onOpenMarkdownLink}
-                  />
-                  {turnIds.map((turnId) => (
-                    <Fragment key={turnId}>
-                      <TurnActivityTimeline
-                        events={eventsByTurn.get(turnId) ?? []}
-                        isActive={activeTurnId === turnId}
-                        formatError={friendlyProviderError}
-                        onOpenMarkdownLink={onOpenMarkdownLink}
-                      />
-                      {!turnsWithAssistantCards.has(turnId) &&
-                        renderTurnChangeCard(turnId)}
-                    </Fragment>
-                  ))}
-                  {resultTurnIds.map(renderTurnChangeCard)}
-                </Fragment>
-              );
-            })
-          )}
-          {orphanTurnErrors.map((event) => (
-            <article
-              className="message assistant turn-error-message"
-              key={event.id}
-            >
-              <div className="message-body" role="alert">
-                <AlertCircle size={15} aria-hidden="true" />
-                <span>
-                  {event.payload.type === "error"
-                    ? friendlyProviderError(event.payload.message)
-                    : "Agent 请求失败"}
-                </span>
-              </div>
-            </article>
-          ))}
-          {showModelThinkingStatus && activeTurnId ? (
-            <PendingTurnStatus
-              key={`model-thinking-${activeTurnId}`}
-              phase="thinking"
-              threadId={threadId}
-              turnId={activeTurnId}
-            />
-          ) : showActiveProcessingStatus && activeTurnId ? (
-            <PendingTurnStatus
-              key={`model-processing-${activeTurnId}`}
-              phase="processing"
-              threadId={threadId}
-              turnId={activeTurnId}
-            />
-          ) : showPendingTurnStatus && pendingTurnFeedback ? (
-            <PendingTurnStatus
-              key={pendingTurnFeedback.startedAt}
-              phase="processing"
-              threadId={pendingTurnFeedback.threadId}
-              turnId={pendingTurnFeedback.turnId}
-            />
-          ) : null}
-        </div>
-      </div>
-      {showScrollToEnd ? (
-        <IconButton
-          className="conversation-scroll-to-end"
-          variant="secondary"
-          aria-label="滚动到对话末尾"
-          title="滚动到对话末尾"
-          onClick={scrollToEnd}
-        >
-          <ArrowDown size={18} aria-hidden="true" />
-        </IconButton>
-      ) : null}
-    </div>
-  );
-}
-
-/**
- * Hands the clipboard the text that was actually selected. Chromium serializes
- * a selection block by block, so a drag that lands a hair past the last glyph
- * of a message still closes that block and opens the next one, and the paste
- * arrives with a blank line or two glued to the end. The rewrite is skipped
- * when nothing needs trimming, which keeps the rich-text flavor intact for the
- * copies that were already clean.
- */
-function trimCopiedSelection(event: ReactClipboardEvent<HTMLDivElement>) {
-  const selected = window.getSelection()?.toString() ?? "";
-  const trimmed = normalizeCopiedText(selected);
-  if (!trimmed || trimmed === selected) return;
-  event.clipboardData.setData("text/plain", trimmed);
-  event.preventDefault();
-}
-
-const MessageBubble = memo(function MessageBubble({
-  attachmentSources,
-  message,
-  threadId,
-  artifacts,
-  onOpenArtifact,
-  onOpenImagePreview,
-  onOpenAttachmentPreview,
-  onOpenMarkdownLink,
-}: {
-  attachmentSources: ContextSourceRef[];
-  message: Message;
-  threadId: string;
-  artifacts: ArtifactDescriptor[];
-  onOpenArtifact(artifactId: string): void;
-  onOpenImagePreview(sourceId: string, image: ImagePreviewSource): void;
-  onOpenAttachmentPreview(source: ContextSourceRef): void;
-  onOpenMarkdownLink(href: string): void;
-}) {
-  const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "error">(
-    "idle",
-  );
-  const renderedParts = useMemo(() => {
-    const referencedImageIds = new Set(
-      message.parts.flatMap((part) =>
-        part.type === "image_ref" ? [part.image_id] : [],
-      ),
-    );
-    const imagesById = new Map(
-      message.parts.flatMap((part) =>
-        part.type === "image" && part.id ? [[part.id, part] as const] : [],
-      ),
-    );
-    let nextImagePreviewIndex = 0;
-
-    return message.parts
-      .filter(
-        (part) =>
-          part.type !== "turn_context" &&
-          part.type !== "tool_call" &&
-          part.type !== "tool_result" &&
-          !(
-            part.type === "image" &&
-            part.id &&
-            referencedImageIds.has(part.id)
-          ),
-      )
-      .map((part) => {
-        const referencedImage =
-          part.type === "image_ref" ? imagesById.get(part.image_id) : undefined;
-        const previewImage = part.type === "image" ? part : referencedImage;
-        const previewIndex = previewImage ? nextImagePreviewIndex++ : null;
-        return { part, referencedImage, previewImage, previewIndex };
-      });
-  }, [message.parts]);
-  const [imagePreviews, setImagePreviews] = useState<ImageLightboxAttachment[]>(
-    [],
-  );
-  const copyText = useMemo(
-    () => conversationMessageCopyText(message.parts),
-    [message.parts],
-  );
-  const timestamp = useMemo(
-    () => formatConversationMessageTimestamp(message.createdAt),
-    [message.createdAt],
-  );
-
-  useEffect(() => {
-    if (copyStatus === "idle") return;
-    const timer = window.setTimeout(() => setCopyStatus("idle"), 1600);
-    return () => window.clearTimeout(timer);
-  }, [copyStatus]);
-
-  useLayoutEffect(() => {
-    // Create and revoke object URLs in the same lifecycle. React StrictMode
-    // re-runs effects, so each setup must produce fresh, usable URLs.
-    const nextImagePreviews = renderedParts.flatMap(({ previewImage }) => {
-      if (!previewImage) return [];
-      const contentType =
-        previewImage.contentType ||
-        (previewImage as typeof previewImage & { content_type?: string })
-          .content_type ||
-        "application/octet-stream";
-      return [
-        {
-          name: previewImage.name || "图片",
-          previewUrl: URL.createObjectURL(
-            new Blob([new Uint8Array(previewImage.data)], {
-              type: contentType,
-            }),
-          ),
-        },
-      ];
-    });
-    setImagePreviews(nextImagePreviews);
-    return () => {
-      nextImagePreviews.forEach(({ previewUrl }) =>
-        URL.revokeObjectURL(previewUrl),
-      );
-    };
-  }, [renderedParts]);
-
-  if (renderedParts.length === 0) return null;
-
-  return (
-    <article className={`message ${message.role}`}>
-      <div className="message-content">
-        <div className="message-body">
-          {renderedParts.map(
-            ({ part, referencedImage, previewImage, previewIndex }, index) => (
-              <MessagePartView
-                attachmentSources={attachmentSources}
-                key={index}
-                messageId={message.id}
-                part={part}
-                referencedImage={referencedImage}
-                imagePreviewUrl={
-                  previewIndex === null
-                    ? undefined
-                    : imagePreviews[previewIndex]?.previewUrl
-                }
-                onPreviewImage={
-                  previewIndex === null || !previewImage
-                    ? undefined
-                    : () =>
-                        onOpenImagePreview(
-                          `${message.id}:${previewIndex}`,
-                          previewImage,
-                        )
-                }
-                role={message.role}
-                threadId={threadId}
-                artifacts={artifacts}
-                onOpenArtifact={onOpenArtifact}
-                onOpenAttachmentPreview={onOpenAttachmentPreview}
-                onOpenMarkdownLink={onOpenMarkdownLink}
-              />
-            ),
-          )}
-        </div>
-        <div className="message-actions">
-          {timestamp ? (
-            <time dateTime={message.createdAt} title={timestamp.title}>
-              {timestamp.label}
-            </time>
-          ) : null}
-          {copyText ? (
-            <IconButton
-              className="message-copy-button"
-              size="compact"
-              variant="quiet"
-              aria-label={
-                copyStatus === "copied"
-                  ? "消息已复制"
-                  : copyStatus === "error"
-                    ? "复制失败，重试"
-                    : "复制消息"
-              }
-              title={
-                copyStatus === "copied"
-                  ? "已复制"
-                  : copyStatus === "error"
-                    ? "复制失败，点击重试"
-                    : "复制消息"
-              }
-              data-state={copyStatus}
-              onClick={() => {
-                void (async () => {
-                  try {
-                    if (!navigator.clipboard?.writeText) {
-                      throw new Error("Clipboard API unavailable");
-                    }
-                    await navigator.clipboard.writeText(copyText);
-                    setCopyStatus("copied");
-                  } catch {
-                    setCopyStatus("error");
-                  }
-                })();
-              }}
-            >
-              {copyStatus === "copied" ? (
-                <Check size={14} aria-hidden="true" />
-              ) : copyStatus === "error" ? (
-                <CircleAlert size={14} aria-hidden="true" />
-              ) : (
-                <Copy size={14} aria-hidden="true" />
-              )}
-            </IconButton>
-          ) : null}
-          <span className="ot-sr-only" aria-live="polite">
-            {copyStatus === "copied"
-              ? "消息已复制到剪贴板"
-              : copyStatus === "error"
-                ? "消息复制失败"
-                : ""}
-          </span>
-        </div>
-      </div>
-    </article>
-  );
-});
-
-function MessagePartView({
-  attachmentSources,
-  messageId,
-  part,
-  referencedImage,
-  imagePreviewUrl,
-  onPreviewImage,
-  role,
-  threadId,
-  artifacts,
-  onOpenArtifact,
-  onOpenAttachmentPreview,
-  onOpenMarkdownLink,
-}: {
-  attachmentSources: ContextSourceRef[];
-  messageId: string;
-  part: MessagePart;
-  referencedImage?: Extract<MessagePart, { type: "image" }>;
-  imagePreviewUrl?: string;
-  onPreviewImage?(): void;
-  role: Message["role"];
-  threadId: string;
-  artifacts: ArtifactDescriptor[];
-  onOpenArtifact(artifactId: string): void;
-  onOpenAttachmentPreview(source: ContextSourceRef): void;
-  onOpenMarkdownLink(href: string): void;
-}) {
-  if (part.type === "image") {
-    return (
-      <InlineImageMessagePart
-        part={part}
-        previewUrl={imagePreviewUrl}
-        onPreview={onPreviewImage}
-      />
-    );
-  }
-  if (part.type === "image_ref") {
-    return referencedImage ? (
-      <InlineImageMessagePart
-        part={referencedImage}
-        previewUrl={imagePreviewUrl}
-        onPreview={onPreviewImage}
-        compact
-      />
-    ) : (
-      <span className="message-image-reference-missing">[图片不可用]</span>
-    );
-  }
-  if (part.type === "text") {
-    const refs = artifactReferencesFromText(part.text);
-    return (
-      <>
-        {role === "assistant" ? (
-          <MarkdownContent
-            attachmentSources={attachmentSources}
-            className="message-markdown"
-            onOpenAttachment={onOpenAttachmentPreview}
-            onOpenLink={onOpenMarkdownLink}
-            renderTrace={{
-              channel: "assistant",
-              threadId,
-              messageId,
-            }}
-            text={part.text}
-          />
-        ) : (
-          <span className="message-text">{part.text}</span>
-        )}
-        <MessageArtifactLinks
-          refs={refs}
-          threadId={threadId}
-          artifacts={artifacts}
-          onOpenArtifact={onOpenArtifact}
-        />
-      </>
-    );
-  }
-  if (part.type === "error")
-    return <p className="message-error">{part.message}</p>;
-  if (part.type === "file_ref") return <code>{part.path}</code>;
-  if (part.type === "source_ref") {
-    return (
-      <button
-        className="message-source-reference"
-        type="button"
-        title={`在右侧预览 ${part.source.name}`}
-        onClick={() => onOpenAttachmentPreview(part.source)}
-      >
-        <FileTypeIcon
-          name={part.source.name}
-          contentType={part.source.contentType}
-        />
-        <span>{part.source.name}</span>
-        <small>{formatBytes(part.source.bytes)}</small>
-      </button>
-    );
-  }
-  if (part.type === "skill_ref") {
-    return (
-      <button
-        className="message-source-reference is-skill"
-        type="button"
-        title={part.skill.description || part.skill.path}
-        onClick={() => void openPath(part.skill.path)}
-      >
-        <Plug size={12} />
-        <span>{part.skill.name}</span>
-        <small>Skill</small>
-      </button>
-    );
-  }
-  return null;
-}
-
-function InlineImageMessagePart({
-  part,
-  previewUrl,
-  onPreview,
-  compact = false,
-}: {
-  part: Extract<MessagePart, { type: "image" }>;
-  previewUrl?: string;
-  onPreview?(): void;
-  compact?: boolean;
-}) {
-  const [copyContextMenu, setCopyContextMenu] = useState<{
-    x: number;
-    y: number;
-  } | null>(null);
-
-  if (!previewUrl) return null;
-  const name = part.name || "图片";
-
-  return (
-    <>
-      <button
-        className={`message-inline-image ${compact ? "is-reference" : ""}`}
-        data-text-context-menu="custom"
-        type="button"
-        aria-controls="workspace-right-panel"
-        aria-label={`在右侧预览 ${name}`}
-        title={`在右侧预览 ${name}`}
-        onClick={onPreview}
-        onContextMenu={(event) => {
-          event.preventDefault();
-          setCopyContextMenu({ x: event.clientX, y: event.clientY });
-        }}
-      >
-        <img src={previewUrl} alt={name} decoding="async" loading="lazy" />
-      </button>
-      {copyContextMenu ? (
-        <ImageCopyContextMenu
-          name={name}
-          position={copyContextMenu}
-          previewUrl={previewUrl}
-          onClose={() => setCopyContextMenu(null)}
-        />
-      ) : null}
-    </>
-  );
-}
-
-type ImageCopyContextMenuPosition = {
-  x: number;
-  y: number;
-};
-
-type ImageCopyStatus = "idle" | "copying" | "copied" | "error";
-
-function ImageCopyContextMenu({
-  name,
-  position,
-  previewUrl,
-  onClose,
-}: {
-  name: string;
-  position: ImageCopyContextMenuPosition;
-  previewUrl: string;
-  onClose(): void;
-}) {
-  const menuRef = useRef<HTMLDivElement>(null);
-  const [resolvedPosition, setResolvedPosition] = useState(position);
-  const [status, setStatus] = useState<ImageCopyStatus>("idle");
-
-  useEffect(() => {
-    setResolvedPosition(position);
-    setStatus("idle");
-  }, [position, previewUrl]);
-
-  useEffect(() => {
-    const closeOnPointerDown = () => onClose();
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    window.addEventListener("pointerdown", closeOnPointerDown);
-    window.addEventListener("blur", onClose);
-    window.addEventListener("keydown", closeOnEscape);
-    return () => {
-      window.removeEventListener("pointerdown", closeOnPointerDown);
-      window.removeEventListener("blur", onClose);
-      window.removeEventListener("keydown", closeOnEscape);
-    };
-  }, [onClose]);
-
-  useEffect(() => {
-    if (status !== "copied") return;
-    const timer = window.setTimeout(onClose, 800);
-    return () => window.clearTimeout(timer);
-  }, [onClose, status]);
-
-  useLayoutEffect(() => {
-    const menu = menuRef.current;
-    if (!menu) return;
-    const bounds = menu.getBoundingClientRect();
-    const nextPosition = {
-      x: Math.max(
-        0,
-        resolvedPosition.x - Math.max(0, bounds.right - window.innerWidth),
-      ),
-      y: Math.max(
-        0,
-        resolvedPosition.y - Math.max(0, bounds.bottom - window.innerHeight),
-      ),
-    };
-    if (
-      nextPosition.x !== resolvedPosition.x ||
-      nextPosition.y !== resolvedPosition.y
-    ) {
-      setResolvedPosition(nextPosition);
-      return;
-    }
-    menu.querySelector<HTMLButtonElement>("button")?.focus();
-  }, [resolvedPosition]);
-
-  const label =
-    status === "copying"
-      ? "正在复制…"
-      : status === "copied"
-        ? "已复制图片"
-        : status === "error"
-          ? "复制失败，请重试"
-          : "复制图片";
-
-  return createPortal(
-    <div
-      ref={menuRef}
-      className="tool-popover image-copy-context-menu"
-      role="menu"
-      aria-label={`${name} 操作`}
-      data-status={status}
-      style={{ left: resolvedPosition.x, top: resolvedPosition.y }}
-      onContextMenu={(event) => event.preventDefault()}
-      onPointerDown={(event) => event.stopPropagation()}
-    >
-      <button
-        role="menuitem"
-        type="button"
-        disabled={status === "copying" || status === "copied"}
-        onClick={() => {
-          setStatus("copying");
-          void copyImageToClipboard(previewUrl)
-            .then(() => setStatus("copied"))
-            .catch(() => setStatus("error"));
-        }}
-      >
-        {status === "copying" ? (
-          <Loader2 className="spin" size={14} aria-hidden="true" />
-        ) : status === "copied" ? (
-          <Check size={14} aria-hidden="true" />
-        ) : (
-          <Copy size={14} aria-hidden="true" />
-        )}
-        <span aria-live="polite">{label}</span>
-      </button>
-    </div>,
-    document.body,
-  );
-}
-
-async function copyImageToClipboard(previewUrl: string): Promise<void> {
-  const pngBlob = await imagePreviewToPngBlob(previewUrl);
-  await writeClipboardImage(pngBlob);
-}
-
-async function imagePreviewToPngBlob(previewUrl: string): Promise<Blob> {
-  const image = new Image();
-  image.src = previewUrl;
-  await image.decode();
-  const canvas = document.createElement("canvas");
-  canvas.width = image.naturalWidth;
-  canvas.height = image.naturalHeight;
-  const context = canvas.getContext("2d");
-  if (!context) throw new Error("无法创建图片复制画布");
-  context.drawImage(image, 0, 0);
-  return new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob((blob) => {
-      if (blob) resolve(blob);
-      else reject(new Error("无法转换待复制图片"));
-    }, "image/png");
-  });
-}
-
-function MessageArtifactLinks({
-  refs,
-  artifacts,
-  onOpenArtifact,
-}: {
-  refs: ArtifactReference[];
-  threadId: string;
-  artifacts: ArtifactDescriptor[];
-  onOpenArtifact(artifactId: string): void;
-}) {
-  if (!refs.length) return null;
-  return (
-    <div className="message-artifact-links">
-      {refs.map((ref) => {
-        const descriptor = artifacts.find((artifact) => artifact.id === ref.id);
-        return (
-          <button
-            className="artifact-reference-button"
-            key={ref.id}
-            type="button"
-            title={ref.id}
-            onClick={() => onOpenArtifact(ref.id)}
-          >
-            <ExternalLink size={12} />
-            <span>{descriptor?.kind ?? ref.kind ?? "artifact"}</span>
-            <small>
-              {descriptor?.bytes
-                ? formatBytes(descriptor.bytes)
-                : ref.bytes
-                  ? formatBytes(ref.bytes)
-                  : "load"}
-            </small>
-          </button>
-        );
-      })}
-    </div>
-  );
-}
-
-function ComposerWorkForm({ form }: { form: WorkForm }) {
-  const [expanded, setExpanded] = useState(false);
-  const completedIds = useMemo(
-    () =>
-      new Set(
-        form.items
-          .filter((item) => item.status === "completed")
-          .map((item) => item.id),
-      ),
-    [form.items],
-  );
-  const currentStepIndex = useMemo(() => {
-    const inProgressIndex = form.items.findIndex(
-      (item) => item.status === "in_progress",
-    );
-    if (inProgressIndex >= 0) return inProgressIndex;
-    return form.items.findIndex(
-      (item) =>
-        item.status === "pending" &&
-        item.dependsOn.every((dependency) => completedIds.has(dependency)),
-    );
-  }, [completedIds, form.items]);
-  const resolvedCount = form.items.filter((item) =>
-    ["completed", "deferred", "blocked", "cancelled"].includes(item.status),
-  ).length;
-  const currentStep =
-    currentStepIndex >= 0 ? form.items[currentStepIndex] : undefined;
-  const progressLabel = currentStep
-    ? `第 ${currentStepIndex + 1}/${form.items.length} 步`
-    : `${resolvedCount}/${form.items.length} 已处理`;
-
-  useEffect(() => {
-    setExpanded(false);
-  }, [form.id]);
-
-  if (form.items.length === 0) return null;
-
-  return (
-    <section className={`composer-plan ${expanded ? "is-expanded" : ""}`}>
-      <button
-        className="composer-plan-summary"
-        type="button"
-        aria-expanded={expanded}
-        aria-controls="composer-plan-steps"
-        onClick={() => setExpanded((current) => !current)}
-      >
-        <ListTodo size={15} aria-hidden="true" />
-        <span className="composer-plan-current">
-          {currentStep?.title || "任务清单"}
-        </span>
-        <span className="composer-plan-count">{progressLabel}</span>
-        <ChevronDown
-          className="composer-plan-chevron"
-          size={14}
-          aria-hidden="true"
-        />
-      </button>
-      {expanded ? (
-        <div className="composer-plan-body" id="composer-plan-steps">
-          <ol className="composer-plan-list">
-            {form.items.map((item, index) => (
-              <li
-                className={`is-${item.status} ${index === currentStepIndex ? "is-current" : ""}`}
-                data-status={item.status}
-                key={item.id}
-              >
-                <span className="composer-plan-step-icon" aria-hidden="true">
-                  <ComposerPlanStepIcon status={item.status} />
-                </span>
-                <span className="composer-plan-step-copy">
-                  <span>{item.title || item.id}</span>
-                  {item.note ? <small>{item.note}</small> : null}
-                </span>
-                {index === currentStepIndex ? (
-                  <span className="composer-plan-step-marker">当前</span>
-                ) : null}
-              </li>
-            ))}
-          </ol>
-        </div>
-      ) : null}
-    </section>
-  );
-}
-
-function ComposerPlanStepIcon({
-  status,
-}: {
-  status: WorkForm["items"][number]["status"];
-}) {
-  if (status === "completed")
-    return <span className="composer-plan-complete" />;
-  if (status === "in_progress") return <span className="composer-plan-flow" />;
-  if (status === "blocked") return <AlertCircle size={13} />;
-  if (status === "cancelled") return <X size={13} />;
-  if (status === "deferred") return <Clock3 size={13} />;
-  return <Circle size={11} />;
-}
-
-const MAX_COMPOSER_IMAGES = 10;
-const MAX_COMPOSER_IMAGE_BYTES = 25 * 1024 * 1024;
-const MAX_COMPOSER_HISTORY_ENTRIES = 200;
-const COMPOSER_DRAFT_PUBLISH_DELAY_MS = 300;
-const COMPOSER_IMAGE_EXTENSIONS = new Set([
-  "bmp",
-  "gif",
-  "jpeg",
-  "jpg",
-  "png",
-  "svg",
-  "webp",
-]);
-
-function isComposerImageFile(file: File): boolean {
-  return (
-    file.type.startsWith("image/") ||
-    COMPOSER_IMAGE_EXTENSIONS.has(fileExtension(file.name).toLowerCase())
-  );
-}
-
-type ComposerImageAttachment = InlineImageAttachment & {
-  previewUrl: string;
-  fingerprint: string;
-};
-
-type ImageLightboxAttachment = {
-  previewUrl: string;
-  name?: string;
-};
-
-async function imageFileFingerprint(file: File): Promise<{
-  data: number[];
-  fingerprint: string;
-}> {
-  const buffer = await file.arrayBuffer();
-  const digest = await crypto.subtle.digest("SHA-256", buffer);
-  const fingerprint = Array.from(new Uint8Array(digest), (byte) =>
-    byte.toString(16).padStart(2, "0"),
-  ).join("");
-  return {
-    data: Array.from(new Uint8Array(buffer)),
-    fingerprint: `${file.type}:${fingerprint}`,
-  };
-}
-
-function pushComposerText(parts: InlineMessageContentPart[], text: string) {
-  if (!text) return;
-  const previous = parts.at(-1);
-  if (previous?.type === "text") previous.text += text;
-  else parts.push({ type: "text", text });
-}
-
-type ComposerCaretPoint = {
-  node: Node;
-  offset: number;
-};
-
-function readComposerContent(
-  editor: HTMLElement,
-  caretPoint?: ComposerCaretPoint,
-): ComposerHistorySnapshot {
-  const parts: InlineMessageContentPart[] = [];
-  let contentOffset = 0;
-  let caretOffset: number | null = null;
-  const appendText = (text: string) => {
-    const normalized = text.replaceAll("\u200b", "");
-    pushComposerText(parts, normalized);
-    contentOffset += composerTextLength(normalized);
-  };
-  const captureElementOffset = (element: HTMLElement, offset: number) => {
-    if (caretPoint?.node === element && caretPoint.offset === offset) {
-      caretOffset = contentOffset;
-    }
-  };
-  const visit = (node: Node) => {
-    if (node.nodeType === Node.TEXT_NODE) {
-      const text = node.textContent ?? "";
-      if (caretPoint?.node === node) {
-        caretOffset =
-          contentOffset + composerTextLength(text.slice(0, caretPoint.offset));
-      }
-      appendText(text);
-      return;
-    }
-    if (!(node instanceof HTMLElement)) return;
-    const imageId = node.dataset.composerImageId;
-    if (imageId) {
-      captureElementOffset(node, 0);
-      parts.push({ type: "image_ref", imageId });
-      contentOffset += 1;
-      captureElementOffset(node, node.childNodes.length);
-      return;
-    }
-    if (node.tagName === "BR") {
-      captureElementOffset(node, 0);
-      appendText("\n");
-      return;
-    }
-    const block = node !== editor && ["DIV", "P"].includes(node.tagName);
-    if (block) {
-      const previous = parts.at(-1);
-      if (previous?.type === "text" && !previous.text.endsWith("\n")) {
-        previous.text += "\n";
-        contentOffset += 1;
-      }
-    }
-    captureElementOffset(node, 0);
-    node.childNodes.forEach((child, index) => {
-      captureElementOffset(node, index);
-      visit(child);
-      captureElementOffset(node, index + 1);
-    });
-    if (block) appendText("\n");
-  };
-  captureElementOffset(editor, 0);
-  editor.childNodes.forEach((child, index) => {
-    captureElementOffset(editor, index);
-    visit(child);
-    captureElementOffset(editor, index + 1);
-  });
-  return {
-    parts: normalizeComposerContentParts(parts),
-    caretOffset: caretOffset ?? contentOffset,
-  };
-}
-
-function readComposerContentParts(
-  editor: HTMLElement,
-): InlineMessageContentPart[] {
-  return readComposerContent(editor).parts;
-}
-
-function cloneComposerHistorySnapshot(
-  snapshot: ComposerHistorySnapshot,
-): ComposerHistorySnapshot {
-  return {
-    parts: snapshot.parts.map((part) => ({ ...part })),
-    caretOffset: snapshot.caretOffset,
-  };
-}
-
-function composerSnapshotAtSelection(
-  editor: HTMLElement,
-): ComposerHistorySnapshot {
-  const selection = window.getSelection();
-  const range =
-    selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
-  return rangeBelongsToEditor(editor, range)
-    ? readComposerContent(editor, {
-        node: range!.startContainer,
-        offset: range!.startOffset,
-      })
-    : readComposerContent(editor);
-}
-
-function renderComposerSnapshot(
-  editor: HTMLElement,
-  snapshot: ComposerHistorySnapshot,
-  attachments: ComposerImageAttachment[],
-): Range {
-  const attachmentsById = new Map(
-    attachments.map((attachment) => [attachment.id, attachment]),
-  );
-  editor.replaceChildren();
-  for (const part of normalizeComposerContentParts(snapshot.parts)) {
-    if (part.type === "text") {
-      editor.append(document.createTextNode(part.text));
-      continue;
-    }
-    const attachment = attachmentsById.get(part.imageId);
-    if (attachment) {
-      editor.append(createComposerImageReferenceNode(attachment));
-    }
-  }
-
-  let remaining = Math.max(0, snapshot.caretOffset);
-  const range = document.createRange();
-  for (const node of editor.childNodes) {
-    if (node.nodeType === Node.TEXT_NODE) {
-      const text = node.textContent ?? "";
-      const graphemes = splitComposerText(text);
-      if (remaining <= graphemes.length) {
-        range.setStart(node, graphemes.slice(0, remaining).join("").length);
-        range.collapse(true);
-        return range;
-      }
-      remaining -= graphemes.length;
-      continue;
-    }
-    if (node instanceof HTMLElement && node.dataset.composerImageId) {
-      if (remaining === 0) {
-        range.setStartBefore(node);
-        range.collapse(true);
-        return range;
-      }
-      remaining -= 1;
-      if (remaining === 0) {
-        range.setStartAfter(node);
-        range.collapse(true);
-        return range;
-      }
-    }
-  }
-  range.selectNodeContents(editor);
-  range.collapse(false);
-  return range;
-}
-
-function createComposerImageReferenceNode(
-  attachment: ComposerImageAttachment,
-): HTMLElement {
-  const wrapper = document.createElement("span");
-  wrapper.className = "composer-inline-image-reference";
-  wrapper.dataset.composerImageId = attachment.id;
-  wrapper.contentEditable = "false";
-
-  const button = document.createElement("button");
-  button.type = "button";
-  button.className = "composer-inline-image-button";
-  button.dataset.composerImageId = attachment.id;
-  button.title = attachment.name || "预览图片";
-  button.setAttribute("aria-label", `预览 ${attachment.name || "图片"}`);
-
-  const image = document.createElement("img");
-  image.src = attachment.previewUrl;
-  image.alt = "";
-  image.setAttribute("aria-hidden", "true");
-  button.append(image);
-  wrapper.append(button);
-  return wrapper;
-}
-
-function rangeBelongsToEditor(
-  editor: HTMLElement,
-  range: Range | null,
-): boolean {
-  if (!range) return false;
-  const container =
-    range.commonAncestorContainer.nodeType === Node.TEXT_NODE
-      ? range.commonAncestorContainer.parentNode
-      : range.commonAncestorContainer;
-  return Boolean(container && editor.contains(container));
-}
-
-function composerRangesEqual(left: Range | null, right: Range): boolean {
-  return Boolean(
-    left &&
-    left.startContainer === right.startContainer &&
-    left.startOffset === right.startOffset &&
-    left.endContainer === right.endContainer &&
-    left.endOffset === right.endOffset,
-  );
-}
-
-function endOfComposerRange(editor: HTMLElement): Range {
-  const range = document.createRange();
-  range.selectNodeContents(editor);
-  range.collapse(false);
-  return range;
-}
-
-function composerRangeAtPoint(x: number, y: number): Range | null {
-  const rangedDocument = document as Document & {
-    caretRangeFromPoint?(x: number, y: number): Range | null;
-    caretPositionFromPoint?(
-      x: number,
-      y: number,
-    ): {
-      offsetNode: Node;
-      offset: number;
-    } | null;
-  };
-  const direct = rangedDocument.caretRangeFromPoint?.(x, y);
-  if (direct) return direct;
-  const position = rangedDocument.caretPositionFromPoint?.(x, y);
-  if (!position) return null;
-  const range = document.createRange();
-  range.setStart(position.offsetNode, position.offset);
-  range.collapse(true);
-  return range;
-}
-
-function fileExtension(name: string): string {
-  const baseName = name.split(/[\\/]/).pop() ?? name;
-  const dotIndex = baseName.lastIndexOf(".");
-  return dotIndex > 0 ? baseName.slice(dotIndex + 1) : "";
-}
-
-type ComposerFileDropHandle = {
-  addFiles(files: File[]): void;
-};
-
-function useConversationFileDrop(receiverRef: {
-  readonly current: ComposerFileDropHandle | null;
-}) {
-  const dragDepthRef = useRef(0);
-  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
-
-  const resetDragState = useCallback(() => {
-    dragDepthRef.current = 0;
-    setIsDraggingFiles(false);
-  }, []);
-
-  const onDragEnter = useCallback(
-    (event: ReactDragEvent<HTMLElement>) => {
-      if (
-        !receiverRef.current ||
-        !hasFileDragPayload(event.dataTransfer.types)
-      ) {
-        return;
-      }
-      event.preventDefault();
-      dragDepthRef.current += 1;
-      setIsDraggingFiles(true);
-    },
-    [receiverRef],
-  );
-
-  const onDragOver = useCallback(
-    (event: ReactDragEvent<HTMLElement>) => {
-      if (
-        !receiverRef.current ||
-        !hasFileDragPayload(event.dataTransfer.types)
-      ) {
-        return;
-      }
-      event.preventDefault();
-      event.dataTransfer.dropEffect = "copy";
-    },
-    [receiverRef],
-  );
-
-  const onDragLeave = useCallback(() => {
-    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
-    if (dragDepthRef.current === 0) setIsDraggingFiles(false);
-  }, []);
-
-  const onDrop = useCallback(
-    (event: ReactDragEvent<HTMLElement>) => {
-      if (!hasFileDragPayload(event.dataTransfer.types)) return;
-      event.preventDefault();
-      const receiver = receiverRef.current;
-      resetDragState();
-      receiver?.addFiles(Array.from(event.dataTransfer.files));
-    },
-    [receiverRef, resetDragState],
-  );
-
-  return { isDraggingFiles, onDragEnter, onDragOver, onDragLeave, onDrop };
-}
-
-function ConversationFileDropTarget() {
-  return (
-    <div className="conversation-drop-target" aria-hidden="true">
-      <Paperclip size={20} />
-      <span>释放以添加文件</span>
-    </div>
-  );
-}
-
-function Composer({
-  autoFocus = false,
-  fileDropHandleRef,
-  fileDropScope = "composer",
-  value,
-  workForm,
-  isSending,
-  isRunning,
-  isCancelling,
-  queuedMessageCount = 0,
-  metrics,
-  providers,
-  activeProviderId,
-  modelSelection,
-  permissionMode,
-  collaborationMode,
-  sandboxMode,
-  contextSources,
-  skills,
-  selectedSkillIds,
-  workspaceRoot,
-  projectName,
-  projects,
-  launchMode,
-  onChange,
-  onSubmit,
-  onCancel,
-  onPickWorkspace,
-  onSelectProject,
-  onChangeLaunchMode,
-  onChangePermissionMode,
-  onChangeCollaborationMode,
-  onChangeSandboxMode,
-  onChangeModelSelection,
-  onOpenSettings,
-  onAddContextSources,
-  onRemoveContextSource,
-  onToggleSkill,
-}: {
-  autoFocus?: boolean;
-  fileDropHandleRef?: { current: ComposerFileDropHandle | null };
-  fileDropScope?: "composer" | "conversation";
-  value: string;
-  workForm?: WorkForm | null;
-  isSending: boolean;
-  isRunning: boolean;
-  isCancelling: boolean;
-  queuedMessageCount?: number;
-  metrics?: ConversationMetrics | null;
-  providers: ProviderSettings[];
-  activeProviderId: string;
-  modelSelection: ThreadModelSelection | null;
-  permissionMode: AppSettings["permissionMode"];
-  collaborationMode: CollaborationMode;
-  sandboxMode: AppSettings["sandbox"]["sandboxMode"];
-  contextSources: ContextSourceFile[];
-  skills: SkillDescriptor[];
-  selectedSkillIds: string[];
-  workspaceRoot: string | null;
-  projectName: string | null;
-  projects: Project[];
-  launchMode?: NewTaskLaunchMode;
-  onChange(value: string): void;
-  onSubmit(
-    value: string,
-    imageAttachments: InlineImageAttachment[],
-    contentParts: InlineMessageContentPart[],
-  ): Promise<boolean>;
-  onCancel(): void;
-  onPickWorkspace(): void;
-  onSelectProject(projectId: string): void;
-  onChangeLaunchMode?(mode: NewTaskLaunchMode): void;
-  onChangePermissionMode(mode: ExecutionPermissionMode): void;
-  onChangeCollaborationMode(mode: CollaborationMode): void;
-  onChangeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]): void;
-  onChangeModelSelection(selection: ThreadModelSelection): void;
-  onOpenSettings(): void;
-  onAddContextSources(files?: File[]): Promise<void>;
-  onRemoveContextSource(path: string): void;
-  onToggleSkill(skillId: string): void;
-}) {
-  const [openMenu, setOpenMenu] = useState<
-    "actions" | "permission" | "model" | "workspace" | "environment" | null
-  >(null);
-  const closeMenus = () => {
-    setOpenMenu(null);
-  };
-  const popoverRef = useDismissiblePopover(Boolean(openMenu), closeMenus);
-  const draftRef = useRef(value);
-  const [hasDraftText, setHasDraftText] = useState(Boolean(value.trim()));
-  const [imageAttachments, setImageAttachments] = useState<
-    ComposerImageAttachment[]
-  >([]);
-  const [hasInlineImageReferences, setHasInlineImageReferences] =
-    useState(false);
-  const [previewIndex, setPreviewIndex] = useState<number | null>(null);
-  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
-  const [imageContextMenu, setImageContextMenu] = useState<{
-    imageId: string;
-    x: number;
-    y: number;
-  } | null>(null);
-  const dragDepthRef = useRef(0);
-  const preDragComposerRangeRef = useRef<Range | null>(null);
-  const imageAttachmentsRef = useRef(imageAttachments);
-  const editorRef = useRef<HTMLDivElement>(null);
-  const contextFileInputRef = useRef<HTMLInputElement>(null);
-  const savedComposerRangeRef = useRef<Range | null>(null);
-  const contextMenuInsertionRangeRef = useRef<Range | null>(null);
-  const contextMenuReferenceRef = useRef<HTMLElement | null>(null);
-  const imageContextMenuRef = useRef<HTMLDivElement>(null);
-  const composerUndoHistoryRef = useRef<ComposerHistorySnapshot[]>([]);
-  const composerRedoHistoryRef = useRef<ComposerHistorySnapshot[]>([]);
-  const currentComposerSnapshotRef = useRef<ComposerHistorySnapshot | null>(
-    null,
-  );
-  const compositionStartSnapshotRef = useRef<ComposerHistorySnapshot | null>(
-    null,
-  );
-  const pendingBeforeInputSnapshotRef = useRef<ComposerHistorySnapshot | null>(
-    null,
-  );
-  const isComposingRef = useRef(false);
-  const lastLocallyPublishedValueRef = useRef<string | null>(null);
-  const deferredExternalValueRef = useRef<{ value: string } | null>(null);
-  const pendingComposerPublishRef = useRef<string | null>(null);
-  const composerPublishTimerRef = useRef<number | null>(null);
-  const lastExternalComposerValueRef = useRef(value);
-
-  useEffect(() => {
-    imageAttachmentsRef.current = imageAttachments;
-  }, [imageAttachments]);
-
-  function cancelPendingComposerPublish() {
-    if (composerPublishTimerRef.current !== null) {
-      window.clearTimeout(composerPublishTimerRef.current);
-      composerPublishTimerRef.current = null;
-    }
-    pendingComposerPublishRef.current = null;
-  }
-
-  function flushPendingComposerPublish() {
-    const nextText = pendingComposerPublishRef.current;
-    cancelPendingComposerPublish();
-    if (nextText !== null) onChange(nextText);
-  }
-
-  function scheduleComposerPublish(text: string) {
-    pendingComposerPublishRef.current = text;
-    if (composerPublishTimerRef.current !== null) {
-      window.clearTimeout(composerPublishTimerRef.current);
-    }
-    composerPublishTimerRef.current = window.setTimeout(() => {
-      composerPublishTimerRef.current = null;
-      const nextText = pendingComposerPublishRef.current;
-      pendingComposerPublishRef.current = null;
-      if (nextText === null) return;
-      onChange(nextText);
-    }, COMPOSER_DRAFT_PUBLISH_DELAY_MS);
-  }
-
-  useEffect(
-    () => () => {
-      flushPendingComposerPublish();
-    },
-    [],
-  );
-
-  useEffect(
-    () => () => {
-      imageAttachmentsRef.current.forEach((attachment) =>
-        URL.revokeObjectURL(attachment.previewUrl),
-      );
-    },
-    [],
-  );
-
-  function applyExternalComposerValue(nextValue: string) {
-    const editor = editorRef.current;
-    if (!editor) return;
-    cancelPendingComposerPublish();
-    deferredExternalValueRef.current = null;
-    lastLocallyPublishedValueRef.current = null;
-    const current = composerSnapshotAtSelection(editor);
-    const currentText = composerVisibleText(current.parts);
-    if (currentComposerSnapshotRef.current && currentText === nextValue) return;
-    if (!currentComposerSnapshotRef.current && currentText === nextValue) {
-      currentComposerSnapshotRef.current = current;
-      return;
-    }
-
-    imageAttachmentsRef.current.forEach((attachment) =>
-      URL.revokeObjectURL(attachment.previewUrl),
-    );
-    imageAttachmentsRef.current = [];
-    setImageAttachments([]);
-    setHasInlineImageReferences(false);
-    setPreviewIndex(null);
-    editor.textContent = nextValue;
-    const next = readComposerContent(editor);
-    currentComposerSnapshotRef.current = next;
-    composerUndoHistoryRef.current = [];
-    composerRedoHistoryRef.current = [];
-    draftRef.current = nextValue;
-    setHasDraftText(Boolean(nextValue.trim()));
-  }
-
-  useLayoutEffect(() => {
-    const compositionPending =
-      isComposingRef.current || Boolean(compositionStartSnapshotRef.current);
-    const valueChangedSinceLastSync =
-      value !== lastExternalComposerValueRef.current;
-    lastExternalComposerValueRef.current = value;
-    const action = composerExternalValueSyncAction({
-      value,
-      lastLocallyPublishedValue: lastLocallyPublishedValueRef.current,
-      compositionPending,
-      pendingLocalPublish: pendingComposerPublishRef.current !== null,
-      lastExternalValue: valueChangedSinceLastSync
-        ? undefined
-        : lastExternalComposerValueRef.current,
-    });
-    if (action === "ignore") {
-      deferredExternalValueRef.current = null;
-      return;
-    }
-    if (action === "defer") {
-      deferredExternalValueRef.current = { value };
-      return;
-    }
-    applyExternalComposerValue(value);
-  }, [value]);
-
-  useEffect(() => {
-    const rememberSelection = () => {
-      const editor = editorRef.current;
-      const selection = window.getSelection();
-      if (!editor || !selection || selection.rangeCount === 0) return;
-      const range = selection.getRangeAt(0);
-      if (rangeBelongsToEditor(editor, range)) {
-        if (composerRangesEqual(savedComposerRangeRef.current, range)) return;
-        savedComposerRangeRef.current = range.cloneRange();
-        if (!isComposingRef.current && currentComposerSnapshotRef.current) {
-          currentComposerSnapshotRef.current = {
-            ...currentComposerSnapshotRef.current,
-            caretOffset: readComposerContent(editor, {
-              node: range.startContainer,
-              offset: range.startOffset,
-            }).caretOffset,
-          };
-        }
-      }
-    };
-    document.addEventListener("selectionchange", rememberSelection);
-    return () =>
-      document.removeEventListener("selectionchange", rememberSelection);
-  }, []);
-
-  useEffect(() => {
-    if (!imageContextMenu) return;
-    const close = () => setImageContextMenu(null);
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") close();
-    };
-    window.addEventListener("pointerdown", close);
-    window.addEventListener("blur", close);
-    window.addEventListener("keydown", closeOnEscape);
-    return () => {
-      window.removeEventListener("pointerdown", close);
-      window.removeEventListener("blur", close);
-      window.removeEventListener("keydown", closeOnEscape);
-    };
-  }, [imageContextMenu]);
-
-  useLayoutEffect(() => {
-    const menu = imageContextMenuRef.current;
-    if (!menu || !imageContextMenu) return;
-    const bounds = menu.getBoundingClientRect();
-    const nextX = Math.max(
-      0,
-      imageContextMenu.x - Math.max(0, bounds.right - window.innerWidth),
-    );
-    const nextY = Math.max(
-      0,
-      imageContextMenu.y - Math.max(0, bounds.bottom - window.innerHeight),
-    );
-    if (nextX !== imageContextMenu.x || nextY !== imageContextMenu.y) {
-      setImageContextMenu((current) =>
-        current ? { ...current, x: nextX, y: nextY } : null,
-      );
-    }
-  }, [imageContextMenu]);
-
-  function publishComposerSnapshot(snapshot: ComposerHistorySnapshot) {
-    const usedIds = referencedImageIds(snapshot.parts);
-    const currentAttachments = imageAttachmentsRef.current;
-    const text = composerVisibleText(snapshot.parts);
-    setHasInlineImageReferences(usedIds.size > 0);
-    setPreviewIndex((current) => {
-      const attachment =
-        current === null ? undefined : currentAttachments[current];
-      return attachment && !usedIds.has(attachment.id) ? null : current;
-    });
-    draftRef.current = text;
-    setHasDraftText(Boolean(text.trim()));
-    lastLocallyPublishedValueRef.current = text;
-    scheduleComposerPublish(text);
-  }
-
-  function commitComposerMutation(
-    splitInsertedContent: boolean,
-    requestedBefore?: ComposerHistorySnapshot | null,
-    normalizeImageDeletionArtifacts = false,
-  ) {
-    const editor = editorRef.current;
-    if (!editor) return;
-    if (
-      !editor.textContent &&
-      !editor.querySelector("[data-composer-image-id]")
-    ) {
-      editor.replaceChildren();
-    }
-    let after = composerSnapshotAtSelection(editor);
-    const before =
-      requestedBefore ?? currentComposerSnapshotRef.current ?? after;
-    if (normalizeImageDeletionArtifacts) {
-      const normalizedAfter = normalizeComposerImageDeletionSnapshot(
-        before,
-        after,
-      );
-      if (normalizedAfter !== after) {
-        const range = renderComposerSnapshot(
-          editor,
-          normalizedAfter,
-          imageAttachmentsRef.current,
-        );
-        const selection = window.getSelection();
-        selection?.removeAllRanges();
-        selection?.addRange(range);
-        savedComposerRangeRef.current = range.cloneRange();
-        after = normalizedAfter;
-      }
-    }
-    const entries = composerUndoEntries(before, after, splitInsertedContent);
-    if (entries.length > 0) {
-      composerUndoHistoryRef.current.push(...entries);
-      if (
-        composerUndoHistoryRef.current.length > MAX_COMPOSER_HISTORY_ENTRIES
-      ) {
-        composerUndoHistoryRef.current.splice(
-          0,
-          composerUndoHistoryRef.current.length - MAX_COMPOSER_HISTORY_ENTRIES,
-        );
-      }
-      composerRedoHistoryRef.current = [];
-    }
-    currentComposerSnapshotRef.current = cloneComposerHistorySnapshot(after);
-    const selection = window.getSelection();
-    if (selection && selection.rangeCount > 0) {
-      const range = selection.getRangeAt(0);
-      if (rangeBelongsToEditor(editor, range)) {
-        savedComposerRangeRef.current = range.cloneRange();
-      }
-    }
-    publishComposerSnapshot(after);
-  }
-
-  function restoreComposerHistorySnapshot(snapshot: ComposerHistorySnapshot) {
-    const editor = editorRef.current;
-    if (!editor) return;
-    const restored = cloneComposerHistorySnapshot(snapshot);
-    const range = renderComposerSnapshot(
-      editor,
-      restored,
-      imageAttachmentsRef.current,
-    );
-    const selection = window.getSelection();
-    selection?.removeAllRanges();
-    selection?.addRange(range);
-    savedComposerRangeRef.current = range.cloneRange();
-    currentComposerSnapshotRef.current = restored;
-    compositionStartSnapshotRef.current = null;
-    pendingBeforeInputSnapshotRef.current = null;
-    deferredExternalValueRef.current = null;
-    setImageContextMenu(null);
-    editor.focus();
-    publishComposerSnapshot(restored);
-  }
-
-  function undoComposerMutation() {
-    const target = composerUndoHistoryRef.current.pop();
-    const editor = editorRef.current;
-    if (!target || !editor) return;
-    composerRedoHistoryRef.current.push(composerSnapshotAtSelection(editor));
-    restoreComposerHistorySnapshot(target);
-  }
-
-  function redoComposerMutation() {
-    const target = composerRedoHistoryRef.current.pop();
-    const editor = editorRef.current;
-    if (!target || !editor) return;
-    composerUndoHistoryRef.current.push(composerSnapshotAtSelection(editor));
-    restoreComposerHistorySnapshot(target);
-  }
-
-  function insertImageReference(
-    attachment: ComposerImageAttachment,
-    requestedRange: Range | null = savedComposerRangeRef.current,
-  ) {
-    const editor = editorRef.current;
-    if (!editor) return;
-    const range = rangeBelongsToEditor(editor, requestedRange)
-      ? requestedRange!.cloneRange()
-      : endOfComposerRange(editor);
-    const node = createComposerImageReferenceNode(attachment);
-    range.deleteContents();
-    range.insertNode(node);
-    range.setStartAfter(node);
-    range.collapse(true);
-    const selection = window.getSelection();
-    selection?.removeAllRanges();
-    selection?.addRange(range);
-    savedComposerRangeRef.current = range.cloneRange();
-    editor.focus();
-  }
-
-  async function addImageFiles(
-    files: File[],
-    requestedRange: Range | null = savedComposerRangeRef.current,
-  ) {
-    const acceptedFiles = files
-      .filter(isComposerImageFile)
-      .filter((file) => file.size <= MAX_COMPOSER_IMAGE_BYTES);
-    if (acceptedFiles.length === 0) return;
-
-    const next: ComposerImageAttachment[] = [];
-    const references: ComposerImageAttachment[] = [];
-    for (const file of acceptedFiles) {
-      const { data, fingerprint } = await imageFileFingerprint(file);
-      const existing = [...imageAttachmentsRef.current, ...next].find(
-        (attachment) => attachment.fingerprint === fingerprint,
-      );
-      if (existing) {
-        references.push(existing);
-        continue;
-      }
-      if (
-        imageAttachmentsRef.current.length + next.length >=
-        MAX_COMPOSER_IMAGES
-      ) {
-        continue;
-      }
-      const attachment = {
-        id: crypto.randomUUID(),
-        name: file.name || `pasted-image-${next.length + 1}.png`,
-        contentType: file.type || "image/png",
-        data,
-        previewUrl: URL.createObjectURL(file),
-        fingerprint,
-      };
-      next.push(attachment);
-      references.push(attachment);
-    }
-    if (references.length === 0) return;
-    const combined = [...imageAttachmentsRef.current, ...next];
-    imageAttachmentsRef.current = combined;
-    setImageAttachments(combined);
-
-    let range = requestedRange?.cloneRange() ?? null;
-    const editor = editorRef.current;
-    const before =
-      editor && rangeBelongsToEditor(editor, range)
-        ? readComposerContent(editor, {
-            node: range!.startContainer,
-            offset: range!.startOffset,
-          })
-        : editor
-          ? composerSnapshotAtSelection(editor)
-          : null;
-    for (const attachment of references) {
-      insertImageReference(attachment, range);
-      range = savedComposerRangeRef.current?.cloneRange() ?? null;
-    }
-    commitComposerMutation(true, before);
-  }
-
-  function removeImageReference(reference: HTMLElement | null) {
-    if (!reference?.isConnected) return;
-    const editor = editorRef.current;
-    const before = editor ? composerSnapshotAtSelection(editor) : null;
-    reference.remove();
-    commitComposerMutation(false, before, true);
-  }
-
-  const submitDraft = async () => {
-    if (isSending) return;
-    flushPendingComposerPublish();
-    const editor = editorRef.current;
-    const parts = editor ? readComposerContentParts(editor) : [];
-    const usedIds = referencedImageIds(parts);
-    const currentAttachments = imageAttachmentsRef.current;
-    const submittedAttachments = currentAttachments
-      .filter((attachment) => usedIds.has(attachment.id))
-      .map(
-        ({
-          previewUrl: _previewUrl,
-          fingerprint: _fingerprint,
-          ...attachment
-        }) => attachment,
-      );
-    const submittedValue =
-      submittedAttachments.length > 0
-        ? composerContentText(parts, submittedAttachments)
-        : draftRef.current;
-    const accepted = await onSubmit(
-      submittedValue,
-      submittedAttachments,
-      submittedAttachments.length > 0 ? parts : [],
-    );
-    if (!accepted) return;
-    currentAttachments.forEach((attachment) =>
-      URL.revokeObjectURL(attachment.previewUrl),
-    );
-    setImageAttachments([]);
-    imageAttachmentsRef.current = [];
-    setHasInlineImageReferences(false);
-    setPreviewIndex(null);
-    if (editor) editor.replaceChildren();
-    currentComposerSnapshotRef.current = {
-      parts: [],
-      caretOffset: 0,
-    };
-    composerUndoHistoryRef.current = [];
-    composerRedoHistoryRef.current = [];
-    compositionStartSnapshotRef.current = null;
-    pendingBeforeInputSnapshotRef.current = null;
-    deferredExternalValueRef.current = null;
-    draftRef.current = "";
-    setHasDraftText(false);
-    lastLocallyPublishedValueRef.current = "";
-    onChange("");
-  };
-
-  async function handlePaste(event: ReactClipboardEvent<HTMLDivElement>) {
-    const items = Array.from(event.clipboardData.items).filter(
-      (item) => item.kind === "file" && item.type.startsWith("image/"),
-    );
-    if (items.length === 0) return;
-
-    event.preventDefault();
-    const range = savedComposerRangeRef.current?.cloneRange() ?? null;
-    const files = items
-      .map((item) => item.getAsFile())
-      .filter((file): file is File => Boolean(file));
-    await addImageFiles(files, range);
-  }
-
-  function addSelectedFiles(
-    files: File[],
-    requestedRange: Range | null = savedComposerRangeRef.current,
-  ) {
-    const images = files.filter(isComposerImageFile);
-    const otherFiles = files.filter((file) => !isComposerImageFile(file));
-    if (images.length > 0) {
-      void addImageFiles(images, requestedRange?.cloneRange() ?? null);
-    }
-    if (otherFiles.length > 0) void onAddContextSources(otherFiles);
-  }
-
-  useImperativeHandle(fileDropHandleRef, () => ({
-    addFiles(files) {
-      addSelectedFiles(files);
-    },
-  }));
-
-  function handleDragEnter(event: ReactDragEvent<HTMLDivElement>) {
-    if (!hasFileDragPayload(event.dataTransfer.types)) return;
-    event.preventDefault();
-    if (dragDepthRef.current === 0) {
-      const editor = editorRef.current;
-      const savedRange = savedComposerRangeRef.current;
-      preDragComposerRangeRef.current =
-        editor && rangeBelongsToEditor(editor, savedRange)
-          ? savedRange!.cloneRange()
-          : null;
-    }
-    dragDepthRef.current += 1;
-    setIsDraggingFiles(true);
-  }
-
-  function handleDragOver(event: ReactDragEvent<HTMLDivElement>) {
-    if (!hasFileDragPayload(event.dataTransfer.types)) return;
-    event.preventDefault();
-    event.dataTransfer.dropEffect = "copy";
-  }
-
-  function handleDragLeave() {
-    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
-    if (dragDepthRef.current === 0) {
-      preDragComposerRangeRef.current = null;
-      setIsDraggingFiles(false);
-    }
-  }
-
-  function handleDrop(event: ReactDragEvent<HTMLDivElement>) {
-    if (!hasFileDragPayload(event.dataTransfer.types)) return;
-    event.preventDefault();
-    dragDepthRef.current = 0;
-    setIsDraggingFiles(false);
-    const files = Array.from(event.dataTransfer.files);
-    const range =
-      preDragComposerRangeRef.current?.cloneRange() ??
-      composerRangeAtPoint(event.clientX, event.clientY);
-    preDragComposerRangeRef.current = null;
-    addSelectedFiles(files, range);
-  }
-
-  const hasSendableContent = Boolean(
-    hasDraftText ||
-    hasInlineImageReferences ||
-    contextSources.length > 0 ||
-    selectedSkillIds.length > 0,
-  );
-  const activePermissionMode = normalizedPermissionMode(permissionMode);
-  const activePermissionOption =
-    permissionModeOptions.find(
-      (option) => option.value === activePermissionMode,
-    ) ?? permissionModeOptions[1];
-  const ActivePermissionIcon = activePermissionOption.icon;
-
-  return (
-    <div className={`composer-shell${metrics ? " has-metrics" : ""}`}>
-      {workForm ? <ComposerWorkForm form={workForm} /> : null}
-      <div
-        className={`composer ${workspaceRoot || projectName ? "has-context" : ""} ${contextSources.length || selectedSkillIds.length ? "has-sources" : ""} ${isDraggingFiles ? "is-dragging-files" : ""}`}
-        ref={popoverRef}
-        onDragEnter={fileDropScope === "composer" ? handleDragEnter : undefined}
-        onDragOver={fileDropScope === "composer" ? handleDragOver : undefined}
-        onDragLeave={fileDropScope === "composer" ? handleDragLeave : undefined}
-        onDrop={fileDropScope === "composer" ? handleDrop : undefined}
-      >
-        {(workspaceRoot || projectName) && (
-          <div className="composer-context">
-            <div className="composer-menu-wrap">
-              <button
-                className="composer-context-button"
-                type="button"
-                title={
-                  workspaceRoot
-                    ? formatPathForDisplay(workspaceRoot)
-                    : (projectName ?? "项目")
-                }
-                aria-expanded={openMenu === "workspace"}
-                onClick={() =>
-                  setOpenMenu((current) =>
-                    current === "workspace" ? null : "workspace",
-                  )
-                }
-              >
-                <Folder size={12} />
-                <span>{projectName ?? workspaceName(workspaceRoot ?? "")}</span>
-                <ChevronDown size={11} />
-              </button>
-              {openMenu === "workspace" && (
-                <div className="tool-popover workspace-popover" role="menu">
-                  <div className="tool-popover-note">
-                    <strong>选择工作区</strong>
-                    <span>当前任务将使用所选文件夹</span>
-                  </div>
-                  {projects
-                    .filter((project) => project.workspaceRoot)
-                    .map((project) => (
-                      <button
-                        key={project.id}
-                        role="menuitemradio"
-                        aria-checked={project.workspaceRoot === workspaceRoot}
-                        onClick={() => {
-                          onSelectProject(project.id);
-                          setOpenMenu(null);
-                        }}
-                      >
-                        {project.workspaceRoot === workspaceRoot ? (
-                          <Check size={13} />
-                        ) : (
-                          <Folder size={13} />
-                        )}
-                        <span>{project.name}</span>
-                      </button>
-                    ))}
-                  <div className="tool-popover-separator" />
-                  <button
-                    role="menuitem"
-                    onClick={() => {
-                      onPickWorkspace();
-                      setOpenMenu(null);
-                    }}
-                  >
-                    <FolderOpen size={14} />
-                    <span>选择其他文件夹</span>
-                  </button>
-                </div>
-              )}
-            </div>
-            <div className="composer-menu-wrap">
-              {launchMode && onChangeLaunchMode ? (
-                <>
-                  <button
-                    className="composer-context-button"
-                    type="button"
-                    aria-label="选择启动模式"
-                    aria-expanded={openMenu === "environment"}
-                    onClick={() =>
-                      setOpenMenu((current) =>
-                        current === "environment" ? null : "environment",
-                      )
-                    }
-                  >
-                    {launchMode === "local" ? (
-                      <Laptop size={12} />
-                    ) : (
-                      <GitFork size={12} />
-                    )}
-                    <span>{newTaskLaunchModeLabel(launchMode)}</span>
-                    <ChevronDown size={11} />
-                  </button>
-                  {openMenu === "environment" && (
-                    <div
-                      className="tool-popover launch-mode-popover"
-                      role="menu"
-                    >
-                      <div className="tool-popover-note">
-                        <strong>启动模式</strong>
-                        <span>选择新任务使用的工作区方式</span>
-                      </div>
-                      <button
-                        className={launchMode === "local" ? "active" : ""}
-                        role="menuitemradio"
-                        aria-checked={launchMode === "local"}
-                        onClick={() => {
-                          onChangeLaunchMode("local");
-                          setOpenMenu(null);
-                        }}
-                      >
-                        <Laptop size={14} />
-                        <span>在本地处理</span>
-                        {launchMode === "local" && <Check size={13} />}
-                      </button>
-                      <button
-                        className={
-                          launchMode === "new_worktree" ? "active" : ""
-                        }
-                        role="menuitemradio"
-                        aria-checked={launchMode === "new_worktree"}
-                        title="线程级工作树创建尚未接入"
-                        onClick={() => {
-                          onChangeLaunchMode("new_worktree");
-                          setOpenMenu(null);
-                        }}
-                      >
-                        <GitFork size={14} />
-                        <span>新工作树</span>
-                        <small>内部未实现</small>
-                      </button>
-                      <button
-                        disabled
-                        role="menuitem"
-                        title="云端任务执行尚未实现"
-                      >
-                        <Cloud size={14} />
-                        <span>发送至云端</span>
-                        <small>未实现</small>
-                      </button>
-                    </div>
-                  )}
-                </>
-              ) : (
-                <>
-                  <button
-                    className="composer-context-button"
-                    type="button"
-                    aria-expanded={openMenu === "environment"}
-                    onClick={() =>
-                      setOpenMenu((current) =>
-                        current === "environment" ? null : "environment",
-                      )
-                    }
-                  >
-                    <TerminalSquare size={12} />
-                    <span>{sandboxModeLabel(sandboxMode)}</span>
-                    <ChevronDown size={11} />
-                  </button>
-                  {openMenu === "environment" && (
-                    <div
-                      className="tool-popover environment-popover"
-                      role="menu"
-                    >
-                      {sandboxModeOptions.map((option) => (
-                        <button
-                          className={
-                            sandboxMode === option.value ? "active" : ""
-                          }
-                          key={option.value}
-                          role="menuitemradio"
-                          aria-checked={sandboxMode === option.value}
-                          onClick={() => {
-                            onChangeSandboxMode(option.value);
-                            setOpenMenu(null);
-                          }}
-                        >
-                          {sandboxMode === option.value ? (
-                            <Check size={13} />
-                          ) : (
-                            <span className="menu-icon-spacer" />
-                          )}
-                          <span>{option.label}</span>
-                          <small>{option.detail}</small>
-                        </button>
-                      ))}
-                      <div className="tool-popover-separator" />
-                      <button disabled title="Git 工作树创建尚未实现">
-                        <GitFork size={14} />
-                        <span>新工作树</span>
-                        <small>未实现</small>
-                      </button>
-                      <button disabled title="远程执行环境尚未实现">
-                        <Cloud size={14} />
-                        <span>云环境</span>
-                        <small>未实现</small>
-                      </button>
-                    </div>
-                  )}
-                </>
-              )}
-            </div>
-            <button
-              className="composer-context-button"
-              type="button"
-              disabled
-              title="分支读取尚未实现"
-            >
-              <GitBranch size={12} />
-              <span>分支未接入</span>
-            </button>
-          </div>
-        )}
-        {(contextSources.length > 0 || selectedSkillIds.length > 0) && (
-          <div className="composer-sources" aria-label="已添加来源">
-            {contextSources.map((source) => (
-              <span
-                className="composer-source"
-                key={source.path}
-                title={source.path}
-              >
-                <FileTypeIcon name={source.name || source.extension} />
-                <span>{source.name}</span>
-                <small>{formatBytes(source.bytes)}</small>
-                <button
-                  type="button"
-                  title={`移除 ${source.name}`}
-                  aria-label={`移除 ${source.name}`}
-                  onClick={() => onRemoveContextSource(source.path)}
-                >
-                  <X size={12} />
-                </button>
-              </span>
-            ))}
-            {skills
-              .filter((skill) => selectedSkillIds.includes(skill.id))
-              .map((skill) => (
-                <span
-                  className="composer-source is-skill"
-                  key={skill.id}
-                  title={skill.description || skill.path}
-                >
-                  <Plug size={12} />
-                  <span>{skill.name}</span>
-                  <small>Skill</small>
-                  <button
-                    type="button"
-                    title={`移除 ${skill.name}`}
-                    aria-label={`移除 ${skill.name}`}
-                    onClick={() => onToggleSkill(skill.id)}
-                  >
-                    <X size={12} />
-                  </button>
-                </span>
-              ))}
-          </div>
-        )}
-        {isDraggingFiles ? (
-          <div className="composer-drop-target" aria-hidden="true">
-            <Paperclip size={20} />
-            <span>释放以添加文件</span>
-          </div>
-        ) : null}
-        <div
-          ref={editorRef}
-          autoFocus={autoFocus}
-          className="composer-rich-input"
-          contentEditable
-          suppressContentEditableWarning
-          role="textbox"
-          aria-label="消息"
-          aria-multiline="true"
-          data-placeholder={collaborationModePlaceholder(collaborationMode)}
-          onFocus={closeMenus}
-          onPointerDown={(event) => {
-            closeMenus();
-            if (
-              event.button === 2 &&
-              (event.target as Element).closest("[data-composer-image-id]")
-            ) {
-              contextMenuInsertionRangeRef.current =
-                savedComposerRangeRef.current?.cloneRange() ?? null;
-            }
-          }}
-          onPaste={(event) => void handlePaste(event)}
-          onBeforeInput={(event) => {
-            const inputType = (event.nativeEvent as InputEvent).inputType;
-            if (inputType === "historyUndo") {
-              event.preventDefault();
-              undoComposerMutation();
-            } else if (inputType === "historyRedo") {
-              event.preventDefault();
-              redoComposerMutation();
-            } else if (
-              !isComposingRef.current &&
-              !compositionStartSnapshotRef.current
-            ) {
-              const editor = editorRef.current;
-              pendingBeforeInputSnapshotRef.current =
-                currentComposerSnapshotRef.current
-                  ? cloneComposerHistorySnapshot(
-                      currentComposerSnapshotRef.current,
-                    )
-                  : editor
-                    ? composerSnapshotAtSelection(editor)
-                    : null;
-            }
-          }}
-          onCompositionStart={() => {
-            const editor = editorRef.current;
-            isComposingRef.current = true;
-            pendingBeforeInputSnapshotRef.current = null;
-            compositionStartSnapshotRef.current =
-              currentComposerSnapshotRef.current
-                ? cloneComposerHistorySnapshot(
-                    currentComposerSnapshotRef.current,
-                  )
-                : editor
-                  ? composerSnapshotAtSelection(editor)
-                  : null;
-          }}
-          onCompositionEnd={() => {
-            isComposingRef.current = false;
-            queueMicrotask(() => {
-              const before = compositionStartSnapshotRef.current;
-              compositionStartSnapshotRef.current = null;
-              pendingBeforeInputSnapshotRef.current = null;
-              const deferredExternalValue = deferredExternalValueRef.current;
-              if (deferredExternalValue) {
-                applyExternalComposerValue(deferredExternalValue.value);
-                return;
-              }
-              commitComposerMutation(true, before);
-            });
-          }}
-          onInput={(event) => {
-            const nativeEvent = event.nativeEvent as InputEvent;
-            if (
-              composerInputCommitPending({
-                isComposing: isComposingRef.current,
-                compositionSnapshotPending: Boolean(
-                  compositionStartSnapshotRef.current,
-                ),
-                nativeIsComposing: nativeEvent.isComposing,
-              })
-            )
-              return;
-            const before = pendingBeforeInputSnapshotRef.current;
-            pendingBeforeInputSnapshotRef.current = null;
-            commitComposerMutation(
-              nativeEvent.inputType === "insertText" ||
-                nativeEvent.inputType === "insertCompositionText" ||
-                nativeEvent.inputType === "insertFromComposition",
-              before,
-              nativeEvent.inputType.startsWith("delete"),
-            );
-          }}
-          onClick={(event) => {
-            const target = (event.target as Element).closest<HTMLElement>(
-              ".composer-inline-image-button",
-            );
-            const imageId = target?.dataset.composerImageId;
-            if (!imageId) return;
-            const index = imageAttachmentsRef.current.findIndex(
-              (attachment) => attachment.id === imageId,
-            );
-            if (index >= 0) setPreviewIndex(index);
-          }}
-          onContextMenu={(event) => {
-            const reference = (event.target as Element).closest<HTMLElement>(
-              ".composer-inline-image-reference",
-            );
-            const imageId = reference?.dataset.composerImageId;
-            if (!imageId) return;
-            event.preventDefault();
-            contextMenuReferenceRef.current = reference;
-            setImageContextMenu({
-              imageId,
-              x: event.clientX,
-              y: event.clientY,
-            });
-          }}
-          onKeyDown={(event) => {
-            if (event.nativeEvent.isComposing) return;
-            const primaryModifier = event.ctrlKey || event.metaKey;
-            if (
-              primaryModifier &&
-              !event.altKey &&
-              event.key.toLocaleLowerCase() === "z"
-            ) {
-              event.preventDefault();
-              if (event.shiftKey) redoComposerMutation();
-              else undoComposerMutation();
-              return;
-            }
-            if (
-              event.ctrlKey &&
-              !event.altKey &&
-              !event.shiftKey &&
-              event.key.toLocaleLowerCase() === "y"
-            ) {
-              event.preventDefault();
-              redoComposerMutation();
-              return;
-            }
-            if (
-              (event.target as Element).closest(".composer-inline-image-button")
-            ) {
-              return;
-            }
-            if (
-              event.key === "Enter" &&
-              !event.altKey &&
-              !event.nativeEvent.isComposing &&
-              !event.repeat
-            ) {
-              event.preventDefault();
-              submitDraft();
-            }
-          }}
-        />
-        <input
-          ref={contextFileInputRef}
-          hidden
-          type="file"
-          multiple
-          onChange={(event) => {
-            const files = Array.from(event.target.files ?? []);
-            event.target.value = "";
-            addSelectedFiles(
-              files,
-              savedComposerRangeRef.current?.cloneRange() ?? null,
-            );
-          }}
-        />
-        <div className="composer-toolbar">
-          <div className="composer-menu-wrap">
-            <button
-              className="composer-icon-button"
-              type="button"
-              title="添加内容或选择模式"
-              aria-label="添加内容或选择模式"
-              aria-expanded={openMenu === "actions"}
-              onClick={() =>
-                setOpenMenu((current) =>
-                  current === "actions" ? null : "actions",
-                )
-              }
-            >
-              <Plus size={16} />
-            </button>
-          </div>
-          <div className="composer-menu-wrap">
-            <button
-              className={`composer-mode is-${activePermissionMode.replace("_", "-")}`}
-              type="button"
-              aria-expanded={openMenu === "permission"}
-              onClick={() =>
-                setOpenMenu((current) =>
-                  current === "permission" ? null : "permission",
-                )
-              }
-            >
-              <ActivePermissionIcon size={14} aria-hidden="true" />
-              <span>{activePermissionOption.label}</span>
-            </button>
-            {openMenu === "permission" && (
-              <div className="tool-popover permission-popover" role="menu">
-                <div className="permission-popover-header">
-                  <span>应如何批准 OpenTopia 操作？</span>
-                  <span title="权限预设会同时调整审批策略和本地沙箱">
-                    了解更多
-                  </span>
-                </div>
-                {permissionModeOptions.map((option) => {
-                  const Icon = option.icon;
-                  const selected =
-                    normalizedPermissionMode(permissionMode) === option.value;
-                  return (
-                    <button
-                      className={`permission-option is-${option.value.replace("_", "-")} ${selected ? "active" : ""}`}
-                      disabled={isRunning || isSending}
-                      key={option.value}
-                      role="menuitemradio"
-                      aria-checked={selected}
-                      onClick={() => {
-                        onChangePermissionMode(option.value);
-                        setOpenMenu(null);
-                      }}
-                    >
-                      <Icon size={17} aria-hidden="true" />
-                      <span className="permission-option-copy">
-                        <strong>{option.label}</strong>
-                        <small>{option.detail}</small>
-                      </span>
-                      {selected ? <Check size={15} aria-hidden="true" /> : null}
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-          {queuedMessageCount > 0 ? (
-            <span className="composer-queue-status">
-              {queuedMessageCount} queued
-            </span>
-          ) : null}
-          {/* Trails the toolbar so the model label sits beside the send button. */}
-          <ModelSelector
-            activeConnectionId={activeProviderId}
-            connections={providers}
-            disabled={isRunning || isSending}
-            onChange={onChangeModelSelection}
-            onOpenSettings={onOpenSettings}
-            selection={modelSelection}
-          />
-        </div>
-        <button
-          className={`send-button${hasSendableContent ? " has-content" : ""}${isSending ? " is-sending" : ""}${isRunning ? " is-running" : ""}`}
-          type="button"
-          disabled={isRunning ? isCancelling : isSending || !hasSendableContent}
-          onClick={isRunning ? onCancel : submitDraft}
-          title={
-            isRunning
-              ? isCancelling
-                ? "正在中断执行"
-                : "中断执行"
-              : isSending
-                ? "正在发送消息"
-                : "发送消息"
-          }
-          aria-label={
-            isRunning
-              ? isCancelling
-                ? "正在中断智能体执行"
-                : "中断智能体执行"
-              : isSending
-                ? "正在发送消息"
-                : "发送消息"
-          }
-          aria-busy={isSending || isCancelling}
-        >
-          {isRunning ? (
-            <Square
-              className="stop-icon"
-              size={15}
-              fill="currentColor"
-              aria-hidden="true"
-            />
-          ) : isSending ? (
-            <Loader2 size={17} className="spin" aria-hidden="true" />
-          ) : (
-            <ArrowUp size={18} strokeWidth={2.25} aria-hidden="true" />
-          )}
-        </button>
-        {openMenu === "actions" && (
-          <div className="tool-popover composer-actions-popover" role="menu">
-            <div className="composer-actions-section-label">添加</div>
-            <button
-              role="menuitem"
-              onClick={() => {
-                contextFileInputRef.current?.click();
-                setOpenMenu(null);
-              }}
-            >
-              <Paperclip size={14} />
-              <span>文件和文件夹</span>
-            </button>
-            <div className="tool-popover-separator" />
-            <div className="composer-actions-section-label">模式</div>
-            {collaborationModeOptions.map((option) => {
-              const Icon = option.icon;
-              const selected = collaborationMode === option.value;
-              return (
-                <button
-                  className={`composer-mode-option is-${option.value} ${selected ? "active" : ""}`}
-                  disabled={isRunning || isSending}
-                  key={option.value}
-                  role="menuitemcheckbox"
-                  aria-checked={selected}
-                  onClick={() => {
-                    onChangeCollaborationMode(
-                      selected ? "default" : option.value,
-                    );
-                    setOpenMenu(null);
-                  }}
-                >
-                  <Icon size={15} aria-hidden="true" />
-                  <span className="composer-action-copy">
-                    <strong>{option.label}</strong>
-                    <small>{option.detail}</small>
-                  </span>
-                  {selected ? <Check size={14} aria-hidden="true" /> : null}
-                </button>
-              );
-            })}
-            {skills.length > 0 ? (
-              <>
-                <div className="tool-popover-separator" />
-                <div className="composer-actions-section-label">插件</div>
-                {skills.map((skill) => {
-                  const selected = selectedSkillIds.includes(skill.id);
-                  return (
-                    <Tooltip
-                      anchor="pointer"
-                      content={skill.description || skill.path}
-                      key={skill.id}
-                      placement="top"
-                    >
-                      {(tooltipProps) => (
-                        <button
-                          {...tooltipProps}
-                          className={`composer-tool-option ${selected ? "active" : ""}`}
-                          role="menuitemcheckbox"
-                          aria-checked={selected}
-                          disabled={!selected && selectedSkillIds.length >= 5}
-                          onClick={() => onToggleSkill(skill.id)}
-                        >
-                          <Plug size={14} aria-hidden="true" />
-                          <span className="composer-action-copy">
-                            <strong>{skill.name}</strong>
-                            {skill.description ? (
-                              <small>{skill.description}</small>
-                            ) : null}
-                          </span>
-                          {selected ? (
-                            <Check size={14} aria-hidden="true" />
-                          ) : null}
-                        </button>
-                      )}
-                    </Tooltip>
-                  );
-                })}
-              </>
-            ) : null}
-          </div>
-        )}
-      </div>
-      {metrics ? <ComposerMetrics metrics={metrics} /> : null}
-      {previewIndex !== null && imageAttachments[previewIndex] ? (
-        <ImageLightbox
-          attachments={imageAttachments}
-          activeIndex={previewIndex}
-          onChangeIndex={setPreviewIndex}
-          onClose={() => setPreviewIndex(null)}
-        />
-      ) : null}
-      {imageContextMenu
-        ? createPortal(
-            <div
-              ref={imageContextMenuRef}
-              className="tool-popover composer-image-context-menu"
-              role="menu"
-              style={{ left: imageContextMenu.x, top: imageContextMenu.y }}
-              onPointerDown={(event) => event.stopPropagation()}
-            >
-              <button
-                role="menuitem"
-                onClick={() => {
-                  const attachment = imageAttachmentsRef.current.find(
-                    (item) => item.id === imageContextMenu.imageId,
-                  );
-                  if (attachment) {
-                    const editor = editorRef.current;
-                    const requestedRange = contextMenuInsertionRangeRef.current;
-                    const before =
-                      editor && rangeBelongsToEditor(editor, requestedRange)
-                        ? readComposerContent(editor, {
-                            node: requestedRange!.startContainer,
-                            offset: requestedRange!.startOffset,
-                          })
-                        : editor
-                          ? composerSnapshotAtSelection(editor)
-                          : null;
-                    insertImageReference(attachment, requestedRange);
-                    commitComposerMutation(true, before);
-                  }
-                  contextMenuInsertionRangeRef.current = null;
-                  setImageContextMenu(null);
-                }}
-              >
-                <Quote size={14} aria-hidden="true" />
-                <span>引用</span>
-              </button>
-              <button
-                role="menuitem"
-                onClick={() => {
-                  removeImageReference(contextMenuReferenceRef.current);
-                  contextMenuInsertionRangeRef.current = null;
-                  contextMenuReferenceRef.current = null;
-                  setImageContextMenu(null);
-                }}
-              >
-                <Trash2 size={14} aria-hidden="true" />
-                <span>删除此引用</span>
-              </button>
-            </div>,
-            document.body,
-          )
-        : null}
-    </div>
-  );
-}
-
-function ComposerMetrics({ metrics }: { metrics: ConversationMetrics }) {
-  const groups = [
-    `${metrics.turnCount.toLocaleString()} 轮 · ${metrics.stepCount.toLocaleString()} 步`,
-    `LLM ${formatMetricDuration(metrics.modelDurationMs)} · 工具调用 ${formatMetricDuration(metrics.toolDurationMs)}`,
-    `首 token 平均 ${formatMetricDuration(metrics.averageTtftMs)} · ${formatMetricTokenRate(metrics.outputTokensPerSecond)}`,
-    `缓存命中 ${formatMetricPercent(metrics.cacheReadRatio)}`,
-    `输入 ${formatMetricTokenCount(metrics.inputTokens)} · 输出 ${formatMetricTokenCount(metrics.outputTokens)}`,
-  ];
-  const exactTokenCounts = `输入 ${metrics.inputTokens.toLocaleString()} tok · 输出 ${metrics.outputTokens.toLocaleString()} tok`;
-
-  return (
-    <div
-      className="composer-metrics"
-      aria-label={`对话运行指标：${groups.slice(0, -1).join("；")}；${exactTokenCounts}`}
-      title={`${groups.slice(0, -1).join(" | ")} | ${exactTokenCounts}`}
-    >
-      {groups.map((group) => (
-        <span className="composer-metric-group" key={group}>
-          {group}
-        </span>
-      ))}
-    </div>
-  );
-}
-
-const IMAGE_LIGHTBOX_MIN_ZOOM_PERCENT = 20;
-const IMAGE_LIGHTBOX_MAX_ZOOM_PERCENT = 300;
-const IMAGE_LIGHTBOX_ZOOM_STEP_PERCENT = 20;
-const IMAGE_LIGHTBOX_DEFAULT_ZOOM_PERCENT = 100;
-
-function ImageLightbox({
-  attachments,
-  activeIndex,
-  onChangeIndex,
-  onClose,
-}: {
-  attachments: ImageLightboxAttachment[];
-  activeIndex: number;
-  onChangeIndex(index: number): void;
-  onClose(): void;
-}) {
-  const [zoomPercent, setZoomPercent] = useState(
-    IMAGE_LIGHTBOX_DEFAULT_ZOOM_PERCENT,
-  );
-  const [copyContextMenu, setCopyContextMenu] =
-    useState<ImageCopyContextMenuPosition | null>(null);
-  const active = attachments[activeIndex];
-
-  useEffect(() => {
-    setZoomPercent(IMAGE_LIGHTBOX_DEFAULT_ZOOM_PERCENT);
-    setCopyContextMenu(null);
-  }, [activeIndex]);
-
-  useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (copyContextMenu) return;
-      if (event.key === "Escape") onClose();
-      if (event.key === "ArrowLeft" && activeIndex > 0) {
-        onChangeIndex(activeIndex - 1);
-      }
-      if (event.key === "ArrowRight" && activeIndex < attachments.length - 1) {
-        onChangeIndex(activeIndex + 1);
-      }
-    };
-    document.addEventListener("keydown", handleKeyDown);
-    return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [
-    activeIndex,
-    attachments.length,
-    copyContextMenu,
-    onChangeIndex,
-    onClose,
-  ]);
-
-  if (!active) return null;
-  const activeName = active.name || "图片";
-
-  return createPortal(
-    <div
-      className="image-lightbox"
-      role="dialog"
-      aria-modal="true"
-      aria-label={`预览 ${activeName}`}
-      onPointerDown={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
-    >
-      <div className="image-lightbox-dialog">
-        <header className="image-lightbox-header">
-          <strong>{activeName}</strong>
-          <span>
-            {activeIndex + 1} / {attachments.length}
-          </span>
-          <IconButton aria-label="关闭图片预览" title="关闭" onClick={onClose}>
-            <X size={18} aria-hidden="true" />
-          </IconButton>
-        </header>
-        <div className="image-lightbox-stage">
-          <IconButton
-            aria-label="上一张图片"
-            title="上一张"
-            disabled={activeIndex === 0}
-            onClick={() => onChangeIndex(activeIndex - 1)}
-          >
-            <ChevronLeft size={20} aria-hidden="true" />
-          </IconButton>
-          <div className="image-lightbox-canvas">
-            <img
-              src={active.previewUrl}
-              alt={activeName}
-              draggable={false}
-              style={{ transform: `scale(${zoomPercent / 100})` }}
-              onContextMenu={(event) => {
-                event.preventDefault();
-                setCopyContextMenu({ x: event.clientX, y: event.clientY });
-              }}
-            />
-          </div>
-          <IconButton
-            aria-label="下一张图片"
-            title="下一张"
-            disabled={activeIndex === attachments.length - 1}
-            onClick={() => onChangeIndex(activeIndex + 1)}
-          >
-            <ChevronRight size={20} aria-hidden="true" />
-          </IconButton>
-        </div>
-        <footer className="image-lightbox-footer">
-          <button
-            className="image-lightbox-reset"
-            type="button"
-            onClick={() => setZoomPercent(IMAGE_LIGHTBOX_DEFAULT_ZOOM_PERCENT)}
-            disabled={zoomPercent === IMAGE_LIGHTBOX_DEFAULT_ZOOM_PERCENT}
-          >
-            <RotateCcw size={16} aria-hidden="true" />
-            <span>重置</span>
-          </button>
-          <div className="image-lightbox-zoom-controls">
-            <IconButton
-              aria-label="缩小图片"
-              title="缩小"
-              disabled={zoomPercent <= IMAGE_LIGHTBOX_MIN_ZOOM_PERCENT}
-              onClick={() =>
-                setZoomPercent((current) =>
-                  Math.max(
-                    IMAGE_LIGHTBOX_MIN_ZOOM_PERCENT,
-                    current - IMAGE_LIGHTBOX_ZOOM_STEP_PERCENT,
-                  ),
-                )
-              }
-            >
-              <ZoomOut size={16} aria-hidden="true" />
-            </IconButton>
-            <span>{zoomPercent}%</span>
-            <IconButton
-              aria-label="放大图片"
-              title="放大"
-              disabled={zoomPercent >= IMAGE_LIGHTBOX_MAX_ZOOM_PERCENT}
-              onClick={() =>
-                setZoomPercent((current) =>
-                  Math.min(
-                    IMAGE_LIGHTBOX_MAX_ZOOM_PERCENT,
-                    current + IMAGE_LIGHTBOX_ZOOM_STEP_PERCENT,
-                  ),
-                )
-              }
-            >
-              <ZoomIn size={16} aria-hidden="true" />
-            </IconButton>
-          </div>
-          <a
-            className="image-lightbox-download"
-            href={active.previewUrl}
-            download={activeName}
-          >
-            <Download size={15} aria-hidden="true" />
-            <span>下载</span>
-          </a>
-        </footer>
-      </div>
-      {copyContextMenu ? (
-        <ImageCopyContextMenu
-          name={activeName}
-          position={copyContextMenu}
-          previewUrl={active.previewUrl}
-          onClose={() => setCopyContextMenu(null)}
-        />
-      ) : null}
-    </div>,
-    document.body,
-  );
-}
-
-const collaborationModeOptions: Array<{
-  value: CollaborationMode;
-  label: string;
-  detail: string;
-  icon: typeof Zap;
-}> = [
-  {
-    value: "plan",
-    label: "计划模式",
-    detail: "开启计划模式",
-    icon: Lightbulb,
-  },
-  {
-    value: "goal",
-    label: "目标",
-    detail: "设置要持续追求的目标",
-    icon: Target,
-  },
-];
-
-function collaborationModePlaceholder(mode: CollaborationMode): string {
-  if (mode === "plan") return "描述任务；需要选择时会列出方案";
-  if (mode === "goal") return "描述要持续推进的目标";
-  return "请求后续更改";
-}
-
-const permissionModeOptions: Array<{
-  value: ExecutionPermissionMode;
-  label: string;
-  detail: string;
-  icon: typeof Hand;
-}> = [
-  {
-    value: "approve",
-    label: "请求批准",
-    detail: "编辑外部文件和使用互联网时始终询问",
-    icon: Hand,
-  },
-  {
-    value: "auto",
-    label: "替我审批",
-    detail: "仅对检测到的风险操作请求批准",
-    icon: ShieldCheck,
-  },
-  {
-    value: "full_access",
-    label: "完全访问权限",
-    detail: "可不受限制地访问互联网和此电脑上的任何文件",
-    icon: ShieldAlert,
-  },
-];
-
-const sandboxModeOptions: Array<{
-  value: AppSettings["sandbox"]["sandboxMode"];
-  label: string;
-  detail: string;
-}> = [
-  { value: "read-only", label: "只读沙箱", detail: "禁止写入" },
-  { value: "workspace-write", label: "工作区写入", detail: "默认" },
-  { value: "danger-full-access", label: "完全访问", detail: "无 OS 沙箱" },
-];
-
-function sandboxModeLabel(mode: AppSettings["sandbox"]["sandboxMode"]): string {
-  return (
-    sandboxModeOptions.find((option) => option.value === mode)?.label ?? mode
-  );
-}
-
-function normalizedPermissionMode(
-  mode: AppSettings["permissionMode"],
-): ExecutionPermissionMode {
-  return mode === "approve" || mode === "full_access" ? mode : "auto";
-}
-
-function SideTaskConversation({
-  client,
-  thread,
-  settings,
-  projects,
-  skills,
-  initialCollaborationMode,
-  onThreadUpdated,
-  onSetThreadActivity,
-  onMarkThreadActivityRead,
-  onChangePermissionMode,
-  onChangeSandboxMode,
-  onOpenSettings,
-  onOpenArtifact,
-  onOpenImagePreview,
-  onOpenPreview,
-  onOpenMarkdownLink,
-  onOpenToolTab,
-  onOpenFileReview,
-}: {
-  client: ApiClient | null;
-  thread: Thread | null;
-  settings: AppSettings | null;
-  projects: Project[];
-  skills: SkillDescriptor[];
-  initialCollaborationMode: CollaborationMode;
-  onThreadUpdated(thread: Thread): void;
-  onSetThreadActivity(
-    threadId: string,
-    status: ThreadActivityStatus | null,
-  ): void;
-  onMarkThreadActivityRead(threadId: string): void;
-  onChangePermissionMode(mode: ExecutionPermissionMode): void;
-  onChangeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]): void;
-  onOpenSettings(): void;
-  onOpenArtifact(threadId: string, artifactId: string): void;
-  onOpenImagePreview(
-    threadId: string,
-    sourceId: string,
-    image: ImagePreviewSource,
-  ): void;
-  onOpenPreview(threadId: string, target: PreviewTarget, title: string): void;
-  onOpenMarkdownLink(href: string, baseWorkspacePath?: string | null): void;
-  onOpenToolTab(kind: ToolTabKind): void;
-  onOpenFileReview(path: string): void;
-}) {
-  const threadId = thread?.id ?? null;
-  const {
-    text: composer,
-    contextSources,
-    selectedSkillIds,
-    setText: setComposer,
-    setContextSources,
-    setSelectedSkillIds,
-  } = useComposerDraft(threadComposerDraftKey(threadId ?? "unavailable"));
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [events, setEvents] = useState<AgentEvent[]>([]);
-  const [loadState, setLoadState] = useState<ConversationLoadState>({
-    threadId,
-    status: threadId ? "loading" : "idle",
-    error: null,
-  });
-  const [loadAttempt, setLoadAttempt] = useState(0);
-  const [isSending, setIsSending] = useState(false);
-  const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
-  const [cancellingTurnId, setCancellingTurnId] = useState<string | null>(null);
-  const [pendingTurnFeedback, setPendingTurnFeedback] =
-    useState<PendingTurnFeedback | null>(null);
-  const [queuedMessageCount, setQueuedMessageCount] = useState(0);
-  const [collaborationMode, setCollaborationMode] = useState(
-    initialCollaborationMode,
-  );
-  const [modelSelection, setModelSelection] =
-    useState<ThreadModelSelection | null>(thread?.modelSelection ?? null);
-  const activityMetrics = useMemo(
-    () => deriveConversationMetrics(events, modelSelection),
-    [events, modelSelection],
-  );
-  const [pendingApprovalIds, setPendingApprovalIds] = useState<string[]>([]);
-  const [decidingApprovalId, setDecidingApprovalId] = useState<string | null>(
-    null,
-  );
-  const [approvalError, setApprovalError] = useState<string | null>(null);
-  const [pendingUserInput, setPendingUserInput] = useState<UserInputRecord[]>(
-    [],
-  );
-  const [submittingUserInputId, setSubmittingUserInputId] = useState<
-    string | null
-  >(null);
-  const [userInputError, setUserInputError] = useState<string | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
-  const [undoingTurnId, setUndoingTurnId] = useState<string | null>(null);
-  const eventIdsRef = useRef(new Set<string>());
-  const composerFileDropHandle = useRef<ComposerFileDropHandle>(null);
-  const conversationFileDrop = useConversationFileDrop(composerFileDropHandle);
-
-  useEffect(() => {
-    setModelSelection(thread?.modelSelection ?? null);
-  }, [thread?.modelSelection]);
-
-  const ingestSideTaskEvent = useCallback(
-    (event: AgentEvent) => {
-      if (!threadId || event.threadId !== threadId) return;
-      if (eventIdsRef.current.has(event.id)) return;
-      eventIdsRef.current.add(event.id);
-      setEvents((current) =>
-        [...current, event].sort((left, right) => left.seq - right.seq),
-      );
-
-      if (event.payload.type === "assistant_message") {
-        const assistantMessage = event.payload.message;
-        setMessages((current) =>
-          current.some((message) => message.id === assistantMessage.id)
-            ? current
-            : [...current, assistantMessage],
-        );
-      }
-      if (event.payload.type === "approval_requested") {
-        const approvalId = event.payload.approval_id;
-        onSetThreadActivity(threadId, "approval");
-        setPendingApprovalIds((current) =>
-          current.includes(approvalId) ? current : [...current, approvalId],
-        );
-        onMarkThreadActivityRead(threadId);
-      }
-      if (event.payload.type === "browser_handoff_required") {
-        onSetThreadActivity(threadId, "user_action");
-        onMarkThreadActivityRead(threadId);
-      }
-      if (event.payload.type === "user_input_requested") {
-        const request = event.payload.request;
-        onSetThreadActivity(threadId, "user_action");
-        setPendingUserInput((current) =>
-          current.some(
-            (record) => record.request.requestId === request.requestId,
-          )
-            ? current
-            : [
-                ...current,
-                {
-                  threadId,
-                  request,
-                  status: "pending",
-                  response: null,
-                  createdAt: event.createdAt,
-                  answeredAt: null,
-                },
-              ],
-        );
-      }
-
-      if (event.payload.type === "turn_started" && event.turnId) {
-        onSetThreadActivity(threadId, "processing");
-        setActiveTurnId(event.turnId);
-        setCancellingTurnId(null);
-        setQueuedMessageCount((current) => Math.max(0, current - 1));
-        onMarkThreadActivityRead(threadId);
-      } else if (event.payload.type === "turn_finished") {
-        onSetThreadActivity(threadId, "succeeded");
-        setActiveTurnId((current) =>
-          !event.turnId || current === event.turnId ? null : current,
-        );
-        setCancellingTurnId(null);
-        setPendingTurnFeedback(null);
-        onMarkThreadActivityRead(threadId);
-      } else if (event.payload.type === "turn_suspended") {
-        onSetThreadActivity(threadId, "approval");
-        setActiveTurnId((current) =>
-          !event.turnId || current === event.turnId ? null : current,
-        );
-        setCancellingTurnId(null);
-        onMarkThreadActivityRead(threadId);
-      } else if (event.payload.type === "browser_handoff_required") {
-        setActiveTurnId((current) =>
-          !event.turnId || current === event.turnId ? null : current,
-        );
-        setCancellingTurnId(null);
-        setPendingTurnFeedback(null);
-      } else if (event.payload.type === "turn_cancelled") {
-        setActiveTurnId((current) =>
-          !event.turnId || current === event.turnId ? null : current,
-        );
-        setCancellingTurnId(null);
-        setPendingTurnFeedback(null);
-        onSetThreadActivity(threadId, null);
-      } else if (
-        event.payload.type === "turn_awaiting_input" ||
-        event.payload.type === "error"
-      ) {
-        if (event.payload.type === "turn_awaiting_input") {
-          onSetThreadActivity(threadId, "user_action");
-        }
-        setActiveTurnId((current) =>
-          !event.turnId || current === event.turnId ? null : current,
-        );
-        setCancellingTurnId(null);
-      }
-
-      if (event.payload.type === "error") {
-        onSetThreadActivity(threadId, "failed");
-        setPendingTurnFeedback(null);
-        setActionError(friendlyProviderError(event.payload.message));
-        onMarkThreadActivityRead(threadId);
-      }
-    },
-    [onMarkThreadActivityRead, onSetThreadActivity, threadId],
-  );
-
-  useEffect(() => {
-    if (!client || !threadId) {
-      setLoadState({ threadId: null, status: "idle", error: null });
-      return;
-    }
-
-    let cancelled = false;
-    let source: StreamHandle | null = null;
-    const controller = new AbortController();
-    eventIdsRef.current = new Set();
-    setMessages([]);
-    setEvents([]);
-    setPendingApprovalIds([]);
-    setPendingUserInput([]);
-    setLoadState({ threadId, status: "loading", error: null });
-
-    void Promise.all([
-      client.listMessages(threadId, controller.signal),
-      client.listConversationEvents(threadId, undefined, controller.signal),
-      client.getTurnStatus(threadId, controller.signal),
-      client.listPendingApprovals(threadId, controller.signal),
-      client.listPendingUserInput(threadId, controller.signal),
-    ])
-      .then(
-        ([
-          loadedMessages,
-          loadedEvents,
-          turnStatus,
-          pendingApprovals,
-          pendingPlanningInput,
-        ]) => {
-          if (cancelled) return;
-          loadedEvents.forEach((event) => eventIdsRef.current.add(event.id));
-          setMessages(loadedMessages);
-          setEvents(loadedEvents);
-          setActiveTurnId(
-            resolveActiveTurnId(
-              turnStatus,
-              inactiveTurnIdsFromEvents(loadedEvents),
-            ),
-          );
-          setPendingApprovalIds(
-            pendingApprovals.map((approval) => approval.approvalId),
-          );
-          setPendingUserInput(pendingPlanningInput);
-          const activityStatus =
-            pendingApprovals.length > 0
-              ? "approval"
-              : resolveThreadActivityStatus(turnStatus);
-          if (activityStatus) onSetThreadActivity(threadId, activityStatus);
-          if (activityStatus) onMarkThreadActivityRead(threadId);
-          setLoadState({ threadId, status: "ready", error: null });
-          source = client.openEventStream(
-            threadId,
-            loadedEvents.at(-1)?.seq,
-            ingestSideTaskEvent,
-          );
-        },
-      )
-      .catch((error) => {
-        if (cancelled || isAbortError(error)) return;
-        setLoadState({
-          threadId,
-          status: "error",
-          error: errorMessage(error),
-        });
-      });
-
-    return () => {
-      cancelled = true;
-      controller.abort();
-      source?.close();
-    };
-  }, [
-    client,
-    ingestSideTaskEvent,
-    loadAttempt,
-    onMarkThreadActivityRead,
-    onSetThreadActivity,
-    threadId,
-  ]);
-
-  const pendingApprovalQueue = useMemo(
-    () =>
-      events
-        .filter(
-          (event): event is AgentEvent & { payload: ApprovalRequest } =>
-            event.payload.type === "approval_requested" &&
-            pendingApprovalIds.includes(event.payload.approval_id),
-        )
-        .sort((left, right) => left.seq - right.seq),
-    [events, pendingApprovalIds],
-  );
-  const activeApproval = pendingApprovalQueue[0]?.payload ?? null;
-  const activeUserInput = pendingUserInput[0] ?? null;
-  const workForm = useMemo(
-    () => resolveComposerWorkForm(events, null),
-    [events],
-  );
-
-  async function updateThreadTitle(firstPrompt: string) {
-    if (!client || !thread || thread.title !== "侧边任务" || !firstPrompt)
-      return;
-    try {
-      if (threadTitleNeedsSummary(firstPrompt)) {
-        const result = await client.generateThreadTitle(
-          thread.id,
-          firstPrompt,
-          thread.title,
-        );
-        if (result.updated) onThreadUpdated(result.thread);
-      } else {
-        onThreadUpdated(
-          await client.updateThread(thread.id, {
-            title: threadTitleFromPrompt(firstPrompt),
-          }),
-        );
-      }
-    } catch (error) {
-      console.warn("OpenTopia could not title the side task", error);
-    }
-  }
-
-  async function submitSideTaskMessage(
-    input: string,
-    imageAttachments: InlineImageAttachment[],
-    contentParts: InlineMessageContentPart[],
-  ): Promise<boolean> {
-    const messageText = input.trim();
-    if (
-      !client ||
-      !thread ||
-      isSending ||
-      activeApproval ||
-      activeUserInput ||
-      (!messageText &&
-        contextSources.length === 0 &&
-        selectedSkillIds.length === 0 &&
-        imageAttachments.length === 0)
-    ) {
-      return false;
-    }
-
-    const isFirstPrompt = !messages.some((message) => message.role === "user");
-    const startedAt = new Date().toISOString();
-    setIsSending(true);
-    setActionError(null);
-    setPendingTurnFeedback({
-      threadId: thread.id,
-      turnId: null,
-      startedAt,
-    });
-    onSetThreadActivity(thread.id, "processing");
-    try {
-      const { message, turnId, queued } = await client.sendMessage(
-        thread.id,
-        messageText,
-        contextSources.map((source) => source.path),
-        selectedSkillIds,
-        collaborationMode,
-        undefined,
-        imageAttachments,
-        contentParts,
-      );
-      setMessages((current) => [...current, message]);
-      setActiveTurnId(turnId);
-      setPendingTurnFeedback((current) =>
-        current?.startedAt === startedAt
-          ? {
-              ...current,
-              turnId,
-            }
-          : current,
-      );
-      if (queued) setQueuedMessageCount((current) => current + 1);
-      setComposer("");
-      setContextSources([]);
-      setSelectedSkillIds([]);
-      onMarkThreadActivityRead(thread.id);
-      if (isFirstPrompt && messageText) void updateThreadTitle(messageText);
-      return true;
-    } catch (error) {
-      onSetThreadActivity(thread.id, "failed");
-      setPendingTurnFeedback((current) =>
-        current?.startedAt === startedAt ? null : current,
-      );
-      setActionError(errorMessage(error));
-      onMarkThreadActivityRead(thread.id);
-      return false;
-    } finally {
-      setIsSending(false);
-    }
-  }
-
-  async function cancelSideTaskTurn() {
-    if (!client || !thread || !activeTurnId || cancellingTurnId) return;
-    setCancellingTurnId(activeTurnId);
-    setActionError(null);
-    try {
-      const result = await client.cancelTurn(thread.id, activeTurnId);
-      if (!result.cancelled) {
-        const turnStatus = await client.getTurnStatus(thread.id);
-        const reconciledTurnId = resolveActiveTurnId(
-          turnStatus,
-          inactiveTurnIdsFromEvents(events),
-        );
-        setActiveTurnId(reconciledTurnId);
-        setCancellingTurnId(null);
-        if (reconciledTurnId) throw new Error(result.message);
-      }
-    } catch (error) {
-      setCancellingTurnId(null);
-      setActionError(errorMessage(error));
-    }
-  }
-
-  async function addSideTaskContextSources(files?: File[]) {
-    if (!thread) return;
-    setActionError(null);
-    try {
-      const result = files
-        ? await getDroppedContextFiles(files)
-        : await selectContextFiles({ defaultPath: thread.workspaceRoot });
-      if (result.canceled) return;
-      setContextSources((current) => {
-        const byPath = new Map(
-          current.map((source) => [workspaceRootKey(source.path), source]),
-        );
-        result.files.forEach((source) =>
-          byPath.set(workspaceRootKey(source.path), source),
-        );
-        return [...byPath.values()].slice(0, 20);
-      });
-    } catch (error) {
-      setActionError(`添加来源失败：${errorMessage(error)}`);
-    }
-  }
-
-  async function changeSideTaskModel(selection: ThreadModelSelection) {
-    if (!client || !thread || activeTurnId) return;
-    const previous = modelSelection;
-    setModelSelection(selection);
-    try {
-      const updated = await client.setThreadModel(thread.id, selection);
-      onThreadUpdated(updated);
-    } catch (error) {
-      setModelSelection(previous);
-      setActionError(`切换模型失败：${errorMessage(error)}`);
-    }
-  }
-
-  async function decideSideTaskApproval(approvalId: string, approved: boolean) {
-    if (!client || !thread || decidingApprovalId) return;
-    setDecidingApprovalId(approvalId);
-    setApprovalError(null);
-    try {
-      const decision = await client.decideApproval(
-        thread.id,
-        approvalId,
-        approved,
-      );
-      if (!decision.accepted) throw new Error("服务端未接受该审批决定。");
-      setPendingApprovalIds((current) =>
-        current.filter((id) => id !== approvalId),
-      );
-    } catch (error) {
-      setApprovalError(`审批决定提交失败：${errorMessage(error)}`);
-    } finally {
-      setDecidingApprovalId(null);
-    }
-  }
-
-  async function submitSideTaskUserInput(
-    requestId: string,
-    response: UserInputResponse,
-  ) {
-    if (!client || !thread || submittingUserInputId) return;
-    setSubmittingUserInputId(requestId);
-    setUserInputError(null);
-    try {
-      const result = await client.respondToUserInput(
-        thread.id,
-        requestId,
-        response,
-      );
-      if (!result.accepted || (!response.cancelled && !result.resumed)) {
-        throw new Error("服务端未恢复侧边任务。");
-      }
-      setPendingUserInput((current) =>
-        current.filter((record) => record.request.requestId !== requestId),
-      );
-    } catch (error) {
-      setUserInputError(`无法提交选择：${errorMessage(error)}`);
-    } finally {
-      setSubmittingUserInputId(null);
-    }
-  }
-
-  async function undoSideTaskTurn(turnId: string) {
-    if (!client || !thread || undoingTurnId || activeTurnId) return;
-    if (!window.confirm("撤销这个回合产生的文件修改？")) return;
-    setUndoingTurnId(turnId);
-    setActionError(null);
-    try {
-      await client.undoTurnChanges(thread.id, turnId);
-    } catch (error) {
-      setActionError(`撤销修改失败：${errorMessage(error)}`);
-    } finally {
-      setUndoingTurnId(null);
-    }
-  }
-
-  if (!thread || loadState.status === "idle") {
-    return <ConversationLoadingState />;
-  }
-
-  return (
-    <section
-      className={`side-task-conversation ${conversationFileDrop.isDraggingFiles ? "is-dragging-files" : ""}`}
-      aria-label="侧边任务会话"
-      onDragEnter={conversationFileDrop.onDragEnter}
-      onDragOver={conversationFileDrop.onDragOver}
-      onDragLeave={conversationFileDrop.onDragLeave}
-      onDrop={conversationFileDrop.onDrop}
-    >
-      {conversationFileDrop.isDraggingFiles ? (
-        <ConversationFileDropTarget />
-      ) : null}
-      {loadState.status === "error" ? (
-        <ConversationLoadErrorState
-          error={loadState.error ?? "无法加载侧边任务"}
-          onRetry={() => setLoadAttempt((current) => current + 1)}
-        />
-      ) : loadState.status === "loading" ? (
-        <ConversationLoadingState />
-      ) : (
-        <MessageList
-          messages={messages}
-          events={events}
-          activeTurnId={activeTurnId}
-          pendingTurnFeedback={pendingTurnFeedback}
-          undoingTurnId={undoingTurnId}
-          threadId={thread.id}
-          artifacts={[]}
-          onOpenArtifact={(artifactId) => onOpenArtifact(thread.id, artifactId)}
-          onOpenImagePreview={(sourceId, image) =>
-            onOpenImagePreview(thread.id, sourceId, image)
-          }
-          onOpenAttachmentPreview={(source) =>
-            onOpenPreview(
-              thread.id,
-              { type: "attachment", attachmentId: source.id },
-              source.name,
-            )
-          }
-          onOpenMarkdownLink={onOpenMarkdownLink}
-          onUndoTurn={(turnId) => void undoSideTaskTurn(turnId)}
-          onReviewChanges={() => onOpenToolTab("diff")}
-          onOpenFileReview={(path) => onOpenFileReview(path)}
-          onLoadTurnFilePreview={(turnId, path, offset) =>
-            client
-              ? client.getTurnFileDiffPreview(thread.id, turnId, path, offset)
-              : Promise.reject(new Error("服务尚未连接"))
-          }
-        />
-      )}
-      {actionError ? (
-        <div className="side-task-conversation-error" role="alert">
-          <AlertCircle size={14} aria-hidden="true" />
-          <span>{actionError}</span>
-        </div>
-      ) : null}
-      {activeApproval ? (
-        <ApprovalDialog
-          key={activeApproval.approval_id}
-          request={activeApproval}
-          queuePosition={1}
-          queueLength={pendingApprovalQueue.length}
-          isSubmitting={decidingApprovalId === activeApproval.approval_id}
-          error={approvalError}
-          onDecision={(approved) =>
-            void decideSideTaskApproval(activeApproval.approval_id, approved)
-          }
-        />
-      ) : activeUserInput ? (
-        <PlanChoiceCard
-          key={activeUserInput.request.requestId}
-          request={activeUserInput.request}
-          isSubmitting={
-            submittingUserInputId === activeUserInput.request.requestId
-          }
-          error={userInputError}
-          onSubmit={(response) =>
-            void submitSideTaskUserInput(
-              activeUserInput.request.requestId,
-              response,
-            )
-          }
-          onSkip={() =>
-            void submitSideTaskUserInput(activeUserInput.request.requestId, {
-              answers: [],
-              skipped: true,
-            })
-          }
-          onCancel={() =>
-            void submitSideTaskUserInput(activeUserInput.request.requestId, {
-              answers: [],
-              cancelled: true,
-            })
-          }
-        />
-      ) : (
-        <Composer
-          autoFocus
-          fileDropHandleRef={composerFileDropHandle}
-          fileDropScope="conversation"
-          value={composer}
-          workForm={workForm}
-          isSending={isSending}
-          isRunning={Boolean(activeTurnId)}
-          isCancelling={
-            Boolean(activeTurnId) && cancellingTurnId === activeTurnId
-          }
-          queuedMessageCount={queuedMessageCount}
-          metrics={activityMetrics}
-          modelSelection={modelSelection}
-          providers={settings?.providers ?? []}
-          activeProviderId={settings?.activeProviderId ?? ""}
-          permissionMode={settings?.permissionMode ?? "auto"}
-          collaborationMode={collaborationMode}
-          sandboxMode={settings?.sandbox.sandboxMode ?? "workspace-write"}
-          contextSources={contextSources}
-          skills={skills}
-          selectedSkillIds={selectedSkillIds}
-          workspaceRoot={null}
-          projectName={null}
-          projects={projects}
-          onChange={setComposer}
-          onSubmit={submitSideTaskMessage}
-          onCancel={() => void cancelSideTaskTurn()}
-          onPickWorkspace={() => undefined}
-          onSelectProject={() => undefined}
-          onChangePermissionMode={onChangePermissionMode}
-          onChangeCollaborationMode={setCollaborationMode}
-          onChangeSandboxMode={onChangeSandboxMode}
-          onChangeModelSelection={(selection) =>
-            void changeSideTaskModel(selection)
-          }
-          onOpenSettings={onOpenSettings}
-          onAddContextSources={addSideTaskContextSources}
-          onRemoveContextSource={(path) =>
-            setContextSources((current) =>
-              current.filter(
-                (source) =>
-                  workspaceRootKey(source.path) !== workspaceRootKey(path),
-              ),
-            )
-          }
-          onToggleSkill={(skillId) =>
-            setSelectedSkillIds((current) =>
-              current.includes(skillId)
-                ? current.filter((id) => id !== skillId)
-                : [...current, skillId],
-            )
-          }
-        />
-      )}
-    </section>
-  );
-}
-
-function RightPanel({
-  client,
-  experienceMode,
-  threads,
-  toolTabs,
-  activeToolTab,
-  toolStageOpen,
-  conversationCollapsed,
-  activeToolRequiresFullWorkspace,
-  contextRailOpen,
-  contextRailAutoVisible,
-  thread,
-  settings,
-  projects,
-  skills,
-  collaborationMode,
-  libraryProvider,
-  workspaceRoot,
-  agentItems,
-  messages,
-  events,
-  conversationLoading,
-  terminalEvents,
-  terminalSession,
-  workspaceTree,
-  filePreview,
-  workspaceDiff,
-  sandbox,
-  plugins,
-  selectedSkillIds,
-  mcpServers,
-  threadMcpServers,
-  workbenchError,
-  isRefreshingWorkbench,
-  pendingApprovalIds,
-  decidingApprovalId,
-  artifacts,
-  contextStatus,
-  isCompactingContext,
-  revertingDiffPath,
-  hunkActionKey,
-  reviewFileRequest,
-  onDecideApproval,
-  onRefreshWorkbench,
-  onOpenWorkspacePath,
-  onOpenWorkspaceEntry,
-  onToggleThreadMcp,
-  onCreateMcpServer,
-  onUpdateMcpServer,
-  onRestartMcpServer,
-  onDeleteMcpServer,
-  onInstallPlugin,
-  onUninstallPlugin,
-  onToggleThreadPlugin,
-  onUsePluginSkills,
-  onOpenWorkspace,
-  onEnsureTerminalSession,
-  onWriteTerminalSession,
-  onResizeTerminalSession,
-  onCloseTerminalSession,
-  onCompactContext,
-  onOpenArtifact,
-  onOpenImagePreview,
-  onOpenPreview,
-  onOpenMarkdownLink,
-  onRevertDiffFile,
-  onApplyDiffHunk,
-  onOpenFileTab,
-  onLoadFileContent,
-  onLoadTurnFileDiff,
-  onGitAction,
-  onGetArtifact,
-  onOpenToolTab,
-  onOpenSideTask,
-  onThreadUpdated,
-  onSetThreadActivity,
-  onMarkThreadActivityRead,
-  onChangePermissionMode,
-  onChangeSandboxMode,
-  onChangeLibraryProvider,
-  onOpenSettings,
-  onActivateToolTab,
-  onCloseToolTab,
-  onPreviewSessionChange,
-  onToggleConversation,
-  onHideToolStage,
-  onAddContextSources,
-  onInterruptAgent,
-}: {
-  client: ApiClient | null;
-  experienceMode: ExperienceMode;
-  threads: Thread[];
-  toolTabs: ToolTab[];
-  activeToolTab: ToolTab | null;
-  toolStageOpen: boolean;
-  conversationCollapsed: boolean;
-  activeToolRequiresFullWorkspace: boolean;
-  contextRailOpen: boolean;
-  contextRailAutoVisible: boolean;
-  thread: Thread | null;
-  settings: AppSettings | null;
-  projects: Project[];
-  skills: SkillDescriptor[];
-  collaborationMode: CollaborationMode;
-  libraryProvider: LibraryProviderId | null;
-  workspaceRoot: string | null;
-  messages: Message[];
-  agentItems: AgentListItem[];
-  events: AgentEvent[];
-  conversationLoading: boolean;
-  terminalEvents: TerminalEvent[];
-  terminalSession: TerminalSession | null;
-  workspaceTree: WorkspaceTree | null;
-  filePreview: WorkspaceFilePreview | null;
-  workspaceDiff: WorkspaceDiff | null;
-  sandbox: SandboxDescriptor | null;
-  plugins: PluginView[];
-  selectedSkillIds: string[];
-  mcpServers: McpServerView[];
-  threadMcpServers: ThreadMcpServerView[];
-  workbenchError: string | null;
-  isRefreshingWorkbench: boolean;
-  pendingApprovalIds: string[];
-  decidingApprovalId: string | null;
-  artifacts: ArtifactDescriptor[];
-  contextStatus: ContextStatus | null;
-  isCompactingContext: boolean;
-  revertingDiffPath: string | null;
-  hunkActionKey: string | null;
-  reviewFileRequest: ReviewFileRequest | null;
-  onDecideApproval(approvalId: string, approved: boolean): void;
-  onRefreshWorkbench(): void;
-  onOpenWorkspacePath(path?: string): void;
-  onOpenWorkspaceEntry(entry: WorkspaceEntry): void;
-  onToggleThreadMcp(serverId: string, enabled: boolean): void;
-  onCreateMcpServer(input: McpServerInput): Promise<void>;
-  onUpdateMcpServer(serverId: string, input: McpServerInput): Promise<void>;
-  onRestartMcpServer(serverId: string): Promise<void>;
-  onDeleteMcpServer(serverId: string): Promise<void>;
-  onInstallPlugin(): Promise<void>;
-  onUninstallPlugin(pluginId: string): Promise<void>;
-  onToggleThreadPlugin(pluginId: string, enabled: boolean): Promise<void>;
-  onUsePluginSkills(pluginId: string, enabled: boolean): void;
-  onOpenWorkspace(workspaceRoot: string): void;
-  onEnsureTerminalSession(threadId: string): Promise<TerminalSession>;
-  onWriteTerminalSession(
-    threadId: string,
-    sessionId: string,
-    data: string,
-  ): void;
-  onResizeTerminalSession(
-    threadId: string,
-    sessionId: string,
-    cols: number,
-    rows: number,
-  ): void;
-  onCloseTerminalSession(threadId: string, sessionId: string): void;
-  onCompactContext(): void;
-  onOpenArtifact(threadId: string, artifactId: string): void;
-  onOpenImagePreview(
-    threadId: string,
-    sourceId: string,
-    image: ImagePreviewSource,
-  ): void;
-  onOpenPreview(threadId: string, target: PreviewTarget, title: string): void;
-  onOpenMarkdownLink(href: string, baseWorkspacePath?: string | null): void;
-  onRevertDiffFile(path: string): void;
-  onApplyDiffHunk(
-    hunk: WorkspaceDiffHunk,
-    action: WorkspaceDiffHunkAction,
-  ): void;
-  onOpenFileTab(path: string): void;
-  onLoadFileContent(path: string): Promise<DiffReviewFileContent>;
-  onLoadTurnFileDiff(turnId: string, path: string): Promise<string>;
-  onGitAction(action: DiffReviewGitAction, message: string): Promise<string>;
-  onGetArtifact(threadId: string, artifactId: string): Promise<ArtifactContent>;
-  onOpenToolTab(kind: ToolTabKind): void;
-  onOpenSideTask(): void;
-  onThreadUpdated(thread: Thread): void;
-  onSetThreadActivity(
-    threadId: string,
-    status: ThreadActivityStatus | null,
-  ): void;
-  onMarkThreadActivityRead(threadId: string): void;
-  onChangePermissionMode(mode: ExecutionPermissionMode): void;
-  onChangeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]): void;
-  onChangeLibraryProvider(provider: LibraryProviderId | null): void;
-  onOpenSettings(): void;
-  onActivateToolTab(tabId: string): void;
-  onCloseToolTab(tabId: string): void;
-  onPreviewSessionChange(
-    tabId: string,
-    session: PreviewDocumentSession,
-  ): void;
-  onToggleConversation(): void;
-  onHideToolStage(): void;
-  onAddContextSources(): void;
-  onInterruptAgent(agentThreadId: string): void;
-}) {
-  const renderWorkbench = (
-    mode: "panel" | "stage",
-    activeTab?: WorkbenchTab,
-  ) => (
-    <WorkbenchPanel
-      client={client}
-      mode={mode}
-      activeTab={activeTab}
-      thread={thread}
-      workspaceRoot={workspaceRoot}
-      events={events}
-      terminalEvents={terminalEvents}
-      terminalSession={terminalSession}
-      workspaceTree={workspaceTree}
-      filePreview={filePreview}
-      workspaceDiff={workspaceDiff}
-      sandbox={sandbox}
-      plugins={plugins}
-      selectedSkillIds={selectedSkillIds}
-      mcpServers={mcpServers}
-      threadMcpServers={threadMcpServers}
-      workbenchError={workbenchError}
-      isRefreshingWorkbench={isRefreshingWorkbench}
-      decidingApprovalId={decidingApprovalId}
-      artifacts={artifacts}
-      contextStatus={contextStatus}
-      isCompactingContext={isCompactingContext}
-      revertingDiffPath={revertingDiffPath}
-      hunkActionKey={hunkActionKey}
-      reviewFileRequest={reviewFileRequest}
-      onDecideApproval={onDecideApproval}
-      onRefreshWorkbench={onRefreshWorkbench}
-      onOpenWorkspacePath={onOpenWorkspacePath}
-      onOpenWorkspaceEntry={onOpenWorkspaceEntry}
-      onToggleThreadMcp={onToggleThreadMcp}
-      onCreateMcpServer={onCreateMcpServer}
-      onUpdateMcpServer={onUpdateMcpServer}
-      onRestartMcpServer={onRestartMcpServer}
-      onDeleteMcpServer={onDeleteMcpServer}
-      onInstallPlugin={onInstallPlugin}
-      onUninstallPlugin={onUninstallPlugin}
-      onToggleThreadPlugin={onToggleThreadPlugin}
-      onUsePluginSkills={onUsePluginSkills}
-      onOpenPath={onOpenWorkspace}
-      onEnsureTerminalSession={onEnsureTerminalSession}
-      onWriteTerminalSession={onWriteTerminalSession}
-      onResizeTerminalSession={onResizeTerminalSession}
-      onCloseTerminalSession={onCloseTerminalSession}
-      onCompactContext={onCompactContext}
-      onOpenArtifact={onOpenArtifact}
-      onRevertDiffFile={onRevertDiffFile}
-      onApplyDiffHunk={onApplyDiffHunk}
-      onOpenFileTab={onOpenFileTab}
-      onLoadFileContent={onLoadFileContent}
-      onLoadTurnFileDiff={onLoadTurnFileDiff}
-      onGitAction={onGitAction}
-      onGetArtifact={onGetArtifact}
-    />
-  );
-
-  if (toolStageOpen) {
-    return (
-      <aside className="right-panel tool-stage" id="workspace-right-panel">
-        <ToolTabStrip
-          tabs={toolTabs}
-          activeTabId={activeToolTab?.id ?? null}
-          canOpenFlow={thread?.experienceMode === "flow"}
-          terminalTitle={
-            terminalSession ? terminalShellName(terminalSession.shell) : null
-          }
-          onActivate={onActivateToolTab}
-          onClose={onCloseToolTab}
-          onOpen={onOpenToolTab}
-          onOpenSideTask={onOpenSideTask}
-          canOpenSideTask={Boolean(thread)}
-          conversationCollapsed={conversationCollapsed}
-          conversationToggleAvailable={!activeToolRequiresFullWorkspace}
-          onToggleConversation={onToggleConversation}
-          onHide={onHideToolStage}
-        />
-        <div className="tool-stage-body">
-          {!activeToolTab ? (
-            <ToolStageLauncher
-              canOpenFlow={thread?.experienceMode === "flow"}
-              onOpen={onOpenToolTab}
-            />
-          ) : activeToolTab.kind === "flow" ? (
-            thread?.experienceMode === "flow" ? (
-              <FlowWorkspacePanel
-                client={client}
-                threadId={thread.id}
-                workspaceRoot={workspaceRoot}
-                settings={settings}
-              />
-            ) : (
-              <div className="unavailable-tool-state">
-                <GitFork aria-hidden="true" size={20} />
-                <h2>Flow View 仅用于 Flow 模式</h2>
-                <p>切换到 Flow 任务后，可在这里设计、运行和审阅 Flow。</p>
-              </div>
-            )
-          ) : activeToolTab.kind === "side-task" ? (
-            activeToolTab.sideTaskThreadId ? (
-              <SideTaskConversation
-                key={activeToolTab.sideTaskThreadId}
-                client={client}
-                thread={
-                  threads.find(
-                    (item) => item.id === activeToolTab.sideTaskThreadId,
-                  ) ?? null
-                }
-                settings={settings}
-                projects={projects}
-                skills={skills}
-                initialCollaborationMode={collaborationMode}
-                onThreadUpdated={onThreadUpdated}
-                onSetThreadActivity={onSetThreadActivity}
-                onMarkThreadActivityRead={onMarkThreadActivityRead}
-                onChangePermissionMode={onChangePermissionMode}
-                onChangeSandboxMode={onChangeSandboxMode}
-                onOpenSettings={onOpenSettings}
-                onOpenArtifact={onOpenArtifact}
-                onOpenImagePreview={onOpenImagePreview}
-                onOpenPreview={onOpenPreview}
-                onOpenMarkdownLink={onOpenMarkdownLink}
-                onOpenToolTab={onOpenToolTab}
-                onOpenFileReview={onOpenFileTab}
-              />
-            ) : (
-              <ConversationLoadingState />
-            )
-          ) : activeToolTab.kind === "browser" ? (
-            <WebPreviewSurface
-              client={client}
-              threadId={thread?.id ?? null}
-              events={events}
-              navigationRequest={activeToolTab.browserNavigation ?? null}
-            />
-          ) : activeToolTab.kind === "computer" ? (
-            <ComputerPanel
-              client={client}
-              threadId={thread?.id ?? null}
-              events={events}
-            />
-          ) : activeToolTab.kind === "usage" ? (
-            thread ? (
-              <UsageLogDashboard
-                thread={thread}
-                events={events}
-                isLoading={conversationLoading}
-              />
-            ) : (
-              <ConversationLoadingState />
-            )
-          ) : activeToolTab.kind === "image" && activeToolTab.imagePreview ? (
-            <InlineImagePreview image={activeToolTab.imagePreview} />
-          ) : activeToolTab.kind === "preview" &&
-            activeToolTab.previewTarget ? (
-            <PreviewHost
-              client={client}
-              sessionId={activeToolTab.id}
-              sessionState={activeToolTab.previewSession}
-              threadId={thread?.id ?? null}
-              workspaceRoot={workspaceRoot}
-              target={activeToolTab.previewTarget}
-              onOpenMarkdownLink={onOpenMarkdownLink}
-              onSessionChange={onPreviewSessionChange}
-            />
-          ) : (
-            activeToolTab.kind !== "image" &&
-            activeToolTab.kind !== "preview" &&
-            renderWorkbench("stage", activeToolTab.kind)
-          )}
-        </div>
-      </aside>
-    );
-  }
-
-  return (
-    <aside
-      className={`context-rail-shell ${
-        contextRailOpen ? "is-visible" : ""
-      } ${contextRailOpen ? (contextRailAutoVisible ? "is-inline" : "is-menu") : ""}`}
-      id="workspace-context-rail"
-      aria-label="右侧上下文摘要"
-      aria-hidden={!contextRailOpen}
-    >
-      <RightContextRail
-        client={client}
-        threadId={thread?.id ?? null}
-        workspaceRoot={workspaceRoot}
-        workspaceDiff={workspaceDiff}
-        terminalEvents={terminalEvents}
-        terminalSession={terminalSession}
-        agentEvents={events}
-        agentItems={agentItems}
-        artifacts={artifacts}
-        messages={messages}
-        libraryPickerEnabled={experienceMode === "flow"}
-        libraryProvider={libraryProvider}
-        onOpenDiff={() => onOpenToolTab("diff")}
-        onOpenTerminal={() => onOpenToolTab("terminal")}
-        onOpenFiles={() => onOpenToolTab("files")}
-        onOpenEnvironment={() => onOpenToolTab("sandbox")}
-        onChangeLibraryProvider={onChangeLibraryProvider}
-        onOpenPreview={(target, title) => {
-          if (thread) onOpenPreview(thread.id, target, title);
-        }}
-        onAddSource={onAddContextSources}
-        onInterruptAgent={onInterruptAgent}
-        onGitChanged={onRefreshWorkbench}
-      />
-    </aside>
-  );
-}
-
-function ToolStageLauncher({
-  canOpenFlow,
-  onOpen,
-}: {
-  canOpenFlow: boolean;
-  onOpen(kind: Exclude<ToolTabKind, "image" | "preview" | "side-task">): void;
-}) {
-  return (
-    <div className="tool-stage-empty">
-      <nav className="tool-stage-launcher" aria-label="打开工具">
-        {toolStageLauncherKinds
-          .filter(({ kind }) => kind !== "flow" || canOpenFlow)
-          .map(({ kind, label }) => {
-            const Icon = toolTabIcon(kind);
-            return (
-              <Button
-                className="tool-stage-launcher-button"
-                key={kind}
-                variant="quiet"
-                onClick={() => onOpen(kind)}
-              >
-                <Icon size={16} aria-hidden="true" />
-                <span>{label}</span>
-              </Button>
-            );
-          })}
-      </nav>
-    </div>
-  );
-}
-
-function ToolTabStrip({
-  tabs,
-  activeTabId,
-  canOpenFlow,
-  terminalTitle,
-  onActivate,
-  onClose,
-  onOpen,
-  onOpenSideTask,
-  canOpenSideTask,
-  conversationCollapsed,
-  conversationToggleAvailable,
-  onToggleConversation,
-  onHide,
-}: {
-  tabs: ToolTab[];
-  activeTabId: string | null;
-  canOpenFlow: boolean;
-  terminalTitle: string | null;
-  onActivate(tabId: string): void;
-  onClose(tabId: string): void;
-  onOpen(kind: ToolTabKind): void;
-  onOpenSideTask(): void;
-  canOpenSideTask: boolean;
-  conversationCollapsed: boolean;
-  conversationToggleAvailable: boolean;
-  onToggleConversation(): void;
-  onHide(): void;
-}) {
-  function open(kind: ToolTabKind, close: () => void) {
-    onOpen(kind);
-    close();
-  }
-
-  return (
-    <div className="tool-tab-strip">
-      <div className="tool-tab-list" role="tablist" aria-label="工作工具">
-        {tabs.map((tab) => {
-          const Icon = toolTabIcon(tab.kind);
-          const title =
-            tab.kind === "terminal" && terminalTitle
-              ? terminalTitle
-              : tab.title;
-          return (
-            <div
-              className={`tool-stage-tab ${tab.id === activeTabId ? "active" : ""}`}
-              key={tab.id}
-            >
-              <button
-                className="tool-tab-main"
-                type="button"
-                role="tab"
-                aria-selected={tab.id === activeTabId}
-                title={title}
-                onClick={() => onActivate(tab.id)}
-              >
-                {tab.kind === "preview" &&
-                tab.previewTarget?.type === "attachment" ? (
-                  <FileTypeIcon name={title} size={14} />
-                ) : (
-                  <Icon size={13} />
-                )}
-                <span>{title}</span>
-              </button>
-              <button
-                className="tool-tab-close"
-                type="button"
-                aria-label={`关闭 ${title}`}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onClose(tab.id);
-                }}
-              >
-                <X size={12} />
-              </button>
-            </div>
-          );
-        })}
-      </div>
-      <div className="tool-tab-add-wrap">
-        <Popover
-          label="打开工具"
-          align="end"
-          placement="bottom"
-          trigger={(props) => (
-            <IconButton
-              className="tool-tab-add"
-              size="compact"
-              variant="quiet"
-              title="打开工具"
-              aria-label="打开工具"
-              {...props}
-            >
-              <Plus size={14} aria-hidden="true" />
-            </IconButton>
-          )}
-        >
-          {({ close }) => (
-            <div className="tool-popover tool-tab-add-popover" role="menu">
-              {toolTabMenuItems
-                .filter(({ kind }) => kind !== "flow" || canOpenFlow)
-                .map(({ kind, shortcut }) => {
-                  const Icon = toolTabIcon(kind);
-                  return (
-                    <button
-                      key={kind}
-                      role="menuitem"
-                      onClick={() => open(kind, close)}
-                    >
-                      <Icon size={14} aria-hidden="true" />
-                      <span>{toolTabTitle(kind)}</span>
-                      {shortcut ? <kbd>{shortcut}</kbd> : null}
-                    </button>
-                  );
-                })}
-              <button
-                type="button"
-                role="menuitem"
-                disabled={!canOpenSideTask}
-                title={canOpenSideTask ? "新建侧边会话" : "请先打开一个任务"}
-                onClick={() => {
-                  close();
-                  onOpenSideTask();
-                }}
-              >
-                <CirclePlus size={14} aria-hidden="true" />
-                <span>侧边任务</span>
-                <kbd>Ctrl+Alt+S</kbd>
-              </button>
-            </div>
-          )}
-        </Popover>
-      </div>
-      <div className="tool-tab-actions">
-        {conversationToggleAvailable ? (
-          <IconButton
-            className="tool-tab-action"
-            size="compact"
-            variant="quiet"
-            title={conversationCollapsed ? "还原工具工作区" : "扩展工具工作区"}
-            aria-label={
-              conversationCollapsed ? "还原工具工作区" : "扩展工具工作区"
-            }
-            aria-pressed={conversationCollapsed}
-            onClick={onToggleConversation}
-          >
-            {conversationCollapsed ? (
-              <Minimize2 size={14} aria-hidden="true" />
-            ) : (
-              <Maximize2 size={14} aria-hidden="true" />
-            )}
-          </IconButton>
-        ) : null}
-        <IconButton
-          className="tool-tab-action"
-          size="compact"
-          variant="quiet"
-          title="折叠工具窗口"
-          aria-label="折叠工具窗口"
-          onClick={onHide}
-        >
-          <PanelRightClose size={14} aria-hidden="true" />
-        </IconButton>
-      </div>
-    </div>
-  );
-}
-
-function NewTaskState({
-  value,
-  workspaceRoot,
-  projectName,
-  projects,
-  modelSelection,
-  providers,
-  activeProviderId,
-  permissionMode,
-  collaborationMode,
-  sandboxMode,
-  contextSources,
-  skills,
-  selectedSkillIds,
-  isSending,
-  launchMode,
-  experienceMode,
-  onChange,
-  onChangeLaunchMode,
-  onPickWorkspace,
-  onSelectProject,
-  onChangePermissionMode,
-  onChangeCollaborationMode,
-  onChangeSandboxMode,
-  onChangeModelSelection,
-  onOpenSettings,
-  onAddContextSources,
-  onRemoveContextSource,
-  onToggleSkill,
-  onSubmit,
-}: {
-  value: string;
-  workspaceRoot: string | null;
-  projectName: string | null;
-  projects: Project[];
-  modelSelection: ThreadModelSelection | null;
-  providers: ProviderSettings[];
-  activeProviderId: string;
-  permissionMode: AppSettings["permissionMode"];
-  collaborationMode: CollaborationMode;
-  sandboxMode: AppSettings["sandbox"]["sandboxMode"];
-  contextSources: ContextSourceFile[];
-  skills: SkillDescriptor[];
-  selectedSkillIds: string[];
-  isSending: boolean;
-  launchMode: NewTaskLaunchMode;
-  experienceMode: ExperienceMode;
-  onChange(value: string): void;
-  onChangeLaunchMode(mode: NewTaskLaunchMode): void;
-  onPickWorkspace(): void;
-  onSelectProject(projectId: string): void;
-  onChangePermissionMode(mode: ExecutionPermissionMode): void;
-  onChangeCollaborationMode(mode: CollaborationMode): void;
-  onChangeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]): void;
-  onChangeModelSelection(selection: ThreadModelSelection): void;
-  onOpenSettings(): void;
-  onAddContextSources(files?: File[]): Promise<void>;
-  onRemoveContextSource(path: string): void;
-  onToggleSkill(skillId: string): void;
-  onSubmit(
-    value: string,
-    imageAttachments: InlineImageAttachment[],
-    contentParts: InlineMessageContentPart[],
-  ): Promise<boolean>;
-}) {
-  const suggestions =
-    experienceMode === "flow"
-      ? [
-          {
-            icon: Workflow,
-            label: "描述企业流程",
-            prompt: "根据我描述的角色、步骤、条件和审批点整理 Flow 设计",
-          },
-          {
-            icon: Activity,
-            label: "总结已完成流程",
-            prompt: "分析一次已经正确完成的任务，并提炼可复用的 FlowDraft",
-          },
-          {
-            icon: Bot,
-            label: "规划多 Agent 协作",
-            prompt: "设计参与 Agent 的职责、依赖、输入输出与验证闭环",
-          },
-          {
-            icon: ShieldCheck,
-            label: "检查流程边界",
-            prompt: "检查流程中的权限、数据流、审批、预算和终止条件",
-          },
-        ]
-      : experienceMode === "work"
-        ? [
-            {
-              icon: Search,
-              label: "研究并汇总资料",
-              prompt: "研究这个主题，核对来源并整理成清晰的结论",
-            },
-            {
-              icon: FileText,
-              label: "撰写与整理文档",
-              prompt: "根据项目资料撰写并整理一份完整文档",
-            },
-            {
-              icon: Table2,
-              label: "分析表格与数据",
-              prompt: "分析项目中的表格和数据，并总结关键发现",
-            },
-            {
-              icon: Presentation,
-              label: "制作演示或报告",
-              prompt: "根据项目内容制作一份结构清晰的演示或报告",
-            },
-          ]
-        : [
-            {
-              icon: Search,
-              label: "探索并理解代码",
-              prompt: "分析这个项目的架构和核心模块",
-            },
-            {
-              icon: FileCode2,
-              label: "构建新功能",
-              prompt: "为这个项目实现一个新功能",
-            },
-            {
-              icon: Check,
-              label: "审查代码更改",
-              prompt: "审查当前工作区中的代码更改",
-            },
-            {
-              icon: Activity,
-              label: "修复问题",
-              prompt: "检查并修复当前项目中的问题",
-            },
-          ];
-
-  return (
-    <>
-      <div className="new-task-state">
-        <Bot size={34} />
-        <h2>
-          {experienceMode === "flow"
-            ? "要在"
-            : experienceMode === "work"
-              ? "今天想在"
-              : "我们应该在"}{" "}
-          <u>
-            {projectName ??
-              (workspaceRoot ? workspaceName(workspaceRoot) : "项目")}
-          </u>{" "}
-          {experienceMode === "flow"
-            ? "中设计什么流程？"
-            : experienceMode === "work"
-              ? "中完成什么？"
-              : "中构建什么？"}
-        </h2>
-        <div className="task-suggestions">
-          {suggestions.map((suggestion) => {
-            const Icon = suggestion.icon;
-            return (
-              <button
-                key={suggestion.label}
-                type="button"
-                onClick={() => onChange(suggestion.prompt)}
-              >
-                <Icon size={15} />
-                <span>{suggestion.label}</span>
-              </button>
-            );
-          })}
-        </div>
-        {!workspaceRoot && (
-          <button className="workspace-picker-button" onClick={onPickWorkspace}>
-            <Folder size={15} />
-            选择项目文件夹
-          </button>
-        )}
-      </div>
-      <Composer
-        value={value}
-        isSending={isSending}
-        isRunning={false}
-        isCancelling={false}
-        modelSelection={modelSelection}
-        providers={providers}
-        activeProviderId={activeProviderId}
-        permissionMode={permissionMode}
-        collaborationMode={collaborationMode}
-        sandboxMode={sandboxMode}
-        contextSources={contextSources}
-        skills={skills}
-        selectedSkillIds={selectedSkillIds}
-        launchMode={launchMode}
-        workspaceRoot={workspaceRoot}
-        projectName={
-          projectName ?? (workspaceRoot ? workspaceName(workspaceRoot) : null)
-        }
-        projects={projects}
-        onChange={onChange}
-        onSubmit={onSubmit}
-        onCancel={() => undefined}
-        onPickWorkspace={onPickWorkspace}
-        onSelectProject={onSelectProject}
-        onChangeLaunchMode={onChangeLaunchMode}
-        onChangePermissionMode={onChangePermissionMode}
-        onChangeCollaborationMode={onChangeCollaborationMode}
-        onChangeSandboxMode={onChangeSandboxMode}
-        onChangeModelSelection={onChangeModelSelection}
-        onOpenSettings={onOpenSettings}
-        onAddContextSources={onAddContextSources}
-        onRemoveContextSource={onRemoveContextSource}
-        onToggleSkill={onToggleSkill}
-      />
-    </>
-  );
-}
-
-function newTaskLaunchModeLabel(mode: NewTaskLaunchMode): string {
-  return mode === "new_worktree" ? "新工作树" : "在本地处理";
-}
-
-function OfflineState({
-  backendUrl,
-  error,
-  attempt,
-  isProbing,
-  onRetry,
-}: {
-  backendUrl?: string;
-  error: string | null;
-  attempt: number;
-  isProbing: boolean;
-  onRetry: () => void;
-}) {
-  return (
-    <div className="empty-state offline">
-      <TerminalSquare size={48} />
-      <h2>正在等待本地服务</h2>
-      <p>
-        {import.meta.env.DEV ? (
-          <>
-            开发模式下本地服务由 <code>cargo run</code> 启动，首次编译或改动
-            Rust 代码后可能需要几分钟；编译进度会打印在运行{" "}
-            <code>pnpm dev</code> 的终端里。
-          </>
-        ) : (
-          "本地服务正在启动。"
-        )}
-        此页面会自动重连，无需手动刷新。
-      </p>
-      <small>{backendUrl ?? "http://127.0.0.1:8787"}</small>
-      <div className="offline-actions">
-        <button
-          className="secondary-button"
-          type="button"
-          disabled={isProbing}
-          onClick={onRetry}
-        >
-          <RotateCcw size={14} className={isProbing ? "spin" : undefined} />
-          {isProbing ? "连接中…" : "立即重试"}
-        </button>
-        <small>已尝试 {attempt + 1} 次</small>
-      </div>
-      {/* Early failures are just the build still running, so the raw error only
-          matters once retrying has clearly stopped helping. */}
-      {error && attempt >= 10 && <pre>{error}</pre>}
-    </div>
-  );
-}
-
-type ArtifactReference = {
-  id: string;
-  kind?: string;
-  contentType?: string;
-  bytes?: number;
-  metadata?: unknown;
-};
-
 type LegacyLocalProject = {
   id: string;
   name: string;
-};
-
-type RenameTarget = {
-  kind: "project" | "thread";
-  id: string;
-  name: string;
-};
-
-type ProjectHoverState = {
-  id: string;
-  name: string;
-  threadCount: number;
-  workspaceRoot: string | null;
-  pinned: boolean;
-  left: number;
-  top: number;
 };
 
 const localProjectsStorageKey = "opentopia.localProjects";
@@ -13119,21 +4827,6 @@ function controlledSandboxSettings(
   };
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function isAbortError(error: unknown): boolean {
-  return error instanceof Error && error.name === "AbortError";
-}
-
-function friendlyProviderError(message: string): string {
-  if (/401|auth_failed|master_key|unauthorized/i.test(message)) {
-    return "认证失败：当前 Provider 的 Base URL 拒绝了 API Key。请在设置中更新该 Provider 的密钥并测试连接。";
-  }
-  return message;
-}
-
 function parseDirectToolCommand(value: string): DirectToolCommand | null {
   const trimmed = value.trim();
   const match = /^\/(run|read)(?:\s+([\s\S]*))?$/i.exec(trimmed);
@@ -13148,17 +4841,6 @@ function parseDirectToolCommand(value: string): DirectToolCommand | null {
 
 function isLegacyDirectToolCommand(value: string): boolean {
   return /^\/(?:run|read)(?:\s|$)/i.test(value.trim());
-}
-
-function parsePathList(value: string): string[] {
-  return [
-    ...new Set(
-      value
-        .split(/\r?\n/)
-        .map((path) => path.trim())
-        .filter(Boolean),
-    ),
-  ];
 }
 
 function collectArtifactReferences(
@@ -13214,17 +4896,6 @@ function artifactReferencesFromMetadata(
   return refs;
 }
 
-function artifactReferencesFromText(text: string): ArtifactReference[] {
-  const refs: ArtifactReference[] = [];
-  const pattern =
-    /\[Artifact:\s*([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\]/g;
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(text)) !== null) {
-    refs.push({ id: match[1] });
-  }
-  return refs;
-}
-
 function uniqueArtifactReferences(
   refs: ArtifactReference[],
 ): ArtifactReference[] {
@@ -13273,99 +4944,6 @@ function readNumber(value: unknown): number | undefined {
     : undefined;
 }
 
-function formatBytes(value: number): string {
-  if (value < 1024) return `${value} B`;
-  const units = ["KB", "MB", "GB"];
-  let amount = value / 1024;
-  let unitIndex = 0;
-  while (amount >= 1024 && unitIndex < units.length - 1) {
-    amount /= 1024;
-    unitIndex += 1;
-  }
-  return `${amount.toFixed(amount >= 10 ? 0 : 1)} ${units[unitIndex]}`;
-}
-
-const toolTabMenuItems: Array<{
-  kind: "flow" | "terminal" | "browser" | "computer" | "files";
-  shortcut: string | null;
-}> = [
-  { kind: "flow", shortcut: null },
-  { kind: "terminal", shortcut: null },
-  { kind: "browser", shortcut: "Ctrl+T" },
-  { kind: "computer", shortcut: null },
-  { kind: "files", shortcut: "Ctrl+P" },
-];
-
-const toolStageLauncherKinds: Array<{
-  kind: Exclude<ToolTabKind, "image" | "preview" | "side-task">;
-  label: string;
-}> = [
-  { kind: "flow", label: "Flow" },
-  { kind: "diff", label: "代码审阅" },
-  { kind: "terminal", label: "终端" },
-  { kind: "browser", label: "浏览器" },
-  { kind: "computer", label: "桌面观察" },
-  { kind: "files", label: "文件" },
-];
-
-function toolTabTitle(kind: ToolTabKind): string {
-  switch (kind) {
-    case "flow":
-      return "Flow";
-    case "files":
-      return "文件";
-    case "terminal":
-      return "终端";
-    case "diff":
-      return "审查";
-    case "extensions":
-      return "Plugins";
-    case "sandbox":
-      return "沙箱";
-    case "browser":
-      return "浏览器";
-    case "computer":
-      return "电脑";
-    case "usage":
-      return "使用日志";
-    case "side-task":
-      return "侧边任务";
-    case "image":
-      return "图片";
-    case "preview":
-      return "预览";
-  }
-}
-
-function toolTabIcon(kind: ToolTabKind): typeof Folder {
-  switch (kind) {
-    case "flow":
-      return GitFork;
-    case "files":
-      return Folder;
-    case "terminal":
-      return TerminalSquare;
-    case "diff":
-      return GitBranch;
-    case "extensions":
-      return Plug;
-    case "sandbox":
-      return Box;
-    case "browser":
-      return Globe2;
-    case "computer":
-      return Monitor;
-    case "usage":
-      return Activity;
-    case "side-task":
-      return CirclePlus;
-    case "image":
-      return FileImage;
-    case "preview":
-      return FileCode2;
-  }
-}
-
 function artifactPreviewTitle(
   descriptor: ArtifactDescriptor | undefined,
   artifactId: string,
@@ -13388,45 +4966,4 @@ function usesFormatAwarePreview(path: string): boolean {
   return /\.(?:avif|bmp|csv|gif|ico|jpe?g|pdf|png|svg|tsv|webp|xlsm?|xlsx|xltx)$/i.test(
     path,
   );
-}
-
-const MAX_THREAD_TITLE_CHARS = 50;
-
-function threadTitleNeedsSummary(prompt: string): boolean {
-  return Array.from(prompt.trim()).length > MAX_THREAD_TITLE_CHARS;
-}
-
-function threadTitleFromPrompt(prompt: string): string {
-  const title = prompt.trim();
-  const chars = Array.from(title);
-  if (chars.length <= MAX_THREAD_TITLE_CHARS) return title;
-  const singleLineTitle = Array.from(title.replace(/\s+/g, " "));
-  return `${singleLineTitle.slice(0, MAX_THREAD_TITLE_CHARS - 1).join("")}…`;
-}
-
-function workspaceName(workspaceRoot: string): string {
-  const trimmed = workspaceRoot.replace(/[\\\/]+$/, "");
-  const parts = trimmed.split(/[\\\/]/).filter(Boolean);
-  return parts.at(-1) || workspaceRoot;
-}
-
-function workspaceRootKey(workspaceRoot: string): string {
-  let unified = workspaceRoot.trim().replace(/\\/g, "/");
-  if (/^\/\/\?\/unc\//i.test(unified)) {
-    unified = `//${unified.slice(8)}`;
-  } else if (/^\/\/\?\//.test(unified)) {
-    unified = unified.slice(4);
-  }
-  const prefix = unified.startsWith("//")
-    ? "//"
-    : unified.startsWith("/")
-      ? "/"
-      : "";
-  const remainder = unified.slice(prefix.length).replace(/^\/+/, "");
-  const normalized = `${prefix}${remainder.replace(/\/+/g, "/")}`;
-  const withoutTrailingSeparators =
-    normalized.length > prefix.length
-      ? normalized.replace(/\/+$/, "")
-      : normalized;
-  return withoutTrailingSeparators.toLowerCase();
 }

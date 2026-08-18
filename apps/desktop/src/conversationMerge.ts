@@ -1,12 +1,5 @@
 import type { AgentEvent, Message } from "./types";
 
-export type ConversationCacheEntry = {
-  messages: Message[];
-  events: AgentEvent[];
-};
-
-export const maxCachedConversations = 8;
-
 export function mergeConversationMessages(
   current: Message[],
   incoming: Message[],
@@ -70,19 +63,4 @@ function appendCompactedEvent(
     return;
   }
   compacted.push(event);
-}
-
-export function cacheConversation(
-  cache: Map<string, ConversationCacheEntry>,
-  threadId: string,
-  entry: ConversationCacheEntry,
-  limit = maxCachedConversations,
-): void {
-  cache.delete(threadId);
-  cache.set(threadId, entry);
-  while (cache.size > limit) {
-    const oldestThreadId = cache.keys().next().value;
-    if (!oldestThreadId) break;
-    cache.delete(oldestThreadId);
-  }
 }

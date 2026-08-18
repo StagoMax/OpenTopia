@@ -1,8 +1,8 @@
-import { BookOpen, Cable, ContactRound, Database, Library } from "lucide-react";
+import { Cable, ContactRound, Database, PlugZap } from "lucide-react";
 import { Badge, Button, Panel } from "./ui";
 import "../styles/flow-library-panel.css";
 
-export type FlowLibraryConnectorKind = "knowledge" | "database" | "crm";
+export type FlowLibraryConnectorKind = "mcp" | "database" | "business_app";
 
 export type FlowLibraryConnector = {
   id: string;
@@ -25,9 +25,9 @@ const FLOW_LIBRARY_KINDS: ReadonlyArray<{
   description: string;
 }> = [
   {
-    kind: "knowledge",
-    title: "知识库 / RAG",
-    description: "接入文档、网页与向量索引，为 Flow 提供可追溯的检索上下文。",
+    kind: "mcp",
+    title: "MCP 服务",
+    description: "连接本地或远程 MCP，登录后按账号、租户与授权范围开放工具。",
   },
   {
     kind: "database",
@@ -35,9 +35,9 @@ const FLOW_LIBRARY_KINDS: ReadonlyArray<{
     description: "连接 SQL、数据仓库或内部数据服务，并按身份授予读写范围。",
   },
   {
-    kind: "crm",
-    title: "CRM",
-    description: "连接客户、销售线索与机会数据，供业务 Flow 查询或更新。",
+    kind: "business_app",
+    title: "业务系统",
+    description: "连接 CRM、ERP、工单与协作应用，并保留独立的凭据引用和权限范围。",
   },
 ];
 
@@ -50,11 +50,11 @@ export function FlowLibraryPanel({
     <div className="flow-library-panel">
       <header className="flow-library-panel__intro">
         <span className="flow-library-panel__intro-icon">
-          <Library aria-hidden="true" size={18} />
+          <PlugZap aria-hidden="true" size={18} />
         </span>
         <span>
-          <strong>Business Context Library</strong>
-          <small>知识、数据与业务系统连接器</small>
+          <strong>Connections / 连接</strong>
+          <small>MCP、API、数据库与业务系统授权</small>
         </span>
         <Badge variant="neutral">接口预留</Badge>
       </header>
@@ -85,7 +85,7 @@ export function FlowLibraryPanel({
 
       <Panel
         actions={<Badge variant="neutral">{connectors.length} connected</Badge>}
-        title="已连接资源"
+        title="已连接服务"
       >
         {connectors.length > 0 ? (
           <div className="flow-library-panel__sources">
@@ -117,9 +117,9 @@ export function FlowLibraryPanel({
           </div>
         ) : (
           <div className="flow-library-panel__empty">
-            <BookOpen aria-hidden="true" size={18} />
-            <strong>尚未连接业务上下文</strong>
-            <span>接口已经预留，后续可接入 RAG、数据库与 CRM。</span>
+            <Cable aria-hidden="true" size={18} />
+            <strong>尚未配置 Connection</strong>
+            <span>连接配置保存能力与凭据引用；Agent Template 只复用配置，不复制账号密钥。</span>
           </div>
         )}
       </Panel>
@@ -129,14 +129,16 @@ export function FlowLibraryPanel({
 
 function libraryKindIcon(kind: FlowLibraryConnectorKind) {
   if (kind === "database") return <Database aria-hidden="true" size={16} />;
-  if (kind === "crm") return <ContactRound aria-hidden="true" size={16} />;
-  return <BookOpen aria-hidden="true" size={16} />;
+  if (kind === "business_app") {
+    return <ContactRound aria-hidden="true" size={16} />;
+  }
+  return <Cable aria-hidden="true" size={16} />;
 }
 
 function libraryKindLabel(kind: FlowLibraryConnectorKind) {
   if (kind === "database") return "Database";
-  if (kind === "crm") return "CRM";
-  return "Knowledge / RAG";
+  if (kind === "business_app") return "CRM / ERP / App";
+  return "MCP";
 }
 
 function libraryStatusVariant(status: FlowLibraryConnector["status"]) {

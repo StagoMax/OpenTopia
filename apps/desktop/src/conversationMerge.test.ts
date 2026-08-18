@@ -1,15 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import type * as ConversationCacheModule from "./conversationCache";
+import type * as ConversationMergeModule from "./conversationMerge";
 import type { AgentEvent, Message } from "./types";
 
-const {
-  cacheConversation,
-  mergeConversationEvents,
-  mergeConversationMessages,
-} = (await import("./conversationCache" +
-  ".ts")) as typeof ConversationCacheModule;
+const { mergeConversationEvents, mergeConversationMessages } = (await import(
+  "./conversationMerge" + ".ts"
+)) as typeof ConversationMergeModule;
 
 function event(id: string, seq: number): AgentEvent {
   return {
@@ -72,12 +69,15 @@ test("merges incremental conversation events by id and sequence", () => {
 });
 
 test("compacts adjacent model deltas without crossing activity boundaries", () => {
-  const merged = mergeConversationEvents([], [
-    modelDelta("delta-1", 1, "hello "),
-    modelDelta("delta-2", 2, "world"),
-    event("boundary", 3),
-    modelDelta("delta-3", 4, "after"),
-  ]);
+  const merged = mergeConversationEvents(
+    [],
+    [
+      modelDelta("delta-1", 1, "hello "),
+      modelDelta("delta-2", 2, "world"),
+      event("boundary", 3),
+      modelDelta("delta-3", 4, "after"),
+    ],
+  );
 
   assert.equal(merged.length, 3);
   assert.equal(merged[0]?.id, "delta-2");
@@ -87,19 +87,4 @@ test("compacts adjacent model deltas without crossing activity boundaries", () =
   });
   assert.equal(merged[1]?.id, "boundary");
   assert.equal(merged[2]?.id, "delta-3");
-});
-
-test("conversation cache uses least-recently-used insertion order", () => {
-  const cache = new Map();
-  cacheConversation(cache, "one", { messages: [], events: [] }, 2);
-  cacheConversation(cache, "two", { messages: [], events: [] }, 2);
-  cacheConversation(
-    cache,
-    "one",
-    { messages: [], events: [event("one", 1)] },
-    2,
-  );
-  cacheConversation(cache, "three", { messages: [], events: [] }, 2);
-
-  assert.deepEqual([...cache.keys()], ["one", "three"]);
 });

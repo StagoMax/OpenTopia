@@ -1,0 +1,15 @@
+{
+  "ok": true,
+  "service": "opentopia-server",
+  "apiVersion": 1,
+  "shellRuntime": {
+    "runtime": {
+      "program": "pwsh",
+      "dialect": "power_shell7",
+      "version": "7.4.0",
+      "source": "path"
+    },
+    "managedVersion": "7.4.0",
+    "managedStatus": "not_required"
+  }
+}

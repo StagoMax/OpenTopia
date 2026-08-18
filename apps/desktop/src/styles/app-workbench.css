@@ -1,0 +1,235 @@
+/*
+ * The review panel scrolls its own diff and keeps a sticky file header, so the
+ * stage hands it a sized row instead of scrolling the whole view.
+ */
+.workbench-tab-panel.stage > .diff-view {
+  grid-template-rows: minmax(0, 1fr);
+  overflow: hidden;
+}
+
+.workbench-tab-panel.stage .xterm-wrapper,
+.workbench-tab-panel.stage .xterm-container {
+  height: 100%;
+  min-height: 0;
+}
+
+.workbench-tab-panel--terminal.stage .xterm-container {
+  border: 0;
+  border-radius: 0;
+}
+
+.workbench-tab-panel--terminal.stage .xterm-container:focus-within {
+  outline: 0;
+}
+
+.workbench-tab-panel--terminal.stage .terminal-toolbar,
+.workbench-tab-panel--terminal.stage .terminal-history {
+  display: none;
+}
+
+.workbench-tab-panel.stage .diff-sub-tabs {
+  border-color: var(--border);
+  background: var(--surface-subtle);
+}
+
+.workbench-tab-panel.stage .diff-sub-tab {
+  color: var(--text-secondary);
+}
+
+.workbench-tab-panel.stage .diff-sub-tab.active,
+.workbench-tab-panel.stage .diff-sub-tab:hover {
+  border-color: var(--border);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.workbench-tab-panel.stage .monaco-editor-wrapper,
+.workbench-tab-panel.stage .diff-editor-container .monaco-editor-wrapper {
+  min-height: 48vh;
+}
+
+.unavailable-tool-state {
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  gap: 10px;
+  height: 100%;
+  padding: 32px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.unavailable-tool-state h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 17px;
+}
+
+.unavailable-tool-state p {
+  max-width: 480px;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.unavailable-tool-state > span {
+  border: 1px solid color-mix(in srgb, var(--danger) 34%, var(--border));
+  border-radius: 4px;
+  background: var(--warning-subtle);
+  color: var(--danger);
+  padding: 3px 7px;
+  font-size: 10px;
+}
+
+.environment-facts button {
+  display: grid;
+  grid-template-columns: 17px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  min-height: 28px;
+  width: 100%;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  padding: 0;
+  text-align: left;
+  font-size: 11px;
+}
+
+.environment-facts button:hover {
+  background: var(--surface-hover);
+}
+
+.environment-facts button:first-child strong {
+  color: var(--success);
+}
+
+.environment-facts button strong {
+  overflow: hidden;
+  max-width: 104px;
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 550;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.right-panel.context-rail-shell {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  margin: 10px 10px 12px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  overflow: visible;
+}
+
+.project-hover-card {
+  position: fixed;
+  z-index: 120;
+  display: grid;
+  width: 320px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 14px 36px rgb(35 43 36 / 18%);
+  color: var(--text);
+  padding: 10px 12px 11px;
+  pointer-events: none;
+}
+
+.project-hover-card header,
+.project-hover-card header > span,
+.project-hover-card__row {
+  display: flex;
+  align-items: center;
+}
+
+.project-hover-card header {
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 27px;
+}
+
+.project-hover-card header > span {
+  min-width: 0;
+  gap: 8px;
+}
+
+.project-hover-card header strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-hover-card header button {
+  display: grid;
+  width: 25px;
+  height: 25px;
+  flex: 0 0 25px;
+  place-items: center;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  padding: 0;
+}
+
+.project-hover-card__row {
+  min-width: 0;
+  min-height: 27px;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.project-hover-card__row svg {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+}
+
+.project-hover-card__row span {
+  overflow: hidden;
+  min-width: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-hover-card__divider {
+  height: 1px;
+  margin: 3px 0;
+  background: var(--surface-subtle);
+}
+
+@media (max-width: 1120px) {
+  .workspace.with-tool-stage {
+    grid-template-columns: var(--workspace-left-width, 252px) 0 minmax(0, 1fr);
+  }
+
+  .workspace.with-tool-stage .center-pane {
+    display: none;
+  }
+
+  .workspace.with-tool-stage .right-panel.tool-stage {
+    display: grid;
+    grid-column: 3;
+  }
+
+  .workspace.with-tool-stage.tool-only {
+    grid-template-columns: var(--workspace-left-width, 210px) 0 minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 760px) {
+  .task-suggestions {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

@@ -1,0 +1,3351 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AgentEvent": {
+      "properties": {
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/definitions/AgentEventPayload"
+        },
+        "seq": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "threadId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "turnId": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "createdAt",
+        "id",
+        "payload",
+        "seq",
+        "threadId"
+      ],
+      "type": "object"
+    },
+    "AgentEventPayload": {
+      "oneOf": [
+        {
+          "properties": {
+            "snapshot": {
+              "$ref": "#/definitions/ThreadContextSnapshot"
+            },
+            "type": {
+              "enum": [
+                "thread_context_snapshot"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "snapshot",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "snapshot": {
+              "$ref": "#/definitions/TurnContextSnapshot"
+            },
+            "type": {
+              "enum": [
+                "turn_context_snapshot"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "snapshot",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "turn_started"
+              ],
+              "type": "string"
+            },
+            "user_message_id": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "user_message_id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "context_hash": {
+              "type": "string"
+            },
+            "dynamic_tail_hash": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "items": {
+              "items": {
+                "$ref": "#/definitions/ModelContextItem"
+              },
+              "type": "array"
+            },
+            "purpose": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ModelCallPurpose"
+                }
+              ],
+              "default": "agent_round"
+            },
+            "request_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "round": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "stable_prefix_hash": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "token_breakdown": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/TokenEstimateBreakdown"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "token_estimate": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "type": {
+              "enum": [
+                "model_context_built"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "context_hash",
+            "round",
+            "token_estimate",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "request": true,
+            "request_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "round": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "type": {
+              "enum": [
+                "model_request"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "round",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "adapter": {
+              "type": "string"
+            },
+            "attempt": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "body": true,
+            "endpoint": {
+              "type": "string"
+            },
+            "method": {
+              "type": "string"
+            },
+            "request_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "round": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "type": {
+              "enum": [
+                "provider_request_sent"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "adapter",
+            "attempt",
+            "endpoint",
+            "method",
+            "request_id",
+            "round",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "attempt": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "body": true,
+            "reason": {
+              "type": "string"
+            },
+            "request_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "retry_index": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "retry_kind": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ProviderRetryKind"
+                }
+              ],
+              "default": "network"
+            },
+            "retry_limit": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "round": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "type": {
+              "enum": [
+                "provider_request_retried"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "attempt",
+            "reason",
+            "request_id",
+            "round",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "attempt": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "body": true,
+            "request_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "response_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "round": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "status": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "provider_response_received"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "attempt",
+            "request_id",
+            "round",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "model_delta"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "text",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "reasoning_delta"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "text",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "call": {
+              "$ref": "#/definitions/ToolCall"
+            },
+            "type": {
+              "enum": [
+                "tool_call_started"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "call",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "result": {
+              "$ref": "#/definitions/ToolResult"
+            },
+            "type": {
+              "enum": [
+                "tool_call_finished"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "result",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "form": {
+              "$ref": "#/definitions/WorkForm"
+            },
+            "type": {
+              "enum": [
+                "work_form_updated"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "form",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "snapshot": {
+              "$ref": "#/definitions/GoalSnapshot"
+            },
+            "type": {
+              "enum": [
+                "goal_updated"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "snapshot",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "request": {
+              "$ref": "#/definitions/UserInputRequest"
+            },
+            "type": {
+              "enum": [
+                "user_input_requested"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "request",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "message": {
+              "$ref": "#/definitions/Message"
+            },
+            "type": {
+              "enum": [
+                "assistant_message"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "message",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "summary": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "file_changed"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "summary",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "change_set": {
+              "$ref": "#/definitions/TurnChangeSet"
+            },
+            "type": {
+              "enum": [
+                "turn_changes_recorded"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "change_set",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "files_changed": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "target_turn_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "turn_undo_completed"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "files_changed",
+            "target_turn_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "action": {
+              "type": "string"
+            },
+            "approval_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "approval_requested"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "action",
+            "approval_id",
+            "reason",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "action": true,
+            "review_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "target_item_id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "automatic_approval_review_started"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "action",
+            "review_id",
+            "target_item_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "action": true,
+            "attempts": {
+              "default": 0,
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "decision_source": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GuardianDecisionSource"
+                }
+              ],
+              "default": "guardian"
+            },
+            "failure_kind": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/GuardianReviewFailureKind"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "rationale": {
+              "type": "string"
+            },
+            "review_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "risk_level": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/GuardianRiskLevel"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "status": {
+              "$ref": "#/definitions/GuardianReviewStatus"
+            },
+            "target_item_id": {
+              "type": "string"
+            },
+            "tool_rounds": {
+              "default": 0,
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "type": {
+              "enum": [
+                "automatic_approval_review_completed"
+              ],
+              "type": "string"
+            },
+            "usage": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ModelUsage"
+                }
+              ],
+              "default": {
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "totalTokens": 0
+              }
+            },
+            "user_authorization": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/GuardianUserAuthorization"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "action",
+            "rationale",
+            "review_id",
+            "status",
+            "target_item_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "auto_review_interruption_warning"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "message",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "details": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ContextCompactionDetails"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "summary": {
+              "$ref": "#/definitions/ContextSummary"
+            },
+            "type": {
+              "enum": [
+                "context_compacted"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "summary",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "projection": {
+              "$ref": "#/definitions/ContextProjection"
+            },
+            "type": {
+              "enum": [
+                "context_projection_built"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "projection",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "compaction_item_count": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "model": {
+              "type": "string"
+            },
+            "provider_id": {
+              "type": "string"
+            },
+            "response_item_count": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "state_kind": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "provider_context_state_updated"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "compaction_item_count",
+            "model",
+            "provider_id",
+            "response_item_count",
+            "state_kind",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "model": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "provider_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reason": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "provider_context_state_invalidated"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "reason",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "stage": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "context_warning"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "message",
+            "stage",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "cache_write_tokens": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "cached_input_tokens": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "input_breakdown": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/TokenEstimateBreakdown"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "input_tokens": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "local_input_estimate": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "output_tokens": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "purpose": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ModelCallPurpose"
+                }
+              ],
+              "default": "agent_round"
+            },
+            "reasoning_tokens": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "request_id": {
+              "format": "uuid",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "round": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "total_tokens": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "type": {
+              "enum": [
+                "token_usage"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "summary": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "turn_finished"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "summary",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "approval_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "turn_suspended"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "approval_id",
+            "reason",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "action": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "browser_handoff_required"
+              ],
+              "type": "string"
+            },
+            "url": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "action",
+            "reason",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "prior_turn_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "browser_handoff_completed"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "prior_turn_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "request_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "turn_awaiting_input"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "request_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "turn_cancelled"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "reason",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "error"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "message",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "CollaborationMode": {
+      "enum": [
+        "default",
+        "plan",
+        "goal"
+      ],
+      "type": "string"
+    },
+    "CompletionDisposition": {
+      "oneOf": [
+        {
+          "description": "The current final candidate must be rejected and returned to the model.",
+          "enum": [
+            "blocking"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The turn may finish; the signal is only surfaced as a reminder.",
+          "enum": [
+            "advisory"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ContextAuthority": {
+      "description": "Semantic authority carried by a context item before a provider adapter maps it to the provider's supported message roles.\n\nThis is harness metadata. Providers never receive this enum as a prompt tag. `Data` means the item is asserted as context or state, but does not mint new instructions merely because its transport role may be `developer`.",
+      "enum": [
+        "system",
+        "developer",
+        "user",
+        "assistant",
+        "tool",
+        "data"
+      ],
+      "type": "string"
+    },
+    "ContextCacheScope": {
+      "enum": [
+        "stable",
+        "thread",
+        "turn",
+        "round",
+        "none"
+      ],
+      "type": "string"
+    },
+    "ContextCheckpoint": {
+      "properties": {
+        "artifacts": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ContextCheckpointArtifact"
+          },
+          "type": "array"
+        },
+        "commandsAndValidation": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ContextCheckpointCommand"
+          },
+          "type": "array"
+        },
+        "coverage": {
+          "$ref": "#/definitions/ContextCheckpointCoverage"
+        },
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "decisions": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ContextCheckpointFact"
+          },
+          "type": "array"
+        },
+        "goal": {
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/definitions/ContextCheckpointMode"
+        },
+        "nextSteps": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ContextCheckpointStep"
+          },
+          "type": "array"
+        },
+        "openIssues": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ContextCheckpointFact"
+          },
+          "type": "array"
+        },
+        "pendingInteractions": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ContextCheckpointInteraction"
+          },
+          "type": "array"
+        },
+        "previousCheckpointId": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "providerCompatibilityHash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "schemaVersion": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "threadId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "userConstraints": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ContextCheckpointFact"
+          },
+          "type": "array"
+        },
+        "workspaceState": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ContextCheckpointWorkspace"
+            }
+          ],
+          "default": {
+            "filesChanged": []
+          }
+        }
+      },
+      "required": [
+        "coverage",
+        "createdAt",
+        "goal",
+        "id",
+        "mode",
+        "schemaVersion",
+        "threadId"
+      ],
+      "type": "object"
+    },
+    "ContextCheckpointArtifact": {
+      "properties": {
+        "id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": "string"
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sourceSeqs": {
+          "default": [],
+          "items": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "summary"
+      ],
+      "type": "object"
+    },
+    "ContextCheckpointCommand": {
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "outcome": {
+          "type": "string"
+        },
+        "sourceSeqs": {
+          "default": [],
+          "items": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "command",
+        "outcome",
+        "summary"
+      ],
+      "type": "object"
+    },
+    "ContextCheckpointCoverage": {
+      "properties": {
+        "throughMessageCount": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "throughSeq": {
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "throughMessageCount",
+        "throughSeq"
+      ],
+      "type": "object"
+    },
+    "ContextCheckpointFact": {
+      "properties": {
+        "confidence": {
+          "format": "uint8",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "sourceSeqs": {
+          "default": [],
+          "items": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "status": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ContextFactStatus"
+            }
+          ],
+          "default": "active"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "text"
+      ],
+      "type": "object"
+    },
+    "ContextCheckpointFile": {
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "sourceSeqs": {
+          "default": [],
+          "items": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "status": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "status",
+        "summary"
+      ],
+      "type": "object"
+    },
+    "ContextCheckpointInteraction": {
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "sourceSeqs": {
+          "default": [],
+          "items": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "summary"
+      ],
+      "type": "object"
+    },
+    "ContextCheckpointMode": {
+      "enum": [
+        "legacy_text",
+        "manual",
+        "structured_local",
+        "native_provider"
+      ],
+      "type": "string"
+    },
+    "ContextCheckpointStep": {
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "sourceSeqs": {
+          "default": [],
+          "items": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "status": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "status",
+        "text"
+      ],
+      "type": "object"
+    },
+    "ContextCheckpointWorkspace": {
+      "properties": {
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "filesChanged": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ContextCheckpointFile"
+          },
+          "type": "array"
+        },
+        "gitStatus": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ContextCompactionDetails": {
+      "properties": {
+        "checkpointId": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "coverage": {
+          "$ref": "#/definitions/ContextCheckpointCoverage"
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ContextCompactionMetrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mode": {
+          "$ref": "#/definitions/ContextCheckpointMode"
+        },
+        "providerStateCheckpointId": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "coverage",
+        "mode"
+      ],
+      "type": "object"
+    },
+    "ContextCompactionMetrics": {
+      "properties": {
+        "activeConstraintRetentionPercent": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "checkpointTokens": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "factRetentionPercent": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "inputTokens": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "latencyMs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "source": {
+          "type": "string"
+        },
+        "tokenReductionPercent": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "activeConstraintRetentionPercent",
+        "checkpointTokens",
+        "factRetentionPercent",
+        "inputTokens",
+        "latencyMs",
+        "source",
+        "tokenReductionPercent"
+      ],
+      "type": "object"
+    },
+    "ContextFactStatus": {
+      "enum": [
+        "active",
+        "resolved",
+        "superseded"
+      ],
+      "type": "string"
+    },
+    "ContextItemKind": {
+      "oneOf": [
+        {
+          "enum": [
+            "base_instructions",
+            "developer_instructions",
+            "repository_instructions",
+            "environment",
+            "world_state",
+            "capability_catalog",
+            "skill_instructions",
+            "summary",
+            "checkpoint",
+            "conversation",
+            "user",
+            "tool_call",
+            "tool_result"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Legacy serialized kind retained for replay compatibility. New contexts use `CapabilityCatalog` or `SkillInstructions` instead.",
+          "enum": [
+            "skill"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ContextLifecycle": {
+      "description": "Semantic lifetime used by the harness for auditing and invalidation.\n\nThis is intentionally independent from `ContextCacheScope`: a Skill chosen for one Turn may still be placed in a reusable provider prefix, while a durable checkpoint belongs to an Epoch even when transported in that same prefix. Providers never receive this enum as a prompt tag.",
+      "enum": [
+        "build",
+        "thread",
+        "epoch",
+        "turn",
+        "round"
+      ],
+      "type": "string"
+    },
+    "ContextProjection": {
+      "properties": {
+        "checkpointId": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "checkpointMode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "checkpointTokens": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "coveredMessageCount": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "coveredThroughSeq": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "nativeCompactionItemCount": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "nativeCompactionSupported": {
+          "type": "boolean"
+        },
+        "providerItemCount": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "providerStateAvailable": {
+          "type": "boolean"
+        },
+        "providerStateKind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "recentTailTokens": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "unsummarizedEventCount": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "unsummarizedMessageCount": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "checkpointTokens",
+        "coveredMessageCount",
+        "coveredThroughSeq",
+        "nativeCompactionItemCount",
+        "nativeCompactionSupported",
+        "providerItemCount",
+        "providerStateAvailable",
+        "recentTailTokens",
+        "unsummarizedEventCount",
+        "unsummarizedMessageCount"
+      ],
+      "type": "object"
+    },
+    "ContextRole": {
+      "enum": [
+        "system",
+        "developer",
+        "user",
+        "assistant",
+        "tool"
+      ],
+      "type": "string"
+    },
+    "ContextSensitivity": {
+      "enum": [
+        "public",
+        "workspace",
+        "sensitive"
+      ],
+      "type": "string"
+    },
+    "ContextSourceKind": {
+      "enum": [
+        "text",
+        "image",
+        "document"
+      ],
+      "type": "string"
+    },
+    "ContextSourceRef": {
+      "properties": {
+        "bytes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "contentType": {
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/definitions/ContextSourceKind"
+        },
+        "name": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "bytes",
+        "contentType",
+        "id",
+        "kind",
+        "name",
+        "path",
+        "truncated"
+      ],
+      "type": "object"
+    },
+    "ContextSummary": {
+      "properties": {
+        "checkpoint": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ContextCheckpoint"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "coveredThroughSeq": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "messageCount": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "metadata": true,
+        "summary": {
+          "type": "string"
+        },
+        "threadId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "tokenEstimate": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "coveredThroughSeq",
+        "createdAt",
+        "id",
+        "messageCount",
+        "metadata",
+        "summary",
+        "threadId"
+      ],
+      "type": "object"
+    },
+    "DesktopStreamKind": {
+      "enum": [
+        "agent_event",
+        "agent_activity",
+        "terminal_event"
+      ],
+      "type": "string"
+    },
+    "GoalRecord": {
+      "properties": {
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "objective": {
+          "type": "string"
+        },
+        "threadId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "timeUsedSeconds": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tokenBudget": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tokensUsed": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "updatedAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "version": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "createdAt",
+        "id",
+        "objective",
+        "threadId",
+        "timeUsedSeconds",
+        "tokensUsed",
+        "updatedAt",
+        "version"
+      ],
+      "type": "object"
+    },
+    "GoalSnapshot": {
+      "properties": {
+        "goal": {
+          "$ref": "#/definitions/GoalRecord"
+        },
+        "workForm": {
+          "$ref": "#/definitions/WorkForm"
+        }
+      },
+      "required": [
+        "goal",
+        "workForm"
+      ],
+      "type": "object"
+    },
+    "GuardianDecisionSource": {
+      "enum": [
+        "guardian",
+        "runtime"
+      ],
+      "type": "string"
+    },
+    "GuardianReviewFailureKind": {
+      "enum": [
+        "reviewer_unavailable",
+        "invalid_reviewer_response"
+      ],
+      "type": "string"
+    },
+    "GuardianReviewStatus": {
+      "enum": [
+        "in_progress",
+        "approved",
+        "needs_user_approval",
+        "denied_by_policy",
+        "reviewer_unavailable",
+        "invalid_reviewer_response",
+        "aborted"
+      ],
+      "type": "string"
+    },
+    "GuardianRiskLevel": {
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ],
+      "type": "string"
+    },
+    "GuardianUserAuthorization": {
+      "enum": [
+        "unknown",
+        "low",
+        "medium",
+        "high"
+      ],
+      "type": "string"
+    },
+    "InstructionSnapshotRef": {
+      "properties": {
+        "bytes": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "contentHash": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "bytes",
+        "contentHash",
+        "path",
+        "scope",
+        "truncated"
+      ],
+      "type": "object"
+    },
+    "Message": {
+      "properties": {
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "parts": {
+          "items": {
+            "$ref": "#/definitions/MessagePart"
+          },
+          "type": "array"
+        },
+        "role": {
+          "$ref": "#/definitions/MessageRole"
+        },
+        "threadId": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "createdAt",
+        "id",
+        "parts",
+        "role",
+        "threadId"
+      ],
+      "type": "object"
+    },
+    "MessagePart": {
+      "oneOf": [
+        {
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "text"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "text",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "contentType": {
+              "type": "string"
+            },
+            "data": {
+              "items": {
+                "format": "uint8",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "id": {
+              "format": "uuid",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "image"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "contentType",
+            "data",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "image_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "image_ref"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "image_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "call": {
+              "$ref": "#/definitions/ToolCall"
+            },
+            "type": {
+              "enum": [
+                "tool_call"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "call",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "result": {
+              "$ref": "#/definitions/ToolResult"
+            },
+            "type": {
+              "enum": [
+                "tool_result"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "result",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "file_ref"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "source": {
+              "$ref": "#/definitions/ContextSourceRef"
+            },
+            "type": {
+              "enum": [
+                "source_ref"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "source",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "skill": {
+              "$ref": "#/definitions/SkillRef"
+            },
+            "type": {
+              "enum": [
+                "skill_ref"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "skill",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "collaboration_mode": {
+              "$ref": "#/definitions/CollaborationMode"
+            },
+            "goal_id": {
+              "format": "uuid",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "library_provider": {
+              "description": "Optional per-Turn retrieval backend selected by the conversation UI. This is execution metadata only; model history projection omits the TurnContext part itself.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "turn_context"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "collaboration_mode",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "error"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "message",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "MessageRole": {
+      "enum": [
+        "system",
+        "user",
+        "assistant",
+        "tool"
+      ],
+      "type": "string"
+    },
+    "ModelCallPurpose": {
+      "enum": [
+        "agent_round",
+        "context_compaction",
+        "guardian_review",
+        "title_generation",
+        "other"
+      ],
+      "type": "string"
+    },
+    "ModelContentPart": {
+      "description": "A typed unit of model input or tool output.\n\nText is the portable baseline for providers and tools, while the other variants retain information that would otherwise be flattened into a prompt string. `Image` stores the original bytes so provider adapters can choose their native multimodal representation at the last possible point.",
+      "oneOf": [
+        {
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "text"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "text",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "json"
+              ],
+              "type": "string"
+            },
+            "value": true
+          },
+          "required": [
+            "type",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "content_type": {
+              "type": "string"
+            },
+            "data": {
+              "items": {
+                "format": "uint8",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "type": {
+              "enum": [
+                "image"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "content_type",
+            "data",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "content_type": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "resource"
+              ],
+              "type": "string"
+            },
+            "uri": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "uri"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ModelContextItem": {
+      "properties": {
+        "authority": {
+          "$ref": "#/definitions/ContextAuthority"
+        },
+        "cacheScope": {
+          "$ref": "#/definitions/ContextCacheScope"
+        },
+        "content": {
+          "items": {
+            "$ref": "#/definitions/ModelContentPart"
+          },
+          "type": "array"
+        },
+        "contentHash": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/definitions/ContextItemKind"
+        },
+        "lifecycle": {
+          "$ref": "#/definitions/ContextLifecycle"
+        },
+        "metadata": true,
+        "role": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ContextRole"
+            }
+          ],
+          "description": "Provider transport role. Semantic authority is tracked separately so contextual data can be carried in a developer-shaped envelope without being classified as a developer-authored rule."
+        },
+        "sensitivity": {
+          "$ref": "#/definitions/ContextSensitivity"
+        },
+        "source": {
+          "type": "string"
+        },
+        "tokenEstimate": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "authority",
+        "cacheScope",
+        "content",
+        "contentHash",
+        "id",
+        "kind",
+        "lifecycle",
+        "role",
+        "sensitivity",
+        "source",
+        "tokenEstimate"
+      ],
+      "type": "object"
+    },
+    "ModelUsage": {
+      "properties": {
+        "cacheWriteTokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cachedInputTokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "inputTokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "outputTokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "reasoningTokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "totalTokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "inputTokens",
+        "outputTokens",
+        "totalTokens"
+      ],
+      "type": "object"
+    },
+    "ProviderRetryKind": {
+      "enum": [
+        "network",
+        "state_recovery"
+      ],
+      "type": "string"
+    },
+    "SkillRef": {
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "description",
+        "id",
+        "name",
+        "path",
+        "truncated"
+      ],
+      "type": "object"
+    },
+    "ThreadContextSnapshot": {
+      "properties": {
+        "capturedAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "contextHash": {
+          "type": "string"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "experienceMode": {
+          "default": "",
+          "type": "string"
+        },
+        "instructions": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/InstructionSnapshotRef"
+          },
+          "type": "array"
+        },
+        "model": {
+          "type": "string"
+        },
+        "permissionMode": {
+          "type": "string"
+        },
+        "providerAdapter": {
+          "default": "",
+          "description": "Concrete protocol contract used by this thread snapshot.",
+          "type": "string"
+        },
+        "providerId": {
+          "type": "string"
+        },
+        "providerKind": {
+          "description": "Deprecated connection preset retained for event compatibility.",
+          "type": "string"
+        },
+        "sandboxMode": {
+          "type": "string"
+        },
+        "toolCatalogHash": {
+          "type": "string"
+        },
+        "workspaceRoot": {
+          "type": "string"
+        },
+        "worldStateHash": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "capturedAt",
+        "contextHash",
+        "cwd",
+        "model",
+        "permissionMode",
+        "providerId",
+        "providerKind",
+        "sandboxMode",
+        "toolCatalogHash",
+        "workspaceRoot",
+        "worldStateHash"
+      ],
+      "type": "object"
+    },
+    "TokenEstimateBreakdown": {
+      "description": "Provider-neutral estimate of the logical input carried by one model request.\n\nThese values are intentionally kept separate from provider-reported usage: they explain which harness modules built the request, while provider usage is the billing/accounting authority after the request completes.",
+      "properties": {
+        "baseInstructions": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "checkpoints": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "conversation": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "currentUser": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "deferredToolCatalog": {
+          "description": "Names/descriptions visible before a deferred tool is selected.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "developerInstructions": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "directToolSchemas": {
+          "description": "Full schemas sent directly on this request (including output schemas).",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "loadedToolSchemas": {
+          "description": "Schemas appended by a provider Tool Search continuation.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "other": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "providerState": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "repositoryInstructions": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "runtimeContext": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "skillInstructions": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "summaries": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "toolCalls": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "toolResults": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "toolSchemas": {
+          "description": "Sum of the three tool-surface buckets above. Counted in `total` once.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "total": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "baseInstructions",
+        "checkpoints",
+        "conversation",
+        "currentUser",
+        "deferredToolCatalog",
+        "developerInstructions",
+        "directToolSchemas",
+        "loadedToolSchemas",
+        "other",
+        "providerState",
+        "repositoryInstructions",
+        "runtimeContext",
+        "skillInstructions",
+        "summaries",
+        "toolCalls",
+        "toolResults",
+        "toolSchemas",
+        "total"
+      ],
+      "type": "object"
+    },
+    "ToolCall": {
+      "properties": {
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "input": true,
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "input",
+        "name"
+      ],
+      "type": "object"
+    },
+    "ToolResult": {
+      "properties": {
+        "callId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "content": {
+          "items": {
+            "$ref": "#/definitions/ModelContentPart"
+          },
+          "type": "array"
+        },
+        "metadata": {
+          "description": "Tool-specific metadata is also the forward-compatible place for context and artifact hints, such as truncated/originalBytes/maxResults."
+        },
+        "output": {
+          "description": "Legacy text output. New tools should populate `content`; consumers can use `content_or_legacy_text` while callers migrate.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "callId",
+        "metadata",
+        "output"
+      ],
+      "type": "object"
+    },
+    "TurnChangeSet": {
+      "properties": {
+        "additions": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "afterTree": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "beforeTree": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "deletions": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "files": {
+          "items": {
+            "$ref": "#/definitions/TurnFileChange"
+          },
+          "type": "array"
+        },
+        "finalizedAt": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repoRoot": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revertedAt": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/definitions/TurnChangeSetStatus"
+        },
+        "threadId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "turnId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "workspacePrefix": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspaceRoot": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "additions",
+        "createdAt",
+        "deletions",
+        "files",
+        "status",
+        "threadId",
+        "turnId",
+        "workspaceRoot"
+      ],
+      "type": "object"
+    },
+    "TurnChangeSetStatus": {
+      "enum": [
+        "capturing",
+        "ready",
+        "empty",
+        "failed"
+      ],
+      "type": "string"
+    },
+    "TurnContextSnapshot": {
+      "properties": {
+        "capturedAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "changedKeys": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "contextHash": {
+          "type": "string"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "experienceMode": {
+          "default": "",
+          "type": "string"
+        },
+        "instructions": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/InstructionSnapshotRef"
+          },
+          "type": "array"
+        },
+        "permissionMode": {
+          "type": "string"
+        },
+        "previousWorldStateHash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sandboxMode": {
+          "type": "string"
+        },
+        "workspaceRoots": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "worldState": {
+          "$ref": "#/definitions/WorldStateSnapshot"
+        },
+        "worldStateHash": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "capturedAt",
+        "contextHash",
+        "cwd",
+        "permissionMode",
+        "sandboxMode",
+        "worldState",
+        "worldStateHash"
+      ],
+      "type": "object"
+    },
+    "TurnFileChange": {
+      "properties": {
+        "additions": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "afterMode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "afterOid": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "beforeMode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "beforeOid": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "binary": {
+          "type": "boolean"
+        },
+        "deletions": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/definitions/TurnFileChangeKind"
+        },
+        "newPath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "oldPath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "binary",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "TurnFileChangeKind": {
+      "enum": [
+        "added",
+        "modified",
+        "deleted",
+        "renamed"
+      ],
+      "type": "string"
+    },
+    "UserInputOption": {
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "recommended": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "description",
+        "id",
+        "label"
+      ],
+      "type": "object"
+    },
+    "UserInputQuestion": {
+      "properties": {
+        "allowCustom": {
+          "default": true,
+          "type": "boolean"
+        },
+        "header": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "options": {
+          "items": {
+            "$ref": "#/definitions/UserInputOption"
+          },
+          "type": "array"
+        },
+        "question": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "header",
+        "id",
+        "options",
+        "question"
+      ],
+      "type": "object"
+    },
+    "UserInputRequest": {
+      "properties": {
+        "questions": {
+          "items": {
+            "$ref": "#/definitions/UserInputQuestion"
+          },
+          "type": "array"
+        },
+        "requestId": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "questions",
+        "requestId"
+      ],
+      "type": "object"
+    },
+    "WorkForm": {
+      "properties": {
+        "acceptance": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "changeReason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "constraints": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "items": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/WorkItem"
+          },
+          "type": "array"
+        },
+        "objective": {
+          "type": "string"
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "scope": {
+          "$ref": "#/definitions/WorkScope"
+        },
+        "status": {
+          "$ref": "#/definitions/WorkFormStatus"
+        },
+        "threadId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "updatedAt": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "createdAt",
+        "id",
+        "objective",
+        "revision",
+        "scope",
+        "status",
+        "threadId",
+        "updatedAt"
+      ],
+      "type": "object"
+    },
+    "WorkFormStatus": {
+      "enum": [
+        "active",
+        "completed",
+        "blocked",
+        "paused",
+        "cancelled"
+      ],
+      "type": "string"
+    },
+    "WorkItem": {
+      "properties": {
+        "acceptance": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "completionDisposition": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CompletionDisposition"
+            }
+          ],
+          "default": "blocking"
+        },
+        "dependsOn": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "evidenceRefs": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "id": {
+          "type": "string"
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/definitions/WorkItemStatus"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "status",
+        "title"
+      ],
+      "type": "object"
+    },
+    "WorkItemStatus": {
+      "enum": [
+        "pending",
+        "in_progress",
+        "completed",
+        "deferred",
+        "blocked",
+        "cancelled"
+      ],
+      "type": "string"
+    },
+    "WorkScope": {
+      "oneOf": [
+        {
+          "properties": {
+            "id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "turn"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "goal"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "WorldStateSkill": {
+      "properties": {
+        "contentHash": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "contentHash",
+        "description",
+        "id",
+        "name",
+        "scope"
+      ],
+      "type": "object"
+    },
+    "WorldStateSnapshot": {
+      "properties": {
+        "currentDate": {
+          "type": "string"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "gitBranch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "gitStatus": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mcpToolCount": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "metadata": {
+          "default": null
+        },
+        "platform": {
+          "type": "string"
+        },
+        "skillCatalog": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/WorldStateSkill"
+          },
+          "type": "array"
+        },
+        "timezone": {
+          "type": "string"
+        },
+        "toolCatalogHash": {
+          "type": "string"
+        },
+        "toolCount": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "workspaceRoots": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "currentDate",
+        "cwd",
+        "mcpToolCount",
+        "platform",
+        "timezone",
+        "toolCatalogHash",
+        "toolCount"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "apiVersion": {
+      "format": "uint16",
+      "maximum": 1.0,
+      "minimum": 1.0,
+      "type": "integer"
+    },
+    "data": {
+      "$ref": "#/definitions/AgentEvent"
+    },
+    "kind": {
+      "$ref": "#/definitions/DesktopStreamKind"
+    },
+    "seq": {
+      "format": "int64",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "apiVersion",
+    "data",
+    "kind",
+    "seq"
+  ],
+  "title": "DesktopStreamEnvelope_for_AgentEvent",
+  "type": "object"
+}

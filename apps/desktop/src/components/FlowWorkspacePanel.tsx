@@ -32,6 +32,7 @@ import type {
   FlowTranscriptEntry,
 } from "../types";
 import { AgentTemplatePanel } from "./AgentTemplatePanel";
+import { HumanTaskInboxPanel } from "./HumanTaskInboxPanel";
 import { Badge, Button, Panel, Select, TextField } from "./ui";
 import "../styles/flow-workspace-panel.css";
 
@@ -376,6 +377,7 @@ function FlowReviewPanel({
         }
         onDefinitionChange={setRunDefinitionKey}
         onInputChange={setRunInputText}
+        onHumanTaskResolved={() => void refresh()}
         onRun={() => void startRuntime()}
         onSelectRun={setSelectedRunId}
         runDefinitionKey={runDefinitionKey}
@@ -627,6 +629,7 @@ type FlowRuntimePanelProps = {
   runInputText: string;
   onDefinitionChange(value: string): void;
   onInputChange(value: string): void;
+  onHumanTaskResolved(): void;
   onRun(): void;
   onSelectRun(runId: string): void;
   onControl(
@@ -646,6 +649,7 @@ function FlowRuntimePanel({
   runInputText,
   onDefinitionChange,
   onInputChange,
+  onHumanTaskResolved,
   onRun,
   onSelectRun,
   onControl,
@@ -653,11 +657,11 @@ function FlowRuntimePanel({
   const canPause = selectedRun
     ? selectedRun.status === "queued" || selectedRun.status === "running"
     : false;
-  const canResume = selectedRun?.status === "paused";
+  const canResume =
+    selectedRun?.status === "paused" && !selectedRun.activeHumanTaskId;
   const hasInterruptedNode = selectedRun?.nodeRuns.some(
     (nodeRun) => nodeRun.status === "running",
   );
-  const waitingApproval = selectedRun?.status === "waiting_approval";
   const canCancel = selectedRun
     ? !isTerminalRunStatus(selectedRun.status) &&
       selectedRun.status !== "cancel_requested"
@@ -747,6 +751,14 @@ function FlowRuntimePanel({
               <dt>Ready</dt>
               <dd>{selectedRun.readyNodes.join(", ") || "none"}</dd>
             </div>
+            {selectedRun.activeHumanTaskId ? (
+              <div>
+                <dt>Human task</dt>
+                <dd>
+                  <code>{selectedRun.activeHumanTaskId}</code>
+                </dd>
+              </div>
+            ) : null}
             <div>
               <dt>Loops</dt>
               <dd>{formatLoopCounts(selectedRun.loopCounts)}</dd>
@@ -805,45 +817,6 @@ function FlowRuntimePanel({
                 {hasInterruptedNode ? "检查后重试" : "恢复"}
               </Button>
             ) : null}
-            {waitingApproval ? (
-              <>
-                <Button
-                  disabled={!client || busy !== null}
-                  onClick={() =>
-                    onControl(
-                      "approve-run",
-                      () =>
-                        client!.resumeFlowRun(selectedRun.id, {
-                          approved: true,
-                        }),
-                      "审批通过，Flow 已继续运行。",
-                    )
-                  }
-                  size="compact"
-                  variant="primary"
-                >
-                  <CheckCircle2 aria-hidden="true" size={14} /> 通过
-                </Button>
-                <Button
-                  disabled={!client || busy !== null}
-                  onClick={() =>
-                    onControl(
-                      "reject-run",
-                      () =>
-                        client!.resumeFlowRun(selectedRun.id, {
-                          approved: false,
-                          note: "Rejected from Flow review panel",
-                        }),
-                      "审批已拒绝，Flow Run 已取消。",
-                    )
-                  }
-                  size="compact"
-                  variant="danger"
-                >
-                  <XCircle aria-hidden="true" size={14} /> 拒绝
-                </Button>
-              </>
-            ) : null}
             {canCancel ? (
               <Button
                 disabled={!client || busy !== null}
@@ -861,6 +834,17 @@ function FlowRuntimePanel({
               </Button>
             ) : null}
           </div>
+
+          {selectedRun.activeHumanTaskId ? (
+            <HumanTaskInboxPanel
+              className="flow-runtime-panel__human-task"
+              client={client}
+              flowRunId={selectedRun.id}
+              initialTaskId={selectedRun.activeHumanTaskId}
+              onResolved={onHumanTaskResolved}
+              pollIntervalMs={2_500}
+            />
+          ) : null}
 
           {selectedRun.error ? (
             <p className="flow-review-panel__message is-error" role="alert">

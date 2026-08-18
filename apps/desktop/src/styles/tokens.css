@@ -155,6 +155,7 @@
   --warning: #9a5c16;
   --warning-subtle: #fff5e8;
   --permission-auto: rgb(142 142 144);
+  --permission-full-access: #c2410c;
   --danger: #c23d42;
   --danger-subtle: #fff0f1;
   --file-type-pdf: #c53d4b;
@@ -374,6 +375,7 @@
   --success-subtle: #1a3227;
   --warning: #e0a75a;
   --warning-subtle: #342a19;
+  --permission-full-access: #ff8a65;
   --danger: #ec8288;
   --danger-subtle: #3a2228;
   --file-type-pdf: #ed7b84;

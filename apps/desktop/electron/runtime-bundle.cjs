@@ -102,6 +102,11 @@ function loadRuntimeBundle(resourcesPath, platform = process.platform) {
     );
   }
   const server = resolveArtifact(resourcesPath, manifest.artifacts?.server, "server");
+  const officeRuntimeManifest = resolveArtifact(
+    resourcesPath,
+    manifest.artifacts?.officeRuntime,
+    "Office runtime manifest",
+  );
   let sandbox = null;
   let sandboxProtocol = null;
   if (platform === "win32") {
@@ -112,7 +117,14 @@ function loadRuntimeBundle(resourcesPath, platform = process.platform) {
     );
     sandboxProtocol = inspectSandboxProtocol(sandbox, manifest.sandboxProtocol);
   }
-  return { manifestPath, server, sandbox, sandboxProtocol, manifest };
+  return {
+    manifestPath,
+    server,
+    sandbox,
+    sandboxProtocol,
+    officeRuntimeRoot: path.dirname(officeRuntimeManifest),
+    manifest,
+  };
 }
 
 module.exports = {
@@ -121,4 +133,3 @@ module.exports = {
   runtimeManifestName,
   validateProtocol,
 };
-

@@ -1,0 +1,56 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AgentActivityNotification": {
+      "properties": {
+        "agentThreadId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "seq": {
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "agentThreadId",
+        "seq"
+      ],
+      "type": "object"
+    },
+    "DesktopStreamKind": {
+      "enum": [
+        "agent_event",
+        "agent_activity",
+        "terminal_event"
+      ],
+      "type": "string"
+    }
+  },
+  "properties": {
+    "apiVersion": {
+      "format": "uint16",
+      "maximum": 1.0,
+      "minimum": 1.0,
+      "type": "integer"
+    },
+    "data": {
+      "$ref": "#/definitions/AgentActivityNotification"
+    },
+    "kind": {
+      "$ref": "#/definitions/DesktopStreamKind"
+    },
+    "seq": {
+      "format": "int64",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "apiVersion",
+    "data",
+    "kind",
+    "seq"
+  ],
+  "title": "DesktopStreamEnvelope_for_AgentActivityNotification",
+  "type": "object"
+}

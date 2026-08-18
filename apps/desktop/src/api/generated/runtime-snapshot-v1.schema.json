@@ -1,0 +1,228 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": true,
+  "definitions": {
+    "AgentSpawnPolicy": {
+      "properties": {
+        "allowChildSpawns": {
+          "type": "boolean"
+        },
+        "maxDepth": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "maxDirectChildren": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "allowChildSpawns",
+        "maxDepth",
+        "maxDirectChildren"
+      ],
+      "type": "object"
+    },
+    "RuntimeForkTurnsLabelV1": {
+      "enum": [
+        "none",
+        "all"
+      ],
+      "type": "string"
+    },
+    "RuntimeForkTurnsV1": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RuntimeForkTurnsLabelV1"
+        },
+        {
+          "properties": {
+            "count": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "count"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "RuntimeWorkspaceAssignmentV1": {
+      "oneOf": [
+        {
+          "properties": {
+            "mode": {
+              "enum": [
+                "shared_read_only"
+              ],
+              "type": "string"
+            },
+            "root": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "mode",
+            "root"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "mode": {
+              "enum": [
+                "shared_coordinated"
+              ],
+              "type": "string"
+            },
+            "root": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "mode",
+            "root"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "base_commit": {
+              "type": "string"
+            },
+            "branch": {
+              "type": "string"
+            },
+            "delivery_state": {
+              "$ref": "#/definitions/RuntimeWorkspaceDeliveryStateV1"
+            },
+            "mode": {
+              "enum": [
+                "isolated_worktree"
+              ],
+              "type": "string"
+            },
+            "repository_root": {
+              "type": "string"
+            },
+            "root": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "base_commit",
+            "branch",
+            "delivery_state",
+            "mode",
+            "repository_root",
+            "root"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "RuntimeWorkspaceDeliveryStateV1": {
+      "enum": [
+        "pending",
+        "ready"
+      ],
+      "type": "string"
+    },
+    "RuntimeWorkspaceModeV1": {
+      "enum": [
+        "shared_read_only",
+        "shared_coordinated",
+        "isolated_worktree"
+      ],
+      "type": "string"
+    }
+  },
+  "description": "The validated collaboration runtime contract stored in snapshot JSON.\n\nSecurity-relevant fields are strongly typed. Provider, plugin, and tool descriptors remain opaque because their owners validate them when consumed; keeping them here preserves the frozen snapshot without creating a reverse dependency from the collaboration domain into every contribution subsystem.",
+  "properties": {
+    "agentProfiles": {
+      "default": [],
+      "items": true,
+      "type": "array"
+    },
+    "agentRuntime": true,
+    "agentType": {
+      "type": "string"
+    },
+    "allowedAgentTypes": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "attachmentReferences": {
+      "default": [],
+      "items": true,
+      "type": "array"
+    },
+    "capabilityProjection": true,
+    "forkTurns": {
+      "$ref": "#/definitions/RuntimeForkTurnsV1"
+    },
+    "gitBaseCommit": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "permissionMode": true,
+    "pluginContributions": {
+      "default": [],
+      "items": true,
+      "type": "array"
+    },
+    "provider": true,
+    "sandbox": true,
+    "schemaVersion": {
+      "format": "uint16",
+      "maximum": 1.0,
+      "minimum": 1.0,
+      "type": "integer"
+    },
+    "spawnPolicy": {
+      "$ref": "#/definitions/AgentSpawnPolicy"
+    },
+    "toolCatalog": {
+      "default": [],
+      "items": true,
+      "type": "array"
+    },
+    "tools": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "workspaceAssignment": {
+      "$ref": "#/definitions/RuntimeWorkspaceAssignmentV1"
+    },
+    "workspaceMode": {
+      "$ref": "#/definitions/RuntimeWorkspaceModeV1"
+    },
+    "workspaceRoot": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "agentType",
+    "allowedAgentTypes",
+    "forkTurns",
+    "schemaVersion",
+    "spawnPolicy",
+    "workspaceAssignment",
+    "workspaceMode",
+    "workspaceRoot"
+  ],
+  "title": "RuntimeSnapshotV1",
+  "type": "object"
+}

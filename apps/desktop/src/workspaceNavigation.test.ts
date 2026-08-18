@@ -7,15 +7,33 @@ const { resolveSidebarDestination } = (await import(
   "./workspaceNavigation" + ".ts"
 )) as typeof WorkspaceNavigationModule;
 
-test("marks the Flow Library as the current sidebar destination", () => {
+test("maps fixed Flow navigation to one primary destination", () => {
   assert.equal(
     resolveSidebarDestination({
       experienceMode: "flow",
-      flowPrimaryView: "library",
+      flowPrimaryView: "inbox",
       toolStageOpen: false,
       activeToolKind: null,
     }),
-    "flow-library",
+    "flow-inbox",
+  );
+  assert.equal(
+    resolveSidebarDestination({
+      experienceMode: "flow",
+      flowPrimaryView: "connections",
+      toolStageOpen: false,
+      activeToolKind: null,
+    }),
+    "flow-connections",
+  );
+  assert.equal(
+    resolveSidebarDestination({
+      experienceMode: "flow",
+      flowPrimaryView: "knowledge",
+      toolStageOpen: false,
+      activeToolKind: null,
+    }),
+    "flow-knowledge",
   );
 });
 
@@ -23,7 +41,7 @@ test("lets the full-workspace Plugins page own the current state", () => {
   assert.equal(
     resolveSidebarDestination({
       experienceMode: "flow",
-      flowPrimaryView: "library",
+      flowPrimaryView: "connections",
       toolStageOpen: true,
       activeToolKind: "extensions",
     }),
@@ -35,16 +53,16 @@ test("keeps contextual tool stages attached to their primary destination", () =>
   assert.equal(
     resolveSidebarDestination({
       experienceMode: "flow",
-      flowPrimaryView: "library",
+      flowPrimaryView: "knowledge",
       toolStageOpen: true,
       activeToolKind: "browser",
     }),
-    "flow-library",
+    "flow-knowledge",
   );
   assert.equal(
     resolveSidebarDestination({
       experienceMode: "code",
-      flowPrimaryView: "library",
+      flowPrimaryView: "knowledge",
       toolStageOpen: true,
       activeToolKind: "terminal",
     }),

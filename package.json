@@ -9,7 +9,7 @@
     "dev": "pnpm --filter @opentopia/desktop dev",
     "dev:desktop": "pnpm --filter @opentopia/desktop dev",
     "dev:server": "cargo run -p opentopia-server",
-    "check": "cargo check --workspace && pnpm --filter @opentopia/desktop typecheck && pnpm --filter @opentopia/desktop test && pnpm design:check && pnpm boundary:check && pnpm test:evaluation",
+    "check": "cargo check --workspace && pnpm --filter @opentopia/desktop contracts:check && pnpm --filter @opentopia/desktop typecheck && pnpm --filter @opentopia/desktop test && pnpm design:check && pnpm boundary:check && pnpm test:evaluation",
     "test": "pnpm --filter @opentopia/desktop test",
     "test:evaluation": "node --test evaluation/test/*.test.mjs",
     "test:provider-release": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-provider-tool-cache-release.ps1",

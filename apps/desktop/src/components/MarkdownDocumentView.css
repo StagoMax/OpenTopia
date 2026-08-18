@@ -1,0 +1,75 @@
+.markdown-document-view {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  flex-direction: column;
+  background: var(--surface);
+}
+
+.markdown-document-toolbar {
+  display: flex;
+  min-width: 0;
+  min-height: calc(var(--control-height-md) + var(--space-4));
+  align-items: center;
+  gap: var(--space-4);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-subtle);
+  padding: var(--space-2) var(--space-4);
+}
+
+.markdown-document-status {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-3);
+  margin-left: auto;
+}
+
+.markdown-document-message {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  border-bottom: 1px solid var(--border);
+  background: var(--danger-subtle);
+  color: var(--danger);
+  padding: var(--space-3) var(--space-6);
+  font-size: var(--font-size-sm);
+}
+
+.markdown-document-message span {
+  overflow-wrap: anywhere;
+}
+
+.markdown-document-body {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+}
+
+.markdown-document-body.mode-preview,
+.markdown-document-body.mode-source {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.markdown-document-body.mode-split {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.markdown-source-pane,
+.markdown-preview-pane {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.markdown-document-body.mode-split .markdown-preview-pane {
+  border-left: 1px solid var(--border);
+}
+
+.markdown-source-pane .monaco-editor-wrapper {
+  height: 100%;
+  min-height: 0;
+  border: 0;
+}

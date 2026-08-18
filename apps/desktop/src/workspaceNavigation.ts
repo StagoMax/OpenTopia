@@ -1,6 +1,17 @@
 import type { ExperienceMode } from "./types";
 
-export type SidebarDestination = "conversation" | "flow-library" | "plugins";
+export type FlowPrimaryView =
+  | "conversation"
+  | "inbox"
+  | "connections"
+  | "knowledge";
+
+export type SidebarDestination =
+  | "conversation"
+  | "flow-inbox"
+  | "flow-connections"
+  | "flow-knowledge"
+  | "plugins";
 
 export function resolveSidebarDestination({
   experienceMode,
@@ -9,7 +20,7 @@ export function resolveSidebarDestination({
   activeToolKind,
 }: {
   experienceMode: ExperienceMode;
-  flowPrimaryView: "conversation" | "library";
+  flowPrimaryView: FlowPrimaryView;
   toolStageOpen: boolean;
   activeToolKind: string | null;
 }): SidebarDestination {
@@ -17,8 +28,8 @@ export function resolveSidebarDestination({
     return "plugins";
   }
 
-  if (experienceMode === "flow" && flowPrimaryView === "library") {
-    return "flow-library";
+  if (experienceMode === "flow" && flowPrimaryView !== "conversation") {
+    return `flow-${flowPrimaryView}`;
   }
 
   return "conversation";

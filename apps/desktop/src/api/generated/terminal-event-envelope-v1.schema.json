@@ -1,0 +1,124 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "DesktopStreamKind": {
+      "enum": [
+        "agent_event",
+        "agent_activity",
+        "terminal_event"
+      ],
+      "type": "string"
+    },
+    "TerminalEvent": {
+      "properties": {
+        "command": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "commandId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "cwd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "data": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "exitCode": {
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "seq": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "success": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "threadId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/definitions/TerminalEventKind"
+        }
+      },
+      "required": [
+        "commandId",
+        "createdAt",
+        "id",
+        "seq",
+        "threadId",
+        "type"
+      ],
+      "type": "object"
+    },
+    "TerminalEventKind": {
+      "enum": [
+        "started",
+        "stdout",
+        "stderr",
+        "finished",
+        "cancelled",
+        "error"
+      ],
+      "type": "string"
+    }
+  },
+  "properties": {
+    "apiVersion": {
+      "format": "uint16",
+      "maximum": 1.0,
+      "minimum": 1.0,
+      "type": "integer"
+    },
+    "data": {
+      "$ref": "#/definitions/TerminalEvent"
+    },
+    "kind": {
+      "$ref": "#/definitions/DesktopStreamKind"
+    },
+    "seq": {
+      "format": "int64",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "apiVersion",
+    "data",
+    "kind",
+    "seq"
+  ],
+  "title": "DesktopStreamEnvelope_for_TerminalEvent",
+  "type": "object"
+}

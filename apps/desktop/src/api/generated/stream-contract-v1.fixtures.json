@@ -1,0 +1,46 @@
+{
+  "agentActivity": {
+    "apiVersion": 1,
+    "data": {
+      "agentThreadId": "00000000-0000-4000-8000-000000000003",
+      "seq": 9
+    },
+    "kind": "agent_activity",
+    "seq": 9
+  },
+  "agentEvent": {
+    "apiVersion": 1,
+    "data": {
+      "createdAt": "2026-08-17T00:00:00Z",
+      "id": "00000000-0000-4000-8000-000000000001",
+      "payload": {
+        "text": "hello",
+        "type": "model_delta"
+      },
+      "seq": 7,
+      "threadId": "00000000-0000-4000-8000-000000000002",
+      "turnId": null
+    },
+    "kind": "agent_event",
+    "seq": 7
+  },
+  "terminalEvent": {
+    "apiVersion": 1,
+    "data": {
+      "command": null,
+      "commandId": "00000000-0000-4000-8000-000000000005",
+      "createdAt": "2026-08-17T00:00:00Z",
+      "cwd": null,
+      "data": "ok",
+      "exitCode": null,
+      "id": "00000000-0000-4000-8000-000000000004",
+      "message": null,
+      "seq": 10,
+      "success": null,
+      "threadId": "00000000-0000-4000-8000-000000000002",
+      "type": "stdout"
+    },
+    "kind": "terminal_event",
+    "seq": 10
+  }
+}

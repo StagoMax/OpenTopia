@@ -19,6 +19,7 @@ const net = require("node:net");
 const updater = require("./updater.cjs");
 const { createDesktopBrowserHost } = require("./browser-host.cjs");
 const { createChromeBridge } = require("./chrome-bridge.cjs");
+const { createAppLogger } = require("./logging.cjs");
 const {
   DEFAULT_SAG_URL,
   createSagServiceManager,
@@ -46,6 +47,21 @@ let defaultBackendUrl =
   process.env.OPENTOPIA_SERVER_URL || "http://127.0.0.1:8787";
 const backendApiToken = crypto.randomBytes(32).toString("base64url");
 const openTopiaProtocol = "opentopia";
+const {
+  backendEndpointInfo,
+  ensureLoggingInitialized,
+  getLogPaths,
+  isSecretName,
+  logConsole,
+  redactSecrets,
+  serializeError,
+  writeLog,
+} = createAppLogger({
+  app,
+  apiToken: backendApiToken,
+  getBackendUrl: () => defaultBackendUrl,
+  isDev,
+});
 
 /*
  * The Windows caption buttons are drawn by the OS above the renderer. Keep the
@@ -67,11 +83,6 @@ let mainWindow = null;
 const appWindows = new Set();
 let backendProcess = null;
 let protocolClientRegistered = false;
-let loggingInitialized = false;
-let logFilePath = null;
-let crashLogFilePath = null;
-let logsDirPath = null;
-let crashLogsDirPath = null;
 let nextOpenRequestId = 1;
 let desktopBrowserHost = null;
 let desktopBrowserBroker = null;
@@ -104,180 +115,6 @@ const providerSecretEnvNames = [
   "CREDIT_REVIEW_LLM_API_KEY",
   "AUDIT_COPILOT_LLM_API_KEY",
 ];
-
-function isSecretName(name) {
-  return /api[_-]?key|token|secret|password|authorization|credential/i.test(
-    String(name || ""),
-  );
-}
-
-function redactSecrets(value) {
-  let output = String(value)
-    .split(backendApiToken)
-    .join("[redacted:api-token]");
-  for (const [key, secretValue] of Object.entries(process.env)) {
-    if (!isSecretName(key) || !secretValue || secretValue.length < 4) continue;
-    output = output.split(secretValue).join(`[redacted:${key}]`);
-  }
-
-  return output
-    .replace(/(Bearer\s+)[^\s"'`]+/gi, "$1[redacted]")
-    .replace(
-      /([?&][^=&\s]*(?:api[_-]?key|token|secret|password)[^=&\s]*=)[^&\s]+/gi,
-      "$1[redacted]",
-    )
-    .replace(
-      /((?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;]+)/gi,
-      "$1[redacted]",
-    )
-    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, "[redacted-api-key]");
-}
-
-function serializeError(error) {
-  if (!error) return null;
-  return {
-    name: error.name || "Error",
-    message: redactSecrets(error.message || String(error)),
-    stack: error.stack ? redactSecrets(error.stack) : undefined,
-    code: error.code,
-  };
-}
-
-function sanitizeForLog(value, key = "", depth = 0) {
-  if (isSecretName(key)) return "[redacted]";
-  if (value instanceof Error) return serializeError(value);
-  if (typeof value === "string") return redactSecrets(value);
-  if (
-    value === null ||
-    value === undefined ||
-    typeof value === "number" ||
-    typeof value === "boolean"
-  ) {
-    return value;
-  }
-  if (depth > 6) return "[max-depth]";
-  if (Array.isArray(value)) {
-    return value.map((entry) => sanitizeForLog(entry, key, depth + 1));
-  }
-  if (typeof value === "object") {
-    const sanitized = {};
-    for (const [entryKey, entryValue] of Object.entries(value)) {
-      sanitized[entryKey] = sanitizeForLog(entryValue, entryKey, depth + 1);
-    }
-    return sanitized;
-  }
-  return redactSecrets(String(value));
-}
-
-function backendEndpointInfo() {
-  try {
-    const parsed = new URL(defaultBackendUrl);
-    return {
-      url: parsed.toString(),
-      protocol: parsed.protocol,
-      host: parsed.hostname,
-      port:
-        parsed.port ||
-        (parsed.protocol === "https:"
-          ? "443"
-          : parsed.protocol === "http:"
-            ? "80"
-            : ""),
-    };
-  } catch {
-    return { url: redactSecrets(defaultBackendUrl) };
-  }
-}
-
-function ensureLoggingInitialized() {
-  if (loggingInitialized) return;
-  loggingInitialized = true;
-
-  logsDirPath = path.join(app.getPath("userData"), "logs");
-  crashLogsDirPath = path.join(logsDirPath, "crashes");
-  fs.mkdirSync(crashLogsDirPath, { recursive: true });
-
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  logFilePath = path.join(
-    logsDirPath,
-    `startup-${timestamp}-${process.pid}.jsonl`,
-  );
-  crashLogFilePath = path.join(
-    crashLogsDirPath,
-    `crash-${timestamp}-${process.pid}.jsonl`,
-  );
-
-  writeLog("info", "app.logging.ready", {
-    pid: process.pid,
-    isDev,
-    userData: app.getPath("userData"),
-    logsDir: logsDirPath,
-    crashLogsDir: crashLogsDirPath,
-    backend: backendEndpointInfo(),
-  });
-
-  process.on("uncaughtExceptionMonitor", (error) => {
-    writeLog("error", "process.uncaughtException", { error });
-  });
-  process.on("unhandledRejection", (reason) => {
-    writeLog("error", "process.unhandledRejection", {
-      reason: reason instanceof Error ? serializeError(reason) : reason,
-    });
-  });
-  app.on("render-process-gone", (_event, webContents, details) => {
-    writeCrashLog("error", "crash.render-process-gone", {
-      url: webContents?.getURL?.(),
-      details,
-    });
-  });
-  app.on("child-process-gone", (_event, details) => {
-    writeCrashLog("error", "crash.child-process-gone", { details });
-  });
-}
-
-function appendLogLine(targetPath, level, event, metadata) {
-  if (!targetPath) return;
-  const record = {
-    ts: new Date().toISOString(),
-    level,
-    event,
-    metadata: sanitizeForLog(metadata || {}),
-  };
-  fs.appendFileSync(targetPath, `${JSON.stringify(record)}\n`, "utf8");
-}
-
-function writeLog(level, event, metadata = {}) {
-  try {
-    appendLogLine(logFilePath, level, event, metadata);
-  } catch (error) {
-    console.error("[opentopia] failed to write log", serializeError(error));
-  }
-}
-
-function writeCrashLog(level, event, metadata = {}) {
-  writeLog(level, event, metadata);
-  try {
-    appendLogLine(crashLogFilePath, level, event, metadata);
-  } catch (error) {
-    console.error(
-      "[opentopia] failed to write crash log",
-      serializeError(error),
-    );
-  }
-}
-
-function logConsole(level, message, metadata = {}) {
-  writeLog(level, message, metadata);
-  const line = `[opentopia] ${message}`;
-  const sanitized = sanitizeForLog(metadata);
-  if (level === "error") {
-    console.error(line, sanitized);
-  } else if (level === "warn") {
-    console.warn(line, sanitized);
-  } else {
-    console.log(line, sanitized);
-  }
-}
 
 function prependPath(env, entry) {
   if (!entry || !fs.existsSync(entry)) return;
@@ -783,6 +620,13 @@ function createBackendEnv(repoRoot, options = {}) {
     env.CARGO_TARGET_DIR ||=
       process.env.OPENTOPIA_DEV_CARGO_TARGET_DIR ||
       path.join(repoRoot, "target", "desktop-dev");
+  }
+
+  if (!isDev) {
+    const bundle = resolvePackagedRuntimeBundle();
+    if (bundle?.officeRuntimeRoot) {
+      env.OPENTOPIA_OFFICE_RUNTIME_ROOT = bundle.officeRuntimeRoot;
+    }
   }
 
   if (desktopBrowserBroker) {
@@ -2074,8 +1918,8 @@ function registerIpc() {
     keyring: keyringMetadata(),
     paths: {
       userData: app.getPath("userData"),
-      logs: logsDirPath,
-      crashLogs: crashLogsDirPath,
+      logs: getLogPaths().logsDirPath,
+      crashLogs: getLogPaths().crashLogsDirPath,
     },
     protocol: {
       scheme: openTopiaProtocol,
@@ -2233,6 +2077,7 @@ function registerIpc() {
   });
 
   ipcMain.handle("logs:list", async () => {
+    const { logsDirPath } = getLogPaths();
     if (!logsDirPath) return [];
     try {
       const entries = fs.readdirSync(logsDirPath, { withFileTypes: true });
@@ -2256,6 +2101,7 @@ function registerIpc() {
   });
 
   ipcMain.handle("logs:read", async (_event, filePath, offset, limit) => {
+    const { logsDirPath } = getLogPaths();
     const resolvedPath = path.resolve(filePath);
     if (!resolvedPath.startsWith(path.resolve(logsDirPath || ""))) {
       throw new Error("Access denied: log file path is outside logs directory");
