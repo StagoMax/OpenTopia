@@ -1,5 +1,18 @@
 # Repository Instructions
 
+## Performance Engineering
+
+- When designing architecture or implementing code, treat performance as a
+  first-class requirement. Consider startup and loading time, runtime latency,
+  main-thread blocking, memory and resource usage, and interaction smoothness.
+- Prefer designs that load only what is needed, avoid unnecessary work and
+  repeated computation, and keep expensive operations off latency-sensitive
+  paths so the application remains responsive and does not stutter.
+- For performance-sensitive changes, identify likely bottlenecks early and
+  verify the result with appropriate profiling, measurement, or regression
+  tests. Avoid speculative micro-optimizations that reduce clarity without
+  evidence of benefit.
+
 ## Desktop UI
 
 For any change under `apps/desktop/src` that adds or changes visible UI, read
