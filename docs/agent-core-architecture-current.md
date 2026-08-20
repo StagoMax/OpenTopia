@@ -251,7 +251,7 @@ flowchart TD
     CHECK["Inject runtime_rollout_checkpoint<br/>注入运行时长轮次检查点"]
     TOKEN{"Shared rollout tokens exhausted?<br/>共享长轮次 Token 已耗尽？"}
     REM["Collect step reminders<br/>收集步骤提醒"]
-    COMPACT["Compact completed tool history<br/>压缩已完成工具历史"]
+    COMPACT["Admit request and compact durable context<br/>请求准入并压缩 durable context"]
     MODEL["Next model round<br/>下一模型轮"]
     COMMITREM["Commit reminder delivery<br/>提交提醒交付状态"]
     DEC{"Decision<br/>决策"}
@@ -326,7 +326,7 @@ flowchart TD
 1. 判断主模型轮数是否达到 270；是则返回 `Stopped（已停止）`；
 2. 判断第 90 / 180 轮检查点是否到期；是则追加一对合成 Call / Result；
 3. 判断共享 Rollout Token Budget（长轮次 Token 预算）是否耗尽；是则返回错误；
-4. 收集步骤提醒、压缩旧工具历史；
+4. 收集步骤提醒，并让完整请求经过统一的 context pressure admission；Round 0 也经过同一边界；
 5. 调用下一模型轮；成功返回后才提交提醒交付状态；
 6. 新决策若为 `Act`，生成下一批待执行队列；若为 `Final`，进入收尾守卫。
 
@@ -530,11 +530,11 @@ AgentCore 在第 90 和 180 个已完成主模型轮之后注入 `runtime_rollou
 
 主模型自己进行 self-review（自我审视）并决定继续或调整。运行时不会启动另一个“进度裁判模型”。第 270 轮是硬上限，到达后保留已完成工作并返回停止结果。
 
-### 6.4 工具历史压缩为什么仍然不具备指令权
+### 6.4 Durable context compaction 为什么仍然不具备指令权
 
-长 Turn 中，AgentCore 会保留至少 4 个最近工具结果，把更早的完整 Call / Result 对压缩成最多约 12,000 字符的摘要，并删除孤立 Provider 状态项。
+每次 Provider 请求（包括新 Turn 的 Round 0）都先装配唯一的规范 `ModelRequest`，再用该请求的完整输入估算和生成预留计算 context pressure。默认达到 80% 时，AgentCore 把同一份请求通过 `RoundContextCompactor` 交给服务端，一次生成结构化 durable checkpoint；成功后 checkpoint 替换旧 checkpoint 与该请求中的历史 conversation，已完成且纳入请求的 Call / Result 被移除，当前用户输入和 live round state 保留。压缩后不设 65% 固定目标，而是记录请求重建前后的实际 token 与剩余比例。
 
-压缩文本明确标记为 untrusted tool observations（不受信任的工具观察），不是 instructions（指令）。压缩不重启 Turn，也不能把工具输出提升为 Developer 权限。
+Checkpoint 是 provider-neutral 的历史状态投影，不是新指令。它按阶段保存时间、问题、根因、解决方式、结果与指标；当前用户输入、未完成工具调用、竞态中尚未持久化的结果和审批边界都不会被裁剪。本地 checkpoint 建立后会清除旧 Provider 的 opaque lineage，避免把不兼容的 reasoning / compaction 状态混入新请求 epoch。
 
 ## 7. 暂停与恢复是同一个状态机
 
@@ -590,7 +590,7 @@ Continuation 保存两类状态：
 - Tool Candidates（工具候选）；
 - 所有 Provider Tool Calls 与 Results；
 - Pending Tool Queue；
-- 已压缩工具历史；
+- 兼容旧 continuation schema 的已压缩工具历史字段（新路径保持为空）；
 - Provider Response Items；
 - model rounds、rollout reviews、TurnRuntimeState；
 - branch instructions 与 provider compatibility hash。
@@ -872,8 +872,7 @@ AgentCore 对工具有三种不同问题：
 | `ROLLOUT_REVIEW_INTERVAL` | 90 | 长轮次按稀疏检查点让主模型自审 |
 | `MAX_ROLLOUT_MODEL_ROUNDS` | 270 | 运行时硬上限，避免无限主模型循环 |
 | `MAX_FINALIZATION_GUARD_ACTIVATIONS` | 3 | 收尾阻塞反馈有界，避免无限 Final 往返 |
-| `MIN_RETAINED_TOOL_RESULTS_AFTER_COMPACTION` | 4 | 压缩旧历史时保留最近完整观察 |
-| `MAX_COMPACTED_TOOL_HISTORY_CHARS` | 12,000 | 控制长 Turn 内工具摘要尺寸 |
+| `OPENTOPIA_CONTEXT_COMPACT_THRESHOLD_PERCENT` | 80%（可配置，50%–95%） | 每个 Provider round 的统一 pressure 触发线 |
 | `AUTOMATIC_TOOL_DISCLOSURE_COUNT_THRESHOLD` | 24 | 大目录开始采用渐进式工具披露 |
 | `AUTOMATIC_TOOL_DISCLOSURE_TOKEN_THRESHOLD` | 12,000 | Schema 成本过高时保护模型上下文 |
 | `MAX_TOOL_SEARCH_RESULTS` | 12 | 单次揭示有界，避免搜索重新膨胀目录 |
@@ -919,7 +918,9 @@ AgentCore 对工具有三种不同问题：
 - `crates/opentopia-core/src/agent.rs:4854` — `finalize_provider_turn（完成提供商轮次）`
 - `crates/opentopia-core/src/agent.rs:5028` — `finalization_outcome（分类完成 / 部分完成 / 被阻塞）`
 - `crates/opentopia-core/src/agent.rs:5187` — `current_task_plan_for_tool（为工具装配当前计划）`
-- `crates/opentopia-core/src/agent.rs:5444` — `compact_completed_tool_history（压缩已完成工具历史）`
+- `crates/opentopia-core/src/agent/context_pressure.rs` — `admitted_round_request（统一 Provider round 请求准入）`
+- `crates/opentopia-core/src/round_compaction.rs` — `RoundContextCompactor（durable 压缩端口）`
+- `crates/opentopia-server/src/context_api/round_compaction.rs` — `ServerRoundContextCompactor（完整规范请求的一次性 checkpoint 实现）`
 - `crates/opentopia-core/src/agent.rs:5656` — `build_model_request（构建模型请求）`
 - `crates/opentopia-core/src/agent.rs:6207` — `AgentTurnInput（智能体轮次输入）`
 - `crates/opentopia-core/src/tools.rs:1257` — `RequestUserInputTool（请求用户输入工具）`

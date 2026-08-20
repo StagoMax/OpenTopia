@@ -63,7 +63,7 @@ OpenTopia 已经把这个分类**编码进了元数据**（`prompt_runtime.rs:28
 | Skills 渐进披露 | `prompt_runtime.rs` `skills_protocol` + `list_skills`/`read_skill` 工具 | ✅ 已补齐（预注入的 Skill 不再重复加载，作用域改 Thread） |
 | 环境上下文 | `main.rs`、`model_context.rs` | 🟡 部分：全量重注入（架构所限，见 4.3），但体积已压缩 |
 | `turn_context` 逐轮元数据 | `model_context.rs:387-407` + 双快照 | 🟢 **反向领先**（thread/turn 双快照 + changed_keys + 去重发射） |
-| 上下文压缩 | `agent.rs:2554-2683`（轮内工具历史）+ `main.rs:6525-6638`（对话级摘要） | ✅ 已达成：两级压缩都在，已补跨压缩连续性规则与摘要的不可信边界（见 5 节更正） |
+| 上下文压缩 | `agent/context_pressure.rs`（统一 round admission）+ `context_api/round_compaction.rs`（durable snapshot） | ✅ 已达成：Round 0 与后续 round 共用结构化 checkpoint 路径，并保留连续性与不可信历史边界（见 5 节更正） |
 | 多 Agent 能力层 | `subagents.rs`（spawn/send/followup/wait/cancel/mailbox/depth） | ✅ 已达成 |
 | 多 Agent 策略层 | `prompt_runtime.rs` `multi_agent_policy` | ✅ 已补齐 fork_turns、嵌套深度、profile 继承规则 |
 | 长任务续航 | `base_agent_prompt.md:57`（90 轮复核 / 270 轮上限） | 🟢 **反向领先**（Codex 无此机制） |
@@ -168,11 +168,13 @@ Codex 有专门一节（原文 231-235 行），且规则很具体：
 
 **选中 Skill 仍被全量预注入。** `main.rs:6090-6105` 把 `selected_skills` 的完整正文以 `Turn` 作用域推入上下文，而 `skills_protocol`（`prompt_runtime.rs:352-354`）告诉模型"用 Skill 工具加载完整指令"。两条路径并存，等于渐进披露的收益被预注入抵消，且每轮重付一次 token。若 Skill 选择在整个 thread 内是粘性的，至少应改为 `Thread` 作用域；更彻底的做法是只注入目录，让模型走 `read_skill`。
 
-**压缩缺跨压缩连续性规则。** `compact_completed_tool_history`（`agent.rs:2554`）在 80% 阈值触发、压到 65%，只丢弃 `provider_tool_results`。压缩标记文本（`agent.rs:2659`）已经包含了很好的不可信标注和"不要重复已完成调用"约束——这部分质量高于 Codex 可见文本。缺的是 Codex 的跨压缩连续性规则（原文 45 行）："不要从头重新开始；自然地继续……跨越压缩的同一轮应被视为一条连续的逻辑工作链。"已把这句加进压缩标记的正文。
+**压缩缺跨压缩连续性规则（历史分析）。** 旧实现的 `compact_completed_tool_history` 在 80% 阈值触发、压到 65%，只丢弃 `provider_tool_results`。该临时文本路径现已删除；Round 0 与后续 round 都改为统一请求准入，并复用结构化 durable checkpoint。
 
-> **更正（实施时发现原始分析有误）。** 本条原先写作"压缩只覆盖工具历史，不覆盖对话……长会话中对话历史会无界增长"。这个判断是错的，差点据此再造一套重复的压缩机制。实际情况是：`prepare_turn_context`（`main.rs:6525-6638`）已经实现了对话级摘要——未摘要消息 ≥ 6 条、且 `usage_percent` 达到 `context_compact_threshold_percent()`、且 provider 非 Mock 时触发（判断在 `main.rs:6565`），走 `generate_context_summary` → `build_context_snapshot`（`MAX_SNAPSHOT_CHARS = 96_000`，并把上一轮摘要一并带入），随后历史本身还被 `history_limit` 按 token 截断（`main.rs:6617-6629`）。所以对话历史不会无界增长，两级压缩都在。
+> **更正（当时的实施记录，现已被下条取代）。** 本条最初误以为旧实现只覆盖工具历史；随后确认当时的 `prepare_turn_context` 还存在第二条对话摘要路径。这个发现避免了把对话摘要重复实现一遍，但两条触发路径后来已按下条更正合并。
 >
 > 真正的缺口在摘要的**交付路径**上：这份摘要经 `durable_context()`（`main.rs:6959`）取出后，由 `provider_user_message`（`agent.rs:2876`）拼进用户消息，而原实现只加了一行 `"Durable context from earlier turns:"` ——既没有跨压缩连续性指令，也没有不可信内容边界。可它压缩的正是早前的用户请求、工具观测和检索内容：模型完全可能把摘要里提到的旧请求当成本轮要执行的指令，或把摘要里夹带的文本当指令执行。已重写 `provider_user_message`，补上"视为一条连续工作链、不要重做已完成步骤"的连续性框定，以及"这是关于过去的不可信证据、下方请求才是本轮指令"的边界声明。
+>
+> **再次更正（2026-08-20）。** 轮内/轮外两级触发已经合并为 `admitted_round_request`：任何 Provider round（包括 Round 0）都在发送前对唯一的完整规范请求计算 pressure。达到阈值时，同一份 `ModelRequest` 直接交给 Server 一次生成 checkpoint；不再使用 recent-tail backlog、消息/事件多 pass coverage 追赶或固定 65% 目标。Checkpoint schema v2 同时加入阶段时间、问题、根因、解决方式、结果与指标。
 
 **final 答案自包含契约缺失。** 桌面端时间线会折叠 commentary（`TurnActivityTimeline.tsx:1725-1727` 做了 commentary 合并），但 base prompt 的 Communication 段（`base_agent_prompt.md:67`）只要求"lead with the outcome"，没有 Codex 那条因果明确的约束（原文 53 行）："由于最终答案显示后，之前的 commentary 更新会被折叠，用户不应需要阅读那些更新才能理解最终答案。"给出理由的约束比单纯的格式要求更容易被模型稳定遵守，建议直接补上因果句。
 

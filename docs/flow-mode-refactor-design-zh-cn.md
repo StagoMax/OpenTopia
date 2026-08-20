@@ -1,7 +1,7 @@
 # OpenTopia 企业 Agent 与 Workflow 重构设计方案
 
-> 状态：设计提案 v1.4
-> 日期：2026-08-17
+> 状态：设计提案 v1.9（Phase 3 Durable Interrupt / HumanTask Resume 已实现）
+> 日期：2026-08-20
 > 输入：`Flow模式重构.md`、当前仓库实现、`docs/enterprise-agent-platform-design-zh-cn.md`
 > 范围：企业 Agent 与 Workflow 控制面、模板、状态图运行时、部署、触发器、输出、连接器权限、人工任务和桌面 UI
 
@@ -44,16 +44,16 @@ WorkflowDefinition（UI：工作流模板）
 
 ### 1.1 命名约定
 
-| 中文产品名称 | UI 英文 | 领域/代码名称 | 职责 |
-| --- | --- | --- | --- |
-| Agent 模板 | Agent templates | `AgentTemplateVersion` | Library、Connection、工具、模型、权限和行为的可复用配置 |
-| Agent | Agents | `Agent` | 可独立对话和执行任务的稳定身份 |
-| 流程 Agent 配置 | Workflow agent | `WorkflowAgentSpec` | 从 Agent 模板派生的工作流内嵌配置，不持有运行状态 |
-| 工作流模板 | Workflow templates | `WorkflowDefinitionVersion` | Agent 配置、编排、Trigger 和 Output 的不可变定义 |
-| 工作流部署 | Deployments | `WorkflowDeployment` | 将定义绑定到部门、环境和真实端点并激活 |
-| 工作流运行 | Runs / Cases | `WorkflowRun` | 一次触发产生的具体执行 |
-| 人工任务 | Inbox | `HumanTask` | 审批、补充输入、输出审查、恢复和人工处理 |
-| 工作流运行时 | Workflow runtime | `WorkflowRuntime` | 共享调度和执行基础设施，不是用户创建的业务对象 |
+| 中文产品名称    | UI 英文            | 领域/代码名称               | 职责                                                    |
+| --------------- | ------------------ | --------------------------- | ------------------------------------------------------- |
+| Agent 模板      | Agent templates    | `AgentTemplateVersion`      | Library、Connection、工具、模型、权限和行为的可复用配置 |
+| Agent           | Agents             | `Agent`                     | 可独立对话和执行任务的稳定身份                          |
+| 流程 Agent 配置 | Workflow agent     | `WorkflowAgentSpec`         | 从 Agent 模板派生的工作流内嵌配置，不持有运行状态       |
+| 工作流模板      | Workflow templates | `WorkflowDefinitionVersion` | Agent 配置、编排、Trigger 和 Output 的不可变定义        |
+| 工作流部署      | Deployments        | `WorkflowDeployment`        | 将定义绑定到部门、环境和真实端点并激活                  |
+| 工作流运行      | Runs / Cases       | `WorkflowRun`               | 一次触发产生的具体执行                                  |
+| 人工任务        | Inbox              | `HumanTask`                 | 审批、补充输入、输出审查、恢复和人工处理                |
+| 工作流运行时    | Workflow runtime   | `WorkflowRuntime`           | 共享调度和执行基础设施，不是用户创建的业务对象          |
 
 ## 2. 当前实现判断
 
@@ -74,15 +74,15 @@ WorkflowDefinition（UI：工作流模板）
 
 当前实现的主要问题不是某个组件缺字段，而是产品对象边界还不完整：
 
-| 现状 | 根因 | 结果 |
-| --- | --- | --- |
-| FlowDraft、发布 Flow 和 Run 集中在同一个面板 | Definition、Deployment、Run 没有独立产品入口 | 配置密集、对象关系不清晰 |
-| 直接编辑 Flow spec JSON | 领域对象没有形成业务化编辑器 | 只有开发者可用，难以审查权限和数据流 |
-| Agent 模板用逗号列表和 JSON 配资源 | 能力目录没有被产品化 | 无法看见 App 的操作级权限和来源 |
-| 已发布 Flow 可直接在会话中启动 | 缺少 WorkflowDeployment | 无法把跑通的模板部署为稳定、可触发的业务对象 |
-| Approval 只是 Run 的一种状态 | 缺少独立 HumanTask 模型 | 无法统一处理审批、补充输入、恢复、分派、SLA 和审计 |
-| Library、Plugin、MCP、App 概念并列 | 包、连接实例、业务数据和授权没有分层 | 用户不知道“装了什么”“连了什么”“谁能做什么” |
-| Flow 是右侧 Tool Stage | Flow 仍被当作会话的附属工具 | 无法承载企业运营工作台 |
+| 现状                                         | 根因                                         | 结果                                               |
+| -------------------------------------------- | -------------------------------------------- | -------------------------------------------------- |
+| FlowDraft、发布 Flow 和 Run 集中在同一个面板 | Definition、Deployment、Run 没有独立产品入口 | 配置密集、对象关系不清晰                           |
+| 直接编辑 Flow spec JSON                      | 领域对象没有形成业务化编辑器                 | 只有开发者可用，难以审查权限和数据流               |
+| Agent 模板用逗号列表和 JSON 配资源           | 能力目录没有被产品化                         | 无法看见 App 的操作级权限和来源                    |
+| 已发布 Flow 可直接在会话中启动               | 缺少 WorkflowDeployment                      | 无法把跑通的模板部署为稳定、可触发的业务对象       |
+| Approval 只是 Run 的一种状态                 | 缺少独立 HumanTask 模型                      | 无法统一处理审批、补充输入、恢复、分派、SLA 和审计 |
+| Library、Plugin、MCP、App 概念并列           | 包、连接实例、业务数据和授权没有分层         | 用户不知道“装了什么”“连了什么”“谁能做什么”         |
+| Flow 是右侧 Tool Stage                       | Flow 仍被当作会话的附属工具                  | 无法承载企业运营工作台                             |
 
 当前 `ExperienceSurfaceProfile::Flow` 使用 unrestricted 能力，再依赖后续上下文收窄。对 Flow 设计态来说边界过宽。设计会话默认只应看见目录、设计、验证、模拟和发布工具；生产操作必须通过独立 Trial 或 WorkflowDeployment 的执行快照获得。
 
@@ -90,16 +90,16 @@ WorkflowDefinition（UI：工作流模板）
 
 命名调整不要求第一阶段立即重命名所有代码。先通过领域服务和 ViewModel 建立语义边界，再决定是否迁移底层类型：
 
-| 当前实现 | 目标领域语义 | 迁移建议 |
-| --- | --- | --- |
-| `AgentTemplateVersionV1` | `AgentTemplateVersion` | 保留，名称已经准确 |
-| `AgentInstanceV1` | `Agent` | API/UI 简化为 Agent，内部可暂时保留类型名 |
-| `FlowDraftV1` | `WorkflowDraft` | 通过适配层迁移，不阻塞现有 `flow_*` 工具 |
-| `FlowDefinitionV1` | `WorkflowDefinitionVersion` | 明确它是不可变定义，不是部署 |
-| 新增 | `WorkflowAgentSpec` | 从 AgentTemplate 派生的工作流内嵌配置 |
-| 新增 | `WorkflowDeployment` | 补齐定义到生产运行之间的部署层 |
-| `FlowRunV1` | `WorkflowRun` | 保留存储兼容，逐步切换 API/ViewModel |
-| `FlowRuntime` | `WorkflowRuntime` | 共享运行时，不暴露为用户可创建对象 |
+| 当前实现                 | 目标领域语义                | 迁移建议                                  |
+| ------------------------ | --------------------------- | ----------------------------------------- |
+| `AgentTemplateVersionV1` | `AgentTemplateVersion`      | 保留，名称已经准确                        |
+| `AgentInstanceV1`        | `Agent`                     | API/UI 简化为 Agent，内部可暂时保留类型名 |
+| `FlowDraftV1`            | `WorkflowDraft`             | 通过适配层迁移，不阻塞现有 `flow_*` 工具  |
+| `FlowDefinitionV1`       | `WorkflowDefinitionVersion` | 明确它是不可变定义，不是部署              |
+| 新增                     | `WorkflowAgentSpec`         | 从 AgentTemplate 派生的工作流内嵌配置     |
+| 新增                     | `WorkflowDeployment`        | 补齐定义到生产运行之间的部署层            |
+| `FlowRunV1`              | `WorkflowRun`               | 保留存储兼容，逐步切换 API/ViewModel      |
+| `FlowRuntime`            | `WorkflowRuntime`           | 共享运行时，不暴露为用户可创建对象        |
 
 ## 3. 统一术语与领域模型
 
@@ -267,14 +267,14 @@ HumanTask
 
 并非所有失败都应进入 Inbox。Runtime 先对中断进行分类：
 
-| 中断类型 | WorkflowRun 行为 | 是否创建 HumanTask |
-| --- | --- | --- |
-| 短暂技术故障，例如超时或限流 | 按策略自动重试和退避 | 否，超过阈值后再转人工或失败 |
-| 预先声明的审批检查点 | 保存 checkpoint，进入 `waiting_for_human` | 是：`approval` |
-| 缺少业务输入或需要选择分支 | 保存 checkpoint，进入 `waiting_for_human` | 是：`input_request` |
-| Connection 登录过期 | 保存 checkpoint，进入 `waiting_for_human` | 是：`reconnect` |
-| 人可以采取恢复动作的中断性失败 | 保存错误、证据和外部副作用状态，进入 `waiting_for_human` | 是：`recovery` |
-| 不可恢复或不应由人决定的终止错误 | 进入 `failed`，保留重新运行入口 | 否，避免制造无意义待办 |
+| 中断类型                         | WorkflowRun 行为                                         | 是否创建 HumanTask           |
+| -------------------------------- | -------------------------------------------------------- | ---------------------------- |
+| 短暂技术故障，例如超时或限流     | 按策略自动重试和退避                                     | 否，超过阈值后再转人工或失败 |
+| 预先声明的审批检查点             | 保存 checkpoint，进入 `waiting_for_human`                | 是：`approval`               |
+| 缺少业务输入或需要选择分支       | 保存 checkpoint，进入 `waiting_for_human`                | 是：`input_request`          |
+| Connection 登录过期              | 保存 checkpoint，进入 `waiting_for_human`                | 是：`reconnect`              |
+| 人可以采取恢复动作的中断性失败   | 保存错误、证据和外部副作用状态，进入 `waiting_for_human` | 是：`recovery`               |
+| 不可恢复或不应由人决定的终止错误 | 进入 `failed`，保留重新运行入口                          | 否，避免制造无意义待办       |
 
 ```text
 WorkflowRun: running
@@ -517,24 +517,24 @@ Flow Runtime 建议系统性参考 LangGraph 的 `StateGraph`、持久化 Checkp
 
 ### 6.2 LangGraph 概念映射
 
-| LangGraph | OpenTopia 目标模型 | 中文解释与边界 |
-|---|---|---|
-| `StateGraph` | `WorkflowDefinitionVersion` | 已编译前的版本化工作流状态图 |
-| Compiled Graph | `CompiledWorkflow` | 完成图结构、schema、权限和路由验证的不可变执行计划 |
-| State | `WorkflowRunState` | 一次 Run 的类型化持久状态，不等于会话消息历史 |
-| State Channel | `WorkflowStateChannel` | 节点可读写的状态字段及其数据等级 |
-| Reducer | `StateReducer` | 串行或并行写入如何合并，禁止依赖隐式覆盖 |
-| Node | `WorkflowNode` | Agent、Tool、Condition、Approval、Join、Output 等执行单元 |
-| Edge / Conditional Edge | `WorkflowTransition` | 普通、条件、异常和循环转移 |
-| Thread | `WorkflowRun` | LangGraph 的持久执行游标映射到一次 Run，不与 ConversationThread 混用 |
-| Task | `NodeAttempt` | 某节点的一次可追踪执行尝试 |
-| Checkpoint | `WorkflowCheckpoint` | 已提交 superstep 的可恢复运行快照 |
-| Pending Writes | `WorkflowStateWrite` | 同一 superstep 中已完成节点的待合并结果 |
-| `interrupt()` | `InterruptRequest` | Runtime 发出的暂停协议，随后投影为产品级 HumanTask |
-| `Command(resume=...)` | `ResumeCommand` | 经权限验证、带 revision 的结构化恢复命令 |
-| Subgraph | `NestedWorkflow` / `AgentNodeRuntime` | 子工作流或复用现有 Agent Harness 的节点内部执行 |
-| State History | `Run Timeline` | Checkpoint、NodeAttempt、HumanTask 和状态差异时间线 |
-| Replay / Fork | `TrialReplay` / `RunFork` | 从历史检查点重放或创建隔离试验分支 |
+| LangGraph               | OpenTopia 目标模型                    | 中文解释与边界                                                       |
+| ----------------------- | ------------------------------------- | -------------------------------------------------------------------- |
+| `StateGraph`            | `WorkflowDefinitionVersion`           | 已编译前的版本化工作流状态图                                         |
+| Compiled Graph          | `CompiledWorkflow`                    | 完成图结构、schema、权限和路由验证的不可变执行计划                   |
+| State                   | `WorkflowRunState`                    | 一次 Run 的类型化持久状态，不等于会话消息历史                        |
+| State Channel           | `WorkflowStateChannel`                | 节点可读写的状态字段及其数据等级                                     |
+| Reducer                 | `StateReducer`                        | 串行或并行写入如何合并，禁止依赖隐式覆盖                             |
+| Node                    | `WorkflowNode`                        | Agent、Tool、Condition、Approval、Join、Output 等执行单元            |
+| Edge / Conditional Edge | `WorkflowTransition`                  | 普通、条件、异常和循环转移                                           |
+| Thread                  | `WorkflowRun`                         | LangGraph 的持久执行游标映射到一次 Run，不与 ConversationThread 混用 |
+| Task                    | `NodeAttempt`                         | 某节点的一次可追踪执行尝试                                           |
+| Checkpoint              | `WorkflowCheckpoint`                  | 已提交 superstep 的可恢复运行快照                                    |
+| Pending Writes          | `WorkflowStateWrite`                  | 同一 superstep 中已完成节点的待合并结果                              |
+| `interrupt()`           | `InterruptRequest`                    | Runtime 发出的暂停协议，随后投影为产品级 HumanTask                   |
+| `Command(resume=...)`   | `ResumeCommand`                       | 经权限验证、带 revision 的结构化恢复命令                             |
+| Subgraph                | `NestedWorkflow` / `AgentNodeRuntime` | 子工作流或复用现有 Agent Harness 的节点内部执行                      |
+| State History           | `Run Timeline`                        | Checkpoint、NodeAttempt、HumanTask 和状态差异时间线                  |
+| Replay / Fork           | `TrialReplay` / `RunFork`             | 从历史检查点重放或创建隔离试验分支                                   |
 
 必须保留四种不同 ID：`conversation_thread_id`、`workflow_run_id`、`agent_node_session_id` 和 `human_task_id`。一个会话可以触发多个 WorkflowRun；一个 WorkflowRun 可以拥有多个 Agent 节点会话和多个人工任务。
 
@@ -771,15 +771,15 @@ Flow 模式应是与 Code/Work 同级的完整 Surface，而不是右侧工具�
 
 一级导航决定下面 `Contextual Collection` 的对象类型：
 
-| 一级导航 | 下方列表展示 | 列表条目的关键信息 |
-| --- | --- | --- |
-| Overview | 最近对象与需要关注的异常 | 类型、状态、更新时间 |
-| Inbox | HumanTask | 类型、来源 Agent/Deployment/Run、原因、SLA、assignee |
-| Agents | Agent，顶部切换 AI 员工 / Agent Templates | 名称、归属、状态、最近活动 |
-| Workflow Templates | WorkflowDefinition | 草稿/已发布版本、Trial 状态、更新时间 |
-| Deployments | WorkflowDeployment | active/degraded/paused、环境、待办数量、最近运行 |
-| Runs | WorkflowRun / Case | 当前步骤、状态、时长、人工等待和风险 |
-| Connections | Connection | 登录账号、tenant、健康、重新认证状态 |
+| 一级导航           | 下方列表展示                              | 列表条目的关键信息                                   |
+| ------------------ | ----------------------------------------- | ---------------------------------------------------- |
+| Overview           | 最近对象与需要关注的异常                  | 类型、状态、更新时间                                 |
+| Inbox              | HumanTask                                 | 类型、来源 Agent/Deployment/Run、原因、SLA、assignee |
+| Agents             | Agent，顶部切换 AI 员工 / Agent Templates | 名称、归属、状态、最近活动                           |
+| Workflow Templates | WorkflowDefinition                        | 草稿/已发布版本、Trial 状态、更新时间                |
+| Deployments        | WorkflowDeployment                        | active/degraded/paused、环境、待办数量、最近运行     |
+| Runs               | WorkflowRun / Case                        | 当前步骤、状态、时长、人工等待和风险                 |
+| Connections        | Connection                                | 登录账号、tenant、健康、重新认证状态                 |
 
 不要在 Deployments 列表中混排 Agent 和 HumanTask。列表必须保持单一对象类型，通过 badge 和来源摘要表达关联；需要处理的事项统一进入 Inbox。每个一级入口独立保存搜索、筛选、滚动位置和已选对象，返回时恢复上下文；URL/route 同时包含 `section + selected_id`，便于通知 deep link 和审计跳转。
 
@@ -995,9 +995,74 @@ crates/opentopia-server/src/enterprise/
 
 退出条件：能回答“这个 Agent 通过哪个登录账号，为什么能对哪个 App 的哪个对象执行哪个操作”，并能在账号失效或能力变化时定位受影响对象。
 
+#### Phase 1A：已实现切片（MCP Connection Control Plane）
+
+当前先落地 Phase 1 的控制面骨架，并保持旧 MCP Runtime 与 `/api/mcp/**` 兼容：
+
+- 新增 `IntegrationDefinition`、账号级 `Connection` 和不可变 `ConnectionCapabilityRevision`；
+- `IntegrationDefinition` 只描述 Provider/服务目录，MCP runtime binding 归属于具体 `Connection`，避免多个账号静默共享同一个进程和凭据上下文；
+- 迁移现有 MCP Server 时保留原 UUID，回填一组 Definition + Connection，因此旧 Agent Template 和 Thread 引用不需要立即重写；
+- Connection 只保存 `vault://`、`keychain://`、`env://` 或 `plugin://` 等不透明凭据引用及非秘密账号元数据，不保存 token、password 或任意认证 payload；
+- 复用现有 `McpExtensionHost` 执行真实健康检查和 `tools/list`，规范化后发布内容哈希稳定的能力修订；相同内容不制造新修订，并返回新增、移除和变化的 operation diff；
+- operation 稳定 ID 使用 `connection_id + capability_kind + provider_native_name`，不依赖可编辑的 MCP display name；
+- 运行健康和认证验证是两个独立状态；stdio 进程可用不等于账号已经登录或凭据已经验证；
+- Desktop 将 Connections 作为固定一级入口，采用列表—详情布局，并提供账号/tenant、runtime、健康、测试、能力刷新和修订查看；左侧上下文集合只展示 Connection，不与会话混排。
+
+Phase 1A 的明确边界：首版只支持已有独立 stdio MCP runtime 的 `tools/list`；`resources/list` 与 `prompts/list` 必须标记为 `unsupported`。真正的 OAuth 登录回调、Vault 解析与注入、远程 HTTP MCP、多账号 runtime 创建、影响分析，以及 Agent Template 的结构化 `ConnectionBinding + OperationGrant` 留在 Phase 1B。新增能力在 Phase 1B 授权闭环完成前不会自动写入任何模板或扩大已有 Agent 权限。
+
+Phase 1A 退出条件：旧 MCP 配置可无损出现在 Connections 中；能区分 Provider 定义、账号 Connection、runtime 与能力修订；测试和刷新来自真实 MCP Host；任何 HTTP 响应、数据库文档和日志都不出现明文凭据。
+
+#### Phase 1B：已实现切片（Agent Template Operation Grants）
+
+本切片把 Phase 1A 的 Connection 能力目录接入 Agent Template，并把“界面上过滤工具”升级为真正的执行时权限边界：
+
+```text
+AgentTemplateVersion（Agent 模板版本）
+  └── ConnectionBinding（连接绑定：Connection + 固定能力修订）
+        └── OperationGrant（操作授权：稳定 operationId）
+              │
+              ▼
+Publish Resolver（发布解析器：账号、健康、修订与操作校验）
+              │
+              ▼
+AgentInstance ExecutionContext（Agent 实例执行上下文）
+  └── Frozen Connection Operations（冻结操作：精确路由 + 描述指纹）
+              │
+              ▼
+Agent Tool Catalog（Agent 工具目录：仅披露已授权操作）
+              │
+              ▼
+Pre-call Live Gate（调用前实时权限门：每次外部调用都重新校验）
+              │
+              ▼
+Exact MCP Route（精确 MCP 路由：serverId + providerToolName）
+```
+
+图中英文名称是领域/代码抽象，括号中的中文解释说明其产品职责。权限链的关键不变量如下：
+
+- `connectionBindings` 固定 `connectionId`、不可变 `capabilityRevision` 和显式 `operationGrants`；一个模板最多绑定 32 个 Connection、授权 256 个 operation；
+- 草稿只做结构校验，允许先保存尚未就绪的 Connection；发布、实例化、绑定 Agent 的每次加载和每次真实外部调用都 fail closed；
+- 发布解析器要求 Connection 与 IntegrationDefinition 已启用、Connection 为 `ready`、认证为 `verified/not_required`，并校验固定修订和活动修订中的已授权 operation 描述指纹完全一致；
+- 活动修订新增无关 operation 不会扩权；已授权 operation 被移除或描述、schema、风险 annotation、权限标签或精确路由发生变化时立即阻断，必须显式审阅并发布新模板版本；
+- Agent 实例保存经过父 Agent 和请求权限继续收窄后的 `connectionOperations`，其中只包含非秘密的 `connectionId`、修订、operationId、MCP serverId、Provider 原生工具名、模型工具别名和固定指纹；
+- 模型工具别名由 Connection 与 Provider 原生工具名确定性生成，不依赖可编辑的 MCP display name；因此同一个 Integration 的不同账号可以暴露同名原生操作而不发生全局路由冲突；
+- structured Connection 路径不读取 `thread_mcp_servers` 或 Plugin activation，避免用户配置模板后还要在每个会话重复启用，也避免 server 级开关把未授权工具重新并入目录；
+- 每次调用先经过 Store-backed live gate，再使用 `serverId + providerToolName + pinnedFingerprint` 精确调用 MCP Host。用户批准只能通过通用风险策略的 `Ask`，不能绕过 Connection 停用、重新认证、降级或 operation 变化；
+- RuntimeSnapshot 显式区分 `deny_all`、`legacy_mcp` 和 `structured`。`structured` 即使 operation 为空也不能回退到 live Thread MCP；续跑和子 Agent 只能继承或继续收窄冻结权限；
+- `FlowRun` 同样持久化三态 `connectionAuthority`。启动时按已发布 Flow 的 capability ceiling 再次收窄 operation 集合；暂停恢复和 HumanTask 恢复只消费 Run 内快照，不重新读取当前模板绑定或 Thread MCP；旧 Run 仅在其冻结 capability projection 明确包含 legacy MCP 时兼容推断为 `legacy_mcp`；
+- 旧模板缺少 `connectionBindings` 时保持历史 content hash 和 legacy MCP 执行语义。Desktop 只读显示旧授权，用户必须点击“开始迁移”才会清空 legacy 授权并改为 operation 选择，不做静默转换；
+- `GET /api/agent-templates/:templateId/versions/:version/connection-access` 按需解释模板当前是否有效、每个绑定和 operation 的问题、最终 MCP runtime 与模型工具目录；模板列表不做 N+1 权限解析。
+
+Desktop 的 Agent Template 编辑器已从 MCP UUID 文本框升级为 Connection/operation 选择器：能力修订按展开项懒加载，支持 Connection 与 operation 搜索、分批渲染、认证和健康状态、权限标签、修订失效、缺失 Connection、可恢复错误与显式 legacy 迁移。Connections 仍是固定一级入口，Agent Template 只引用账号连接和操作权限，不复制凭据。
+
+Phase 1B 的明确边界：本切片完成独立 Agent、绑定 Agent 的 Flow Run、续跑与子 Agent 所使用的 MCP `tools/list` operation 级授权和调用时撤权闭环。Flow 图中每个 `Agent` 节点依据其 `AgentTemplateVersion` 创建独立 node-scoped execution context，属于 Phase 2 的 `WorkflowAgentSpec / DeploymentSnapshot` 编译工作；在该上下文完成前，带 structured Connection binding 的 Agent 节点显式 fail closed，不继承 Root Flow Agent 的账号权限。尚未实现真实 OAuth 回调、Vault 凭据解析与账号级进程注入、远程 HTTP MCP、resource/prompt discovery、资源/字段级约束、规范化的反向影响索引，以及 Connection 失效后自动创建 HumanTask。这些能力分别进入后续 Connection Provider、WorkflowCompiler、影响分析和 HumanTask 阶段，不能用当前的 `credentialRef` 元数据冒充已完成。
+
+Phase 1B 退出条件：能够回答“某个 Agent 通过哪个 Connection 的哪个能力修订，为什么能调用哪个 operation”；新增 operation 不自动进入已有 Agent；Connection 停用、认证失效、运行降级、活动能力移除或描述变化会在外部调用前阻断；旧模板、续跑和子 Agent 不发生静默扩权。
+
 ### Phase 2：WorkflowDefinition、状态图运行时与手动部署
 
 - 允许同一个 Agent Template 创建独立 Agent 和派生 WorkflowAgentSpec；
+- WorkflowCompiler 为每个 Agent 节点解析并冻结来源 AgentTemplateVersion 的独立 Connection operation authority；节点只能在 DeploymentSnapshot ceiling 内继续收窄，不能继承 Root Flow Agent 的账号身份；
 - 新增 WorkflowDefinitionVersion，包含 WorkflowAgentSpecs、Graph、Trigger 和 Output；
 - 参考 LangGraph 建立 WorkflowCompiler、类型化 State Channel、Reducer、CompiledWorkflow 和 superstep 执行模型；
 - 每个已提交 superstep 原子保存 WorkflowCheckpoint，保留并行节点的 pending writes，恢复时不重放已成功节点；
@@ -1008,17 +1073,151 @@ crates/opentopia-server/src/enterprise/
 
 退出条件：WorkflowDefinition 未跑通不能创建 active Deployment；生产 WorkflowRun 必须由 Deployment 的 Trigger 创建；进程在任意已提交 superstep 后中断都能从最新一致 Checkpoint 恢复。
 
+#### Phase 2A：已实现切片（Workflow Compiler + Manual Deployment）
+
+本切片先完成 Phase 2 的生产身份与权限闭环，不把尚未实现的并行 superstep、Reducer 和 Checkpoint 冒充为已完成。当前落地链路如下：
+
+```text
+Published FlowDefinition（已发布工作流定义）
+  + Published AgentTemplateVersion（已发布 Agent 模板版本）
+  + Resolved Connection Operations（已解析连接操作权限）
+                         │
+                         ▼
+WorkflowCompiler（工作流编译器）
+  ├── WorkflowAgentSpec（节点级 Agent 执行配置）
+  ├── CompiledWorkflow（不可变编译产物）
+  └── contentHash（内容指纹）
+                         │
+                         ▼
+DeploymentSnapshot（部署快照）
+  ├── Manual Trigger（手动触发器）
+  ├── Inbox Output（收件箱输出）
+  └── Frozen Node Authorities（冻结的节点级权限）
+                         │
+                         ▼
+WorkflowDeployment（工作流部署）
+  ├── Active / Disabled（激活 / 已停用）
+  └── revision CAS（修订版本并发控制）
+                         │
+                         ▼
+WorkflowRun（工作流运行）
+  └── 持有同一个 DeploymentSnapshot，不重新解析当前模板或账号权限
+```
+
+图中英文是 UI/领域/代码名称，括号中的中文说明其职责。实现不变量如下：
+
+- `WorkflowCompiler` 遍历每个 `Agent` 节点，精确加载节点引用的已发布 `AgentTemplateVersion`，校验模板状态与内容哈希，并通过 Connection access resolver 解析当前仍有效的 operation grant；
+- 每个 `WorkflowAgentSpec` 固定 `nodeId`、模板 ID/版本/content hash、instructions、model policy、resource grants、risk class、Connection bindings 和精确 `RuntimeConnectionAuthority`；没有 operation 的 structured authority 仍是显式空集合，不能回退到 Thread MCP；
+- `CompiledWorkflow` 固定 Flow definition identity、Graph、schema、budget、节点 Agent specs、Harness 能力并集和 Harness operation 并集。并集只用于预装载共享 Harness 目录，不赋予节点权限；执行节点前会按该节点的 `WorkflowAgentSpec` 再次收窄；
+- Agent 节点执行优先消费 Run 内冻结的 `WorkflowAgentSpec`，不重新读取可变模板。兼容路径若遇到 structured Connection 模板会继续 fail closed，只有带 `DeploymentSnapshot` 的生产路径可以执行；
+- Node-scoped context 同时收窄 capability projection、工具 descriptor 和精确 operation route，避免一个 Agent 节点继承 Root Flow Agent 或相邻 Agent 节点的账号身份；
+- `WorkflowDeployment` 保存不可变 `DeploymentSnapshot`，数据库按 Flow、状态和更新时间建立查询索引；停用使用 `expectedRevision` CAS，不能用陈旧页面覆盖新状态；
+- 首版 Deployment 只激活 `Manual Trigger / 手动触发器` 和 `Inbox Output / 收件箱输出`。手动触发通过 Deployment API 创建 `WorkflowRun`，Run 序列化并持久化同一个快照；暂停、HumanTask 恢复和进程内继续执行都从 Run 快照读取 Harness 与节点权限；
+- Desktop 新增固定一级 `Deployments / 部署` 入口。左侧上下文集合只显示 Deployment，主区提供已发布 Flow 选择、服务端编译、快照/Agent 权限解释、手动 JSON 输入运行和带确认的停用操作；`Connections / 连接` 仍保留固定一级入口；
+- HTTP 契约新增 Deployment list/get/create/disable 与 deployed run start，并由 Rust schema 生成 Desktop 类型；旧 `startFlowRun` 暂时保留为显式兼容路径。
+
+Phase 2A 的明确边界：`WorkflowAgentSpec` 当前冻结节点执行配置，但尚未绑定或物化一个长期存在的受管 Agent 身份；Trigger/Output 当前属于 `DeploymentSnapshot`，尚未进入通用的 WorkflowDefinition 接口编辑器；现有运行协调器仍是 ready-node 队列与逐节点持久化，不是 LangGraph 风格的类型化 State Channel、Reducer、并行 superstep、pending writes 和原子 `WorkflowCheckpoint`。因此 Phase 2 退出条件尚未全部满足，下一切片是 Phase 2B 的 Checkpoint/Superstep Runtime，而不是继续扩充部署页面。
+
+Phase 2A 验收结果：同一个 Agent Template 可继续创建独立 Agent，也可在编译时派生 `WorkflowAgentSpec`；部署前会解析所有 Agent 节点和 Connection operation，任何模板缺失、未发布、内容变化、legacy MCP 或无效 Connection 都会阻断；手动 Run 固定 DeploymentSnapshot；停用后拒绝新触发；历史 Run 和快照不被改写。
+
+#### Phase 2B：已实现切片（State Channel + Superstep Checkpoint Runtime）
+
+本切片把 ready-node 顺序队列升级为参考 LangGraph 的批次提交模型，同时保留 OpenTopia 对外部副作用更保守的默认策略：
+
+```text
+Ready Nodes（就绪节点）
+        │
+        ▼
+Superstep Planner（超步规划器：冻结本批节点、输入和 attempt）
+        │
+        ├── Parallel-safe Nodes（可安全并行节点）──┐
+        └── Side-effect Nodes（副作用节点，默认串行）│
+                                                   ▼
+Pending Writes（待提交写入：逐节点持久化成功或失败结果）
+        │
+        ▼
+Atomic WorkflowCheckpoint Commit（原子工作流检查点提交）
+        ├── Node Outputs（节点输出：供边和 Join 路由）
+        ├── State Channels（状态通道：按 Reducer 合并）
+        ├── Next Ready Nodes（下一批就绪节点）
+        └── Checkpoint History（检查点历史摘要）
+```
+
+图中英文是领域/代码抽象，括号中的中文解释说明运行职责。实现不变量如下：
+
+- 一个 superstep 在开始时冻结本批 `nodeId / nodeRunId / attempt / input`，并和 Run 状态通过同一 SQLite 文档 CAS 原子持久化；节点真正执行前已经存在可恢复的边界；
+- 每个节点完成后先写入 `WorkflowPendingWrite`，不会立刻修改共享 State、后继队列或对外 Run output；全部节点产生待提交结果后才执行一次 Checkpoint commit；
+- 同一批次的完成顺序不影响结果。Pending Write 和提交应用都按稳定 `nodeId` 排序，避免异步调度导致不可复现状态；
+- `Condition / Validator / Join / Loop / Output` 默认可以并行；`Agent / Skill / Tool` 默认串行，只有节点显式声明 `config.parallelSafe=true` 才进入最多 8 路的并行池。该声明是能力而不是性能提示，设计者必须确认跨节点副作用和 Provider 限流允许并行；
+- 节点通过 `config.stateWrites` 声明 State Channel 写入，首版 Reducer 包含 `replace`、`append` 和 `merge_object`。Channel 名称、数量、valuePath、Reducer 一致性在 Flow 验证阶段检查；`replace` 通道只允许一个 writer；
+- `nodeOutputs` 与共享 `state` 分离：前者是边投影和 Join readiness 的不可混淆来源，后者仅由 Reducer 在已提交 superstep 中更新；失败批次不能泄漏一半共享状态；
+- Checkpoint summary 记录 ID、superstep、节点集合、Pending Write 数量、状态与时间；Run 响应保留最近 100 个 summary，活动 Checkpoint 则保留完整冻结输入和 Pending Writes，控制文档增长；
+- 进程中断时，活动 Checkpoint 和已经持久化的成功 Pending Write 会保留。Recovery HumanTask 显示 checkpoint/superstep/节点和完成数量；操作者明确重试后只为尚未成功的节点创建新 attempt，成功兄弟节点不会重放；
+- Pause 在活动 superstep 的提交边界生效；Cancel 会废弃未提交 checkpoint 并把活动 NodeRun 标记为 cancelled，不把部分结果合入 State；Approval 节点优先形成独立人工边界，不会和同批其他节点一起执行；
+- 多个 terminal Output 在同一个 superstep 到达时，以 `nodeId -> output` 对象形成确定性最终输出；单 Output 保持原有值形态。
+
+Phase 2B 的明确边界：当前 Checkpoint 作为 `FlowRun.document_json` 内的活动原子边界与有界历史摘要持久化，尚未拆成可长期查询、Replay/Fork 的独立 checkpoint/event 表；普通节点失败仍沿现有 error route 或 terminal failure 语义，动态 Agent Interrupt 和 AgentContinuation 恢复进入 Phase 3；显式 `parallelSafe` 尚未由 operation annotation 自动推导；跨进程分布式 worker、Exactly-once 外部副作用、ActivityReceipt 和补偿事务也不在本切片内。因此本阶段保证“已成功 Pending Write 不因服务中断而重放”，不宣称任意外部系统调用具备 Exactly-once。
+
+Phase 2B 退出条件：一个 fan-out/fan-in Flow 能在同一 superstep 并行执行安全节点；State reducer 的结果不受完成顺序影响；每个已提交批次有 Checkpoint summary；服务在批次中断后会进入 HumanTask，明确恢复时只执行没有成功 Pending Write 的节点；旧 Run 缺少新字段时按空 State、superstep 0 无损读取。
+
+2026-08-20 已完成后台真实 Topia 验收：使用隐藏的隔离 Server、独立数据库和正式 HTTP API 完成 Thread → FlowDraft → Validate → Simulate → Publish → WorkflowDeployment → Run 全链路。fan-out 的 `left`、`right` 在 superstep 2 形成同一 committed Checkpoint，记录 2 条 Pending Writes；整个 Run 以 4 个 Checkpoint 成功结束，共写入 2 个稳定排序的 `results` State 项。可重复执行入口为 `scripts/verify-flow-superstep.ps1`。
+
+后续阶段采用两层验收：自动化测试验证领域不变量、恢复和契约；随后在后台启动隔离的 Topia Server，通过真实 HTTP API 创建 Thread、Definition、Deployment 和 Run，并检查持久化结果。后台验收使用独立数据库、插件目录、runtime 目录和端口，服务窗口隐藏且按精确 PID 回收，不调用 Computer Use、不操纵用户前台。只有必须验证像素、焦点或桌面交互时才单独安排可见 UI 验收，不能用单元测试冒充真实运行，也不能用前台自动点击替代可后台完成的 API 测试。
+
 ### Phase 3：HumanTask、Flow 中断与 Inbox
 
-- 将 approval、input request、output review、recovery 和 reconnect 统一成 HumanTask；
-- 增加 InterruptRequest、ResumeCommand、claim、assign、act、SLA、checkpoint 和幂等 continuation；
-- Flow Agent 内部动态审批或输入必须保存 AgentContinuation，不能把 Interrupt 当作节点失败，也不能默认从 Agent 节点开头重放；
-- 建立 `running -> waiting_for_human -> resuming` 状态机，并区分自动重试、人工可恢复中断和终止失败；
-- 构建 Inbox 列表—详情—决策界面；
-- 在 WorkflowRun 时间线复用同一 HumanTaskPanel，保证就地处理和 Inbox 处理同源；
-- 默认全部输出进入人工审查，并支持后续 review policy。
+#### Phase 3：已实现切片（Durable Interrupt + HumanTask Resume）
 
-退出条件：人工动作可从一致 checkpoint 恢复原 WorkflowRun；两个入口不能重复执行 continuation，并完整记录动作前后快照和审计。
+本切片把 Flow Agent 内部产生的动态审批、补充输入、外部动作确认和副作用核对，从“节点失败”升级为可持久化、可审计、可恢复的工作流控制面：
+
+```text
+AgentTurnOutcome（Agent 本轮结果）
+        │
+        ▼
+Interrupt Adapter（中断适配器：把 Agent 等待态转换成工作流领域事件）
+        │
+        ▼
+InterruptRequest（中断请求：固定 Run、NodeRun、attempt、superstep 与 checkpoint）
+        │
+        ├── AgentContinuation（Agent 延续状态：保存待恢复模型/工具循环）
+        └── ActivityReceipt（活动回执：说明外部操作已知事实与幂等身份）
+        │
+        ▼
+WorkflowPendingWrite（工作流待提交写入：中断与节点结果同属检查点）
+        │
+        ▼
+HumanTask（人工任务：分派、认领、SLA、动作 schema 与证据）
+        │
+        ▼
+ResumeCommand（恢复命令：稳定 commandId + idempotencyKey）
+        │
+        ▼
+same WorkflowCheckpoint / same NodeRun（同一检查点 / 同一节点执行记录）
+        │
+        ▼
+AgentContinuation.resume（恢复 Agent 延续状态，不从节点开头重放）
+```
+
+图中的英文是领域和代码抽象，括号中的中文解释说明其职责。实现不变量如下：
+
+- Flow 状态机现在区分 `running -> waiting_human -> resuming -> running/succeeded`。显式 Approval 继续兼容 `waiting_approval`；动态中断统一进入 `waiting_human`，恢复中的精确状态保存在 Run 文档，数据库状态列继续使用兼容值，旧索引和旧数据无需破坏性迁移；
+- Agent/Skill 节点返回 `Completed` 或 `Interrupted`。审批、结构化输入、外部动作、效果核对都会产生 `WorkflowInterruptRequest`，并把 `AgentContinuationEnvelope`、NodeRun ID、attempt、superstep 和 Checkpoint ID 原子写入活动 Checkpoint；中断不计作节点失败；
+- 人工动作生成 `ResumeCommand`。同一 `humanTaskId + action + idempotencyKey` 使用稳定 UUID，客户端超时重试、Inbox 与 Run 内联入口重复提交都会得到同一个 command，而不是恢复两次；不同 key 或不同动作会冲突关闭；
+- 恢复执行继续使用原 NodeRun、原 attempt 和原 Checkpoint，只替换对应 Pending Write。恢复本身若发生可中断错误，会创建 `ResumeRetry` HumanTask，并继续携带同一 continuation 和上一个命令信号，不退回为一个全新的节点 attempt；
+- `HumanTask` 统一承载 approval、input request、reconnect、reconciliation、recovery 和 output review；同时保存 `actionSchema`、assignee、claimant、SLA/dueAt、checkpointId、continuationId、操作者、响应、note、commandId 和 idempotencyKey；
+- 全局 Inbox 使用服务端 HumanTask 列表作为单一任务源，支持筛选、详情、分派、认领和动作提交；Flow Run 就地面板按同一个 taskId 加载，因此两处界面不是两份队列，也不靠扫描所有会话拼接；
+- 生产 `WorkflowDeployment` 创建的 Run 默认 `outputReviewRequired=true`。Output 节点提交完成后先生成 OutputReview HumanTask，批准才进入 `succeeded`，拒绝进入 `cancelled`；Draft simulate 和非部署型内部运行保持 `false`，避免测试/预览被生产策略误阻塞。后续可把这个固定默认值提升为 Deployment ReviewPolicy；
+- 具有 material side effect 的顺序工具调用若 Provider 返回 `reconciliationRequired`，运行时不会自动重放，而是生成 Reconciliation HumanTask。HumanTask 展示 `ActivityReceipt`，包含 operation、effect status 与 idempotency key，要求操作者确认外部系统事实后再继续；
+- Effect Journal 的 v28 迁移把 `turn_id` 提升为逻辑 execution scope。普通 Agent 仍用 Turn ID，Flow Agent 使用 FlowRun ID，因此 Activity Receipt 不需要伪造 Turn。这里保证的是“有持久化事实和幂等身份的安全恢复”，不宣称第三方系统具有 Exactly-once；外部结果不确定时必须人工核对，不能自动重试写操作；
+- 进程重启时，带 ResumeCommand 的活动 Checkpoint 会恢复到 `resuming` 语义；没有 continuation 的旧式中断仍进入 Recovery HumanTask。所有路径都保持 fail closed，不能因为旧文档缺少新字段而扩大行为。
+
+首版 API 为 `GET /api/human-tasks`、`GET /api/human-tasks/{id}`、`POST /api/human-tasks/{id}/assign`、`POST /api/human-tasks/{id}/claim` 和 `POST /api/human-tasks/{id}/resolve`。`resolve` 接收 expectedRevision、action、idempotencyKey、note 和可选结构化 response；Run 与 HumanTask 通过同一个存储事务和 CAS 一起更新。
+
+Phase 3 的明确边界：本阶段已经验证动态 Agent interrupt 在同一 checkpoint/node attempt 上恢复，但后台真实 HTTP 验收采用确定性的显式 Approval + OutputReview，不依赖外部模型账号；Flow 图中每个 Agent 节点独立解析自身 Agent Template/Connection execution context 仍属于下一阶段；生产输出复核目前是部署级固定默认值，尚未提供可配置 ReviewPolicy；当前本地部署的 claim actor 是 `local_operator`，组织身份、队列路由和升级策略将在企业身份层接入后扩展。
+
+Phase 3 退出条件：人工动作可从一致 checkpoint 恢复原 WorkflowRun；动态 Agent 不会从节点开头重放；Inbox 与 Run 内联入口共享同一 HumanTask；重复动作不会重复执行 continuation；具有不确定副作用的恢复先进入 reconciliation；生产部署输出必须经过人工复核，并记录完整命令、检查点、延续状态和活动回执。
+
+2026-08-20 已完成后台真实 Topia 验收：隐藏的隔离 Server 通过正式 HTTP API 完成 Thread → FlowDraft → Validate → Simulate → Publish → WorkflowDeployment → Run；Approval HumanTask 完成 assign、claim、approve 和同 key 重复提交，随后生产输出生成独立 OutputReview HumanTask并完成 claim、approve 和同 key 重复提交。两类重复动作均返回同一 commandId，最终 Run 为 `succeeded`、`outputReviewRequired=true`、`outputReviewed=true`，待处理任务为 0。可重复执行入口为 `scripts/verify-flow-human-tasks.ps1`；本次结果保存在 `.opentopia/evaluations/flow-human-tasks-502bf29616574795920c2478cd62027b/result.json`。同时重新执行 `scripts/verify-flow-superstep.ps1`，确认 Phase 2B 的 4 个 Checkpoint、并行 left/right 两条 Pending Write 和稳定 Reducer 结果在新增输出复核后保持成立。两次服务均使用独立数据库和端口、隐藏窗口，并按精确 PID 回收，未调用 Computer Use。
 
 ### Phase 4：Agent / Workflow 企业 Surface
 

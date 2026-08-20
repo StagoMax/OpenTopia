@@ -541,7 +541,9 @@ pnpm.cmd dev:desktop
 
 直接启动服务端时必须设置符合长度要求的 `OPENTOPIA_API_TOKEN`。`dev-env.ps1` 仅为本地验证提供默认 Token；Electron 启动时会替换为每次启动随机生成的 Token。
 
-Windows shell 由统一运行时解析器选择，优先级为：`OPENTOPIA_POWERSHELL_PATH` 显式路径、OpenTopia 受管理运行时、PowerShell 7 标准安装目录、绝对 `PATH` 条目，最后回退系统 `powershell.exe` 5.1。找不到 PowerShell 7 时，服务端在后台下载固定版本到 `%LOCALAPPDATA%\OpenTopia\runtimes`，校验固定 SHA-256 后安全解压并原子启用；下载失败不阻止启动。可用 `OPENTOPIA_RUNTIME_HOME` 改变运行时根目录、用 `OPENTOPIA_POWERSHELL_ARCHIVE` 提供离线官方 ZIP，或用 `OPENTOPIA_POWERSHELL_AUTO_INSTALL=false` 禁用自动下载。`/health` 返回当前 executable、版本、来源和受管理安装状态。
+Windows shell 由统一运行时解析器选择，优先级为：`OPENTOPIA_POWERSHELL_PATH` 显式路径、OpenTopia 受管理运行时、PowerShell 7 标准安装目录、绝对 `PATH` 条目，最后回退系统 `powershell.exe` 5.1。找不到 PowerShell 7 时，服务端在后台下载固定版本到 `%LOCALAPPDATA%\OpenTopia\runtimes`；通用受管理运行时下载器会对连接失败、超时、429、502、503 和 504 执行最多三次的有界指数退避重试，每次失败都清理临时文件，固定 SHA-256 校验通过后才安全解压并原子启用。下载失败不阻止启动，并可从“设置 → 高级 → PowerShell 运行时”手动重试。可用 `OPENTOPIA_RUNTIME_HOME` 改变运行时根目录、用 `OPENTOPIA_POWERSHELL_ARCHIVE` 提供离线官方 ZIP，或用 `OPENTOPIA_POWERSHELL_AUTO_INSTALL=false` 禁用自动下载。`/health` 返回当前 executable、版本、来源和受管理安装状态。
+
+Office 能力不发现或依赖用户 `PATH` 中的 Python。`runtime/office/runtime-lock.json` 固定可搬移的 `python-build-standalone` Python 版本、六个桌面目标的直接下载地址与 SHA-256，以及 OpenPyXL 依赖 wheel；发布构建把完整独立运行时放入应用资源，开发或资源损坏场景则通过同一受管理运行时下载器安装到版本化缓存。Python 发行包和 wheel 全部校验后才在独立暂存目录中安装、探测版本，并通过目录重命名原子启用。失败时 Office 操作保留 Rust 原生后备实现，并可从“设置 → 高级 → Office Python 运行时”手动重试。`OPENTOPIA_OFFICE_RUNTIME_ROOT` 可指定已准备的离线运行时，`OPENTOPIA_OFFICE_RUNTIME_AUTO_INSTALL=false` 可关闭后台安装。
 
 所有内置文件变更入口把 `.ps1` 规范化为 UTF-8 BOM，使同一脚本在 PowerShell 7 和 Windows PowerShell 5.1 下都能按相同 Unicode 源码解析；控制台 UTF-8 设置只负责进程 I/O，不能替代脚本源码编码策略。
 
@@ -550,9 +552,12 @@ Windows shell 由统一运行时解析器选择，优先级为：`OPENTOPIA_POWE
 `scripts/build-desktop.ps1` 按顺序：
 
 1. 构建 release 版 `opentopia-server`；
-2. 将二进制复制到 `apps/desktop/resources/`；
-3. 在 Windows 上校验并暂存 Codex restricted-token sandbox helpers；
-4. 构建桌面前端并调用 `electron-builder`。
+2. 从版本化缓存复用或准备独立 Office Python，并校验 v2 manifest；
+3. 将服务端、Office 运行时和平台 helper 暂存到 `.runtime-stage`；
+4. 在 Windows 上校验 Codex restricted-token sandbox helper；
+5. 构建桌面前端并调用 `electron-builder`。
+
+`scripts/prepare-office-runtime.ps1` 不再接受构建机 Python 来创建 venv；它只接受锁文件指定的独立发行包，或通过 `-PythonArchive` 使用 SHA-256 匹配的离线归档。完整的已准备目录也可以通过 `-OfficeRuntimeSource` 直接传给 `scripts/build-desktop.ps1`。
 
 `scripts/check.ps1` 运行 `cargo check --workspace`、桌面 TypeScript typecheck 和前端 build。它是基础静态/构建验证，不替代 Provider、沙箱、浏览器或端到端人工验证。
 
