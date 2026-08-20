@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 1,
+  "id": "ai.opentopia.office-runtime.lock",
+  "runtimeVersion": "python-3.12.14-openpyxl-3.1.5-r1",
+  "pythonVersion": "3.12.14",
+  "pythonRelease": "20260814",
+  "packages": [
+    {
+      "name": "openpyxl",
+      "version": "3.1.5",
+      "fileName": "openpyxl-3.1.5-py2.py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/c0/da/977ded879c29cbd04de313843e76868e6e13408a94ed6b987245dc7c8506/openpyxl-3.1.5-py2.py3-none-any.whl",
+      "sha256": "5282c12b107bffeef825f4617dc029afaf41d0ea60823bbb665ef3079dc79de2",
+      "maxBytes": 2097152
+    },
+    {
+      "name": "et_xmlfile",
+      "version": "2.0.0",
+      "fileName": "et_xmlfile-2.0.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/c1/8b/5fe2cc11fee489817272089c4203e679c63b570a5aaeb18d852ae3cbba6a/et_xmlfile-2.0.0-py3-none-any.whl",
+      "sha256": "7a91720bc756843502c3b7504c77b8fe44217c85c537d85037f0f536151b2caa",
+      "maxBytes": 1048576
+    }
+  ],
+  "targets": {
+    "windows-x86_64": {
+      "targetTriple": "x86_64-pc-windows-msvc",
+      "fileName": "cpython-3.12.14+20260814-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.12.14%2B20260814-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+      "sha256": "89f18f6932917163b74339ebcec2645c8e47ae7f1c5f2ac37f2b4f4cf3beb647",
+      "maxBytes": 67108864,
+      "pythonPath": "python/python.exe"
+    },
+    "windows-aarch64": {
+      "targetTriple": "aarch64-pc-windows-msvc",
+      "fileName": "cpython-3.12.14+20260814-aarch64-pc-windows-msvc-install_only_stripped.tar.gz",
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.12.14%2B20260814-aarch64-pc-windows-msvc-install_only_stripped.tar.gz",
+      "sha256": "1e1de8b5d0df73b965aa72f0c27d5c617a5d7256ce6d205228a0f9638bf6df21",
+      "maxBytes": 67108864,
+      "pythonPath": "python/python.exe"
+    },
+    "macos-x86_64": {
+      "targetTriple": "x86_64-apple-darwin",
+      "fileName": "cpython-3.12.14+20260814-x86_64-apple-darwin-install_only_stripped.tar.gz",
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.12.14%2B20260814-x86_64-apple-darwin-install_only_stripped.tar.gz",
+      "sha256": "aec265e3cddaccdb2a3d783331596351b24d4a63c97af0a38f75f643c9451de9",
+      "maxBytes": 67108864,
+      "pythonPath": "python/bin/python3"
+    },
+    "macos-aarch64": {
+      "targetTriple": "aarch64-apple-darwin",
+      "fileName": "cpython-3.12.14+20260814-aarch64-apple-darwin-install_only_stripped.tar.gz",
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.12.14%2B20260814-aarch64-apple-darwin-install_only_stripped.tar.gz",
+      "sha256": "dd5b76ab11451a4a4367c17c61d944dded56b425396b07f102922a7ebef7d55f",
+      "maxBytes": 67108864,
+      "pythonPath": "python/bin/python3"
+    },
+    "linux-x86_64": {
+      "targetTriple": "x86_64-unknown-linux-gnu",
+      "fileName": "cpython-3.12.14+20260814-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.12.14%2B20260814-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+      "sha256": "5acfa3e9ba26b51ae161c83aff278da915b590d22373a424b2ba55b8afe91fcc",
+      "maxBytes": 67108864,
+      "pythonPath": "python/bin/python3"
+    },
+    "linux-aarch64": {
+      "targetTriple": "aarch64-unknown-linux-gnu",
+      "fileName": "cpython-3.12.14+20260814-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz",
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260814/cpython-3.12.14%2B20260814-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz",
+      "sha256": "2d8e17dfd732102cfeb18e0e1fa6769b24caa034e159981129590fe409c7157a",
+      "maxBytes": 67108864,
+      "pythonPath": "python/bin/python3"
+    }
+  }
+}
