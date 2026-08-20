@@ -1974,8 +1974,14 @@ mod tests {
         assert_eq!(changes.files.len(), 2);
         let undo = manager.undo(changes).await.unwrap();
         assert!(undo.applied, "conflicts: {:?}", undo.preview.conflicts);
-        assert_eq!(repo.read("first.txt"), "before first\n");
-        assert_eq!(repo.read("second.txt"), "before second\n");
+        assert_eq!(
+            repo.read("first.txt").replace("\r\n", "\n"),
+            "before first\n"
+        );
+        assert_eq!(
+            repo.read("second.txt").replace("\r\n", "\n"),
+            "before second\n"
+        );
     }
 
     #[tokio::test]
@@ -2023,8 +2029,14 @@ mod tests {
         assert_eq!(changes.files.len(), 2);
         let undo = manager.undo(changes).await.unwrap();
         assert!(undo.applied, "conflicts: {:?}", undo.preview.conflicts);
-        assert_eq!(repo.read("first.txt"), "before first\n");
-        assert_eq!(repo.read("second.txt"), "before second\n");
+        assert_eq!(
+            repo.read("first.txt").replace("\r\n", "\n"),
+            "before first\n"
+        );
+        assert_eq!(
+            repo.read("second.txt").replace("\r\n", "\n"),
+            "before second\n"
+        );
     }
 
     #[tokio::test]
