@@ -56,7 +56,7 @@ try {
         if (
           $health.ok -and
           $health.service -eq "opentopia-server" -and
-          $health.apiVersion -eq 1
+          $health.apiVersion -eq 2
         ) {
           $healthy = $true
           break
