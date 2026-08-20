@@ -24,8 +24,10 @@ import { threadComposerDraftKey } from "../../composerDrafts";
 import { resolveComposerWorkForm } from "../../conversationWorkForm";
 import { ConversationSessionRegistry } from "../../conversationSessionController";
 import { errorMessage } from "../../errorMessage";
+import type { SendShortcut } from "../../editorPreferences";
 import { getDroppedContextFiles, selectContextFiles } from "../../platform";
 import { friendlyProviderError } from "../../providerErrors";
+import { resolveThreadModelContextWindow } from "../../modelCapabilities";
 import {
   resolveThreadActivityStatus,
   type ThreadActivityStatus,
@@ -60,6 +62,8 @@ export function SideTaskConversation({
   projects,
   skills,
   initialCollaborationMode,
+  sendShortcut,
+  showContextWindowUsage,
   onThreadUpdated,
   onSetThreadActivity,
   onMarkThreadActivityRead,
@@ -80,6 +84,8 @@ export function SideTaskConversation({
   projects: Project[];
   skills: SkillDescriptor[];
   initialCollaborationMode: CollaborationMode;
+  sendShortcut: SendShortcut;
+  showContextWindowUsage: boolean;
   onThreadUpdated(thread: Thread): void;
   onSetThreadActivity(
     threadId: string,
@@ -182,10 +188,18 @@ export function SideTaskConversation({
   const submittingUserInputId = sessionState?.submittingUserInputId ?? null;
   const userInputError = sessionState?.userInputError ?? null;
   const sessionError = sessionState?.commandError ?? null;
-  const activityMetrics = useMemo(
-    () => deriveConversationMetrics(events, modelSelection),
-    [events, modelSelection],
-  );
+  const activityMetrics = useMemo(() => {
+    const contextWindow = resolveThreadModelContextWindow(
+      settings?.providers ?? [],
+      settings?.activeProviderId,
+      modelSelection,
+    );
+    return deriveConversationMetrics(
+      events,
+      modelSelection,
+      contextWindow?.contextWindowTokens,
+    );
+  }, [events, modelSelection, settings?.activeProviderId, settings?.providers]);
 
   useEffect(() => {
     if (!threadId || sessionState?.loadState.status !== "ready") return;
@@ -459,6 +473,7 @@ export function SideTaskConversation({
       ) : (
         <Composer
           autoFocus
+          sendShortcut={sendShortcut}
           fileDropHandleRef={composerFileDropHandle}
           fileDropScope="conversation"
           value={composer}
@@ -468,6 +483,7 @@ export function SideTaskConversation({
           isCancelling={sessionState?.cancelling ?? false}
           queuedMessageCount={queuedMessageCount}
           metrics={activityMetrics}
+          showContextWindowUsage={showContextWindowUsage}
           modelSelection={modelSelection}
           providers={settings?.providers ?? []}
           activeProviderId={settings?.activeProviderId ?? ""}

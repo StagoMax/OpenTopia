@@ -14,6 +14,16 @@ export type ModelDiscoveryState =
   | { status: "success"; modelCount: number }
   | { status: "error"; message: string };
 
+const providerDiscoveryDependentFields = new Set<keyof ProviderSettings>([
+  "baseUrl",
+  "model",
+  "kind",
+  "transport",
+  "auth",
+  "allowedAdapters",
+  "preferredAdapter",
+]);
+
 export type ProviderBaseUrlPreset = {
   id: string;
   label: string;
@@ -126,7 +136,7 @@ export function providerAxesFromKind(kind: ProviderKind): {
   return {
     transport: "http",
     auth: "bearer",
-    allowedAdapters: ["open_ai_chat", "open_ai_responses"],
+    allowedAdapters: ["open_ai_responses", "open_ai_chat"],
     preferredAdapter: kind === "openai_responses" ? "open_ai_responses" : null,
   };
 }
@@ -211,6 +221,20 @@ export function providerDiscoverySignature(
   return `${provider.id}\u0000${provider.baseUrl.trim()}\u0000${provider.model.trim()}\u0000${providerProtocolSelection(provider)}\u0000${auth}\u0000${
     pendingApiKey || "configured"
   }`;
+}
+
+/** A completed model sync is persisted and should be reused when revisiting settings. */
+export function hasCachedProviderModelCatalog(
+  provider: ProviderSettings,
+): boolean {
+  return provider.modelsSyncedAt != null;
+}
+
+/** Changes to these fields require a fresh catalog and adapter negotiation. */
+export function providerChangeInvalidatesModelDiscovery(
+  field: keyof ProviderSettings,
+): boolean {
+  return providerDiscoveryDependentFields.has(field);
 }
 
 export function isHttpUrl(value: string): boolean {

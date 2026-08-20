@@ -22,11 +22,13 @@ import "./TurnActivityTimeline.css";
 export function TurnActivityTimeline({
   events,
   isActive,
+  standalone = false,
   formatError = (message) => message,
   onOpenMarkdownLink,
 }: {
   events: AgentEvent[];
   isActive: boolean;
+  standalone?: boolean;
   formatError?(message: string): string;
   onOpenMarkdownLink?(href: string): void;
 }) {
@@ -83,6 +85,35 @@ export function TurnActivityTimeline({
   if (!isActive && entries.length === 0 && !changeSet && !hasTurnLifecycle) {
     return null;
   }
+  const entryViews = entries.map((entry) => (
+    <ActivityEntryView
+      key={activityEntryKey(entry)}
+      entry={entry}
+      isActive={isActive}
+      now={now}
+      traceThreadId={traceEvent?.threadId}
+      traceTurnId={traceEvent?.turnId}
+      formatError={formatError}
+      onOpenMarkdownLink={onOpenMarkdownLink}
+    />
+  ));
+
+  if (standalone) {
+    return (
+      <section
+        className="turn-activity is-standalone"
+        data-state={state}
+        aria-label="上下文活动"
+      >
+        <div
+          className="turn-activity-body"
+          aria-live={isActive ? "polite" : undefined}
+        >
+          {entryViews}
+        </div>
+      </section>
+    );
+  }
 
   return (
     <section className="turn-activity" data-state={state}>
@@ -115,18 +146,7 @@ export function TurnActivityTimeline({
           id={bodyId}
           aria-live={isActive ? "polite" : undefined}
         >
-          {entries.map((entry) => (
-            <ActivityEntryView
-              key={activityEntryKey(entry)}
-              entry={entry}
-              isActive={isActive}
-              now={now}
-              traceThreadId={traceEvent?.threadId}
-              traceTurnId={traceEvent?.turnId}
-              formatError={formatError}
-              onOpenMarkdownLink={onOpenMarkdownLink}
-            />
-          ))}
+          {entryViews}
         </div>
       )}
     </section>

@@ -44,6 +44,41 @@ export function composerInputCommitPending({
   return isComposing || compositionSnapshotPending || nativeIsComposing;
 }
 
+/**
+ * Builds the text inserted by a line break inside a plain-text ordered-list
+ * item. The composer stores caret offsets as grapheme counts, so slice through
+ * the same representation instead of using UTF-16 offsets.
+ */
+export function composerOrderedListContinuation(
+  snapshot: ComposerHistorySnapshot,
+): string | null {
+  const text = composerPlainText(snapshot.parts);
+  if (text === null) return null;
+
+  const beforeCaret = splitComposerText(text)
+    .slice(0, Math.max(0, snapshot.caretOffset))
+    .join("");
+  const currentLine = beforeCaret.slice(beforeCaret.lastIndexOf("\n") + 1);
+  const match = /^(\s*)(\d+)\.\s+/.exec(currentLine);
+  if (!match) return null;
+
+  return `\n${match[1]}${BigInt(match[2]) + 1n}. `;
+}
+
+/**
+ * The composer presents a draft that starts with a CommonMark ordered-list
+ * marker with the same leading indentation as a rendered list. Keep the
+ * indentation visual so the submitted text remains portable Markdown.
+ */
+export function composerUsesOrderedListIndentation(text: string): boolean {
+  const firstContentLine = text
+    .split(/\r?\n/)
+    .find((line) => line.trim().length > 0);
+  return Boolean(
+    firstContentLine && /^[ \t]{0,3}\d+\.[ \t]+/.test(firstContentLine),
+  );
+}
+
 type ComposerContentToken =
   { type: "text"; text: string } | { type: "image_ref"; imageId: string };
 

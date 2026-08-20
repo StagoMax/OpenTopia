@@ -415,6 +415,87 @@
   gap: var(--space-4);
 }
 
+.flow-runtime-panel__checkpoints {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.flow-runtime-panel__checkpoints > li {
+  display: grid;
+  grid-template-columns: var(--control-height-sm) minmax(0, 1fr);
+  align-items: center;
+  gap: var(--space-4);
+  border-left: var(--space-1) solid var(--border-strong);
+  background: var(--surface-subtle);
+  padding: var(--space-3) var(--space-4);
+}
+
+.flow-runtime-panel__checkpoints > li[data-status="running"] {
+  border-left-color: var(--accent);
+}
+
+.flow-runtime-panel__checkpoints > li[data-status="committed"] {
+  border-left-color: var(--success);
+}
+
+.flow-runtime-panel__checkpoints > li[data-status="failed"] {
+  border-left-color: var(--danger);
+}
+
+.flow-runtime-panel__checkpoints > li[data-status="cancelled"] {
+  border-left-color: var(--warning);
+}
+
+.flow-runtime-panel__checkpoint-step {
+  display: inline-flex;
+  inline-size: var(--control-height-sm);
+  block-size: var(--control-height-sm);
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+}
+
+.flow-runtime-panel__checkpoints > li > div {
+  display: grid;
+  gap: var(--space-2);
+  min-inline-size: 0;
+}
+
+.flow-runtime-panel__checkpoint-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.flow-runtime-panel__checkpoint-title strong,
+.flow-runtime-panel__checkpoints small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.flow-runtime-panel__checkpoints small,
+.flow-runtime-panel__checkpoint-empty {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.flow-runtime-panel__checkpoint-empty {
+  margin: 0;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-4);
+}
+
 .flow-runtime-panel__trace {
   display: grid;
   gap: var(--space-3);

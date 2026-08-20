@@ -145,6 +145,13 @@ export type ModelCallPurpose =
   | "title_generation"
   | "other";
 
+export type TokenEstimateDetail = {
+  id: string;
+  label: string;
+  tokens: number;
+  children?: TokenEstimateDetail[];
+};
+
 export type TokenEstimateBreakdown = {
   baseInstructions: number;
   developerInstructions: number;
@@ -161,9 +168,12 @@ export type TokenEstimateBreakdown = {
   deferredToolCatalog?: number;
   loadedToolSchemas?: number;
   toolSchemas: number;
+  outputSchema?: number;
+  turnAssistantState?: number;
   providerState: number;
   other: number;
   total: number;
+  details?: TokenEstimateDetail[];
 };
 
 export type ThreadContextSnapshot = {
@@ -288,6 +298,10 @@ export type AgentEventPayload =
       retry_limit?: number | null;
       reason: string;
       body?: unknown;
+    }
+  | {
+      type: "provider_first_token_received";
+      request_id: string;
     }
   | {
       type: "provider_response_received";

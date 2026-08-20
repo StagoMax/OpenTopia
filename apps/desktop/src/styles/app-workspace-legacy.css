@@ -1564,6 +1564,32 @@
   content: "";
 }
 
+.composer-context-usage-ring {
+  display: block;
+  flex: 0 0 auto;
+  width: var(--icon-size-xs);
+  height: var(--icon-size-xs);
+  overflow: visible;
+}
+
+.composer-context-usage-track,
+.composer-context-usage-value {
+  fill: none;
+  stroke-width: 2;
+}
+
+.composer-context-usage-track {
+  stroke: var(--border-strong);
+}
+
+.composer-context-usage-value {
+  stroke: var(--text-secondary);
+  stroke-linecap: round;
+  transform: rotate(-90deg);
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
 .composer-plan {
   width: min(
     var(--conversation-composer-max-width),

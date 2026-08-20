@@ -33,7 +33,10 @@ import {
 import { isConversationScrollNearEnd } from "../../conversationScroll";
 import type { PendingTurnFeedback } from "../../conversationSession";
 import { friendlyProviderError } from "../../providerErrors";
-import { shouldShowRecordedTurnChanges } from "../../turnChangeOwnership";
+import {
+  isTurnChangeDisplaySettled,
+  shouldShowRecordedTurnChanges,
+} from "../../turnChangeOwnership";
 import {
   hasPendingProviderRequest,
   hasPendingToolCall,
@@ -116,6 +119,7 @@ export function MessageList({
     turnIdsByAssistantMessage,
     changeSetsByTurn,
     revertedTurnIds,
+    orphanContextActivityTurnIds,
     orphanTurnErrors,
     turnsWithAssistantCards,
   } = useMemo(() => {
@@ -164,6 +168,17 @@ export function MessageList({
         event.payload.type === "error" &&
         (!event.turnId || !anchoredTurnIds.has(event.turnId)),
     );
+    const orphanContextActivityTurnIds = [...eventsByTurn.entries()]
+      .filter(
+        ([turnId, turnEvents]) =>
+          !anchoredTurnIds.has(turnId) &&
+          turnEvents.some(isContextCompactionActivityEvent),
+      )
+      .sort(
+        ([, leftEvents], [, rightEvents]) =>
+          (leftEvents[0]?.seq ?? 0) - (rightEvents[0]?.seq ?? 0),
+      )
+      .map(([turnId]) => turnId);
     const turnsWithAssistantCards = new Set(
       [...turnIdsByAssistantMessage.values()].flatMap((turnIds) => turnIds),
     );
@@ -173,6 +188,7 @@ export function MessageList({
       turnIdsByAssistantMessage,
       changeSetsByTurn,
       revertedTurnIds,
+      orphanContextActivityTurnIds,
       orphanTurnErrors,
       turnsWithAssistantCards,
     };
@@ -275,7 +291,12 @@ export function MessageList({
 
   const renderTurnChangeCard = (turnId: string) => {
     const changeSet = changeSetsByTurn.get(turnId);
-    if (!changeSet) return null;
+    if (
+      !changeSet ||
+      !isTurnChangeDisplaySettled(events, turnId, activeTurnId)
+    ) {
+      return null;
+    }
     return (
       <TurnChangeCard
         key={`turn-change-card-${turnId}`}
@@ -360,6 +381,19 @@ export function MessageList({
               );
             })
           )}
+          {orphanContextActivityTurnIds.map((turnId) => {
+            const activityEvents = eventsByTurn.get(turnId) ?? [];
+            return (
+              <TurnActivityTimeline
+                key={`context-compaction-${turnId}`}
+                events={activityEvents}
+                isActive={!contextCompactionActivityFinished(activityEvents)}
+                standalone
+                formatError={friendlyProviderError}
+                onOpenMarkdownLink={onOpenMarkdownLink}
+              />
+            );
+          })}
           {orphanTurnErrors.map((event) => (
             <article
               className="message assistant turn-error-message"
@@ -412,6 +446,27 @@ export function MessageList({
       ) : null}
     </div>
   );
+}
+
+function isContextCompactionActivityEvent(event: AgentEvent) {
+  const payload = event.payload;
+  return (
+    (payload.type === "model_context_built" &&
+      payload.purpose === "context_compaction") ||
+    payload.type === "context_compacted" ||
+    (payload.type === "context_warning" && payload.stage.includes("compaction"))
+  );
+}
+
+function contextCompactionActivityFinished(events: AgentEvent[]) {
+  return events.some((event) => {
+    const payload = event.payload;
+    return (
+      payload.type === "context_compacted" ||
+      (payload.type === "context_warning" &&
+        payload.stage.includes("compaction"))
+    );
+  });
 }
 
 function trimCopiedSelection(event: ReactClipboardEvent<HTMLDivElement>) {

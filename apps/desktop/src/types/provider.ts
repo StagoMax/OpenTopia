@@ -28,7 +28,11 @@ export type ProviderInstructionEncoding =
   "native_roles" | "fold_developer_into_system" | "portable_chat_envelope";
 
 export type ProviderReasoningProtocol =
-  "reasoning_effort" | "deep_seek_thinking" | "glm_thinking";
+  | "omit"
+  | "chat_reasoning_effort"
+  | "chat_thinking_reasoning_effort"
+  | "chat_thinking_high_max_no_tool_choice"
+  | "responses_reasoning";
 
 export type ProviderMessageProtocolCapabilities = {
   requiresReasoningContentForToolCalls: boolean;
@@ -91,7 +95,7 @@ export type Project = {
 };
 
 export type PermissionMode =
-  "chat" | "read_only" | "auto" | "approve" | "full_access";
+  "chat" | "read_only" | "auto" | "approve" | "full_access" | "unrestricted";
 
 export type AgentRuntimeSettings = {
   personality: "focused" | "professional" | "warm";

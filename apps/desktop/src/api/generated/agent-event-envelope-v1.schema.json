@@ -297,6 +297,25 @@
         },
         {
           "properties": {
+            "request_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "provider_first_token_received"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "request_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
             "attempt": {
               "format": "uint",
               "minimum": 0.0,
@@ -1202,6 +1221,13 @@
           },
           "type": "array"
         },
+        "phases": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ContextCheckpointPhase"
+          },
+          "type": "array"
+        },
         "previousCheckpointId": {
           "format": "uuid",
           "type": [
@@ -1423,6 +1449,35 @@
       ],
       "type": "object"
     },
+    "ContextCheckpointMetric": {
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "sourceSeqs": {
+          "default": [],
+          "items": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "unit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "value"
+      ],
+      "type": "object"
+    },
     "ContextCheckpointMode": {
       "enum": [
         "legacy_text",
@@ -1431,6 +1486,100 @@
         "native_provider"
       ],
       "type": "string"
+    },
+    "ContextCheckpointPhase": {
+      "description": "One evidence-backed stage in the task's durable history.\n\n`from_seq`/`through_seq` are the authoritative ordering keys. Timestamps are canonicalized from those events by the checkpoint service rather than trusted from model output.",
+      "properties": {
+        "endedAt": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fromSeq": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "metrics": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ContextCheckpointMetric"
+          },
+          "type": "array"
+        },
+        "objective": {
+          "type": "string"
+        },
+        "outcome": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "problem": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "remainingRisks": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "resolution": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rootCause": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sourceSeqs": {
+          "default": [],
+          "items": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "startedAt": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": "string"
+        },
+        "throughSeq": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "fromSeq",
+        "id",
+        "objective",
+        "status",
+        "throughSeq",
+        "title"
+      ],
+      "type": "object"
     },
     "ContextCheckpointStep": {
       "properties": {
@@ -1529,6 +1678,18 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "cacheHitPercent": {
+          "default": 0,
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "cachedInputTokens": {
+          "default": 0,
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
         "checkpointTokens": {
           "format": "uint",
           "minimum": 0.0,
@@ -1540,6 +1701,7 @@
           "type": "integer"
         },
         "inputTokens": {
+          "description": "Exact logical agent request before local compaction.",
           "format": "uint",
           "minimum": 0.0,
           "type": "integer"
@@ -1549,10 +1711,43 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "postCompactionTokens": {
+          "default": 0,
+          "description": "Exact logical agent request after the checkpoint starts a new epoch.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "providerInputTokens": {
+          "default": 0,
+          "description": "Provider-reported usage for the auxiliary compaction model call.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "providerOutputTokens": {
+          "default": 0,
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "remainingPercent": {
+          "default": 0,
+          "description": "Percentage of the original request remaining after compaction.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
         "source": {
           "type": "string"
         },
         "tokenReductionPercent": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tokensRemoved": {
+          "default": 0,
           "format": "uint",
           "minimum": 0.0,
           "type": "integer"
@@ -2579,10 +2774,18 @@
           "type": "integer"
         },
         "deferredToolCatalog": {
+          "default": 0,
           "description": "Names/descriptions visible before a deferred tool is selected.",
           "format": "uint",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "details": {
+          "description": "Hierarchical local attribution. Omitted when replaying legacy logs.",
+          "items": {
+            "$ref": "#/definitions/TokenEstimateDetail"
+          },
+          "type": "array"
         },
         "developerInstructions": {
           "format": "uint",
@@ -2590,18 +2793,27 @@
           "type": "integer"
         },
         "directToolSchemas": {
-          "description": "Full schemas sent directly on this request (including output schemas).",
+          "default": 0,
+          "description": "Full input schemas sent directly in the request's tool surface.",
           "format": "uint",
           "minimum": 0.0,
           "type": "integer"
         },
         "loadedToolSchemas": {
+          "default": 0,
           "description": "Schemas appended by a provider Tool Search continuation.",
           "format": "uint",
           "minimum": 0.0,
           "type": "integer"
         },
         "other": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "outputSchema": {
+          "default": 0,
+          "description": "A structured-output schema is a request field, not a tool definition.",
           "format": "uint",
           "minimum": 0.0,
           "type": "integer"
@@ -2651,6 +2863,13 @@
           "format": "uint",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "turnAssistantState": {
+          "default": 0,
+          "description": "Provider-native assistant message items replayed inside the active turn. These are neither durable conversation history nor opaque continuation state, so they remain a separate, mutually exclusive bucket.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
         }
       },
       "required": [
@@ -2658,10 +2877,7 @@
         "checkpoints",
         "conversation",
         "currentUser",
-        "deferredToolCatalog",
         "developerInstructions",
-        "directToolSchemas",
-        "loadedToolSchemas",
         "other",
         "providerState",
         "repositoryInstructions",
@@ -2672,6 +2888,34 @@
         "toolResults",
         "toolSchemas",
         "total"
+      ],
+      "type": "object"
+    },
+    "TokenEstimateDetail": {
+      "description": "One node in the local attribution tree for a logical model request.\n\nProviders report request-level usage totals. These nodes preserve the harness-owned structure used to assemble that request without presenting the individual values as provider-billed facts.",
+      "properties": {
+        "children": {
+          "items": {
+            "$ref": "#/definitions/TokenEstimateDetail"
+          },
+          "type": "array"
+        },
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "tokens": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "tokens"
       ],
       "type": "object"
     },

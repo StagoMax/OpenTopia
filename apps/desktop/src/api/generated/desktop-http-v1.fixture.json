@@ -1,7 +1,7 @@
 {
   "ok": true,
   "service": "opentopia-server",
-  "apiVersion": 1,
+  "apiVersion": 2,
   "shellRuntime": {
     "runtime": {
       "program": "pwsh",
@@ -10,6 +10,18 @@
       "source": "path"
     },
     "managedVersion": "7.4.0",
+    "managedStatus": "not_required"
+  },
+  "officeRuntime": {
+    "runtime": {
+      "executable": "python/python.exe",
+      "root": "office-runtime",
+      "runtimeVersion": "python-3.12.14-openpyxl-3.1.5-r1",
+      "pythonVersion": "3.12.14",
+      "openpyxlVersion": "3.1.5",
+      "source": "packaged"
+    },
+    "managedVersion": "python-3.12.14-openpyxl-3.1.5-r1",
     "managedStatus": "not_required"
   }
 }

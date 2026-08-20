@@ -36,12 +36,17 @@ function task(id: string, overrides: Partial<HumanTask> = {}): HumanTask {
 test("presents task types, statuses, and actions consistently", () => {
   assert.equal(humanTaskTypeLabel("approval"), "等待审批");
   assert.equal(humanTaskTypeLabel("reconnect"), "重新连接");
+  assert.equal(humanTaskTypeLabel("reconciliation"), "副作用对账");
   assert.equal(humanTaskStatusLabel("pending"), "待处理");
   assert.deepEqual(humanTaskActionPresentation("retry"), {
     label: "检查后重试",
     pendingLabel: "正在重试…",
     variant: "secondary",
   });
+  assert.equal(
+    humanTaskActionPresentation("acknowledge").label,
+    "确认核对结果并继续",
+  );
 });
 
 test("orders only actions allowed by the task", () => {
@@ -61,6 +66,15 @@ test("orders only actions allowed by the task", () => {
       }),
     ),
     ["retry", "approve", "cancel"],
+  );
+  assert.deepEqual(
+    orderedHumanTaskActions(
+      task("reconciliation", {
+        taskType: "reconciliation",
+        allowedActions: ["cancel", "acknowledge"],
+      }),
+    ),
+    ["acknowledge", "cancel"],
   );
 });
 

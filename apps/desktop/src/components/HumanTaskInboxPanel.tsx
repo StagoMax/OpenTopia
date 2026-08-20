@@ -8,6 +8,7 @@ import {
 } from "react";
 import {
   CheckCircle2,
+  ClipboardCheck,
   CircleAlert,
   Clock3,
   Inbox,
@@ -16,6 +17,7 @@ import {
   RotateCcw,
   ShieldCheck,
   Square,
+  UserCheck,
   XCircle,
 } from "lucide-react";
 import type { ApiClient } from "../api/client";
@@ -32,7 +34,10 @@ import type {
   HumanTaskAction,
   HumanTaskResolutionResult,
   HumanTaskType,
+  UserInputRequest,
+  UserInputResponse,
 } from "../types";
+import { PlanChoiceCard } from "./PlanChoiceCard";
 import { Badge, Button, IconButton, Panel, Select } from "./ui";
 import "./HumanTaskInboxPanel.css";
 
@@ -49,6 +54,7 @@ const taskKindOptions: ReadonlyArray<{
   { value: "recovery", label: "故障恢复" },
   { value: "reconnect", label: "重新连接" },
   { value: "data_correction", label: "数据修正" },
+  { value: "reconciliation", label: "副作用对账" },
   { value: "manual", label: "人工处理" },
 ];
 
@@ -87,8 +93,10 @@ export function HumanTaskInboxPanel({
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [busyAction, setBusyAction] = useState<HumanTaskAction | null>(null);
+  const [claiming, setClaiming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const hiddenTaskIdsRef = useRef(new Set<string>());
+  const commandKeysRef = useRef(new Map<string, string>());
 
   const selectedTask = useMemo(
     () => tasks.find((task) => task.id === selectedTaskId) ?? null,
@@ -187,17 +195,24 @@ export function HumanTaskInboxPanel({
     onSelectedTaskChange?.(selectedTaskId);
   }, [onSelectedTaskChange, selectedTaskId]);
 
-  async function resolveTask(action: HumanTaskAction) {
+  async function resolveTask(action: HumanTaskAction, response?: unknown) {
     if (!client || !selectedTask || busyAction) return;
     const taskId = selectedTask.id;
     setBusyAction(action);
     setError(null);
+    const commandKey = `${taskId}:${action}`;
+    const idempotencyKey =
+      commandKeysRef.current.get(commandKey) ?? crypto.randomUUID();
+    commandKeysRef.current.set(commandKey, idempotencyKey);
     try {
       const result = await client.resolveHumanTask(taskId, {
         expectedRevision: selectedTask.revision,
         action,
         note: note.trim() || undefined,
+        idempotencyKey,
+        response,
       });
+      commandKeysRef.current.delete(commandKey);
       hiddenTaskIdsRef.current.add(taskId);
       const remaining = tasks.filter((task) => task.id !== taskId);
       setTasks(remaining);
@@ -216,6 +231,25 @@ export function HumanTaskInboxPanel({
       setError(readableError(cause));
     } finally {
       setBusyAction(null);
+    }
+  }
+
+  async function claimTask() {
+    if (!client || !selectedTask || claiming || busyAction) return;
+    setClaiming(true);
+    setError(null);
+    try {
+      const updated = await client.claimHumanTask(
+        selectedTask.id,
+        selectedTask.revision,
+      );
+      setTasks((current) =>
+        current.map((task) => (task.id === updated.id ? updated : task)),
+      );
+    } catch (cause) {
+      setError(readableError(cause));
+    } finally {
+      setClaiming(false);
     }
   }
 
@@ -326,9 +360,13 @@ export function HumanTaskInboxPanel({
           {selectedTask ? (
             <HumanTaskDetail
               busyAction={busyAction}
+              claiming={claiming}
               note={note}
               onNoteChange={setNote}
-              onResolve={(action) => void resolveTask(action)}
+              onClaim={() => void claimTask()}
+              onResolve={(action, response) =>
+                void resolveTask(action, response)
+              }
               task={selectedTask}
             />
           ) : (
@@ -345,18 +383,26 @@ export function HumanTaskInboxPanel({
 
 function HumanTaskDetail({
   busyAction,
+  claiming,
   note,
   onNoteChange,
+  onClaim,
   onResolve,
   task,
 }: {
   busyAction: HumanTaskAction | null;
+  claiming: boolean;
   note: string;
   onNoteChange(value: string): void;
-  onResolve(action: HumanTaskAction): void;
+  onClaim(): void;
+  onResolve(action: HumanTaskAction, response?: unknown): void;
   task: HumanTask;
 }) {
   const actions = orderedHumanTaskActions(task);
+  const inputRequest = humanTaskInputRequest(task);
+  const requiresObservation =
+    task.taskType === "reconciliation" || task.taskType === "reconnect";
+  const activityReceipt = humanTaskActivityReceipt(task);
   return (
     <article
       className="human-task-detail"
@@ -381,6 +427,37 @@ function HumanTaskDetail({
             <code>{task.sourceId}</code>
           </dd>
         </div>
+        {task.checkpointId ? (
+          <div>
+            <dt>Checkpoint</dt>
+            <dd>
+              <code>{task.checkpointId}</code>
+            </dd>
+          </div>
+        ) : null}
+        {task.continuationId ? (
+          <div>
+            <dt>Continuation</dt>
+            <dd>
+              <code>{task.continuationId}</code>
+            </dd>
+          </div>
+        ) : null}
+        {task.dueAt ? (
+          <div>
+            <dt>SLA</dt>
+            <dd className={isOverdue(task.dueAt) ? "is-overdue" : undefined}>
+              {isOverdue(task.dueAt) ? "已超时 · " : "截止 "}
+              {formatDateTime(task.dueAt)}
+            </dd>
+          </div>
+        ) : null}
+        {task.claimedBy || task.assignedTo ? (
+          <div>
+            <dt>负责人</dt>
+            <dd>{task.claimedBy ?? task.assignedTo}</dd>
+          </div>
+        ) : null}
         {task.sourceNodeId ? (
           <div>
             <dt>节点</dt>
@@ -401,13 +478,81 @@ function HumanTaskDetail({
         </div>
       </dl>
 
-      {task.taskType === "recovery" ? (
+      {task.taskType === "recovery" || task.taskType === "reconciliation" ? (
         <div className="human-task-detail__warning">
           <CircleAlert aria-hidden="true" size={16} />
           <span>
-            重试前请确认外部系统是否已经产生副作用；继续后会创建新的节点尝试。
+            {task.taskType === "reconciliation"
+              ? "系统不会自动重放这次外部调用。请核对目标系统后，提交你观察到的真实结果。"
+              : "重试前请确认外部系统是否已经产生副作用；若存在 continuation，将恢复原执行点。"}
           </span>
         </div>
+      ) : null}
+
+      {activityReceipt ? (
+        <section
+          className="human-task-detail__receipt"
+          aria-label="Activity Receipt 活动回执"
+        >
+          <span aria-hidden="true">
+            <ClipboardCheck size={16} />
+          </span>
+          <div>
+            <strong>Activity Receipt / 活动回执</strong>
+            <dl>
+              <div>
+                <dt>操作</dt>
+                <dd>{readString(activityReceipt.operation) ?? "未知"}</dd>
+              </div>
+              <div>
+                <dt>状态</dt>
+                <dd>{readString(activityReceipt.status) ?? "未知"}</dd>
+              </div>
+              <div>
+                <dt>幂等键</dt>
+                <dd>
+                  <code>
+                    {readString(activityReceipt.idempotencyKey) ?? "—"}
+                  </code>
+                </dd>
+              </div>
+            </dl>
+          </div>
+        </section>
+      ) : null}
+
+      {!task.claimedBy ? (
+        <div className="human-task-detail__claim">
+          <span>先领取任务可防止其他处理人同时操作。</span>
+          <Button
+            disabled={claiming || busyAction !== null}
+            onClick={onClaim}
+            variant="secondary"
+          >
+            {claiming ? (
+              <Loader2 aria-hidden="true" className="is-spinning" size={14} />
+            ) : (
+              <UserCheck aria-hidden="true" size={14} />
+            )}
+            {claiming ? "正在领取…" : "领取任务"}
+          </Button>
+        </div>
+      ) : null}
+
+      {inputRequest ? (
+        <PlanChoiceCard
+          error={null}
+          isSubmitting={busyAction !== null}
+          onCancel={() => onResolve("cancel")}
+          onSkip={() =>
+            onResolve("submit", {
+              answers: [],
+              skipped: true,
+            } satisfies UserInputResponse)
+          }
+          onSubmit={(response) => onResolve("submit", response)}
+          request={inputRequest}
+        />
       ) : null}
 
       {task.payload !== null && task.payload !== undefined ? (
@@ -417,23 +562,36 @@ function HumanTaskDetail({
         </details>
       ) : null}
 
-      <label className="human-task-detail__note">
-        <span>处理说明（可选）</span>
-        <textarea
-          disabled={busyAction !== null}
-          onChange={(event) => onNoteChange(event.target.value)}
-          placeholder="记录审批依据、检查结果或拒绝原因"
-          value={note}
-        />
-      </label>
+      {!inputRequest ? (
+        <label className="human-task-detail__note">
+          <span>
+            {requiresObservation ? "核对结果（必填）" : "处理说明（可选）"}
+          </span>
+          <textarea
+            disabled={busyAction !== null}
+            onChange={(event) => onNoteChange(event.target.value)}
+            placeholder={
+              requiresObservation
+                ? "说明外部系统中的真实状态或已完成的人工动作"
+                : "记录审批依据、检查结果或拒绝原因"
+            }
+            value={note}
+          />
+        </label>
+      ) : null}
 
-      {actions.length > 0 ? (
+      {!inputRequest && actions.length > 0 ? (
         <footer className="human-task-detail__actions">
           {actions.map((action) => {
             const presentation = humanTaskActionPresentation(action);
             return (
               <Button
-                disabled={busyAction !== null}
+                disabled={
+                  busyAction !== null ||
+                  (requiresObservation &&
+                    ["resume", "reconnect", "acknowledge"].includes(action) &&
+                    !note.trim())
+                }
                 key={action}
                 onClick={() => onResolve(action)}
                 variant={presentation.variant}
@@ -454,11 +612,11 @@ function HumanTaskDetail({
             );
           })}
         </footer>
-      ) : (
+      ) : !inputRequest ? (
         <p className="human-task-detail__no-actions">
           该任务目前没有可用操作，请联系 Flow 管理员。
         </p>
-      )}
+      ) : null}
     </article>
   );
 }
@@ -495,7 +653,8 @@ function TaskTypeIcon({ type }: { type: HumanTaskType }) {
   if (
     type === "recovery" ||
     type === "reconnect" ||
-    type === "data_correction"
+    type === "data_correction" ||
+    type === "reconciliation"
   ) {
     return <RotateCcw aria-hidden="true" size={16} />;
   }
@@ -512,7 +671,42 @@ function TaskActionIcon({ action }: { action: HumanTaskAction }) {
   if (action === "retry") {
     return <RotateCcw aria-hidden="true" size={14} />;
   }
+  if (["resume", "submit", "reconnect", "acknowledge"].includes(action)) {
+    return <CheckCircle2 aria-hidden="true" size={14} />;
+  }
   return <Square aria-hidden="true" size={14} />;
+}
+
+function humanTaskInputRequest(task: HumanTask): UserInputRequest | null {
+  if (task.taskType !== "input_request") return null;
+  const request = asRecord(task.payload)?.request;
+  const record = asRecord(request);
+  return record &&
+    typeof record.requestId === "string" &&
+    Array.isArray(record.questions)
+    ? (request as UserInputRequest)
+    : null;
+}
+
+function humanTaskActivityReceipt(
+  task: HumanTask,
+): Record<string, unknown> | null {
+  return asRecord(asRecord(task.payload)?.activityReceipt);
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function readString(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+function isOverdue(value: string): boolean {
+  const time = new Date(value).getTime();
+  return Number.isFinite(time) && time < Date.now();
 }
 
 function formatDateTime(value: string): string {

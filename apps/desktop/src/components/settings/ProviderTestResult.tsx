@@ -14,7 +14,7 @@ export function ProviderTestResult({
     >
       <div>
         {success
-          ? `连接成功${result?.latencyMs ? ` · ${result.latencyMs} ms` : ""}`
+          ? `兼容性检测通过${result?.latencyMs ? ` · 总用时 ${formatCompatibilityCheckDuration(result.latencyMs)}（含多项请求）` : ""}`
           : (result?.error ?? "连接失败，请检查地址、模型和密钥。")}
       </div>
       {result?.openaiCompatibility ? (
@@ -22,6 +22,12 @@ export function ProviderTestResult({
       ) : null}
     </div>
   );
+}
+
+function formatCompatibilityCheckDuration(durationMs: number): string {
+  return durationMs >= 1_000
+    ? `${(durationMs / 1_000).toFixed(1)} 秒`
+    : `${durationMs} 毫秒`;
 }
 
 export function OpenAiCompatibilityDetails({

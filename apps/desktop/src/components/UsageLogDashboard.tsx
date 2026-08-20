@@ -9,6 +9,7 @@ import {
 } from "../usageLogs";
 import type { AgentEvent, Thread } from "../types";
 import { Badge, Panel, type BadgeVariant } from "./ui";
+import { UsageTokenBreakdown } from "./UsageTokenBreakdown";
 import "./UsageLogDashboard.css";
 
 type UsageLogDashboardProps = {
@@ -162,22 +163,7 @@ export function UsageLogDashboard({
           </Panel>
         </div>
 
-        <Panel
-          className="usage-token-breakdown-panel"
-          title="输入 Token 瀑布（本地估算）"
-          actions={
-            <Badge variant="neutral">
-              {formatInteger(data.summary.tokenBreakdown.total)} Tokens
-            </Badge>
-          }
-        >
-          <p className="usage-token-breakdown-help">
-            按请求实际组装的上下文模块归因；模块合计是原始估算，后续轮次会用同一任务中
-            Provider 已返回 usage 的中位数校准调用前预算。两者都不替代实际
-            usage。
-          </p>
-          <TokenBreakdownTable summary={data.summary} />
-        </Panel>
+        <UsageTokenBreakdown calls={data.calls} summary={data.summary} />
 
         <Panel className="usage-waste-panel" title="可归因浪费与附加成本">
           <MetricList
@@ -509,86 +495,6 @@ function MetricList({ items }: { items: Array<[string, string]> }) {
         </div>
       ))}
     </dl>
-  );
-}
-
-function TokenBreakdownTable({ summary }: { summary: UsageSummary }) {
-  const breakdown = summary.tokenBreakdown;
-  const hasDetailedToolSurface =
-    (breakdown.directToolSchemas ?? 0) > 0 ||
-    (breakdown.deferredToolCatalog ?? 0) > 0 ||
-    (breakdown.loadedToolSchemas ?? 0) > 0;
-  const toolRows: Array<[string, number]> = hasDetailedToolSurface
-    ? [
-        ["直接加载的工具 / 输出 Schema", breakdown.directToolSchemas ?? 0],
-        ["延迟工具目录", breakdown.deferredToolCatalog ?? 0],
-        ["Tool Search 后加载的 Schema", breakdown.loadedToolSchemas ?? 0],
-      ]
-    : [["工具 / 输出 Schema", breakdown.toolSchemas]];
-  const allRows: Array<[string, number]> = [
-    ["基础指令", breakdown.baseInstructions],
-    ["开发者指令", breakdown.developerInstructions],
-    ["仓库指令", breakdown.repositoryInstructions],
-    ["运行时环境", breakdown.runtimeContext],
-    ["Skills", breakdown.skillInstructions],
-    ["上下文摘要", breakdown.summaries],
-    ["检查点", breakdown.checkpoints],
-    ["会话历史", breakdown.conversation],
-    ["当前用户输入", breakdown.currentUser],
-    ["工具调用", breakdown.toolCalls],
-    ["工具结果", breakdown.toolResults],
-    ...toolRows,
-    ["Provider 状态对象", breakdown.providerState],
-    ["其他", breakdown.other],
-  ];
-  const rows = allRows.filter(([, tokens]) => tokens > 0);
-
-  if (rows.length === 0) {
-    return (
-      <div className="usage-table-state">
-        <span>新请求完成后会记录可审计的模块级 Token 构成。</span>
-      </div>
-    );
-  }
-
-  return (
-    <div className="usage-table-wrap">
-      <table className="usage-token-breakdown-table">
-        <thead>
-          <tr>
-            <th scope="col">输入模块</th>
-            <th scope="col" className="usage-number-cell">
-              估算 Tokens
-            </th>
-            <th scope="col" className="usage-number-cell">
-              占比
-            </th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map(([label, tokens]) => (
-            <tr key={label}>
-              <th scope="row">{label}</th>
-              <td className="usage-number-cell">{formatInteger(tokens)}</td>
-              <td className="usage-number-cell">
-                {formatPercent(
-                  breakdown.total > 0 ? tokens / breakdown.total : null,
-                )}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-        <tfoot>
-          <tr>
-            <th scope="row">合计</th>
-            <td className="usage-number-cell">
-              {formatInteger(breakdown.total)}
-            </td>
-            <td className="usage-number-cell">100%</td>
-          </tr>
-        </tfoot>
-      </table>
-    </div>
   );
 }
 

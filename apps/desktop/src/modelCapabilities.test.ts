@@ -5,10 +5,15 @@ import type * as ModelCapabilitiesModule from "./modelCapabilities";
 import type { ProviderSettings } from "./types";
 
 const {
+  DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS,
+  knownModelContextWindowTokens,
   knownModelSupportsVision,
   modelSupportsVision,
   modelVisionSupportSource,
+  resolveKnownModelContextWindow,
+  resolveModelContextWindow,
   resolveModelVisionSupport,
+  resolveThreadModelContextWindow,
 } = (await import(
   "./modelCapabilities" + ".ts"
 )) as typeof ModelCapabilitiesModule;
@@ -41,6 +46,82 @@ test("uses detected vision support for the selected model", () => {
   const settings = provider();
   assert.equal(modelSupportsVision(settings, "text-only"), false);
   assert.equal(modelVisionSupportSource(settings, "vision"), "detected");
+});
+
+test("resolves and identifies the context-window source used by the runtime", () => {
+  const settings = provider();
+  settings.modelContextWindows = { "text-only": 32_768 };
+
+  assert.deepEqual(resolveModelContextWindow(settings, "text-only"), {
+    contextWindowTokens: 32_768,
+    source: "detected",
+  });
+  assert.deepEqual(resolveModelContextWindow(settings, "deepseek-v4-flash"), {
+    contextWindowTokens: 1_048_576,
+    source: "official",
+  });
+  assert.equal(
+    knownModelContextWindowTokens("openai/deepseek-v4-flash:batch"),
+    1_048_576,
+  );
+  assert.deepEqual(resolveKnownModelContextWindow("deepseek-v5-flash"), {
+    contextWindowTokens: 1_048_576,
+    source: "inferred",
+    referenceModelId: "deepseek-v4-flash",
+  });
+  assert.deepEqual(resolveModelContextWindow(settings, "deepseek-v5-flash"), {
+    contextWindowTokens: 1_048_576,
+    source: "inferred",
+    inferredFromModelId: "deepseek-v4-flash",
+  });
+  assert.equal(knownModelContextWindowTokens("deepseek-v5-image"), undefined);
+  assert.deepEqual(resolveModelContextWindow(settings, "unknown-model"), {
+    contextWindowTokens: DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS,
+    source: "fallback",
+  });
+});
+
+test("keeps explicit context-window overrides above automatic resolution", () => {
+  const settings = provider();
+  settings.contextWindowTokens = 64_000;
+  settings.modelSettings = {
+    vision: { contextWindowTokens: 128_000 },
+  };
+
+  assert.deepEqual(resolveModelContextWindow(settings, "text-only"), {
+    contextWindowTokens: 64_000,
+    source: "connection_override",
+  });
+  assert.deepEqual(resolveModelContextWindow(settings, "vision"), {
+    contextWindowTokens: 128_000,
+    source: "model_override",
+  });
+});
+
+test("resolves the context window for a pinned thread model", () => {
+  const active = provider();
+  active.id = "active";
+  active.contextWindowTokens = 64_000;
+  const pinned = provider();
+  pinned.id = "pinned";
+  pinned.modelSettings = { vision: { contextWindowTokens: 256_000 } };
+
+  assert.deepEqual(
+    resolveThreadModelContextWindow([active, pinned], active.id, {
+      connectionId: pinned.id,
+      modelId: "vision",
+      reasoningEffort: null,
+    }),
+    { contextWindowTokens: 256_000, source: "model_override" },
+  );
+  assert.deepEqual(
+    resolveThreadModelContextWindow([active], active.id, {
+      connectionId: "removed",
+      modelId: "vision",
+      reasoningEffort: null,
+    }),
+    { contextWindowTokens: 64_000, source: "connection_override" },
+  );
 });
 
 test("keeps an explicit per-model override above discovered metadata", () => {

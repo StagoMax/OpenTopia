@@ -4,7 +4,10 @@ import {
   classifyModelFamily,
   formatModelDisplayName,
 } from "../../modelCatalog";
-import { resolveModelVisionSupport } from "../../modelCapabilities";
+import {
+  resolveModelContextWindow,
+  resolveModelVisionSupport,
+} from "../../modelCapabilities";
 import {
   REASONING_EFFORT_DETAILS,
   resolveModelReasoningCapability,
@@ -76,7 +79,10 @@ export function ModelConfigurationSection({
     connection.kind,
     modelId,
   );
-  const reportedContextWindow = connection.modelContextWindows?.[modelId];
+  const contextWindowResolution = resolveModelContextWindow(
+    connection,
+    modelId,
+  );
   const visionResolution = resolveModelVisionSupport(connection, modelId);
   const supportsVision = visionResolution.supportsVision;
   const visionPreference =
@@ -139,7 +145,7 @@ export function ModelConfigurationSection({
         <div>
           <strong>模型配置</strong>
           <span>
-            参数只应用到选中的模型；API 返回的上下文与多模态能力会自动显示。
+            参数只应用到选中的模型；上下文窗口与多模态能力会自动解析并显示。
           </span>
         </div>
       </header>
@@ -222,9 +228,7 @@ export function ModelConfigurationSection({
                 type: "number",
                 min: 4096,
                 step: 1024,
-                placeholder: reportedContextWindow
-                  ? "API 自动识别"
-                  : "自动识别",
+                placeholder: "自动识别",
               }}
               label="选择常用上下文窗口"
               menuLabel="常用上下文窗口"
@@ -236,11 +240,17 @@ export function ModelConfigurationSection({
               onOptionSelect={selectContextWindowPreset}
             />
             <small role="status">
-              {modelSettings?.contextWindowTokens !== undefined
-                ? `正在使用此模型的手动覆盖：${modelSettings.contextWindowTokens?.toLocaleString()} tokens。`
-                : reportedContextWindow
-                  ? `API /models 已报告此模型为 ${reportedContextWindow.toLocaleString()} tokens。`
-                  : "API 未报告上下文窗口，将使用内置模型表或连接默认值。"}
+              {contextWindowResolution.source === "model_override"
+                ? `正在使用此模型的手动覆盖：${contextWindowResolution.contextWindowTokens.toLocaleString()} tokens。`
+                : contextWindowResolution.source === "connection_override"
+                  ? `正在继承连接默认值：${contextWindowResolution.contextWindowTokens.toLocaleString()} tokens。`
+                  : contextWindowResolution.source === "detected"
+                    ? `自动识别结果：${contextWindowResolution.contextWindowTokens.toLocaleString()} tokens（API /models 报告）。`
+                    : contextWindowResolution.source === "official"
+                      ? `自动识别结果：${contextWindowResolution.contextWindowTokens.toLocaleString()} tokens（内置模型表）。`
+                      : contextWindowResolution.source === "inferred"
+                        ? `自动识别结果：${contextWindowResolution.contextWindowTokens.toLocaleString()} tokens（按同前缀上一代 ${contextWindowResolution.inferredFromModelId} 推断）。`
+                        : `自动识别结果：${contextWindowResolution.contextWindowTokens.toLocaleString()} tokens（未知模型保守兜底）。`}
             </small>
           </label>
         </div>

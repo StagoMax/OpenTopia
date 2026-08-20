@@ -7,6 +7,10 @@ import {
   type ToolActivityGroup as ToolGroupKey,
 } from "../../toolActivity";
 import type { GuardianReviewCompletedPayload } from "../../guardianActivity";
+import {
+  buildContextCompactionActivities,
+  type ContextCompactionActivityEntry,
+} from "./contextCompactionActivity";
 
 export type ToolExecution = {
   call: ToolCall;
@@ -99,7 +103,8 @@ type PrimitiveActivity =
     }
   | { kind: "error"; seq: number; message: string; createdAt: string }
   | { kind: "cancelled"; seq: number; reason: string; createdAt: string }
-  | { kind: "suspended"; seq: number; reason: string; createdAt: string };
+  | { kind: "suspended"; seq: number; reason: string; createdAt: string }
+  | ContextCompactionActivityEntry;
 
 export type ActivityEntry =
   | {
@@ -134,7 +139,8 @@ export function buildActivityEntries(events: AgentEvent[]): ActivityEntry[] {
     string,
     Extract<PrimitiveActivity, { kind: "reconnect" }>
   >();
-  const primitives: PrimitiveActivity[] = [];
+  const primitives: PrimitiveActivity[] =
+    buildContextCompactionActivities(sorted);
   const formEvents = sorted.filter(
     (event) => event.payload.type === "work_form_updated",
   );
@@ -486,6 +492,7 @@ export function activityEntryIsRunning(entry: ActivityEntry) {
     return entry.form.items.some((item) => item.status === "in_progress");
   }
   if (entry.kind === "guardian-review") return !entry.completed;
+  if (entry.kind === "context-compaction") return !entry.finishedAt;
   return false;
 }
 
@@ -517,6 +524,9 @@ export function activityEntryKey(entry: ActivityEntry) {
     return entry.id;
   if (entry.kind === "guardian-review") {
     return `guardian-review-${entry.reviewId}`;
+  }
+  if (entry.kind === "context-compaction") {
+    return `context-compaction-${entry.requestId}`;
   }
   return `${entry.kind}-${entry.seq}`;
 }

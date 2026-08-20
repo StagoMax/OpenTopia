@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import {
   Archive,
@@ -23,6 +23,7 @@ import {
   Pin,
   Plug,
   Plus,
+  Rocket,
   Search,
   Settings,
   SquarePen,
@@ -66,9 +67,11 @@ export function Sidebar({
   flowModeEnabled,
   newTaskOpen,
   flowInboxOpen,
+  flowDeploymentsOpen,
   flowConnectionsOpen,
   flowKnowledgeOpen,
   pluginsOpen,
+  contextualCollection,
   onExperienceModeChange,
   onOpenFlowPrimaryView,
   onSelect,
@@ -99,9 +102,11 @@ export function Sidebar({
   flowModeEnabled: boolean;
   newTaskOpen: boolean;
   flowInboxOpen: boolean;
+  flowDeploymentsOpen: boolean;
   flowConnectionsOpen: boolean;
   flowKnowledgeOpen: boolean;
   pluginsOpen: boolean;
+  contextualCollection?: ReactNode;
   onExperienceModeChange(mode: ExperienceMode): void;
   onOpenFlowPrimaryView(view: Exclude<FlowPrimaryView, "conversation">): void;
   onSelect(id: string): void;
@@ -292,6 +297,14 @@ export function Sidebar({
                 <small>审批 / 恢复</small>
               </button>
               <button
+                aria-current={flowDeploymentsOpen ? "page" : undefined}
+                onClick={() => onOpenFlowPrimaryView("deployments")}
+              >
+                <Rocket aria-hidden="true" size={15} />
+                <span>Deployments</span>
+                <small>部署 / 触发</small>
+              </button>
+              <button
                 aria-current={flowConnectionsOpen ? "page" : undefined}
                 onClick={() => onOpenFlowPrimaryView("connections")}
               >
@@ -330,323 +343,339 @@ export function Sidebar({
           </button>
         </nav>
 
-        <div className="project-heading">
-          <span>项目</span>
-          <div className="sidebar-project-menu-wrap" ref={projectMenuRef}>
-            <button
-              className="sidebar-icon-button"
-              disabled={isPickingWorkspace}
-              onClick={() => setProjectMenuOpen((current) => !current)}
-              title="添加项目"
-              aria-label="添加项目"
-              aria-expanded={projectMenuOpen}
-            >
-              {isPickingWorkspace ? (
-                <Loader2 size={14} className="spin" />
-              ) : (
-                <Plus size={14} />
-              )}
-            </button>
-            {projectMenuOpen && (
-              <div className="tool-popover sidebar-project-popover" role="menu">
-                <button
-                  role="menuitem"
-                  onClick={() => {
-                    setNewProjectOpen(true);
-                    setProjectMenuOpen(false);
-                  }}
-                >
-                  <Plus size={14} />
-                  <span>新建空白项目</span>
-                </button>
-                <button
-                  role="menuitem"
-                  onClick={() => {
-                    onPickWorkspace();
-                    setProjectMenuOpen(false);
-                  }}
-                >
-                  <FolderOpen size={14} />
-                  <span>使用现有文件夹</span>
-                </button>
-              </div>
-            )}
+        {contextualCollection ? (
+          <div className="sidebar-contextual-collection">
+            {contextualCollection}
           </div>
-        </div>
-        <div className="project-tree">
-          {projects.map((project, projectIndex) => {
-            const projectThreads = modeThreads.filter(
-              (thread) => thread.projectId === project.id && !thread.archivedAt,
-            );
-            const isActive = project.id === activeProjectId;
-            const isExpanded = expandedProjects.has(project.id);
-            const threadDisplayLimit =
-              projectThreadDisplayLimits.get(project.id) ??
-              PROJECT_THREAD_PREVIEW_LIMIT;
-            const visibleProjectThreads = projectThreads.slice(
-              0,
-              threadDisplayLimit,
-            );
-            const isMoreMenuOpen = moreMenuProjectId === project.id;
-            const projectInfoId = `project-hover-card-${projectIndex}`;
-            return (
-              <section
-                className={`project-node ${isActive ? "active" : ""}`}
-                key={project.id}
-              >
-                <div className="project-row">
-                  <button
-                    className="project-select"
-                    title={
-                      project.workspaceRoot
-                        ? formatPathForDisplay(project.workspaceRoot)
-                        : project.name
-                    }
-                    aria-label={`项目 ${project.name}`}
-                    aria-describedby={projectInfoId}
-                    onMouseEnter={(event) => {
-                      const bounds =
-                        event.currentTarget.getBoundingClientRect();
-                      const cardWidth = 320;
-                      const left = Math.min(
-                        bounds.right + 8,
-                        window.innerWidth - cardWidth - 8,
-                      );
-                      setHoveredProject({
-                        id: projectInfoId,
-                        name: project.name,
-                        threadCount: projectThreads.length,
-                        workspaceRoot: project.workspaceRoot,
-                        pinned: project.pinned,
-                        left: Math.max(8, left),
-                        top: Math.max(
-                          36,
-                          Math.min(bounds.top, window.innerHeight - 174),
-                        ),
-                      });
-                    }}
-                    onMouseLeave={() => setHoveredProject(null)}
-                    onClick={() => {
-                      if (isExpanded) {
-                        setProjectThreadDisplayLimits((current) => {
-                          if (!current.has(project.id)) return current;
-                          const next = new Map(current);
-                          next.delete(project.id);
-                          return next;
-                        });
-                      }
-                      toggleExpandedProject(project.id);
-                      onSelectProject(project);
-                    }}
+        ) : (
+          <>
+            <div className="project-heading">
+              <span>项目</span>
+              <div className="sidebar-project-menu-wrap" ref={projectMenuRef}>
+                <button
+                  className="sidebar-icon-button"
+                  disabled={isPickingWorkspace}
+                  onClick={() => setProjectMenuOpen((current) => !current)}
+                  title="添加项目"
+                  aria-label="添加项目"
+                  aria-expanded={projectMenuOpen}
+                >
+                  {isPickingWorkspace ? (
+                    <Loader2 size={14} className="spin" />
+                  ) : (
+                    <Plus size={14} />
+                  )}
+                </button>
+                {projectMenuOpen && (
+                  <div
+                    className="tool-popover sidebar-project-popover"
+                    role="menu"
                   >
-                    {isExpanded ? (
-                      <FolderOpen size={14} />
-                    ) : (
-                      <Folder size={14} />
-                    )}
-                    <span>{project.name}</span>
-                  </button>
-                  <div className="project-row-actions">
-                    <div
-                      className="project-menu-wrap"
-                      ref={isMoreMenuOpen ? moreMenuRef : undefined}
-                    >
-                      <button
-                        className="project-more"
-                        aria-label={`菜单 ${project.name}`}
-                        aria-expanded={isMoreMenuOpen}
-                        onClick={() =>
-                          setMoreMenuProjectId(
-                            isMoreMenuOpen ? null : project.id,
-                          )
-                        }
-                      >
-                        <MoreHorizontal size={13} />
-                      </button>
-                      {isMoreMenuOpen && (
-                        <div
-                          className="tool-popover project-row-popover"
-                          role="menu"
-                        >
-                          <button
-                            role="menuitem"
-                            disabled={!project.workspaceRoot}
-                            onClick={() => {
-                              if (project.workspaceRoot) {
-                                onOpenThreadWorkspace(project.workspaceRoot);
-                              }
-                              setMoreMenuProjectId(null);
-                            }}
-                          >
-                            <FolderOpen size={14} />
-                            <span>在文件管理器中打开</span>
-                          </button>
-                          <button
-                            role="menuitem"
-                            onClick={() => {
-                              onRenameProject(project);
-                              setMoreMenuProjectId(null);
-                            }}
-                          >
-                            <Pencil size={14} />
-                            <span>重命名</span>
-                          </button>
-                          <button disabled title="Git 工作树管理尚未实现">
-                            <GitFork size={14} />
-                            <span>创建工作树</span>
-                            <small>未实现</small>
-                          </button>
-                          <button
-                            role="menuitem"
-                            onClick={() => {
-                              onRemoveProject(project);
-                              setMoreMenuProjectId(null);
-                            }}
-                          >
-                            <Archive size={14} />
-                            <span>归档</span>
-                          </button>
-                        </div>
-                      )}
-                    </div>
                     <button
-                      className="project-new-thread"
-                      title="新建对话"
-                      aria-label={`在 ${project.name} 中新建对话`}
+                      role="menuitem"
                       onClick={() => {
-                        onNewThreadForProject?.(project);
+                        setNewProjectOpen(true);
+                        setProjectMenuOpen(false);
                       }}
                     >
-                      <SquarePen size={13} />
+                      <Plus size={14} />
+                      <span>新建空白项目</span>
+                    </button>
+                    <button
+                      role="menuitem"
+                      onClick={() => {
+                        onPickWorkspace();
+                        setProjectMenuOpen(false);
+                      }}
+                    >
+                      <FolderOpen size={14} />
+                      <span>使用现有文件夹</span>
                     </button>
                   </div>
-                </div>
-                {isExpanded && (
-                  <div className="project-tasks">
-                    {visibleProjectThreads.map((thread) => (
-                      <SidebarThreadRow
-                        active={thread.id === activeThreadId}
-                        activityStatus={activityStatusForThread(thread.id)}
-                        key={thread.id}
-                        project={project}
-                        thread={thread}
-                        onSelect={() => onSelect(thread.id)}
-                        onRename={() => onRenameThread(thread)}
-                        onOpenUsage={() => onOpenThreadUsage(thread)}
-                        onRemoveProject={onRemoveProject}
-                        onToggleProjectPinned={onToggleProjectPinned}
-                      />
-                    ))}
-                    {projectThreads.length > threadDisplayLimit && (
-                      <Button
-                        className="project-show-more"
-                        size="compact"
-                        variant="quiet"
-                        onClick={() =>
-                          setProjectThreadDisplayLimits((current) => {
-                            const next = new Map(current);
-                            next.set(
-                              project.id,
-                              (current.get(project.id) ??
-                                PROJECT_THREAD_PREVIEW_LIMIT) +
-                                PROJECT_THREAD_PREVIEW_LIMIT,
-                            );
-                            return next;
-                          })
-                        }
-                      >
-                        展开显示
-                      </Button>
-                    )}
-                    {projectThreads.length === 0 && (
-                      <span className="project-empty">无任务</span>
-                    )}
-                  </div>
                 )}
-              </section>
-            );
-          })}
-          {unassignedThreads.length > 0 && (
-            <section className="project-node">
-              <div className="project-row">
-                <button
-                  className="project-select"
-                  title="尚未归属到项目的任务"
-                  onClick={() => setUnassignedExpanded((current) => !current)}
-                >
-                  {unassignedExpanded ? (
-                    <FolderOpen size={14} />
-                  ) : (
-                    <Folder size={14} />
-                  )}
-                  <span>未归属任务 ({unassignedThreads.length})</span>
-                </button>
               </div>
-              {unassignedExpanded && (
-                <div className="project-tasks">
-                  {unassignedThreads.map((thread) => (
-                    <SidebarThreadRow
-                      active={thread.id === activeThreadId}
-                      activityStatus={activityStatusForThread(thread.id)}
-                      key={thread.id}
-                      project={null}
-                      thread={thread}
-                      onSelect={() => onSelect(thread.id)}
-                      onRename={() => onRenameThread(thread)}
-                      onOpenUsage={() => onOpenThreadUsage(thread)}
-                      onRemoveProject={onRemoveProject}
-                      onToggleProjectPinned={onToggleProjectPinned}
-                    />
-                  ))}
-                </div>
-              )}
-            </section>
-          )}
-          {archivedThreads.length > 0 && (
-            <section className="project-node">
-              <div className="project-row">
-                <button
-                  className="project-select"
-                  title="查看可恢复的归档任务"
-                  onClick={() => setArchivedExpanded((current) => !current)}
-                >
-                  <Archive size={14} />
-                  <span>已归档 ({archivedThreads.length})</span>
-                </button>
-              </div>
-              {archivedExpanded && (
-                <div className="project-tasks">
-                  {archivedThreads.map((thread) => (
-                    <SidebarThreadRow
-                      archived
-                      active={false}
-                      activityStatus={activityStatusForThread(thread.id)}
-                      key={thread.id}
-                      project={
-                        projects.find(
-                          (project) => project.id === thread.projectId,
-                        ) ?? null
+            </div>
+            <div className="project-tree">
+              {projects.map((project, projectIndex) => {
+                const projectThreads = modeThreads.filter(
+                  (thread) =>
+                    thread.projectId === project.id && !thread.archivedAt,
+                );
+                const isActive = project.id === activeProjectId;
+                const isExpanded = expandedProjects.has(project.id);
+                const threadDisplayLimit =
+                  projectThreadDisplayLimits.get(project.id) ??
+                  PROJECT_THREAD_PREVIEW_LIMIT;
+                const visibleProjectThreads = projectThreads.slice(
+                  0,
+                  threadDisplayLimit,
+                );
+                const isMoreMenuOpen = moreMenuProjectId === project.id;
+                const projectInfoId = `project-hover-card-${projectIndex}`;
+                return (
+                  <section
+                    className={`project-node ${isActive ? "active" : ""}`}
+                    key={project.id}
+                  >
+                    <div className="project-row">
+                      <button
+                        className="project-select"
+                        title={
+                          project.workspaceRoot
+                            ? formatPathForDisplay(project.workspaceRoot)
+                            : project.name
+                        }
+                        aria-label={`项目 ${project.name}`}
+                        aria-describedby={projectInfoId}
+                        onMouseEnter={(event) => {
+                          const bounds =
+                            event.currentTarget.getBoundingClientRect();
+                          const cardWidth = 320;
+                          const left = Math.min(
+                            bounds.right + 8,
+                            window.innerWidth - cardWidth - 8,
+                          );
+                          setHoveredProject({
+                            id: projectInfoId,
+                            name: project.name,
+                            threadCount: projectThreads.length,
+                            workspaceRoot: project.workspaceRoot,
+                            pinned: project.pinned,
+                            left: Math.max(8, left),
+                            top: Math.max(
+                              36,
+                              Math.min(bounds.top, window.innerHeight - 174),
+                            ),
+                          });
+                        }}
+                        onMouseLeave={() => setHoveredProject(null)}
+                        onClick={() => {
+                          if (isExpanded) {
+                            setProjectThreadDisplayLimits((current) => {
+                              if (!current.has(project.id)) return current;
+                              const next = new Map(current);
+                              next.delete(project.id);
+                              return next;
+                            });
+                          }
+                          toggleExpandedProject(project.id);
+                          onSelectProject(project);
+                        }}
+                      >
+                        {isExpanded ? (
+                          <FolderOpen size={14} />
+                        ) : (
+                          <Folder size={14} />
+                        )}
+                        <span>{project.name}</span>
+                      </button>
+                      <div className="project-row-actions">
+                        <div
+                          className="project-menu-wrap"
+                          ref={isMoreMenuOpen ? moreMenuRef : undefined}
+                        >
+                          <button
+                            className="project-more"
+                            aria-label={`菜单 ${project.name}`}
+                            aria-expanded={isMoreMenuOpen}
+                            onClick={() =>
+                              setMoreMenuProjectId(
+                                isMoreMenuOpen ? null : project.id,
+                              )
+                            }
+                          >
+                            <MoreHorizontal size={13} />
+                          </button>
+                          {isMoreMenuOpen && (
+                            <div
+                              className="tool-popover project-row-popover"
+                              role="menu"
+                            >
+                              <button
+                                role="menuitem"
+                                disabled={!project.workspaceRoot}
+                                onClick={() => {
+                                  if (project.workspaceRoot) {
+                                    onOpenThreadWorkspace(
+                                      project.workspaceRoot,
+                                    );
+                                  }
+                                  setMoreMenuProjectId(null);
+                                }}
+                              >
+                                <FolderOpen size={14} />
+                                <span>在文件管理器中打开</span>
+                              </button>
+                              <button
+                                role="menuitem"
+                                onClick={() => {
+                                  onRenameProject(project);
+                                  setMoreMenuProjectId(null);
+                                }}
+                              >
+                                <Pencil size={14} />
+                                <span>重命名</span>
+                              </button>
+                              <button disabled title="Git 工作树管理尚未实现">
+                                <GitFork size={14} />
+                                <span>创建工作树</span>
+                                <small>未实现</small>
+                              </button>
+                              <button
+                                role="menuitem"
+                                onClick={() => {
+                                  onRemoveProject(project);
+                                  setMoreMenuProjectId(null);
+                                }}
+                              >
+                                <Archive size={14} />
+                                <span>归档</span>
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                        <button
+                          className="project-new-thread"
+                          title="新建对话"
+                          aria-label={`在 ${project.name} 中新建对话`}
+                          onClick={() => {
+                            onNewThreadForProject?.(project);
+                          }}
+                        >
+                          <SquarePen size={13} />
+                        </button>
+                      </div>
+                    </div>
+                    {isExpanded && (
+                      <div className="project-tasks">
+                        {visibleProjectThreads.map((thread) => (
+                          <SidebarThreadRow
+                            active={thread.id === activeThreadId}
+                            activityStatus={activityStatusForThread(thread.id)}
+                            key={thread.id}
+                            project={project}
+                            thread={thread}
+                            onSelect={() => onSelect(thread.id)}
+                            onRename={() => onRenameThread(thread)}
+                            onOpenUsage={() => onOpenThreadUsage(thread)}
+                            onRemoveProject={onRemoveProject}
+                            onToggleProjectPinned={onToggleProjectPinned}
+                          />
+                        ))}
+                        {projectThreads.length > threadDisplayLimit && (
+                          <Button
+                            className="project-show-more"
+                            size="compact"
+                            variant="quiet"
+                            onClick={() =>
+                              setProjectThreadDisplayLimits((current) => {
+                                const next = new Map(current);
+                                next.set(
+                                  project.id,
+                                  (current.get(project.id) ??
+                                    PROJECT_THREAD_PREVIEW_LIMIT) +
+                                    PROJECT_THREAD_PREVIEW_LIMIT,
+                                );
+                                return next;
+                              })
+                            }
+                          >
+                            展开显示
+                          </Button>
+                        )}
+                        {projectThreads.length === 0 && (
+                          <span className="project-empty">无任务</span>
+                        )}
+                      </div>
+                    )}
+                  </section>
+                );
+              })}
+              {unassignedThreads.length > 0 && (
+                <section className="project-node">
+                  <div className="project-row">
+                    <button
+                      className="project-select"
+                      title="尚未归属到项目的任务"
+                      onClick={() =>
+                        setUnassignedExpanded((current) => !current)
                       }
-                      thread={thread}
-                      onSelect={() => onRestoreThread(thread)}
-                      onRename={() => onRenameThread(thread)}
-                      onOpenUsage={() => onOpenThreadUsage(thread)}
-                      onRemoveProject={onRemoveProject}
-                      onToggleProjectPinned={onToggleProjectPinned}
-                      onRestore={() => onRestoreThread(thread)}
-                    />
-                  ))}
-                </div>
+                    >
+                      {unassignedExpanded ? (
+                        <FolderOpen size={14} />
+                      ) : (
+                        <Folder size={14} />
+                      )}
+                      <span>未归属任务 ({unassignedThreads.length})</span>
+                    </button>
+                  </div>
+                  {unassignedExpanded && (
+                    <div className="project-tasks">
+                      {unassignedThreads.map((thread) => (
+                        <SidebarThreadRow
+                          active={thread.id === activeThreadId}
+                          activityStatus={activityStatusForThread(thread.id)}
+                          key={thread.id}
+                          project={null}
+                          thread={thread}
+                          onSelect={() => onSelect(thread.id)}
+                          onRename={() => onRenameThread(thread)}
+                          onOpenUsage={() => onOpenThreadUsage(thread)}
+                          onRemoveProject={onRemoveProject}
+                          onToggleProjectPinned={onToggleProjectPinned}
+                        />
+                      ))}
+                    </div>
+                  )}
+                </section>
               )}
-            </section>
-          )}
-          {projects.length === 0 && (
-            <p className="workspace-empty">尚未打开项目</p>
-          )}
-          {workspaceError && (
-            <p className="workspace-error">{workspaceError}</p>
-          )}
-        </div>
+              {archivedThreads.length > 0 && (
+                <section className="project-node">
+                  <div className="project-row">
+                    <button
+                      className="project-select"
+                      title="查看可恢复的归档任务"
+                      onClick={() => setArchivedExpanded((current) => !current)}
+                    >
+                      <Archive size={14} />
+                      <span>已归档 ({archivedThreads.length})</span>
+                    </button>
+                  </div>
+                  {archivedExpanded && (
+                    <div className="project-tasks">
+                      {archivedThreads.map((thread) => (
+                        <SidebarThreadRow
+                          archived
+                          active={false}
+                          activityStatus={activityStatusForThread(thread.id)}
+                          key={thread.id}
+                          project={
+                            projects.find(
+                              (project) => project.id === thread.projectId,
+                            ) ?? null
+                          }
+                          thread={thread}
+                          onSelect={() => onRestoreThread(thread)}
+                          onRename={() => onRenameThread(thread)}
+                          onOpenUsage={() => onOpenThreadUsage(thread)}
+                          onRemoveProject={onRemoveProject}
+                          onToggleProjectPinned={onToggleProjectPinned}
+                          onRestore={() => onRestoreThread(thread)}
+                        />
+                      ))}
+                    </div>
+                  )}
+                </section>
+              )}
+              {projects.length === 0 && (
+                <p className="workspace-empty">尚未打开项目</p>
+              )}
+              {workspaceError && (
+                <p className="workspace-error">{workspaceError}</p>
+              )}
+            </div>
+          </>
+        )}
 
         <div className="sidebar-footer">
           <button

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Check, ExternalLink, FileText, Shield } from "lucide-react";
+import type { ApiClient } from "../../api/client";
 import { openExternal } from "../../platform";
 import { providerDisplayName } from "../../providerSettings";
 import type {
@@ -7,17 +8,27 @@ import type {
   CodexAccountStatus,
   CodexLoginStart,
   ProviderHealth,
+  PermissionMode,
   ProviderSettings,
   WindowsSandboxSetupStatus,
 } from "../../types";
 import { Badge, Button, Panel } from "../ui";
 import { SettingsGroup, SettingsPage, SettingsRow } from "../SettingsLayout";
+import {
+  approvalStrategyMode,
+  permissionAccessMode,
+  systemSandboxIsActive,
+  type ApprovalStrategyMode,
+  type PermissionAccessMode,
+} from "./permissionSettingsModel";
+import { ManagedRuntimeSettings } from "./ManagedRuntimeSettings";
 
 export function PermissionSettings({
   permissionMode,
   sandbox,
   isWindows,
   onPermissionModeChange,
+  onAccessModeChange,
   onSandboxChange,
   windowsSetup,
   windowsSetupBusy,
@@ -25,10 +36,11 @@ export function PermissionSettings({
   onSetupWindowsSandbox,
   onRemoveWindowsSandbox,
 }: {
-  permissionMode: "chat" | "read_only" | "auto" | "approve" | "full_access";
+  permissionMode: PermissionMode;
   sandbox: AppSettings["sandbox"];
   isWindows: boolean;
-  onPermissionModeChange(mode: "auto" | "approve" | "full_access"): void;
+  onPermissionModeChange(mode: ApprovalStrategyMode): void;
+  onAccessModeChange(mode: PermissionAccessMode): void;
   onSandboxChange(settings: AppSettings["sandbox"]): void;
   windowsSetup: WindowsSandboxSetupStatus | null;
   windowsSetupBusy: boolean;
@@ -36,6 +48,24 @@ export function PermissionSettings({
   onSetupWindowsSandbox(): Promise<WindowsSandboxSetupStatus>;
   onRemoveWindowsSandbox(): Promise<WindowsSandboxSetupStatus>;
 }) {
+  const accessMode = permissionAccessMode(permissionMode, sandbox);
+  const activeApprovalStrategy = approvalStrategyMode(permissionMode);
+  const showWindowsSandboxStatus = isWindows && systemSandboxIsActive(sandbox);
+
+  function confirmHostAccess(mode: "full_access" | "unrestricted"): boolean {
+    if (mode === "full_access") {
+      return window.confirm(
+        "此模式会关闭系统沙箱，并允许访问当前用户可用的文件和网络；删除、重置等破坏性操作仍需确认。确定继续吗？",
+      );
+    }
+    if (mode === "unrestricted") {
+      return window.confirm(
+        "完整系统访问会关闭系统沙箱并跳过所有工具审批，命令可访问当前用户可用的文件和网络。确定继续吗？",
+      );
+    }
+    return true;
+  }
+
   async function configureWindowsSandbox() {
     try {
       await onSetupWindowsSandbox();
@@ -67,27 +97,28 @@ export function PermissionSettings({
             [
               ["approve", "请求批准", "每次高风险操作前等待确认。"],
               ["auto", "自动审批", "按策略自动处理常规权限请求。"],
-              ["full_access", "完全访问", "关闭系统沙箱并允许网络访问。"],
+              [
+                "unrestricted",
+                "完整系统访问",
+                "关闭系统沙箱并跳过所有工具审批。",
+              ],
             ] as const
           ).map(([id, title, description]) => (
             <button
               key={id}
               type="button"
-              className={permissionMode === id ? "active" : ""}
-              aria-pressed={permissionMode === id}
+              className={activeApprovalStrategy === id ? "active" : ""}
+              aria-pressed={activeApprovalStrategy === id}
               onClick={() => {
-                if (
-                  id === "full_access" &&
-                  !window.confirm(
-                    "完全访问会允许命令访问当前用户可用的文件和网络。确定继续吗？",
-                  )
-                ) {
+                if (id === "unrestricted" && !confirmHostAccess(id)) {
                   return;
                 }
                 onPermissionModeChange(id);
               }}
             >
-              <span>{permissionMode === id ? <Check size={15} /> : null}</span>
+              <span>
+                {activeApprovalStrategy === id ? <Check size={15} /> : null}
+              </span>
               <strong>{title}</strong>
               <small>{description}</small>
             </button>
@@ -95,8 +126,8 @@ export function PermissionSettings({
         </div>
       </SettingsGroup>
 
-      <SettingsGroup title="沙箱">
-        {isWindows && windowsSetup === null ? (
+      <SettingsGroup title="权限设置">
+        {showWindowsSandboxStatus && windowsSetup === null ? (
           <div
             className="settings-warning-notice settings-sandbox-status"
             role="status"
@@ -117,7 +148,8 @@ export function PermissionSettings({
             </Button>
           </div>
         ) : null}
-        {isWindows && windowsSetup?.state === "not_configured" ? (
+        {showWindowsSandboxStatus &&
+        windowsSetup?.state === "not_configured" ? (
           <div
             className="settings-warning-notice settings-sandbox-status"
             role="status"
@@ -137,7 +169,7 @@ export function PermissionSettings({
             </Button>
           </div>
         ) : null}
-        {isWindows && windowsSetup?.state === "degraded" ? (
+        {showWindowsSandboxStatus && windowsSetup?.state === "degraded" ? (
           <div
             className="settings-danger-notice settings-sandbox-status"
             role="alert"
@@ -165,7 +197,7 @@ export function PermissionSettings({
             </Button>
           </div>
         ) : null}
-        {isWindows && windowsSetup?.state === "ready" ? (
+        {showWindowsSandboxStatus && windowsSetup?.state === "ready" ? (
           <div
             className="settings-success-notice settings-sandbox-status"
             role="status"
@@ -182,7 +214,7 @@ export function PermissionSettings({
             </Button>
           </div>
         ) : null}
-        {isWindows && windowsSetup?.state === "unavailable" ? (
+        {showWindowsSandboxStatus && windowsSetup?.state === "unavailable" ? (
           <div
             className="settings-danger-notice settings-sandbox-status"
             role="alert"
@@ -194,7 +226,7 @@ export function PermissionSettings({
             </span>
           </div>
         ) : null}
-        {isWindows && windowsSetupError ? (
+        {showWindowsSandboxStatus && windowsSetupError ? (
           <div
             className="settings-danger-notice settings-sandbox-status"
             role="alert"
@@ -207,26 +239,25 @@ export function PermissionSettings({
           <label>
             <span>访问模式</span>
             <select
-              value={sandbox.sandboxMode}
+              value={accessMode}
               onChange={(event) => {
-                const sandboxMode = event.target
-                  .value as AppSettings["sandbox"]["sandboxMode"];
-                const danger = sandboxMode === "danger-full-access";
-                onSandboxChange({
-                  ...sandbox,
-                  sandboxMode,
-                  enforcement: danger
-                    ? "disabled"
-                    : sandbox.enforcement === "disabled"
-                      ? "enforce"
-                      : sandbox.enforcement,
-                  network: danger ? "allow" : sandbox.network,
-                });
+                const next = event.target.value as PermissionAccessMode;
+                const permission =
+                  next === "guarded-full-access"
+                    ? "full_access"
+                    : next === "unrestricted"
+                      ? "unrestricted"
+                      : null;
+                if (permission && !confirmHostAccess(permission)) {
+                  return;
+                }
+                onAccessModeChange(next);
               }}
             >
               <option value="read-only">只读</option>
               <option value="workspace-write">工作区可写</option>
-              <option value="danger-full-access">完整系统访问</option>
+              <option value="guarded-full-access">破坏性操作仍需确认</option>
+              <option value="unrestricted">完整系统访问</option>
             </select>
           </label>
           <label>
@@ -443,16 +474,21 @@ export function CodexAccountSettings({
 }
 
 export function AdvancedSettings({
+  client,
+  isWindows,
   providers,
   providerHealth,
   onOpenLogs,
 }: {
+  client: ApiClient | null;
+  isWindows: boolean;
   providers: ProviderSettings[];
   providerHealth: ProviderHealth[];
   onOpenLogs(): void;
 }) {
   return (
     <SettingsPage title="高级" description="检查模型连接状态并打开诊断信息。">
+      <ManagedRuntimeSettings client={client} isWindows={isWindows} />
       <SettingsGroup title="供应商连接">
         {providers.map((provider) => {
           const displayName = providerDisplayName(provider);

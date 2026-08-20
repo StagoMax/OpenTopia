@@ -25,6 +25,101 @@
       ],
       "type": "object"
     },
+    "ExecutionConnectionOperationV1": {
+      "additionalProperties": false,
+      "description": "Credential-free operation route frozen into an Agent instance. The runtime must still revalidate the live Connection and fingerprint immediately before crossing the external-call boundary.",
+      "properties": {
+        "capabilityRevision": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "connectionId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "mcpServerId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "modelToolName": {
+          "type": "string"
+        },
+        "operationId": {
+          "type": "string"
+        },
+        "pinnedOperationFingerprint": {
+          "type": "string"
+        },
+        "providerToolName": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "capabilityRevision",
+        "connectionId",
+        "mcpServerId",
+        "modelToolName",
+        "operationId",
+        "pinnedOperationFingerprint",
+        "providerToolName"
+      ],
+      "type": "object"
+    },
+    "RuntimeConnectionAuthorityV1": {
+      "description": "Frozen authority for external Connection operations.\n\nThis discriminator is independent from collaboration snapshots because the same immutable authority is also owned by persisted Flow runs. In particular, `structured { operations: [] }` is an explicit empty grant and must never fall back to mutable legacy thread MCP bindings.",
+      "oneOf": [
+        {
+          "properties": {
+            "mode": {
+              "enum": [
+                "deny_all"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "mode": {
+              "enum": [
+                "legacy_mcp"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "mode": {
+              "enum": [
+                "structured"
+              ],
+              "type": "string"
+            },
+            "operations": {
+              "default": [],
+              "items": {
+                "$ref": "#/definitions/ExecutionConnectionOperationV1"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "RuntimeForkTurnsLabelV1": {
       "enum": [
         "none",
@@ -165,6 +260,9 @@
       "type": "array"
     },
     "capabilityProjection": true,
+    "connectionAuthority": {
+      "$ref": "#/definitions/RuntimeConnectionAuthorityV1"
+    },
     "forkTurns": {
       "$ref": "#/definitions/RuntimeForkTurnsV1"
     },
@@ -216,6 +314,7 @@
   "required": [
     "agentType",
     "allowedAgentTypes",
+    "connectionAuthority",
     "forkTurns",
     "schemaVersion",
     "spawnPolicy",

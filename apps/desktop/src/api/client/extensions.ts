@@ -33,7 +33,9 @@ import type {
   PluginSettingsResponse,
   PluginView,
   ThreadCapabilities,
+  WorkflowDeployment,
 } from "../../types";
+import type { AgentTemplateConnectionAccessView } from "../generated/desktop-http-v1.generated";
 import { ApiResponseError, queryString } from "./transport";
 import { ConfigurationApi } from "./configuration";
 
@@ -207,6 +209,18 @@ export class ExtensionsApi extends ConfigurationApi {
     );
   }
 
+  async getAgentTemplateConnectionAccess(
+    templateId: string,
+    version: number,
+    signal?: AbortSignal,
+  ): Promise<AgentTemplateConnectionAccessView> {
+    return this.get(
+      "getAgentTemplateConnectionAccess",
+      `/api/agent-templates/${encodeURIComponent(templateId)}/versions/${version}/connection-access`,
+      signal,
+    );
+  }
+
   async createAgentTemplateVersion(input: {
     templateId: string;
     name: string;
@@ -312,6 +326,67 @@ export class ExtensionsApi extends ConfigurationApi {
     return this.get(
       "searchFlows",
       `/api/flows${queryString({ query: query || undefined })}`,
+    );
+  }
+
+  async listWorkflowDeployments(
+    filters: {
+      flowId?: string;
+      status?: WorkflowDeployment["status"];
+    } = {},
+  ): Promise<WorkflowDeployment[]> {
+    return this.get(
+      "listWorkflowDeployments",
+      `/api/workflow-deployments${queryString({
+        flowId: filters.flowId,
+        status: filters.status,
+      })}`,
+    );
+  }
+
+  async getWorkflowDeployment(
+    deploymentId: string,
+  ): Promise<WorkflowDeployment> {
+    return this.get(
+      "getWorkflowDeployment",
+      `/api/workflow-deployments/${encodeURIComponent(deploymentId)}`,
+    );
+  }
+
+  async createWorkflowDeployment(input: {
+    flowId: string;
+    flowVersion: number;
+    name: string;
+    environment: string;
+    createdBy: string;
+  }): Promise<WorkflowDeployment> {
+    return this.post(
+      "createWorkflowDeployment",
+      "/api/workflow-deployments",
+      input,
+    );
+  }
+
+  async disableWorkflowDeployment(
+    deploymentId: string,
+    expectedRevision: number,
+  ): Promise<WorkflowDeployment> {
+    return this.post(
+      "disableWorkflowDeployment",
+      `/api/workflow-deployments/${encodeURIComponent(deploymentId)}/disable`,
+      { expectedRevision },
+    );
+  }
+
+  async startDeployedWorkflowRun(
+    threadId: string,
+    deploymentId: string,
+    input: unknown,
+  ): Promise<FlowRun> {
+    return this.post(
+      "startDeployedWorkflowRun",
+      `/api/threads/${encodeURIComponent(threadId)}/workflow-deployments/${encodeURIComponent(deploymentId)}/runs`,
+      { input },
     );
   }
 
@@ -464,17 +539,49 @@ export class ExtensionsApi extends ConfigurationApi {
     );
   }
 
+  async getHumanTask(taskId: string, signal?: AbortSignal): Promise<HumanTask> {
+    return this.get(
+      "getHumanTask",
+      `/api/human-tasks/${encodeURIComponent(taskId)}`,
+      signal,
+    );
+  }
+
   async resolveHumanTask(
     taskId: string,
     input: {
       expectedRevision: number;
       action: HumanTaskAction;
       note?: string;
+      idempotencyKey?: string;
+      response?: unknown;
     },
   ): Promise<HumanTaskResolutionResult> {
     return this.post(
       "resolveHumanTask",
       `/api/human-tasks/${encodeURIComponent(taskId)}/resolve`,
+      input,
+    );
+  }
+
+  async claimHumanTask(
+    taskId: string,
+    expectedRevision: number,
+  ): Promise<HumanTask> {
+    return this.post(
+      "claimHumanTask",
+      `/api/human-tasks/${encodeURIComponent(taskId)}/claim`,
+      { expectedRevision },
+    );
+  }
+
+  async assignHumanTask(
+    taskId: string,
+    input: { expectedRevision: number; assignee?: string },
+  ): Promise<HumanTask> {
+    return this.post(
+      "assignHumanTask",
+      `/api/human-tasks/${encodeURIComponent(taskId)}/assign`,
       input,
     );
   }

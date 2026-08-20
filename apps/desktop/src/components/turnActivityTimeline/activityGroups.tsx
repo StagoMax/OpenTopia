@@ -18,6 +18,7 @@ import { ToolActivityCard, toolActivityIcon } from "../ToolActivityCard";
 import {
   ActivityNotice,
   ActivityResultIcon,
+  ContextCompactionActivity,
   GuardianReviewActivity,
   NarrativeActivity,
   WorkFormActivity,
@@ -93,6 +94,9 @@ export function ActivityEntryView({
         now={now}
       />
     );
+  }
+  if (entry.kind === "context-compaction") {
+    return <ContextCompactionActivity entry={entry} now={now} />;
   }
   if (entry.kind === "approval") {
     return (

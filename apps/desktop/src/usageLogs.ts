@@ -7,6 +7,11 @@ import type {
   TokenEstimateBreakdown,
 } from "./types";
 import { toolExecutionDurationMs } from "./toolExecutionTiming.ts";
+import {
+  addTokenBreakdown,
+  emptyTokenBreakdown,
+  hydrateLegacyTokenBreakdown,
+} from "./usageTokenBreakdown.ts";
 
 export type UsageCallStatus = "running" | "succeeded" | "failed";
 
@@ -243,22 +248,25 @@ export function aggregateUsageEvents(
 
     if (payload.type === "model_context_built") {
       contextEstimateByRequest.set(payload.request_id, payload.token_estimate);
-      if (payload.token_breakdown) {
-        inputBreakdownByRequest.set(
-          payload.request_id,
-          payload.token_breakdown,
-        );
-      }
-      purposeByRequest.set(
-        payload.request_id,
-        payload.purpose ?? "agent_round",
-      );
       const observation = getCacheObservation(
         cacheObservationByRequest,
         payload.request_id,
       );
       observation.contextHash = payload.context_hash;
       observation.contextItems = payload.items ?? [];
+      if (payload.token_breakdown) {
+        inputBreakdownByRequest.set(
+          payload.request_id,
+          hydrateLegacyTokenBreakdown(
+            payload.token_breakdown,
+            observation.contextItems,
+          ),
+        );
+      }
+      purposeByRequest.set(
+        payload.request_id,
+        payload.purpose ?? "agent_round",
+      );
     }
 
     if (payload.type === "model_request" && payload.request) {
@@ -372,6 +380,13 @@ export function aggregateUsageEvents(
         }
         break;
       }
+      case "provider_first_token_received": {
+        const call = callsById.get(payload.request_id);
+        if (!call || call.firstTokenAt) break;
+        call.firstTokenAt = event.createdAt;
+        call.ttftMs = elapsedMs(call.startedAt, event.createdAt);
+        break;
+      }
       case "provider_response_received": {
         const call = callsById.get(payload.request_id);
         if (!call) break;
@@ -398,7 +413,12 @@ export function aggregateUsageEvents(
         call.purpose = payload.purpose ?? call.purpose;
         call.contextTokenEstimate =
           payload.local_input_estimate ?? call.contextTokenEstimate;
-        call.inputBreakdown = payload.input_breakdown ?? call.inputBreakdown;
+        call.inputBreakdown = payload.input_breakdown
+          ? hydrateLegacyTokenBreakdown(
+              payload.input_breakdown,
+              call.cacheObservation.contextItems,
+            )
+          : call.inputBreakdown;
         call.inputTokens = payload.input_tokens;
         call.cachedInputTokens = payload.cached_input_tokens ?? 0;
         call.cacheReadTokensReported =
@@ -1018,56 +1038,6 @@ function relativeEstimateError(
 ): number | null {
   if (estimate === null || actual <= 0) return null;
   return Math.abs(estimate - actual) / actual;
-}
-
-function emptyTokenBreakdown(): TokenEstimateBreakdown {
-  return {
-    baseInstructions: 0,
-    developerInstructions: 0,
-    repositoryInstructions: 0,
-    runtimeContext: 0,
-    skillInstructions: 0,
-    summaries: 0,
-    checkpoints: 0,
-    conversation: 0,
-    currentUser: 0,
-    toolCalls: 0,
-    toolResults: 0,
-    directToolSchemas: 0,
-    deferredToolCatalog: 0,
-    loadedToolSchemas: 0,
-    toolSchemas: 0,
-    providerState: 0,
-    other: 0,
-    total: 0,
-  };
-}
-
-function addTokenBreakdown(
-  target: TokenEstimateBreakdown,
-  source: TokenEstimateBreakdown,
-): void {
-  target.baseInstructions += source.baseInstructions;
-  target.developerInstructions += source.developerInstructions;
-  target.repositoryInstructions += source.repositoryInstructions;
-  target.runtimeContext += source.runtimeContext;
-  target.skillInstructions += source.skillInstructions;
-  target.summaries += source.summaries;
-  target.checkpoints += source.checkpoints;
-  target.conversation += source.conversation;
-  target.currentUser += source.currentUser;
-  target.toolCalls += source.toolCalls;
-  target.toolResults += source.toolResults;
-  target.directToolSchemas =
-    (target.directToolSchemas ?? 0) + (source.directToolSchemas ?? 0);
-  target.deferredToolCatalog =
-    (target.deferredToolCatalog ?? 0) + (source.deferredToolCatalog ?? 0);
-  target.loadedToolSchemas =
-    (target.loadedToolSchemas ?? 0) + (source.loadedToolSchemas ?? 0);
-  target.toolSchemas += source.toolSchemas;
-  target.providerState += source.providerState;
-  target.other += source.other;
-  target.total += source.total;
 }
 
 function stableSerialize(value: unknown): string {

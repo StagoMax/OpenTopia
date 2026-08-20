@@ -240,6 +240,10 @@
   white-space: pre-wrap;
 }
 
+.composer-rich-input.is-markdown-ordered-list {
+  padding-inline-start: var(--space-8);
+}
+
 .composer-rich-input:empty::before {
   color: var(--text-muted);
   content: attr(data-placeholder);

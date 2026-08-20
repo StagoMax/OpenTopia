@@ -31,6 +31,7 @@ import type {
   ThreadModelSelection,
 } from "../../types";
 import { workspaceName } from "../../workspaceName";
+import type { SendShortcut } from "../../editorPreferences";
 
 export function NewTaskState({
   value,
@@ -47,6 +48,7 @@ export function NewTaskState({
   skills,
   selectedSkillIds,
   isSending,
+  sendShortcut,
   launchMode,
   experienceMode,
   onChange,
@@ -77,6 +79,7 @@ export function NewTaskState({
   skills: SkillDescriptor[];
   selectedSkillIds: string[];
   isSending: boolean;
+  sendShortcut: SendShortcut;
   launchMode: NewTaskLaunchMode;
   experienceMode: ExperienceMode;
   onChange(value: string): void;
@@ -211,6 +214,7 @@ export function NewTaskState({
       </div>
       <Composer
         value={value}
+        sendShortcut={sendShortcut}
         isSending={isSending}
         isRunning={false}
         isCancelling={false}

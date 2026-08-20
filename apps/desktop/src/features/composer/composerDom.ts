@@ -262,6 +262,25 @@ export function endOfComposerRange(editor: HTMLElement): Range {
   return range;
 }
 
+export function insertComposerTextAtSelection(
+  editor: HTMLElement,
+  text: string,
+): boolean {
+  const selection = window.getSelection();
+  const range =
+    selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
+  if (!rangeBelongsToEditor(editor, range)) return false;
+
+  range!.deleteContents();
+  const textNode = document.createTextNode(text);
+  range!.insertNode(textNode);
+  range!.setStartAfter(textNode);
+  range!.collapse(true);
+  selection!.removeAllRanges();
+  selection!.addRange(range!);
+  return true;
+}
+
 export function composerRangeAtPoint(x: number, y: number): Range | null {
   const rangedDocument = document as Document & {
     caretRangeFromPoint?(x: number, y: number): Range | null;

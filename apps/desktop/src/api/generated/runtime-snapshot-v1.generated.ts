@@ -1,6 +1,25 @@
 /* eslint-disable */
 // Generated from the Rust DTO schema. Run `pnpm contracts:generate`; do not edit.
 
+/**
+ * Frozen authority for external Connection operations.
+ *
+ * This discriminator is independent from collaboration snapshots because the same immutable authority is also owned by persisted Flow runs. In particular, `structured { operations: [] }` is an explicit empty grant and must never fall back to mutable legacy thread MCP bindings.
+ */
+export type RuntimeConnectionAuthorityV1 =
+  | {
+      mode: "deny_all";
+      [k: string]: unknown;
+    }
+  | {
+      mode: "legacy_mcp";
+      [k: string]: unknown;
+    }
+  | {
+      mode: "structured";
+      operations?: ExecutionConnectionOperationV1[];
+      [k: string]: unknown;
+    };
 export type RuntimeForkTurnsV1 =
   | RuntimeForkTurnsLabelV1
   | {
@@ -44,6 +63,7 @@ export interface RuntimeSnapshotV1 {
   allowedAgentTypes: string[];
   attachmentReferences?: unknown[];
   capabilityProjection?: unknown;
+  connectionAuthority: RuntimeConnectionAuthorityV1;
   forkTurns: RuntimeForkTurnsV1;
   gitBaseCommit?: string | null;
   permissionMode?: unknown;
@@ -58,6 +78,18 @@ export interface RuntimeSnapshotV1 {
   workspaceMode: RuntimeWorkspaceModeV1;
   workspaceRoot: string;
   [k: string]: unknown;
+}
+/**
+ * Credential-free operation route frozen into an Agent instance. The runtime must still revalidate the live Connection and fingerprint immediately before crossing the external-call boundary.
+ */
+export interface ExecutionConnectionOperationV1 {
+  capabilityRevision: number;
+  connectionId: string;
+  mcpServerId: string;
+  modelToolName: string;
+  operationId: string;
+  pinnedOperationFingerprint: string;
+  providerToolName: string;
 }
 export interface AgentSpawnPolicy {
   allowChildSpawns: boolean;

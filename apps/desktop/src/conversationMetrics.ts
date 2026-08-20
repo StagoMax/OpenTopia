@@ -11,13 +11,19 @@ export type ConversationMetrics = {
   cacheReadRatio: number | null;
   inputTokens: number;
   outputTokens: number;
+  contextWindowUsage: {
+    usedTokens: number;
+    totalTokens: number;
+    ratio: number;
+  } | null;
 };
 
 export function conversationMetrics(
   events: AgentEvent[],
   fallbackModelSelection?: ThreadModelSelection | null,
+  contextWindowTokens?: number | null,
 ): ConversationMetrics | null {
-  const { summary } = aggregateUsageEvents(events, {
+  const { calls, summary } = aggregateUsageEvents(events, {
     fallbackModelSelection,
   });
   if (
@@ -38,6 +44,29 @@ export function conversationMetrics(
     cacheReadRatio: summary.cacheReadRatio,
     inputTokens: summary.inputTokens,
     outputTokens: summary.outputTokens,
+    contextWindowUsage: latestContextWindowUsage(calls, contextWindowTokens),
+  };
+}
+
+function latestContextWindowUsage(
+  calls: ReturnType<typeof aggregateUsageEvents>["calls"],
+  contextWindowTokens: number | null | undefined,
+): ConversationMetrics["contextWindowUsage"] {
+  if (!contextWindowTokens || contextWindowTokens <= 0) return null;
+  const latestAgentCall = calls.find((call) => call.purpose === "agent_round");
+  if (!latestAgentCall) return null;
+
+  const inputTokens =
+    latestAgentCall.inputTokens > 0
+      ? latestAgentCall.inputTokens
+      : latestAgentCall.contextTokenEstimate;
+  if (inputTokens === null) return null;
+
+  const usedTokens = Math.max(0, inputTokens) + latestAgentCall.outputTokens;
+  return {
+    usedTokens,
+    totalTokens: contextWindowTokens,
+    ratio: usedTokens / contextWindowTokens,
   };
 }
 

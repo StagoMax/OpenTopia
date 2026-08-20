@@ -1,4 +1,4 @@
-export type ExecutionPermissionMode = "auto" | "approve" | "full_access";
+export type ExecutionPermissionMode = "auto" | "approve" | "unrestricted";
 export type NewTaskLaunchMode = "local" | "new_worktree";
 export type ComposerOpenMenu =
   "actions" | "permission" | "model" | "workspace" | "environment" | null;

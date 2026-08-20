@@ -31,6 +31,7 @@ import {
 import { Button, IconButton, Popover } from "../../components/ui";
 import { ConversationSessionRegistry } from "../../conversationSessionController";
 import { PreviewSessionStore } from "../../previewSessionStore";
+import type { SendShortcut } from "../../editorPreferences";
 import type { ThreadActivityStatus } from "../../threadActivityStatus";
 import {
   toolStageLauncherKinds,
@@ -91,6 +92,8 @@ export function RightPanel({
   projects,
   skills,
   collaborationMode,
+  sendShortcut,
+  showContextWindowUsage,
   libraryProvider,
   workspaceRoot,
   agentItems,
@@ -180,6 +183,8 @@ export function RightPanel({
   projects: Project[];
   skills: SkillDescriptor[];
   collaborationMode: CollaborationMode;
+  sendShortcut: SendShortcut;
+  showContextWindowUsage: boolean;
   libraryProvider: LibraryProviderId | null;
   workspaceRoot: string | null;
   messages: Message[];
@@ -388,6 +393,8 @@ export function RightPanel({
                 projects={projects}
                 skills={skills}
                 initialCollaborationMode={collaborationMode}
+                sendShortcut={sendShortcut}
+                showContextWindowUsage={showContextWindowUsage}
                 onThreadUpdated={onThreadUpdated}
                 onSetThreadActivity={onSetThreadActivity}
                 onMarkThreadActivityRead={onMarkThreadActivityRead}

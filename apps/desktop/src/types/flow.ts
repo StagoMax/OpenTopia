@@ -28,10 +28,44 @@ export type AgentModelPolicy = {
   allowedModels: AgentModelBinding[];
 };
 
+export type AgentConnectionOperationGrant = {
+  operationId: string;
+};
+
+export type AgentConnectionBinding = {
+  connectionId: string;
+  capabilityRevision: number;
+  operationGrants: AgentConnectionOperationGrant[];
+};
+
+export type ExecutionConnectionOperation = {
+  connectionId: string;
+  capabilityRevision: number;
+  operationId: string;
+  mcpServerId: string;
+  providerToolName: string;
+  modelToolName: string;
+  pinnedOperationFingerprint: string;
+};
+
+export type RuntimeConnectionAuthority =
+  | { mode: "deny_all" }
+  | { mode: "legacy_mcp" }
+  | {
+      mode: "structured";
+      operations: ExecutionConnectionOperation[];
+    };
+
 export type AgentTemplateSpec = {
   description: string;
   instructions: string;
   capabilities: CapabilityProjection;
+  /**
+   * Operation-level grants pinned to an immutable Connection capability
+   * revision. Older persisted templates omit this field and are represented by
+   * the legacy `capabilities.mcpServers` projection instead.
+   */
+  connectionBindings?: AgentConnectionBinding[];
   resourceGrants: ExecutionResourceGrant[];
   modelPolicy: AgentModelPolicy;
   stateSchema: unknown;
@@ -89,6 +123,8 @@ export type EnterpriseExecutionContext = {
   parentAgentId: string | null;
   delegationChain: string[];
   capabilities: CapabilityProjection;
+  connectionBindings?: AgentConnectionBinding[];
+  connectionOperations?: ExecutionConnectionOperation[];
   resourceGrants: ExecutionResourceGrant[];
   modelPolicy: AgentModelPolicy;
 };
@@ -246,12 +282,73 @@ export type FlowDefinition = {
   publishedBy: string;
 };
 
+export type WorkflowAgentSpec = {
+  nodeId: string;
+  templateId: string;
+  templateVersion: number;
+  templateContentHash: string;
+  name: string;
+  owner: string;
+  instructions: string;
+  capabilities: CapabilityProjection;
+  resourceGrants: ExecutionResourceGrant[];
+  modelPolicy: AgentModelPolicy;
+  stateSchema: unknown;
+  outputSchema: unknown;
+  riskClass: "low" | "medium" | "high" | "critical";
+  connectionBindings: AgentConnectionBinding[];
+  connectionAuthority: RuntimeConnectionAuthority;
+};
+
+export type CompiledWorkflow = {
+  schemaVersion: number;
+  definitionId: string;
+  flowId: string;
+  flowVersion: number;
+  definitionContentHash: string;
+  graph: FlowSpec["graph"];
+  inputSchema: unknown;
+  outputSchema: unknown;
+  rootCapabilities: CapabilityProjection;
+  harnessCapabilities: CapabilityProjection;
+  harnessConnectionAuthority: RuntimeConnectionAuthority;
+  budget: FlowSpec["budget"];
+  agentSpecs: Record<string, WorkflowAgentSpec>;
+  contentHash: string;
+};
+
+export type DeploymentSnapshot = {
+  schemaVersion: number;
+  id: string;
+  compiledWorkflow: CompiledWorkflow;
+  trigger: { kind: "manual" };
+  output: { kind: "inbox" };
+  contentHash: string;
+  createdAt: string;
+  createdBy: string;
+};
+
+export type WorkflowDeployment = {
+  schemaVersion: number;
+  id: string;
+  revision: number;
+  name: string;
+  environment: string;
+  status: "active" | "disabled";
+  snapshot: DeploymentSnapshot;
+  createdAt: string;
+  updatedAt: string;
+  createdBy: string;
+};
+
 export type FlowRunStatus =
   | "queued"
   | "running"
   | "pause_requested"
   | "paused"
   | "waiting_approval"
+  | "waiting_human"
+  | "resuming"
   | "succeeded"
   | "failed"
   | "cancel_requested"
@@ -261,7 +358,14 @@ export type FlowNodeRun = {
   id: string;
   nodeId: string;
   attempt: number;
-  status: "running" | "waiting_approval" | "succeeded" | "failed" | "cancelled";
+  status:
+    | "running"
+    | "waiting_approval"
+    | "waiting_human"
+    | "resuming"
+    | "succeeded"
+    | "failed"
+    | "cancelled";
   input: unknown;
   output: unknown | null;
   error: string | null;
@@ -282,6 +386,48 @@ export type FlowTranscriptEntry = {
   createdAt: string;
 };
 
+export type WorkflowCheckpointStatus =
+  "running" | "committed" | "failed" | "cancelled";
+
+export type WorkflowPendingWrite = {
+  nodeId: string;
+  nodeRunId: string;
+  result?: {
+    output: unknown;
+    toolCalls: number;
+    transcript: FlowTranscriptEntry[];
+  } | null;
+  error?: string | null;
+  interrupt?: unknown | null;
+  resumeCommand?: unknown | null;
+  completedAt: string;
+};
+
+export type WorkflowCheckpoint = {
+  id: string;
+  superstep: number;
+  status: WorkflowCheckpointStatus;
+  nodes: Array<{
+    nodeId: string;
+    nodeRunId: string;
+    attempt: number;
+    input: unknown;
+  }>;
+  pendingWrites: WorkflowPendingWrite[];
+  createdAt: string;
+  completedAt?: string | null;
+};
+
+export type WorkflowCheckpointSummary = {
+  id: string;
+  superstep: number;
+  status: WorkflowCheckpointStatus;
+  nodeIds: string[];
+  pendingWriteCount: number;
+  createdAt: string;
+  completedAt: string;
+};
+
 export type FlowRun = {
   schemaVersion: number;
   id: string;
@@ -290,19 +436,28 @@ export type FlowRun = {
   flowVersion: number;
   definitionId: string;
   definitionContentHash: string;
+  deploymentId?: string | null;
+  deploymentSnapshot?: DeploymentSnapshot | null;
   revision: number;
   status: FlowRunStatus;
   input: unknown;
   output: unknown | null;
   graph: FlowSpec["graph"];
   effectiveCapabilities: CapabilityProjection;
+  connectionAuthority?: RuntimeConnectionAuthority;
   budget: FlowSpec["budget"];
   readyNodes: string[];
   nodeRuns: FlowNodeRun[];
   nodeOutputs: Record<string, unknown>;
+  state: Record<string, unknown>;
+  superstep: number;
+  activeCheckpoint?: WorkflowCheckpoint | null;
+  checkpointHistory: WorkflowCheckpointSummary[];
   loopCounts: Record<string, number>;
   nodeExecutions: number;
   toolCalls: number;
+  outputReviewRequired: boolean;
+  outputReviewed: boolean;
   waitingNodeId: string | null;
   activeHumanTaskId?: string | null;
   error: string | null;
@@ -312,7 +467,15 @@ export type FlowRun = {
   updatedAt: string;
 };
 
-export type HumanTaskAction = "approve" | "reject" | "retry" | "cancel";
+export type HumanTaskAction =
+  | "approve"
+  | "reject"
+  | "retry"
+  | "resume"
+  | "submit"
+  | "reconnect"
+  | "acknowledge"
+  | "cancel";
 
 export type HumanTaskType =
   | "approval"
@@ -321,6 +484,7 @@ export type HumanTaskType =
   | "recovery"
   | "reconnect"
   | "data_correction"
+  | "reconciliation"
   | "manual";
 
 export type HumanTaskStatus = "pending" | "completed" | "cancelled";
@@ -340,7 +504,22 @@ export type HumanTask = {
   description: string;
   allowedActions: HumanTaskAction[];
   payload: unknown;
-  resolution?: unknown | null;
+  actionSchema?: unknown | null;
+  assignedTo?: string | null;
+  claimedBy?: string | null;
+  claimedAt?: string | null;
+  dueAt?: string | null;
+  checkpointId?: string | null;
+  continuationId?: string | null;
+  resolution?: {
+    action: HumanTaskAction;
+    note?: string | null;
+    resolvedBy: string;
+    resolvedAt: string;
+    commandId?: string | null;
+    idempotencyKey?: string | null;
+    response?: unknown | null;
+  } | null;
   createdAt: string;
   updatedAt: string;
   resolvedAt?: string | null;

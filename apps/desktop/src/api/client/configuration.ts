@@ -1,6 +1,7 @@
 import type {
   AgentRuntimeSettings,
   AppSettings,
+  BackendHealth,
   CodexAccountStatus,
   CodexLoginStart,
   ExperienceMode,
@@ -11,6 +12,7 @@ import type {
   LibrarySearchRequest,
   LibrarySearchResponse,
   LibrarySourcePage,
+  OfficeRuntimeStatus,
   PermissionMode,
   ProviderDriverDescriptor,
   ProviderHealth,
@@ -21,36 +23,31 @@ import type {
   SagSearchRequest,
   SagSearchResponse,
   SagSource,
+  ShellRuntimeStatus,
   SkillDescriptor,
   WindowsSandboxSetupStatus,
 } from "../../types";
 import { ApiTransport, parseResponse, queryString } from "./transport";
 
 export class ConfigurationApi extends ApiTransport {
-  async health(): Promise<{
-    ok: boolean;
-    service: string;
-    apiVersion: number;
-    shellRuntime: {
-      runtime: {
-        program: string;
-        dialect: "power_shell7" | "windows_power_shell51" | "posix_sh";
-        version: string | null;
-        source:
-          "configured" | "managed" | "standard_install" | "path" | "system";
-      };
-      managedVersion: string;
-      managedStatus:
-        | "not_required"
-        | "pending"
-        | "downloading"
-        | "ready"
-        | "disabled"
-        | "failed";
-      managedError?: string;
-    };
-  }> {
+  async health(): Promise<BackendHealth> {
     return this.get("health", "/health");
+  }
+
+  async retryManagedPowerShell(): Promise<ShellRuntimeStatus> {
+    return this.post(
+      "retryManagedPowerShell",
+      "/api/runtime/powershell/retry",
+      {},
+    );
+  }
+
+  async retryManagedOfficeRuntime(): Promise<OfficeRuntimeStatus> {
+    return this.post(
+      "retryManagedOfficeRuntime",
+      "/api/runtime/office/retry",
+      {},
+    );
   }
 
   async getSettings(): Promise<AppSettings> {

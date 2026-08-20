@@ -10,7 +10,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import { Cable, Inbox, Library, X } from "lucide-react";
+import { Cable, Inbox, Library, Rocket, X } from "lucide-react";
 import { ApiClient } from "./api/client";
 import type { StreamHandle } from "./api/client";
 import type {
@@ -25,6 +25,11 @@ import {
 import { PlanChoiceCard } from "./components/PlanChoiceCard";
 import type { ImagePreviewSource } from "./components/PreviewHost";
 import { FlowLibraryPanel } from "./components/FlowLibraryPanel";
+import { ConnectionSidebarCollection } from "./components/connections";
+import {
+  WorkflowDeploymentSidebarCollection,
+  WorkflowDeploymentsPanel,
+} from "./components/workflowDeployments";
 import { HumanTaskInboxPanel } from "./components/HumanTaskInboxPanel";
 import { LibraryPanel } from "./components/LibraryPanel";
 import {
@@ -55,6 +60,7 @@ import { threadTitleRetryDelay } from "./threadTitleRetry";
 import { closeToolTabState } from "./toolTabState";
 import { resolveMarkdownLink } from "./markdownLinks";
 import { conversationMetrics as deriveConversationMetrics } from "./conversationMetrics";
+import { resolveThreadModelContextWindow } from "./modelCapabilities";
 import {
   useWorkspacePathIndex,
   WorkspacePathIndexContext,
@@ -98,6 +104,7 @@ import {
 import { errorMessage, isAbortError } from "./errorMessage";
 import { threadTitleFromPrompt, threadTitleNeedsSummary } from "./threadTitle";
 import { workspaceRootKey } from "./workspaceRootKey";
+import { isSpreadsheetFilePath } from "./spreadsheetFormats.ts";
 import { shouldPromptForWindowsSandboxSetup } from "./windowsSandboxSetup";
 import {
   applyAppearance,
@@ -147,6 +154,7 @@ import type {
   PlatformInfo,
   PluginView,
   Project,
+  PermissionMode,
   ProviderHealth,
   ProviderHealthCheckResult,
   ProviderKind,
@@ -980,14 +988,23 @@ export function App() {
     conversationLoadError === null;
   const conversationMessages = isConversationReady ? messages : [];
   const conversationEvents = isConversationReady ? events : [];
-  const conversationActivityMetrics = useMemo(
-    () =>
-      deriveConversationMetrics(
-        conversationEvents,
-        activeThread?.modelSelection,
-      ),
-    [activeThread?.modelSelection, conversationEvents],
-  );
+  const conversationActivityMetrics = useMemo(() => {
+    const contextWindow = resolveThreadModelContextWindow(
+      settings?.providers ?? [],
+      settings?.activeProviderId,
+      activeThread?.modelSelection,
+    );
+    return deriveConversationMetrics(
+      conversationEvents,
+      activeThread?.modelSelection,
+      contextWindow?.contextWindowTokens,
+    );
+  }, [
+    activeThread?.modelSelection,
+    conversationEvents,
+    settings?.activeProviderId,
+    settings?.providers,
+  ]);
   const conversationGoalSnapshot = isConversationReady ? goalSnapshot : null;
   const conversationActiveTurnId = isConversationReady ? activeTurnId : null;
   const conversationPendingTurnFeedback =
@@ -2668,7 +2685,7 @@ export function App() {
     baseUrl?: string;
     model?: string;
     apiKeySource?: string;
-    permissionMode?: "chat" | "read_only" | "auto" | "approve" | "full_access";
+    permissionMode?: PermissionMode;
     agentRuntime?: AppSettings["agentRuntime"];
     sandbox?: AppSettings["sandbox"];
   }) {
@@ -2689,13 +2706,13 @@ export function App() {
   }
 
   function changeExecutionPreset(
-    permissionMode: "auto" | "approve" | "full_access",
+    permissionMode: "auto" | "approve" | "unrestricted",
   ) {
     if (!settings || isSavingSettings || activeTurnId) return;
     if (
-      permissionMode === "full_access" &&
+      permissionMode === "unrestricted" &&
       !window.confirm(
-        "完全访问权限将允许访问互联网和此电脑上的任意文件。确认继续？",
+        "完整系统访问会关闭系统沙箱并跳过所有工具审批。确定继续吗？",
       )
     ) {
       return;
@@ -2703,7 +2720,7 @@ export function App() {
     void saveSettings({
       permissionMode,
       sandbox:
-        permissionMode === "full_access"
+        permissionMode === "unrestricted"
           ? {
               ...settings.sandbox,
               sandboxMode: "danger-full-access",
@@ -2717,7 +2734,14 @@ export function App() {
   function changeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]) {
     if (!settings) return;
     const danger = mode === "danger-full-access";
+    const permissionMode =
+      !danger &&
+      (settings.permissionMode === "full_access" ||
+        settings.permissionMode === "unrestricted")
+        ? "auto"
+        : settings.permissionMode;
     void saveSettings({
+      permissionMode,
       sandbox: {
         ...settings.sandbox,
         sandboxMode: mode,
@@ -4032,9 +4056,17 @@ export function App() {
               sidebarDestination === "conversation" && activeThreadId === null
             }
             flowInboxOpen={sidebarDestination === "flow-inbox"}
+            flowDeploymentsOpen={sidebarDestination === "flow-deployments"}
             flowConnectionsOpen={sidebarDestination === "flow-connections"}
             flowKnowledgeOpen={sidebarDestination === "flow-knowledge"}
             pluginsOpen={sidebarDestination === "plugins"}
+            contextualCollection={
+              sidebarDestination === "flow-deployments" && client ? (
+                <WorkflowDeploymentSidebarCollection client={client} />
+              ) : sidebarDestination === "flow-connections" && client ? (
+                <ConnectionSidebarCollection client={client} />
+              ) : undefined
+            }
             onExperienceModeChange={changeExperienceMode}
             onOpenFlowPrimaryView={(view) => {
               setFlowPrimaryView(view);
@@ -4119,6 +4151,8 @@ export function App() {
               headingIcon={
                 flowPrimaryView === "inbox" ? (
                   <Inbox aria-hidden="true" size={15} />
+                ) : flowPrimaryView === "deployments" ? (
+                  <Rocket aria-hidden="true" size={15} />
                 ) : flowPrimaryView === "connections" ? (
                   <Cable aria-hidden="true" size={15} />
                 ) : flowPrimaryView === "knowledge" ? (
@@ -4128,11 +4162,13 @@ export function App() {
               title={
                 flowPrimaryView === "inbox"
                   ? "Inbox / 待处理"
-                  : flowPrimaryView === "connections"
-                    ? "Connections / 连接"
-                    : flowPrimaryView === "knowledge"
-                      ? "Knowledge / 知识库"
-                      : undefined
+                  : flowPrimaryView === "deployments"
+                    ? "Deployments / 部署"
+                    : flowPrimaryView === "connections"
+                      ? "Connections / 连接"
+                      : flowPrimaryView === "knowledge"
+                        ? "Knowledge / 知识库"
+                        : undefined
               }
               showThreadControls={!flowPrimarySurface}
               toolStageOpen={toolStageOpen}
@@ -4180,8 +4216,19 @@ export function App() {
             ) : null}
             {flowPrimaryView === "inbox" ? (
               <HumanTaskInboxPanel client={client} />
+            ) : flowPrimaryView === "deployments" ? (
+              client ? (
+                <WorkflowDeploymentsPanel
+                  activeFlowThreadId={
+                    activeThread?.experienceMode === "flow"
+                      ? activeThread.id
+                      : null
+                  }
+                  client={client}
+                />
+              ) : null
             ) : flowPrimaryView === "connections" ? (
-              <FlowLibraryPanel />
+              <FlowLibraryPanel client={client} />
             ) : flowPrimaryView === "knowledge" ? (
               <LibraryPanel client={client} />
             ) : serverStatus === "offline" ? (
@@ -4305,6 +4352,7 @@ export function App() {
                     fileDropHandleRef={conversationComposerFileDropHandle}
                     fileDropScope="conversation"
                     value={composer}
+                    sendShortcut={editorPreferences.sendShortcut}
                     workForm={composerWorkForm}
                     isSending={isSending}
                     isRunning={conversationTurnCanBeCancelled}
@@ -4313,6 +4361,9 @@ export function App() {
                       isConversationReady ? queuedMessageCount : 0
                     }
                     metrics={conversationActivityMetrics}
+                    showContextWindowUsage={
+                      editorPreferences.showContextWindowUsage
+                    }
                     modelSelection={activeThread?.modelSelection ?? null}
                     providers={settings?.providers ?? []}
                     activeProviderId={settings?.activeProviderId ?? ""}
@@ -4346,6 +4397,7 @@ export function App() {
             ) : (
               <NewTaskState
                 value={composer}
+                sendShortcut={editorPreferences.sendShortcut}
                 workspaceRoot={currentWorkspaceRoot}
                 projectName={draftProject?.name ?? null}
                 projects={projects}
@@ -4417,6 +4469,8 @@ export function App() {
             projects={projects}
             skills={skills}
             collaborationMode={collaborationMode}
+            sendShortcut={editorPreferences.sendShortcut}
+            showContextWindowUsage={editorPreferences.showContextWindowUsage}
             libraryProvider={activeFlowLibraryProvider}
             workspaceRoot={currentWorkspaceRoot}
             messages={conversationMessages}
@@ -4524,6 +4578,7 @@ export function App() {
         </main>
         {settingsOpen && (
           <RedesignedSettingsPanel
+            client={client}
             initialTab={settingsInitialTab}
             platform={platform}
             settings={settings}
@@ -4963,7 +5018,8 @@ function markdownLinkTitle(path: string): string {
 }
 
 function usesFormatAwarePreview(path: string): boolean {
-  return /\.(?:avif|bmp|csv|gif|ico|jpe?g|pdf|png|svg|tsv|webp|xlsm?|xlsx|xltx)$/i.test(
-    path,
+  return (
+    isSpreadsheetFilePath(path) ||
+    /\.(?:avif|bmp|gif|ico|jpe?g|pdf|png|svg|webp)$/i.test(path)
   );
 }

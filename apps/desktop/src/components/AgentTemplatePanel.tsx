@@ -17,13 +17,20 @@ import {
 } from "lucide-react";
 import type { ApiClient } from "../api/client";
 import type {
+  AgentConnectionBinding,
   AgentInstance,
   AgentTemplateSpec,
   AgentTemplateVersionView,
   AppSettings,
   ExecutionResourceGrant,
 } from "../types";
+import type { AgentTemplateConnectionAccessView } from "../api/generated/desktop-http-v1.generated";
 import { Badge, Button, Panel, TextField } from "./ui";
+import {
+  AgentTemplateConnectionAccessSummary,
+  AgentTemplateConnectionGrantsField,
+  normalizeConnectionBindings,
+} from "./agentTemplateConnectionGrants";
 import "../styles/agent-template-panel.css";
 
 type AgentTemplatePanelProps = {
@@ -42,7 +49,9 @@ type DraftForm = {
   tools: string;
   skills: string;
   plugins: string;
+  legacyAllowAllMcpServers: boolean;
   mcpServers: string;
+  connectionBindings: AgentConnectionBinding[];
   workspaceRoots: string;
   models: string;
   resourceGrants: string;
@@ -72,6 +81,13 @@ export function AgentTemplatePanel({
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [connectionAccess, setConnectionAccess] =
+    useState<AgentTemplateConnectionAccessView | null>(null);
+  const [connectionAccessLoading, setConnectionAccessLoading] = useState(false);
+  const [connectionAccessError, setConnectionAccessError] = useState<
+    string | null
+  >(null);
+  const [connectionAccessRefresh, setConnectionAccessRefresh] = useState(0);
 
   const selected = useMemo(
     () => templates.find((view) => templateKey(view) === selectedKey) ?? null,
@@ -99,6 +115,7 @@ export function AgentTemplatePanel({
       setTemplates(nextTemplates);
       setInstances(nextInstances);
       setBoundInstance(nextBound);
+      setConnectionAccessRefresh((current) => current + 1);
       setSelectedKey((current) => {
         if (
           current &&
@@ -116,6 +133,37 @@ export function AgentTemplatePanel({
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    if (!client || !selected) {
+      setConnectionAccess(null);
+      setConnectionAccessError(null);
+      setConnectionAccessLoading(false);
+      return;
+    }
+    const controller = new AbortController();
+    setConnectionAccess(null);
+    setConnectionAccessError(null);
+    setConnectionAccessLoading(true);
+    void client
+      .getAgentTemplateConnectionAccess(
+        selected.template.templateId,
+        selected.template.version,
+        controller.signal,
+      )
+      .then((access) => {
+        if (!controller.signal.aborted) setConnectionAccess(access);
+      })
+      .catch((accessError: unknown) => {
+        if (!controller.signal.aborted) {
+          setConnectionAccessError(readableError(accessError));
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setConnectionAccessLoading(false);
+      });
+    return () => controller.abort();
+  }, [client, connectionAccessRefresh, selected]);
 
   useEffect(() => {
     if (!editing) setForm(blankDraft(workspaceRoot, settings));
@@ -150,11 +198,12 @@ export function AgentTemplatePanel({
             skills: parseList(form.skills),
             allowAllPlugins: false,
             plugins: parseList(form.plugins),
-            allowAllMcpServers: false,
+            allowAllMcpServers: form.legacyAllowAllMcpServers,
             mcpServers: parseList(form.mcpServers),
             allowAllWorkspaceRoots: false,
             workspaceRoots: parseList(form.workspaceRoots),
           },
+          connectionBindings: form.connectionBindings,
           resourceGrants,
           modelPolicy: {
             allowAllModels: false,
@@ -428,11 +477,21 @@ export function AgentTemplatePanel({
                 setFormValue(setForm, "plugins", event.target.value)
               }
             />
-            <TextField
-              label="MCP Server ID（逗号分隔）"
-              value={form.mcpServers}
-              onChange={(event) =>
-                setFormValue(setForm, "mcpServers", event.target.value)
+            <AgentTemplateConnectionGrantsField
+              client={client}
+              disabled={Boolean(busy)}
+              legacyAllowAllMcpServers={form.legacyAllowAllMcpServers}
+              legacyMcpServerIds={parseList(form.mcpServers)}
+              value={form.connectionBindings}
+              onChange={(connectionBindings) =>
+                setFormValue(setForm, "connectionBindings", connectionBindings)
+              }
+              onClearLegacyMcpServers={() =>
+                setForm((current) => ({
+                  ...current,
+                  legacyAllowAllMcpServers: false,
+                  mcpServers: "",
+                }))
               }
             />
             <TextField
@@ -553,6 +612,16 @@ export function AgentTemplatePanel({
               </dd>
             </div>
             <div>
+              <dt>Connections</dt>
+              <dd>
+                {selected.template.spec.connectionBindings?.length
+                  ? `${selected.template.spec.connectionBindings.length} 个结构化绑定`
+                  : selected.template.spec.capabilities.mcpServers.length
+                    ? `${selected.template.spec.capabilities.mcpServers.length} 个 Legacy MCP 绑定`
+                    : "无"}
+              </dd>
+            </div>
+            <div>
               <dt>模型</dt>
               <dd>
                 {selected.template.spec.modelPolicy.allowedModels
@@ -561,6 +630,12 @@ export function AgentTemplatePanel({
               </dd>
             </div>
           </dl>
+          <AgentTemplateConnectionAccessSummary
+            access={connectionAccess}
+            error={connectionAccessError}
+            loading={connectionAccessLoading}
+            onRetry={() => setConnectionAccessRefresh((current) => current + 1)}
+          />
           <div className="agent-template-panel__diff">
             <div className="agent-template-panel__section-title">
               <GitCompareArrows size={14} aria-hidden="true" />
@@ -758,7 +833,9 @@ function blankDraft(
     tools: "filesystem, shell, list_skills, read_skill",
     skills: "",
     plugins: "",
+    legacyAllowAllMcpServers: false,
     mcpServers: "",
+    connectionBindings: [],
     workspaceRoots: workspaceRoot ?? "",
     models: provider ? `${provider.id}:${provider.model}` : "",
     resourceGrants: "[]",
@@ -787,7 +864,11 @@ function draftFromTemplate(
     tools: template.spec.capabilities.tools.join(", "),
     skills: template.spec.capabilities.skills.join(", "),
     plugins: template.spec.capabilities.plugins.join(", "),
+    legacyAllowAllMcpServers: template.spec.capabilities.allowAllMcpServers,
     mcpServers: template.spec.capabilities.mcpServers.join(", "),
+    connectionBindings: normalizeConnectionBindings(
+      template.spec.connectionBindings,
+    ),
     workspaceRoots: template.spec.capabilities.workspaceRoots.join(", "),
     models: template.spec.modelPolicy.allowedModels
       .map((model) => `${model.providerId}:${model.modelId}`)

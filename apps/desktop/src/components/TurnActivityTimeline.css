@@ -47,6 +47,30 @@
   color: var(--text-secondary);
 }
 
+.context-compaction-summary {
+  margin: 0;
+  padding: var(--space-4) var(--space-5);
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-relaxed);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.context-compaction-summary[data-tone="error"] {
+  color: var(--danger);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .turn-activity-body {
+    animation: none;
+  }
+}
+
+[data-reduce-motion="on"] .turn-activity-body {
+  animation: none;
+}
+
 .turn-change-card {
   width: 100%;
   max-width: 700px;

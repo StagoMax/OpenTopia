@@ -173,6 +173,10 @@ export function ProviderSettingsView({
   const reportedContextWindow = editingProvider
     ? editingProvider.modelContextWindows?.[editingProvider.model.trim()]
     : undefined;
+  const detectedContextWindowText =
+    reportedContextWindow == null
+      ? null
+      : `当前模型上下文窗口自动识别为 ${reportedContextWindow.toLocaleString()} tokens。`;
   const providerProtocolHint = editingProvider
     ? providerProtocolDescription(editingProvider)
     : "";
@@ -278,8 +282,8 @@ export function ProviderSettingsView({
             : {
                 kind: "openai_compatible" as const,
                 allowed: [
-                  "open_ai_chat",
                   "open_ai_responses",
+                  "open_ai_chat",
                 ] as ProviderAdapterKind[],
                 preferred: null,
               };
@@ -561,13 +565,18 @@ export function ProviderSettingsView({
                       />
                     </label>
                     <div className="settings-model-meta">
-                      <span>
-                        {editingProvider.syncedModels.length > 0
-                          ? modelDescription
-                          : providerEffectiveAuth(editingProvider) === "none"
-                            ? "填写 Base URL 后会自动识别此 API 的所有模型，无需手动填写模型名称。"
-                            : "填写 Base URL 和 API 密钥后会自动识别此 API 的所有模型，无需手动填写模型名称。"}
-                      </span>
+                      <div>
+                        <span>
+                          {editingProvider.syncedModels.length > 0
+                            ? modelDescription
+                            : providerEffectiveAuth(editingProvider) === "none"
+                              ? "填写 Base URL 后会自动识别此 API 的所有模型，无需手动填写模型名称。"
+                              : "填写 Base URL 和 API 密钥后会自动识别此 API 的所有模型，无需手动填写模型名称。"}
+                        </span>
+                        {detectedContextWindowText ? (
+                          <small role="status">{detectedContextWindowText}</small>
+                        ) : null}
+                      </div>
                       {modelSourceUrl ? (
                         <button
                           type="button"

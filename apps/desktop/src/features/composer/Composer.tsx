@@ -12,7 +12,9 @@ import {
   composerContentText,
   composerExternalValueSyncAction,
   composerInputCommitPending,
+  composerOrderedListContinuation,
   composerUndoEntries,
+  composerUsesOrderedListIndentation,
   composerVisibleText,
   normalizeComposerImageDeletionSnapshot,
   referencedImageIds,
@@ -21,6 +23,7 @@ import {
 import type { ConversationMetrics } from "../../conversationMetrics";
 import { hasFileDragPayload } from "../../fileDrop";
 import { useDismissiblePopover } from "../../hooks/useDismissiblePopover";
+import { shouldSubmitOnKey, type SendShortcut } from "../../editorPreferences";
 import { ComposerMetrics } from "./ComposerMetrics";
 import { ComposerContextBar } from "./ComposerContextBar";
 import { ComposerSources } from "./ComposerSources";
@@ -40,6 +43,7 @@ import {
   createComposerImageReferenceNode,
   endOfComposerRange,
   imageFileFingerprint,
+  insertComposerTextAtSelection,
   isComposerImageFile,
   rangeBelongsToEditor,
   readComposerContent,
@@ -84,6 +88,7 @@ const MAX_COMPOSER_HISTORY_ENTRIES = 200;
 const COMPOSER_DRAFT_PUBLISH_DELAY_MS = 300;
 export function Composer({
   autoFocus = false,
+  sendShortcut,
   fileDropHandleRef,
   fileDropScope = "composer",
   value,
@@ -93,6 +98,7 @@ export function Composer({
   isCancelling,
   queuedMessageCount = 0,
   metrics,
+  showContextWindowUsage = false,
   providers,
   activeProviderId,
   modelSelection,
@@ -122,6 +128,7 @@ export function Composer({
   onToggleSkill,
 }: {
   autoFocus?: boolean;
+  sendShortcut: SendShortcut;
   fileDropHandleRef?: { current: ComposerFileDropHandle | null };
   fileDropScope?: "composer" | "conversation";
   value: string;
@@ -131,6 +138,7 @@ export function Composer({
   isCancelling: boolean;
   queuedMessageCount?: number;
   metrics?: ConversationMetrics | null;
+  showContextWindowUsage?: boolean;
   providers: ProviderSettings[];
   activeProviderId: string;
   modelSelection: ThreadModelSelection | null;
@@ -173,6 +181,9 @@ export function Composer({
   const popoverRef = useDismissiblePopover(Boolean(openMenu), closeMenus);
   const draftRef = useRef(value);
   const [hasDraftText, setHasDraftText] = useState(Boolean(value.trim()));
+  const [usesOrderedListIndentation, setUsesOrderedListIndentation] = useState(
+    () => composerUsesOrderedListIndentation(value),
+  );
   const [imageAttachments, setImageAttachments] = useState<
     ComposerImageAttachment[]
   >([]);
@@ -265,6 +276,9 @@ export function Composer({
     lastLocallyPublishedValueRef.current = null;
     const current = composerSnapshotAtSelection(editor);
     const currentText = composerVisibleText(current.parts);
+    setUsesOrderedListIndentation(
+      composerUsesOrderedListIndentation(nextValue),
+    );
     if (currentComposerSnapshotRef.current && currentText === nextValue) return;
     if (!currentComposerSnapshotRef.current && currentText === nextValue) {
       currentComposerSnapshotRef.current = current;
@@ -377,6 +391,7 @@ export function Composer({
     const usedIds = referencedImageIds(snapshot.parts);
     const currentAttachments = imageAttachmentsRef.current;
     const text = composerVisibleText(snapshot.parts);
+    setUsesOrderedListIndentation(composerUsesOrderedListIndentation(text));
     setHasInlineImageReferences(usedIds.size > 0);
     setPreviewIndex((current) => {
       const attachment =
@@ -619,6 +634,7 @@ export function Composer({
     deferredExternalValueRef.current = null;
     draftRef.current = "";
     setHasDraftText(false);
+    setUsesOrderedListIndentation(false);
     lastLocallyPublishedValueRef.current = "";
     onChange("");
   };
@@ -744,7 +760,7 @@ export function Composer({
         <div
           ref={editorRef}
           autoFocus={autoFocus}
-          className="composer-rich-input"
+          className={`composer-rich-input${usesOrderedListIndentation ? " is-markdown-ordered-list" : ""}`}
           contentEditable
           suppressContentEditableWarning
           role="textbox"
@@ -888,14 +904,29 @@ export function Composer({
             ) {
               return;
             }
-            if (
-              event.key === "Enter" &&
-              !event.altKey &&
-              !event.nativeEvent.isComposing &&
-              !event.repeat
-            ) {
+            if (!event.altKey && shouldSubmitOnKey(event, sendShortcut)) {
               event.preventDefault();
-              submitDraft();
+              if (!event.repeat) void submitDraft();
+              return;
+            }
+            if (event.key === "Enter" && !event.altKey) {
+              const editor = editorRef.current;
+              const selection = window.getSelection();
+              const range =
+                selection && selection.rangeCount > 0
+                  ? selection.getRangeAt(0)
+                  : null;
+              if (!editor || !range || !rangeBelongsToEditor(editor, range)) {
+                return;
+              }
+              const before = composerSnapshotAtSelection(editor);
+              const continuation = range.collapsed
+                ? composerOrderedListContinuation(before)
+                : null;
+              event.preventDefault();
+              if (insertComposerTextAtSelection(editor, continuation ?? "\n")) {
+                commitComposerMutation(false, before);
+              }
             }
           }}
         />
@@ -943,7 +974,12 @@ export function Composer({
           onCancel={onCancel}
         />
       </div>
-      {metrics ? <ComposerMetrics metrics={metrics} /> : null}
+      {metrics ? (
+        <ComposerMetrics
+          metrics={metrics}
+          showContextWindowUsage={showContextWindowUsage}
+        />
+      ) : null}
       {previewIndex !== null && imageAttachments[previewIndex] ? (
         <ImageLightbox
           attachments={imageAttachments}

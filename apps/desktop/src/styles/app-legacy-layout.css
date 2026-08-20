@@ -441,6 +441,13 @@ button:disabled {
   font-size: 9px;
 }
 
+.sidebar-contextual-collection {
+  grid-row: 3 / 5;
+  min-inline-size: var(--space-0);
+  min-block-size: var(--space-0);
+  overflow: auto;
+}
+
 .project-heading {
   display: flex;
   align-items: center;

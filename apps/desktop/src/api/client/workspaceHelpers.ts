@@ -5,6 +5,7 @@ import type {
   PreviewDescriptor,
   PreviewTarget,
 } from "../../types";
+import { isSpreadsheetFileExtension } from "../../spreadsheetFormats.ts";
 
 export type PreviewDescriptorResponse = {
   id: string;
@@ -97,7 +98,7 @@ function previewRenderer(
   )
     return "document";
   if (
-    ["csv", "tsv", "xlsx", "xlsm", "xltx"].includes(extension) ||
+    isSpreadsheetFileExtension(extension) ||
     ["text/csv", "text/tab-separated-values"].includes(mediaType)
   )
     return "spreadsheet";

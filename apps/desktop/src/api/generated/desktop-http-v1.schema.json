@@ -263,6 +263,30 @@
       ],
       "type": "object"
     },
+    "AgentContinuationEnvelopeV1": {
+      "properties": {
+        "contentHash": {
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "payload": true,
+        "schemaVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "contentHash",
+        "id",
+        "payload",
+        "schemaVersion"
+      ],
+      "type": "object"
+    },
     "AgentEvent": {
       "properties": {
         "createdAt": {
@@ -553,6 +577,25 @@
             "reason",
             "request_id",
             "round",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "request_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "provider_first_token_received"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "request_id",
             "type"
           ],
           "type": "object"
@@ -1660,6 +1703,52 @@
       ],
       "type": "object"
     },
+    "AgentTemplateConnectionAccessView": {
+      "properties": {
+        "bindings": {
+          "items": {
+            "$ref": "#/definitions/ConnectionAccessBindingView"
+          },
+          "type": "array"
+        },
+        "effectiveMcpServerIds": {
+          "items": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "effectiveModelToolNames": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "issues": {
+          "items": {
+            "$ref": "#/definitions/ConnectionAccessIssueView"
+          },
+          "type": "array"
+        },
+        "mode": {
+          "$ref": "#/definitions/ConnectionAccessMode"
+        },
+        "valid": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "bindings",
+        "effectiveMcpServerIds",
+        "effectiveModelToolNames",
+        "issues",
+        "mode",
+        "valid"
+      ],
+      "type": "object"
+    },
     "AgentTemplateDiffV1": {
       "properties": {
         "changes": {
@@ -1702,6 +1791,12 @@
         },
         "capabilities": {
           "$ref": "#/definitions/CapabilityProjection"
+        },
+        "connectionBindings": {
+          "items": {
+            "$ref": "#/definitions/ConnectionBindingV1"
+          },
+          "type": "array"
         },
         "delegateTemplateIds": {
           "items": {
@@ -2722,6 +2817,20 @@
       ],
       "type": "object"
     },
+    "CapabilityDiscoveryKindV1": {
+      "enum": [
+        "mcp_tools_list",
+        "static"
+      ],
+      "type": "string"
+    },
+    "CapabilityDiscoverySupportV1": {
+      "enum": [
+        "supported",
+        "unsupported"
+      ],
+      "type": "string"
+    },
     "CapabilityProjection": {
       "description": "A deterministic, fail-closed view of the capabilities available to one Agent execution. `allow_all_*` is explicit so a missing field never means unrestricted access when an ExecutionContext is deserialized.",
       "properties": {
@@ -3020,6 +3129,73 @@
       ],
       "type": "string"
     },
+    "CompiledWorkflowV1": {
+      "properties": {
+        "agentSpecs": {
+          "additionalProperties": {
+            "$ref": "#/definitions/WorkflowAgentSpecV1"
+          },
+          "type": "object"
+        },
+        "budget": {
+          "$ref": "#/definitions/FlowBudgetV1"
+        },
+        "contentHash": {
+          "type": "string"
+        },
+        "definitionContentHash": {
+          "type": "string"
+        },
+        "definitionId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "flowId": {
+          "type": "string"
+        },
+        "flowVersion": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "graph": {
+          "$ref": "#/definitions/GraphDefinitionV1"
+        },
+        "harnessCapabilities": {
+          "$ref": "#/definitions/CapabilityProjection"
+        },
+        "harnessConnectionAuthority": {
+          "$ref": "#/definitions/RuntimeConnectionAuthorityV1"
+        },
+        "inputSchema": true,
+        "outputSchema": true,
+        "rootCapabilities": {
+          "$ref": "#/definitions/CapabilityProjection"
+        },
+        "schemaVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "agentSpecs",
+        "budget",
+        "contentHash",
+        "definitionContentHash",
+        "definitionId",
+        "flowId",
+        "flowVersion",
+        "graph",
+        "harnessCapabilities",
+        "harnessConnectionAuthority",
+        "inputSchema",
+        "outputSchema",
+        "rootCapabilities",
+        "schemaVersion"
+      ],
+      "type": "object"
+    },
     "CompletionDisposition": {
       "oneOf": [
         {
@@ -3118,6 +3294,616 @@
       "required": [
         "bytes",
         "mimeType"
+      ],
+      "type": "object"
+    },
+    "ConnectionAccessBindingView": {
+      "properties": {
+        "capabilityRevision": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "connectionId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "connectionName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "issues": {
+          "items": {
+            "$ref": "#/definitions/ConnectionAccessIssueView"
+          },
+          "type": "array"
+        },
+        "operations": {
+          "items": {
+            "$ref": "#/definitions/ConnectionAccessOperationView"
+          },
+          "type": "array"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ConnectionStatusV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "valid": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "capabilityRevision",
+        "connectionId",
+        "issues",
+        "operations",
+        "valid"
+      ],
+      "type": "object"
+    },
+    "ConnectionAccessIssueSeverity": {
+      "enum": [
+        "error",
+        "warning"
+      ],
+      "type": "string"
+    },
+    "ConnectionAccessIssueView": {
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "connectionId": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "operationId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "severity": {
+          "$ref": "#/definitions/ConnectionAccessIssueSeverity"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "severity"
+      ],
+      "type": "object"
+    },
+    "ConnectionAccessMode": {
+      "enum": [
+        "none",
+        "legacy",
+        "structured"
+      ],
+      "type": "string"
+    },
+    "ConnectionAccessOperationView": {
+      "properties": {
+        "displayName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ConnectionCapabilityKindV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "modelToolName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operationId": {
+          "type": "string"
+        },
+        "permissionLabels": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "providerPublicName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "operationId",
+        "permissionLabels"
+      ],
+      "type": "object"
+    },
+    "ConnectionAccountV1": {
+      "properties": {
+        "displayName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "externalAccountId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tenantId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tenantName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspaceName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ConnectionAuthContextV1": {
+      "properties": {
+        "account": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ConnectionAccountV1"
+            }
+          ],
+          "default": {}
+        },
+        "credentialRef": {
+          "description": "Opaque reference resolved by a credential provider. Never a token or password.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expiresAt": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "grantedScopes": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "verification": {
+          "$ref": "#/definitions/ConnectionAuthVerificationV1"
+        }
+      },
+      "required": [
+        "verification"
+      ],
+      "type": "object"
+    },
+    "ConnectionAuthVerificationV1": {
+      "enum": [
+        "not_required",
+        "unverified",
+        "legacy_unverified",
+        "verified"
+      ],
+      "type": "string"
+    },
+    "ConnectionBindingV1": {
+      "additionalProperties": false,
+      "description": "Pins one account-level Connection and the immutable capability revision that was reviewed when an Agent template was published.",
+      "properties": {
+        "capabilityRevision": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "connectionId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "operationGrants": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/OperationGrantV1"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "capabilityRevision",
+        "connectionId"
+      ],
+      "type": "object"
+    },
+    "ConnectionCapabilityDiffView": {
+      "properties": {
+        "addedCapabilityIds": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "changedCapabilityIds": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "removedCapabilityIds": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "addedCapabilityIds",
+        "changedCapabilityIds",
+        "removedCapabilityIds"
+      ],
+      "type": "object"
+    },
+    "ConnectionCapabilityDiscoveryCoverageV1": {
+      "properties": {
+        "prompts": {
+          "$ref": "#/definitions/CapabilityDiscoverySupportV1"
+        },
+        "resources": {
+          "$ref": "#/definitions/CapabilityDiscoverySupportV1"
+        },
+        "tools": {
+          "$ref": "#/definitions/CapabilityDiscoverySupportV1"
+        }
+      },
+      "required": [
+        "prompts",
+        "resources",
+        "tools"
+      ],
+      "type": "object"
+    },
+    "ConnectionCapabilityKindV1": {
+      "enum": [
+        "tool"
+      ],
+      "type": "string"
+    },
+    "ConnectionCapabilityProviderMetadataV1": {
+      "properties": {
+        "publicName": {
+          "type": "string"
+        },
+        "serverId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "toolName": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "publicName",
+        "serverId",
+        "toolName"
+      ],
+      "type": "object"
+    },
+    "ConnectionCapabilityRevisionV1": {
+      "properties": {
+        "capabilities": {
+          "items": {
+            "$ref": "#/definitions/ConnectionCapabilityV1"
+          },
+          "type": "array"
+        },
+        "connectionId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "contentHash": {
+          "type": "string"
+        },
+        "discoveredAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "discoveryCoverage": {
+          "$ref": "#/definitions/ConnectionCapabilityDiscoveryCoverageV1"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "revision": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "schemaVersion": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "source": {
+          "$ref": "#/definitions/ConnectionCapabilitySourceV1"
+        }
+      },
+      "required": [
+        "capabilities",
+        "connectionId",
+        "contentHash",
+        "discoveredAt",
+        "discoveryCoverage",
+        "id",
+        "revision",
+        "schemaVersion",
+        "source"
+      ],
+      "type": "object"
+    },
+    "ConnectionCapabilitySourceV1": {
+      "enum": [
+        "mcp_tools_list",
+        "static"
+      ],
+      "type": "string"
+    },
+    "ConnectionCapabilityV1": {
+      "properties": {
+        "annotations": {
+          "description": "Only standard, public MCP behavior hints are projected here."
+        },
+        "capabilityId": {
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "displayName": {
+          "type": "string"
+        },
+        "inputSchema": true,
+        "kind": {
+          "$ref": "#/definitions/ConnectionCapabilityKindV1"
+        },
+        "name": {
+          "type": "string"
+        },
+        "permissionLabels": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "providerMetadata": {
+          "$ref": "#/definitions/ConnectionCapabilityProviderMetadataV1"
+        }
+      },
+      "required": [
+        "annotations",
+        "capabilityId",
+        "displayName",
+        "inputSchema",
+        "kind",
+        "name",
+        "permissionLabels",
+        "providerMetadata"
+      ],
+      "type": "object"
+    },
+    "ConnectionHealthView": {
+      "properties": {
+        "authStatus": {
+          "$ref": "#/definitions/ConnectionAuthVerificationV1"
+        },
+        "checkedAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "runtimeStatus": {
+          "$ref": "#/definitions/McpLifecycleStatus"
+        },
+        "toolsCount": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "authStatus",
+        "checkedAt",
+        "message",
+        "ok",
+        "runtimeStatus",
+        "toolsCount"
+      ],
+      "type": "object"
+    },
+    "ConnectionOwnerTypeV1": {
+      "enum": [
+        "personal",
+        "org_shared",
+        "service_account"
+      ],
+      "type": "string"
+    },
+    "ConnectionRuntimeBindingV1": {
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "mcp_server"
+              ],
+              "type": "string"
+            },
+            "serverId": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "serverId"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ConnectionStatusV1": {
+      "enum": [
+        "configured",
+        "ready",
+        "degraded",
+        "reauth_required",
+        "disabled"
+      ],
+      "type": "string"
+    },
+    "ConnectionV1": {
+      "properties": {
+        "activeCapabilityRevision": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "authContext": {
+          "$ref": "#/definitions/ConnectionAuthContextV1"
+        },
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "environment": {
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "integrationDefinitionId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "lastError": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lastTestedAt": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "ownerType": {
+          "$ref": "#/definitions/ConnectionOwnerTypeV1"
+        },
+        "revision": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "runtimeBinding": {
+          "$ref": "#/definitions/ConnectionRuntimeBindingV1"
+        },
+        "schemaVersion": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "status": {
+          "$ref": "#/definitions/ConnectionStatusV1"
+        },
+        "updatedAt": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "authContext",
+        "createdAt",
+        "enabled",
+        "environment",
+        "id",
+        "integrationDefinitionId",
+        "name",
+        "ownerType",
+        "revision",
+        "runtimeBinding",
+        "schemaVersion",
+        "status",
+        "updatedAt"
       ],
       "type": "object"
     },
@@ -3232,6 +4018,13 @@
           "default": [],
           "items": {
             "$ref": "#/definitions/ContextCheckpointInteraction"
+          },
+          "type": "array"
+        },
+        "phases": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ContextCheckpointPhase"
           },
           "type": "array"
         },
@@ -3456,6 +4249,35 @@
       ],
       "type": "object"
     },
+    "ContextCheckpointMetric": {
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "sourceSeqs": {
+          "default": [],
+          "items": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "unit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "value"
+      ],
+      "type": "object"
+    },
     "ContextCheckpointMode": {
       "enum": [
         "legacy_text",
@@ -3464,6 +4286,100 @@
         "native_provider"
       ],
       "type": "string"
+    },
+    "ContextCheckpointPhase": {
+      "description": "One evidence-backed stage in the task's durable history.\n\n`from_seq`/`through_seq` are the authoritative ordering keys. Timestamps are canonicalized from those events by the checkpoint service rather than trusted from model output.",
+      "properties": {
+        "endedAt": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fromSeq": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "metrics": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ContextCheckpointMetric"
+          },
+          "type": "array"
+        },
+        "objective": {
+          "type": "string"
+        },
+        "outcome": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "problem": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "remainingRisks": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "resolution": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rootCause": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sourceSeqs": {
+          "default": [],
+          "items": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "startedAt": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": "string"
+        },
+        "throughSeq": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "fromSeq",
+        "id",
+        "objective",
+        "status",
+        "throughSeq",
+        "title"
+      ],
+      "type": "object"
     },
     "ContextCheckpointStep": {
       "properties": {
@@ -3562,6 +4478,18 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "cacheHitPercent": {
+          "default": 0,
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "cachedInputTokens": {
+          "default": 0,
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
         "checkpointTokens": {
           "format": "uint",
           "minimum": 0.0,
@@ -3573,6 +4501,7 @@
           "type": "integer"
         },
         "inputTokens": {
+          "description": "Exact logical agent request before local compaction.",
           "format": "uint",
           "minimum": 0.0,
           "type": "integer"
@@ -3582,10 +4511,43 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "postCompactionTokens": {
+          "default": 0,
+          "description": "Exact logical agent request after the checkpoint starts a new epoch.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "providerInputTokens": {
+          "default": 0,
+          "description": "Provider-reported usage for the auxiliary compaction model call.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "providerOutputTokens": {
+          "default": 0,
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "remainingPercent": {
+          "default": 0,
+          "description": "Percentage of the original request remaining after compaction.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
         "source": {
           "type": "string"
         },
         "tokenReductionPercent": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tokensRemoved": {
+          "default": 0,
           "format": "uint",
           "minimum": 0.0,
           "type": "integer"
@@ -4165,6 +5127,49 @@
       ],
       "type": "object"
     },
+    "DeploymentSnapshotV1": {
+      "properties": {
+        "compiledWorkflow": {
+          "$ref": "#/definitions/CompiledWorkflowV1"
+        },
+        "contentHash": {
+          "type": "string"
+        },
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "createdBy": {
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "output": {
+          "$ref": "#/definitions/WorkflowOutputSpecV1"
+        },
+        "schemaVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "trigger": {
+          "$ref": "#/definitions/WorkflowTriggerSpecV1"
+        }
+      },
+      "required": [
+        "compiledWorkflow",
+        "contentHash",
+        "createdAt",
+        "createdBy",
+        "id",
+        "output",
+        "schemaVersion",
+        "trigger"
+      ],
+      "type": "object"
+    },
     "EnterpriseExecutionContextV1": {
       "properties": {
         "agentId": {
@@ -4173,6 +5178,18 @@
         },
         "capabilities": {
           "$ref": "#/definitions/CapabilityProjection"
+        },
+        "connectionBindings": {
+          "items": {
+            "$ref": "#/definitions/ConnectionBindingV1"
+          },
+          "type": "array"
+        },
+        "connectionOperations": {
+          "items": {
+            "$ref": "#/definitions/ExecutionConnectionOperationV1"
+          },
+          "type": "array"
         },
         "delegationChain": {
           "items": {
@@ -4257,6 +5274,47 @@
       "required": [
         "isDuration",
         "serial"
+      ],
+      "type": "object"
+    },
+    "ExecutionConnectionOperationV1": {
+      "additionalProperties": false,
+      "description": "Credential-free operation route frozen into an Agent instance. The runtime must still revalidate the live Connection and fingerprint immediately before crossing the external-call boundary.",
+      "properties": {
+        "capabilityRevision": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "connectionId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "mcpServerId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "modelToolName": {
+          "type": "string"
+        },
+        "operationId": {
+          "type": "string"
+        },
+        "pinnedOperationFingerprint": {
+          "type": "string"
+        },
+        "providerToolName": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "capabilityRevision",
+        "connectionId",
+        "mcpServerId",
+        "modelToolName",
+        "operationId",
+        "pinnedOperationFingerprint",
+        "providerToolName"
       ],
       "type": "object"
     },
@@ -4544,10 +5602,34 @@
       ],
       "type": "object"
     },
+    "FlowNodeExecutionResultV1": {
+      "properties": {
+        "output": true,
+        "toolCalls": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "transcript": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/FlowTranscriptEntryV1"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "output",
+        "toolCalls"
+      ],
+      "type": "object"
+    },
     "FlowNodeRunStatusV1": {
       "enum": [
         "running",
         "waiting_approval",
+        "waiting_human",
+        "resuming",
         "succeeded",
         "failed",
         "cancelled"
@@ -4614,6 +5696,128 @@
       ],
       "type": "object"
     },
+    "FlowResumeCommandV1": {
+      "properties": {
+        "expectedInterruptRevision": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "idempotencyKey": {
+          "type": "string"
+        },
+        "interruptId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "issuedAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "issuedBy": {
+          "type": "string"
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "schemaVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "signal": {
+          "$ref": "#/definitions/FlowResumeSignalV1"
+        }
+      },
+      "required": [
+        "expectedInterruptRevision",
+        "id",
+        "idempotencyKey",
+        "interruptId",
+        "issuedAt",
+        "issuedBy",
+        "schemaVersion",
+        "signal"
+      ],
+      "type": "object"
+    },
+    "FlowResumeSignalV1": {
+      "oneOf": [
+        {
+          "properties": {
+            "approval_id": {
+              "format": "uuid",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "approved": {
+              "type": "boolean"
+            },
+            "kind": {
+              "enum": [
+                "approval"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "approved",
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "user_input"
+              ],
+              "type": "string"
+            },
+            "request_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "response": {
+              "$ref": "#/definitions/UserInputResponse"
+            }
+          },
+          "required": [
+            "kind",
+            "request_id",
+            "response"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "external_action"
+              ],
+              "type": "string"
+            },
+            "observation": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "observation"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "FlowRunStatusV1": {
       "enum": [
         "queued",
@@ -4621,6 +5825,8 @@
         "pause_requested",
         "paused",
         "waiting_approval",
+        "waiting_human",
+        "resuming",
         "succeeded",
         "failed",
         "cancel_requested",
@@ -4630,6 +5836,16 @@
     },
     "FlowRunV1": {
       "properties": {
+        "activeCheckpoint": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/WorkflowCheckpointV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "activeHumanTaskId": {
           "format": "uuid",
           "type": [
@@ -4640,12 +5856,30 @@
         "budget": {
           "$ref": "#/definitions/FlowBudgetV1"
         },
+        "checkpointHistory": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/WorkflowCheckpointSummaryV1"
+          },
+          "type": "array"
+        },
         "completedAt": {
           "format": "date-time",
           "type": [
             "string",
             "null"
           ]
+        },
+        "connectionAuthority": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RuntimeConnectionAuthorityV1"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Immutable operation-level authority captured when the Run starts. `None` is reserved for persisted runs created before this field existed; those are restored through explicit legacy-projection inference."
         },
         "createdAt": {
           "format": "date-time",
@@ -4657,6 +5891,23 @@
         "definitionId": {
           "format": "uuid",
           "type": "string"
+        },
+        "deploymentId": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "deploymentSnapshot": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DeploymentSnapshotV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "effectiveCapabilities": {
           "$ref": "#/definitions/CapabilityProjection"
@@ -4710,6 +5961,15 @@
           "type": "array"
         },
         "output": true,
+        "outputReviewRequired": {
+          "default": false,
+          "description": "Production deployments pause after terminal output until a HumanTask records the review decision. Trial/manual compatibility runs may opt out.",
+          "type": "boolean"
+        },
+        "outputReviewed": {
+          "default": false,
+          "type": "boolean"
+        },
         "readyNodes": {
           "default": [],
           "items": {
@@ -4734,8 +5994,20 @@
             "null"
           ]
         },
+        "state": {
+          "additionalProperties": true,
+          "default": {},
+          "description": "Reducer-owned shared state. Node outputs remain the immutable routing source; state channels are applied only at a committed superstep.",
+          "type": "object"
+        },
         "status": {
           "$ref": "#/definitions/FlowRunStatusV1"
+        },
+        "superstep": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
         },
         "threadId": {
           "format": "uuid",
@@ -5614,6 +6886,9 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "officeRuntime": {
+          "$ref": "#/definitions/OfficeRuntimeStatus"
+        },
         "ok": {
           "type": "boolean"
         },
@@ -5626,6 +6901,7 @@
       },
       "required": [
         "apiVersion",
+        "officeRuntime",
         "ok",
         "service",
         "shellRuntime"
@@ -5650,6 +6926,19 @@
         "action": {
           "$ref": "#/definitions/HumanTaskActionV1"
         },
+        "commandId": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "idempotencyKey": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "note": {
           "type": [
             "string",
@@ -5662,7 +6951,8 @@
         },
         "resolvedBy": {
           "type": "string"
-        }
+        },
+        "response": true
       },
       "required": [
         "action",
@@ -5693,17 +6983,52 @@
         "recovery",
         "reconnect",
         "data_correction",
+        "reconciliation",
         "manual"
       ],
       "type": "string"
     },
     "HumanTaskV1": {
       "properties": {
+        "actionSchema": true,
         "allowedActions": {
           "items": {
             "$ref": "#/definitions/HumanTaskActionV1"
           },
           "type": "array"
+        },
+        "assignedTo": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "checkpointId": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "claimedAt": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "claimedBy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "continuationId": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "createdAt": {
           "format": "date-time",
@@ -5711,6 +7036,13 @@
         },
         "description": {
           "type": "string"
+        },
+        "dueAt": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "id": {
           "format": "uuid",
@@ -5829,6 +7161,88 @@
         "truncated"
       ],
       "type": "object"
+    },
+    "IntegrationAuthSchemeV1": {
+      "enum": [
+        "none",
+        "api_key",
+        "oauth2",
+        "external"
+      ],
+      "type": "string"
+    },
+    "IntegrationDefinitionV1": {
+      "properties": {
+        "authScheme": {
+          "$ref": "#/definitions/IntegrationAuthSchemeV1"
+        },
+        "capabilityDiscovery": {
+          "$ref": "#/definitions/CapabilityDiscoveryKindV1"
+        },
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/definitions/IntegrationKindV1"
+        },
+        "name": {
+          "type": "string"
+        },
+        "revision": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "schemaVersion": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "updatedAt": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "authScheme",
+        "capabilityDiscovery",
+        "createdAt",
+        "enabled",
+        "id",
+        "key",
+        "kind",
+        "name",
+        "revision",
+        "schemaVersion",
+        "updatedAt"
+      ],
+      "type": "object"
+    },
+    "IntegrationKindV1": {
+      "enum": [
+        "mcp",
+        "oauth_api",
+        "database",
+        "local_app"
+      ],
+      "type": "string"
     },
     "LibraryIngestionResponseView": {
       "additionalProperties": true,
@@ -6252,6 +7666,17 @@
         "require_human",
         "return_partial",
         "fail"
+      ],
+      "type": "string"
+    },
+    "ManagedOfficeRuntimeStatus": {
+      "enum": [
+        "not_required",
+        "pending",
+        "downloading",
+        "ready",
+        "disabled",
+        "failed"
       ],
       "type": "string"
     },
@@ -7206,6 +8631,77 @@
       ],
       "type": "object"
     },
+    "OfficePythonRuntime": {
+      "properties": {
+        "executable": {
+          "type": "string"
+        },
+        "openpyxlVersion": {
+          "type": "string"
+        },
+        "pythonVersion": {
+          "type": "string"
+        },
+        "root": {
+          "type": "string"
+        },
+        "runtimeVersion": {
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/definitions/OfficeRuntimeSource"
+        }
+      },
+      "required": [
+        "executable",
+        "openpyxlVersion",
+        "pythonVersion",
+        "root",
+        "runtimeVersion",
+        "source"
+      ],
+      "type": "object"
+    },
+    "OfficeRuntimeSource": {
+      "enum": [
+        "configured",
+        "packaged",
+        "managed",
+        "legacy_override"
+      ],
+      "type": "string"
+    },
+    "OfficeRuntimeStatus": {
+      "properties": {
+        "managedError": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "managedStatus": {
+          "$ref": "#/definitions/ManagedOfficeRuntimeStatus"
+        },
+        "managedVersion": {
+          "type": "string"
+        },
+        "runtime": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OfficePythonRuntime"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "managedStatus",
+        "managedVersion"
+      ],
+      "type": "object"
+    },
     "OpenAiCompatibilityReport": {
       "properties": {
         "baseUrl": {
@@ -7248,6 +8744,17 @@
             }
           ],
           "default": "unknown"
+        },
+        "chatReasoningProtocol": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ProviderReasoningProtocol"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Reasoning request envelope proven together with the Chat function-tool round trip. `None` is reserved for reports written before v7."
         },
         "chatStreamingTools": {
           "allOf": [
@@ -7341,6 +8848,17 @@
           ],
           "default": "unknown"
         },
+        "responsesReasoningProtocol": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ProviderReasoningProtocol"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Reasoning request envelope proven together with the Responses function-tool round trip. `None` is reserved for legacy reports."
+        },
         "responsesStreamingTools": {
           "allOf": [
             {
@@ -7382,6 +8900,19 @@
       ],
       "type": "string"
     },
+    "OperationGrantV1": {
+      "additionalProperties": false,
+      "description": "Grants one stable provider operation. The operation ID is deliberately not a runtime tool name; the server resolves it through the pinned capability revision before execution.",
+      "properties": {
+        "operationId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "operationId"
+      ],
+      "type": "object"
+    },
     "OsSandboxMode": {
       "enum": [
         "disabled",
@@ -7400,14 +8931,31 @@
       "type": "string"
     },
     "PermissionMode": {
-      "enum": [
-        "chat",
-        "read_only",
-        "auto",
-        "approve",
-        "full_access"
-      ],
-      "type": "string"
+      "oneOf": [
+        {
+          "enum": [
+            "chat",
+            "read_only",
+            "auto",
+            "approve"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrestricted host access with destructive actions still reviewed.\n\nThis preserves the behavior of the original `full_access` preset.",
+          "enum": [
+            "full_access"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Unrestricted host access with approval requests disabled.",
+          "enum": [
+            "unrestricted"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "PluginActivationRecord": {
       "properties": {
@@ -8457,7 +10005,7 @@
               "$ref": "#/definitions/ProviderReasoningProtocol"
             }
           ],
-          "default": "reasoning_effort"
+          "default": "omit"
         },
         "toolProtocol": {
           "allOf": [
@@ -8472,6 +10020,7 @@
             "functionTools": "unknown",
             "hostedApplyPatch": "unknown",
             "hostedToolSearch": "unknown",
+            "hostedWebSearch": "unknown",
             "namespaceTools": "unknown",
             "parallelToolCalls": "unknown",
             "streamingTools": "unknown",
@@ -8809,11 +10358,13 @@
       "type": "object"
     },
     "ProviderReasoningProtocol": {
-      "description": "Provider-specific request fields used to control model reasoning. The negotiated profile owns this choice; request codecs never infer it again from a model id.",
+      "description": "Structural request envelope used to control model reasoning. Variant names describe wire behavior rather than vendors or model families. Capability negotiation owns this choice; request codecs never infer it from a model id.",
       "enum": [
-        "reasoning_effort",
-        "deep_seek_thinking",
-        "glm_thinking"
+        "omit",
+        "chat_reasoning_effort",
+        "chat_thinking_reasoning_effort",
+        "chat_thinking_high_max_no_tool_choice",
+        "responses_reasoning"
       ],
       "type": "string"
     },
@@ -9115,6 +10666,15 @@
           "default": "unknown",
           "description": "The provider can execute the hosted `tool_search` tool."
         },
+        "hostedWebSearch": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ProviderFeatureSupport"
+            }
+          ],
+          "default": "unknown",
+          "description": "The endpoint/model can execute the Responses hosted `web_search` tool. Compatible relays must prove this independently from function tools."
+        },
         "namespaceTools": {
           "allOf": [
             {
@@ -9160,6 +10720,29 @@
         "mock"
       ],
       "type": "string"
+    },
+    "RefreshConnectionCapabilitiesResponse": {
+      "properties": {
+        "capabilityRevision": {
+          "$ref": "#/definitions/ConnectionCapabilityRevisionV1"
+        },
+        "changed": {
+          "type": "boolean"
+        },
+        "connection": {
+          "$ref": "#/definitions/ConnectionV1"
+        },
+        "diff": {
+          "$ref": "#/definitions/ConnectionCapabilityDiffView"
+        }
+      },
+      "required": [
+        "capabilityRevision",
+        "changed",
+        "connection",
+        "diff"
+      ],
+      "type": "object"
     },
     "ResolveHumanTaskResponse": {
       "properties": {
@@ -9217,6 +10800,60 @@
         "limitTokens"
       ],
       "type": "object"
+    },
+    "RuntimeConnectionAuthorityV1": {
+      "description": "Frozen authority for external Connection operations.\n\nThis discriminator is independent from collaboration snapshots because the same immutable authority is also owned by persisted Flow runs. In particular, `structured { operations: [] }` is an explicit empty grant and must never fall back to mutable legacy thread MCP bindings.",
+      "oneOf": [
+        {
+          "properties": {
+            "mode": {
+              "enum": [
+                "deny_all"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "mode": {
+              "enum": [
+                "legacy_mcp"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "mode": {
+              "enum": [
+                "structured"
+              ],
+              "type": "string"
+            },
+            "operations": {
+              "default": [],
+              "items": {
+                "$ref": "#/definitions/ExecutionConnectionOperationV1"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "SagConnectionView": {
       "properties": {
@@ -10388,6 +12025,21 @@
       ],
       "type": "object"
     },
+    "TestConnectionResponse": {
+      "properties": {
+        "connection": {
+          "$ref": "#/definitions/ConnectionV1"
+        },
+        "health": {
+          "$ref": "#/definitions/ConnectionHealthView"
+        }
+      },
+      "required": [
+        "connection",
+        "health"
+      ],
+      "type": "object"
+    },
     "Thread": {
       "properties": {
         "archivedAt": {
@@ -10696,10 +12348,18 @@
           "type": "integer"
         },
         "deferredToolCatalog": {
+          "default": 0,
           "description": "Names/descriptions visible before a deferred tool is selected.",
           "format": "uint",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "details": {
+          "description": "Hierarchical local attribution. Omitted when replaying legacy logs.",
+          "items": {
+            "$ref": "#/definitions/TokenEstimateDetail"
+          },
+          "type": "array"
         },
         "developerInstructions": {
           "format": "uint",
@@ -10707,18 +12367,27 @@
           "type": "integer"
         },
         "directToolSchemas": {
-          "description": "Full schemas sent directly on this request (including output schemas).",
+          "default": 0,
+          "description": "Full input schemas sent directly in the request's tool surface.",
           "format": "uint",
           "minimum": 0.0,
           "type": "integer"
         },
         "loadedToolSchemas": {
+          "default": 0,
           "description": "Schemas appended by a provider Tool Search continuation.",
           "format": "uint",
           "minimum": 0.0,
           "type": "integer"
         },
         "other": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "outputSchema": {
+          "default": 0,
+          "description": "A structured-output schema is a request field, not a tool definition.",
           "format": "uint",
           "minimum": 0.0,
           "type": "integer"
@@ -10768,6 +12437,13 @@
           "format": "uint",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "turnAssistantState": {
+          "default": 0,
+          "description": "Provider-native assistant message items replayed inside the active turn. These are neither durable conversation history nor opaque continuation state, so they remain a separate, mutually exclusive bucket.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
         }
       },
       "required": [
@@ -10775,10 +12451,7 @@
         "checkpoints",
         "conversation",
         "currentUser",
-        "deferredToolCatalog",
         "developerInstructions",
-        "directToolSchemas",
-        "loadedToolSchemas",
         "other",
         "providerState",
         "repositoryInstructions",
@@ -10789,6 +12462,34 @@
         "toolResults",
         "toolSchemas",
         "total"
+      ],
+      "type": "object"
+    },
+    "TokenEstimateDetail": {
+      "description": "One node in the local attribution tree for a logical model request.\n\nProviders report request-level usage totals. These nodes preserve the harness-owned structure used to assemble that request without presenting the individual values as provider-billed facts.",
+      "properties": {
+        "children": {
+          "items": {
+            "$ref": "#/definitions/TokenEstimateDetail"
+          },
+          "type": "array"
+        },
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "tokens": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "tokens"
       ],
       "type": "object"
     },
@@ -11879,6 +13580,449 @@
         }
       ]
     },
+    "WorkflowAgentSpecV1": {
+      "properties": {
+        "capabilities": {
+          "$ref": "#/definitions/CapabilityProjection"
+        },
+        "connectionAuthority": {
+          "$ref": "#/definitions/RuntimeConnectionAuthorityV1"
+        },
+        "connectionBindings": {
+          "items": {
+            "$ref": "#/definitions/ConnectionBindingV1"
+          },
+          "type": "array"
+        },
+        "instructions": {
+          "type": "string"
+        },
+        "modelPolicy": {
+          "$ref": "#/definitions/AgentModelPolicyV1"
+        },
+        "name": {
+          "type": "string"
+        },
+        "nodeId": {
+          "type": "string"
+        },
+        "outputSchema": true,
+        "owner": {
+          "type": "string"
+        },
+        "resourceGrants": {
+          "items": {
+            "$ref": "#/definitions/ExecutionResourceGrantV1"
+          },
+          "type": "array"
+        },
+        "riskClass": {
+          "$ref": "#/definitions/AgentRiskClassV1"
+        },
+        "stateSchema": true,
+        "templateContentHash": {
+          "type": "string"
+        },
+        "templateId": {
+          "type": "string"
+        },
+        "templateVersion": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "capabilities",
+        "connectionAuthority",
+        "connectionBindings",
+        "instructions",
+        "modelPolicy",
+        "name",
+        "nodeId",
+        "outputSchema",
+        "owner",
+        "resourceGrants",
+        "riskClass",
+        "stateSchema",
+        "templateContentHash",
+        "templateId",
+        "templateVersion"
+      ],
+      "type": "object"
+    },
+    "WorkflowCheckpointStatusV1": {
+      "enum": [
+        "running",
+        "committed",
+        "failed",
+        "cancelled"
+      ],
+      "type": "string"
+    },
+    "WorkflowCheckpointSummaryV1": {
+      "properties": {
+        "completedAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "nodeIds": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "pendingWriteCount": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "status": {
+          "$ref": "#/definitions/WorkflowCheckpointStatusV1"
+        },
+        "superstep": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "completedAt",
+        "createdAt",
+        "id",
+        "nodeIds",
+        "pendingWriteCount",
+        "status",
+        "superstep"
+      ],
+      "type": "object"
+    },
+    "WorkflowCheckpointV1": {
+      "properties": {
+        "completedAt": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "nodes": {
+          "items": {
+            "$ref": "#/definitions/WorkflowSuperstepNodeV1"
+          },
+          "type": "array"
+        },
+        "pendingWrites": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/WorkflowPendingWriteV1"
+          },
+          "type": "array"
+        },
+        "status": {
+          "$ref": "#/definitions/WorkflowCheckpointStatusV1"
+        },
+        "superstep": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "createdAt",
+        "id",
+        "nodes",
+        "status",
+        "superstep"
+      ],
+      "type": "object"
+    },
+    "WorkflowDeploymentStatusV1": {
+      "enum": [
+        "active",
+        "disabled"
+      ],
+      "type": "string"
+    },
+    "WorkflowDeploymentV1": {
+      "properties": {
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "createdBy": {
+          "type": "string"
+        },
+        "environment": {
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "revision": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "schemaVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "snapshot": {
+          "$ref": "#/definitions/DeploymentSnapshotV1"
+        },
+        "status": {
+          "$ref": "#/definitions/WorkflowDeploymentStatusV1"
+        },
+        "updatedAt": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "createdAt",
+        "createdBy",
+        "environment",
+        "id",
+        "name",
+        "revision",
+        "schemaVersion",
+        "snapshot",
+        "status",
+        "updatedAt"
+      ],
+      "type": "object"
+    },
+    "WorkflowInterruptKindV1": {
+      "enum": [
+        "approval",
+        "input_request",
+        "external_action",
+        "effect_reconciliation",
+        "resume_retry"
+      ],
+      "type": "string"
+    },
+    "WorkflowInterruptRequestV1": {
+      "properties": {
+        "checkpointId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "continuation": {
+          "$ref": "#/definitions/AgentContinuationEnvelopeV1"
+        },
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/definitions/WorkflowInterruptKindV1"
+        },
+        "nodeId": {
+          "type": "string"
+        },
+        "nodeRunId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "payload": {
+          "default": null
+        },
+        "revision": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "schemaVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "superstep": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "title": {
+          "type": "string"
+        },
+        "toolCalls": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "transcript": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/FlowTranscriptEntryV1"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "checkpointId",
+        "continuation",
+        "createdAt",
+        "description",
+        "id",
+        "kind",
+        "nodeId",
+        "nodeRunId",
+        "revision",
+        "schemaVersion",
+        "superstep",
+        "title",
+        "toolCalls"
+      ],
+      "type": "object"
+    },
+    "WorkflowOutputSpecV1": {
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "inbox"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "WorkflowPendingWriteV1": {
+      "properties": {
+        "completedAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "interrupt": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/WorkflowInterruptRequestV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "nodeId": {
+          "type": "string"
+        },
+        "nodeRunId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "result": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FlowNodeExecutionResultV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "resumeCommand": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FlowResumeCommandV1"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The command is retained after execution as an immutable audit record. It only applies when its interrupt id/revision matches `interrupt`."
+        }
+      },
+      "required": [
+        "completedAt",
+        "nodeId",
+        "nodeRunId"
+      ],
+      "type": "object"
+    },
+    "WorkflowSuperstepNodeV1": {
+      "properties": {
+        "attempt": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "input": true,
+        "nodeId": {
+          "type": "string"
+        },
+        "nodeRunId": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "attempt",
+        "input",
+        "nodeId",
+        "nodeRunId"
+      ],
+      "type": "object"
+    },
+    "WorkflowTriggerSpecV1": {
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "manual"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "WorkspaceDiff": {
       "properties": {
         "branch": {
@@ -12225,6 +14369,9 @@
     "archiveAgentTemplate": {
       "$ref": "#/definitions/DeleteResponse"
     },
+    "assignHumanTask": {
+      "$ref": "#/definitions/HumanTaskV1"
+    },
     "bindBrowserRuntime": {
       "$ref": "#/definitions/BrowserRuntimeStatus"
     },
@@ -12246,6 +14393,9 @@
     "cancelTurn": {
       "$ref": "#/definitions/TurnCancelResult"
     },
+    "claimHumanTask": {
+      "$ref": "#/definitions/HumanTaskV1"
+    },
     "closeComputerSession": {
       "$ref": "#/definitions/DeleteResponse"
     },
@@ -12264,8 +14414,14 @@
     "createAgentTemplateVersion": {
       "$ref": "#/definitions/AgentTemplateVersionView"
     },
+    "createConnection": {
+      "$ref": "#/definitions/ConnectionV1"
+    },
     "createFlowDraft": {
       "$ref": "#/definitions/FlowDraftView"
+    },
+    "createIntegrationDefinition": {
+      "$ref": "#/definitions/IntegrationDefinitionV1"
     },
     "createMcpServer": {
       "$ref": "#/definitions/McpServerView"
@@ -12275,6 +14431,9 @@
     },
     "createThread": {
       "$ref": "#/definitions/Thread"
+    },
+    "createWorkflowDeployment": {
+      "$ref": "#/definitions/WorkflowDeploymentV1"
     },
     "decideApproval": {
       "$ref": "#/definitions/ApprovalDecisionResponse"
@@ -12291,6 +14450,9 @@
     "deleteThread": {
       "$ref": "#/definitions/DeleteResponse"
     },
+    "disableWorkflowDeployment": {
+      "$ref": "#/definitions/WorkflowDeploymentV1"
+    },
     "ensureTerminalSession": {
       "$ref": "#/definitions/TerminalSessionResponse"
     },
@@ -12299,6 +14461,9 @@
     },
     "generateThreadTitle": {
       "$ref": "#/definitions/GenerateThreadTitleResponse"
+    },
+    "getAgentTemplateConnectionAccess": {
+      "$ref": "#/definitions/AgentTemplateConnectionAccessView"
     },
     "getArtifact": {
       "$ref": "#/definitions/Artifact"
@@ -12319,6 +14484,12 @@
     "getCodexAccount": {
       "$ref": "#/definitions/CodexAccountStatus"
     },
+    "getConnection": {
+      "$ref": "#/definitions/ConnectionV1"
+    },
+    "getConnectionCapabilityRevision": {
+      "$ref": "#/definitions/ConnectionCapabilityRevisionV1"
+    },
     "getContextStatus": {
       "$ref": "#/definitions/ContextStatusResponse"
     },
@@ -12337,6 +14508,12 @@
           "type": "null"
         }
       ]
+    },
+    "getHumanTask": {
+      "$ref": "#/definitions/HumanTaskV1"
+    },
+    "getIntegrationDefinition": {
+      "$ref": "#/definitions/IntegrationDefinitionV1"
     },
     "getLibraryProviderStatus": {
       "$ref": "#/definitions/LibraryProviderStatus"
@@ -12428,6 +14605,9 @@
     "getWindowsSandboxSetup": {
       "$ref": "#/definitions/WindowsSandboxSetupStatus"
     },
+    "getWorkflowDeployment": {
+      "$ref": "#/definitions/WorkflowDeploymentV1"
+    },
     "getWorkspaceDiff": {
       "$ref": "#/definitions/WorkspaceDiff"
     },
@@ -12470,6 +14650,18 @@
       },
       "type": "array"
     },
+    "listConnectionCapabilityRevisions": {
+      "items": {
+        "$ref": "#/definitions/ConnectionCapabilityRevisionV1"
+      },
+      "type": "array"
+    },
+    "listConnections": {
+      "items": {
+        "$ref": "#/definitions/ConnectionV1"
+      },
+      "type": "array"
+    },
     "listConversationEvents": {
       "items": {
         "$ref": "#/definitions/AgentEvent"
@@ -12497,6 +14689,12 @@
     "listHumanTasks": {
       "items": {
         "$ref": "#/definitions/HumanTaskV1"
+      },
+      "type": "array"
+    },
+    "listIntegrationDefinitions": {
+      "items": {
+        "$ref": "#/definitions/IntegrationDefinitionV1"
       },
       "type": "array"
     },
@@ -12587,6 +14785,12 @@
       },
       "type": "array"
     },
+    "listWorkflowDeployments": {
+      "items": {
+        "$ref": "#/definitions/WorkflowDeploymentV1"
+      },
+      "type": "array"
+    },
     "listWorkspaceTree": {
       "$ref": "#/definitions/WorkspaceTree"
     },
@@ -12614,6 +14818,9 @@
     "readWorkspaceFile": {
       "$ref": "#/definitions/WorkspaceFilePreview"
     },
+    "refreshConnectionCapabilities": {
+      "$ref": "#/definitions/RefreshConnectionCapabilitiesResponse"
+    },
     "removeWindowsSandbox": {
       "$ref": "#/definitions/WindowsSandboxSetupStatus"
     },
@@ -12637,6 +14844,12 @@
     },
     "resumeFlowRun": {
       "$ref": "#/definitions/FlowRunV1"
+    },
+    "retryManagedOfficeRuntime": {
+      "$ref": "#/definitions/OfficeRuntimeStatus"
+    },
+    "retryManagedPowerShell": {
+      "$ref": "#/definitions/ShellRuntimeStatus"
     },
     "revertWorkspaceFile": {
       "$ref": "#/definitions/WorkspaceDiffActionResponse"
@@ -12692,6 +14905,9 @@
     "startCodexLogin": {
       "$ref": "#/definitions/CodexLoginStart"
     },
+    "startDeployedWorkflowRun": {
+      "$ref": "#/definitions/FlowRunV1"
+    },
     "startFlowRun": {
       "$ref": "#/definitions/FlowRunV1"
     },
@@ -12707,6 +14923,9 @@
     "syncProviderModels": {
       "$ref": "#/definitions/ProviderModelSyncResult"
     },
+    "testConnection": {
+      "$ref": "#/definitions/TestConnectionResponse"
+    },
     "testProviderConnection": {
       "$ref": "#/definitions/ProviderHealthCheck"
     },
@@ -12719,11 +14938,17 @@
     "updateAgentInstance": {
       "$ref": "#/definitions/AgentInstanceV1"
     },
+    "updateConnection": {
+      "$ref": "#/definitions/ConnectionV1"
+    },
     "updateFlowDraft": {
       "$ref": "#/definitions/FlowDraftView"
     },
     "updateGoal": {
       "$ref": "#/definitions/GoalSnapshot"
+    },
+    "updateIntegrationDefinition": {
+      "$ref": "#/definitions/IntegrationDefinitionV1"
     },
     "updateMcpServer": {
       "$ref": "#/definitions/McpServerView"
@@ -12756,6 +14981,7 @@
   "required": [
     "applyWorkspaceDiffHunk",
     "archiveAgentTemplate",
+    "assignHumanTask",
     "bindBrowserRuntime",
     "bindThreadAgentInstance",
     "callMcpTool",
@@ -12763,30 +14989,40 @@
     "cancelFlowRun",
     "cancelTerminalCommand",
     "cancelTurn",
+    "claimHumanTask",
     "closeComputerSession",
     "closePreview",
     "closeTerminalSession",
     "compactContext",
     "createAgentInstance",
     "createAgentTemplateVersion",
+    "createConnection",
     "createFlowDraft",
+    "createIntegrationDefinition",
     "createMcpServer",
     "createProject",
     "createThread",
+    "createWorkflowDeployment",
     "decideApproval",
     "deleteAgentTemplateVersion",
     "deleteMcpServer",
     "deleteProject",
     "deleteThread",
+    "disableWorkflowDeployment",
     "ensureTerminalSession",
     "executeLocalGit",
     "generateThreadTitle",
+    "getAgentTemplateConnectionAccess",
     "getArtifact",
     "getBrowserRuntime",
     "getCodexAccount",
+    "getConnection",
+    "getConnectionCapabilityRevision",
     "getContextStatus",
     "getContributionHosts",
     "getFlowRun",
+    "getHumanTask",
+    "getIntegrationDefinition",
     "getLibraryProviderStatus",
     "getPluginContributions",
     "getPluginDetail",
@@ -12804,6 +15040,7 @@
     "getTurnChanges",
     "getTurnFileDiffPreview",
     "getWindowsSandboxSetup",
+    "getWorkflowDeployment",
     "getWorkspaceDiff",
     "health",
     "ingestSagText",
@@ -12814,11 +15051,14 @@
     "listAgents",
     "listArtifacts",
     "listComputerWindows",
+    "listConnectionCapabilityRevisions",
+    "listConnections",
     "listConversationEvents",
     "listEvents",
     "listFlowDrafts",
     "listFlowRuns",
     "listHumanTasks",
+    "listIntegrationDefinitions",
     "listLibraryProviders",
     "listLibrarySources",
     "listMcpServers",
@@ -12834,6 +15074,7 @@
     "listThreadAgentInstances",
     "listThreadMcpServers",
     "listThreads",
+    "listWorkflowDeployments",
     "listWorkspaceTree",
     "logoutCodexAccount",
     "observeComputerWindow",
@@ -12843,6 +15084,7 @@
     "publishAgentTemplateVersion",
     "publishFlowDraft",
     "readWorkspaceFile",
+    "refreshConnectionCapabilities",
     "removeWindowsSandbox",
     "resizeTerminalSession",
     "resolveHumanTask",
@@ -12851,6 +15093,8 @@
     "restartMcpServer",
     "resumeExternalAction",
     "resumeFlowRun",
+    "retryManagedOfficeRuntime",
+    "retryManagedPowerShell",
     "revertWorkspaceFile",
     "runBrowserCommand",
     "runGitWorkflow",
@@ -12868,17 +15112,21 @@
     "setupWindowsSandbox",
     "simulateFlowDraft",
     "startCodexLogin",
+    "startDeployedWorkflowRun",
     "startFlowRun",
     "startPluginAppSession",
     "startTerminalCommand",
     "stopPluginAppSession",
     "syncProviderModels",
+    "testConnection",
     "testProviderConnection",
     "undoTurnChanges",
     "uninstallPlugin",
     "updateAgentInstance",
+    "updateConnection",
     "updateFlowDraft",
     "updateGoal",
+    "updateIntegrationDefinition",
     "updateMcpServer",
     "updatePluginSettings",
     "updateProject",

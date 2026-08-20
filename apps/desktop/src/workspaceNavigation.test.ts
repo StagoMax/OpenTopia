@@ -11,6 +11,15 @@ test("maps fixed Flow navigation to one primary destination", () => {
   assert.equal(
     resolveSidebarDestination({
       experienceMode: "flow",
+      flowPrimaryView: "deployments",
+      toolStageOpen: false,
+      activeToolKind: null,
+    }),
+    "flow-deployments",
+  );
+  assert.equal(
+    resolveSidebarDestination({
+      experienceMode: "flow",
       flowPrimaryView: "inbox",
       toolStageOpen: false,
       activeToolKind: null,

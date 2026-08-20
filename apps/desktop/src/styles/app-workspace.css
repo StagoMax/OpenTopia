@@ -840,6 +840,7 @@
   color: var(--text);
 }
 
+.composer-mode.is-full-access,
 .permission-popover button.permission-option.is-full-access,
 .permission-popover button.permission-option.is-full-access strong,
 .permission-popover button.permission-option.is-full-access small {

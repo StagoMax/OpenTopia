@@ -95,6 +95,64 @@ test("derives composer metrics from conversation usage events", () => {
     cacheReadRatio: 0.99,
     inputTokens: 12_500_000,
     outputTokens: 264,
+    contextWindowUsage: null,
+  });
+});
+
+test("uses the latest agent request for context-window occupancy", () => {
+  const metrics = conversationMetrics(
+    [
+      event(1, "2026-08-16T00:00:00.000Z", {
+        type: "model_context_built",
+        request_id: "agent-request",
+        round: 1,
+        context_hash: "agent-context",
+        token_estimate: 24_000,
+        purpose: "agent_round",
+      }),
+      event(2, "2026-08-16T00:00:00.100Z", {
+        type: "provider_request_sent",
+        request_id: "agent-request",
+        round: 1,
+        attempt: 1,
+        adapter: "responses",
+        method: "POST",
+        endpoint: "https://api.example.test/responses",
+      }),
+      event(3, "2026-08-16T00:00:01.000Z", {
+        type: "token_usage",
+        request_id: "agent-request",
+        purpose: "agent_round",
+        input_tokens: 25_000,
+        output_tokens: 600,
+        total_tokens: 25_600,
+      }),
+      event(4, "2026-08-16T00:00:02.000Z", {
+        type: "model_context_built",
+        request_id: "compaction-request",
+        round: 0,
+        context_hash: "compaction-context",
+        token_estimate: 80_000,
+        purpose: "context_compaction",
+      }),
+      event(5, "2026-08-16T00:00:02.100Z", {
+        type: "provider_request_sent",
+        request_id: "compaction-request",
+        round: 0,
+        attempt: 1,
+        adapter: "responses",
+        method: "POST",
+        endpoint: "https://api.example.test/responses",
+      }),
+    ],
+    null,
+    100_000,
+  );
+
+  assert.deepEqual(metrics?.contextWindowUsage, {
+    usedTokens: 25_600,
+    totalTokens: 100_000,
+    ratio: 0.256,
   });
 });
 

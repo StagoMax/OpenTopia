@@ -25,6 +25,46 @@ export type PlatformInfo = {
   };
 };
 
+export type ManagedPowerShellStatus =
+  "not_required" | "pending" | "downloading" | "ready" | "disabled" | "failed";
+
+export type ShellRuntimeStatus = {
+  runtime: {
+    program: string;
+    dialect: "power_shell7" | "windows_power_shell51" | "posix_sh";
+    version: string | null;
+    source: "configured" | "managed" | "standard_install" | "path" | "system";
+  };
+  managedVersion: string;
+  managedStatus: ManagedPowerShellStatus;
+  managedError?: string;
+};
+
+export type ManagedOfficeRuntimeStatus =
+  "not_required" | "pending" | "downloading" | "ready" | "disabled" | "failed";
+
+export type OfficeRuntimeStatus = {
+  runtime?: {
+    executable: string;
+    root: string;
+    runtimeVersion: string;
+    pythonVersion: string;
+    openpyxlVersion: string;
+    source: "configured" | "packaged" | "managed" | "legacy_override";
+  };
+  managedVersion: string;
+  managedStatus: ManagedOfficeRuntimeStatus;
+  managedError?: string;
+};
+
+export type BackendHealth = {
+  ok: boolean;
+  service: string;
+  apiVersion: number;
+  officeRuntime: OfficeRuntimeStatus;
+  shellRuntime: ShellRuntimeStatus;
+};
+
 export type LibraryProviderId = "sag" | "graph-rag";
 
 export type LibraryProviderServiceRuntimeStatus = {

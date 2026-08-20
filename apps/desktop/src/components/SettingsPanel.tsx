@@ -8,6 +8,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
+import type { ApiClient } from "../api/client";
 import {
   ArrowLeft,
   Bell,
@@ -34,12 +35,19 @@ import {
   AdvancedSettings,
   PermissionSettings,
 } from "./settings/RuntimeSettingsPages";
+import {
+  selectPermissionAccessMode,
+  selectPermissionMode,
+  type ApprovalStrategyMode,
+  type PermissionAccessMode,
+} from "./settings/permissionSettingsModel";
 import { ProviderImportDialog } from "./settings/ProviderImportDialog";
 import { ProviderSettingsView } from "./settings/ProviderSettingsView";
 import {
-  controlledSandboxSettings,
   createProviderSettings,
+  hasCachedProviderModelCatalog,
   providerAllowedAdapters,
+  providerChangeInvalidatesModelDiscovery,
   providerDiscoverySignature,
   providerEffectiveAuth,
   providerEffectiveTransport,
@@ -64,6 +72,7 @@ import type {
   CodexAccountStatus,
   CodexLoginStart,
   PlatformInfo,
+  PermissionMode,
   ProviderHealth,
   ProviderHealthCheckResult,
   ProviderModelSyncResult,
@@ -93,7 +102,7 @@ const settingsSectionLabels: Record<SettingsSection, string> = {
 export type SettingsSaveInput = {
   providers?: ProviderSettings[];
   activeProviderId?: string;
-  permissionMode?: "chat" | "read_only" | "auto" | "approve" | "full_access";
+  permissionMode?: PermissionMode;
   agentRuntime?: AgentRuntimeSettings;
   sandbox?: AppSettings["sandbox"];
 };
@@ -113,6 +122,7 @@ type SettingsSidebarResize = {
 };
 
 type SettingsPanelProps = {
+  client: ApiClient | null;
   initialTab: SettingsTab;
   platform: PlatformInfo | null;
   settings: AppSettings | null;
@@ -244,6 +254,7 @@ const defaultAgentRuntimeSettings: AgentRuntimeSettings = {
 };
 
 export function SettingsPanel({
+  client,
   initialTab,
   platform,
   settings,
@@ -294,9 +305,9 @@ export function SettingsPanel({
   const [editingProviderId, setEditingProviderId] = useState(
     settings?.activeProviderId ?? settings?.providers[0]?.id ?? null,
   );
-  const [permissionMode, setPermissionMode] = useState<
-    "chat" | "read_only" | "auto" | "approve" | "full_access"
-  >(settings?.permissionMode ?? "auto");
+  const [permissionMode, setPermissionMode] = useState<PermissionMode>(
+    settings?.permissionMode ?? "auto",
+  );
   const [agentRuntime, setAgentRuntime] = useState<AgentRuntimeSettings>(
     settings?.agentRuntime ?? defaultAgentRuntimeSettings,
   );
@@ -500,22 +511,22 @@ export function SettingsPanel({
     scheduleAutomaticSave({ agentRuntime: next });
   }
 
-  function updatePermissionMode(nextMode: "auto" | "approve" | "full_access") {
-    const nextSandbox =
-      nextMode === "full_access"
-        ? {
-            ...sandboxSettings,
-            sandboxMode: "danger-full-access" as const,
-            enforcement: "disabled" as const,
-            network: "allow" as const,
-          }
-        : controlledSandboxSettings(sandboxSettings);
-    setPermissionMode(nextMode);
-    setSandboxSettings(nextSandbox);
-    scheduleAutomaticSave({
-      permissionMode: nextMode,
-      sandbox: nextSandbox,
-    });
+  function updatePermissionMode(nextMode: ApprovalStrategyMode) {
+    const next = selectPermissionMode(nextMode, sandboxSettings);
+    setPermissionMode(next.permissionMode);
+    setSandboxSettings(next.sandbox);
+    scheduleAutomaticSave(next);
+  }
+
+  function updateAccessMode(nextMode: PermissionAccessMode) {
+    const next = selectPermissionAccessMode(
+      nextMode,
+      permissionMode,
+      sandboxSettings,
+    );
+    setPermissionMode(next.permissionMode);
+    setSandboxSettings(next.sandbox);
+    scheduleAutomaticSave(next);
   }
 
   function updateSandbox(nextSandbox: AppSettings["sandbox"]) {
@@ -554,6 +565,9 @@ export function SettingsPanel({
           ? {
               ...provider,
               [field]: value,
+              ...(providerChangeInvalidatesModelDiscovery(field)
+                ? { modelsSyncedAt: null }
+                : {}),
               ...(["baseUrl", "model", "kind"].includes(field as string)
                 ? { openaiCompatibility: null }
                 : {}),
@@ -720,6 +734,17 @@ export function SettingsPanel({
       modelDiscoveryAttemptsRef.current[editingProvider.id] === signature ||
       modelDiscoveryInFlightRef.current.has(editingProvider.id)
     ) {
+      return;
+    }
+
+    // The server persists the catalog and its sync time. Re-entering settings
+    // creates a new panel instance, so hydrate this in-memory dedupe marker
+    // from that durable cache instead of hitting `/models` again.
+    if (
+      !editingProviderApiKey.trim() &&
+      hasCachedProviderModelCatalog(editingProvider)
+    ) {
+      modelDiscoveryAttemptsRef.current[editingProvider.id] = signature;
       return;
     }
 
@@ -1096,6 +1121,7 @@ export function SettingsPanel({
                   platform?.os === "win32" || platform?.os === "windows"
                 }
                 onPermissionModeChange={updatePermissionMode}
+                onAccessModeChange={updateAccessMode}
                 onSandboxChange={updateSandbox}
                 windowsSetup={windowsSandboxSetup}
                 windowsSetupBusy={windowsSandboxSetupBusy}
@@ -1106,6 +1132,10 @@ export function SettingsPanel({
             ) : null}
             {activeTab === "advanced" ? (
               <AdvancedSettings
+                client={client}
+                isWindows={
+                  platform?.os === "win32" || platform?.os === "windows"
+                }
                 providers={providers}
                 providerHealth={providerHealth}
                 onOpenLogs={onOpenLogs}

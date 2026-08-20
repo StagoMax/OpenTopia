@@ -9,18 +9,20 @@ import {
   Clock3,
   FileWarning,
   Loader2,
+  Minimize2,
   ShieldCheck,
   ShieldX,
   X,
 } from "lucide-react";
-import type { WorkForm } from "../../types";
-import { redactText } from "../../toolActivity";
+import type { ContextCompactionDetails, WorkForm } from "../../types";
+import { redactText, type ToolActivityChip } from "../../toolActivity";
 import {
   guardianActivityPresentation,
   type GuardianActivityIcon,
   type GuardianActivityMetric,
 } from "../../guardianActivity";
 import { MarkdownContent } from "../MarkdownContent";
+import { ActivityCallCard } from "../ToolActivityCard";
 import type { ActivityEntry, WorkItemTiming } from "./model";
 import { formatActivityTiming, formatWorkItemTiming } from "./timing";
 
@@ -273,6 +275,131 @@ function guardianActivityIcon(kind: GuardianActivityIcon): ReactNode {
     case "aborted":
       return <CircleSlash size={13} />;
   }
+}
+
+export function ContextCompactionActivity({
+  entry,
+  now,
+}: {
+  entry: Extract<ActivityEntry, { kind: "context-compaction" }>;
+  now: number;
+}) {
+  const running = !entry.finishedAt;
+  const failed = Boolean(entry.error);
+  const metrics = entry.details?.metrics;
+  const messageCount =
+    entry.details?.coverage.throughMessageCount ?? entry.messageCount;
+  const inputTokens = metrics?.inputTokens || entry.inputTokenEstimate;
+  const checkpointTokens =
+    metrics?.checkpointTokens || entry.checkpointTokenEstimate;
+  const chips: ToolActivityChip[] = [];
+  if (entry.modelRequestCount > 1) {
+    chips.push({ label: `${entry.modelRequestCount} 次模型调用` });
+  }
+  if (messageCount) chips.push({ label: `${messageCount} 条消息` });
+  if (metrics?.tokenReductionPercent) {
+    chips.push({
+      label: `减少 ${metrics.tokenReductionPercent}%`,
+      tone: "success",
+    });
+  }
+  if (failed) chips.push({ label: "失败", tone: "danger" });
+  const timing = formatActivityTiming(
+    entry.createdAt,
+    entry.finishedAt,
+    running,
+    now,
+    metrics?.latencyMs ? metrics.latencyMs : undefined,
+  );
+  const fields = [
+    {
+      label: "压缩方式",
+      value: contextCompactionModeLabel(entry.details?.mode),
+    },
+    messageCount
+      ? {
+          label: "覆盖范围",
+          value: `${messageCount.toLocaleString()} 条消息${
+            entry.details?.coverage.throughSeq
+              ? ` · 至事件 #${entry.details.coverage.throughSeq.toLocaleString()}`
+              : ""
+          }`,
+        }
+      : null,
+    inputTokens
+      ? { label: "输入 Token", value: inputTokens.toLocaleString() }
+      : null,
+    checkpointTokens
+      ? {
+          label: "检查点 Token",
+          value: checkpointTokens.toLocaleString(),
+        }
+      : null,
+    metrics?.factRetentionPercent
+      ? {
+          label: "事实保留",
+          value: `${metrics.factRetentionPercent}%`,
+        }
+      : null,
+  ].filter((field): field is { label: string; value: string } =>
+    Boolean(field),
+  );
+
+  return (
+    <ActivityCallCard
+      identity={entry.requestId}
+      state={failed ? "error" : running ? "running" : "complete"}
+      kind="context-compaction"
+      icon={<Minimize2 size={14} />}
+      title={
+        failed ? "上下文压缩失败" : running ? "正在压缩上下文" : "已压缩上下文"
+      }
+      detail={contextCompactionModeLabel(entry.details?.mode)}
+      chips={chips}
+      timing={timing}
+      defaultExpanded={failed}
+    >
+      {running ? (
+        <div className="tool-panel is-pending" role="status">
+          正在读取历史并生成上下文检查点…
+        </div>
+      ) : failed ? (
+        <div className="tool-panel" data-panel="text">
+          <div className="tool-panel-scroll">
+            <p className="context-compaction-summary" data-tone="error">
+              {redactText(entry.error ?? "上下文压缩未完成。")}
+            </p>
+          </div>
+        </div>
+      ) : (
+        <div className="tool-panel" data-panel="fields">
+          <dl className="tool-panel-fields">
+            {fields.map((field) => (
+              <div key={field.label}>
+                <dt>{field.label}</dt>
+                <dd>{field.value}</dd>
+              </div>
+            ))}
+          </dl>
+          {entry.summary && (
+            <div className="tool-panel-scroll">
+              <p className="context-compaction-summary">
+                {redactText(entry.summary)}
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+    </ActivityCallCard>
+  );
+}
+
+function contextCompactionModeLabel(mode?: ContextCompactionDetails["mode"]) {
+  if (mode === "native_provider") return "提供商原生压缩";
+  if (mode === "structured_local") return "本地检查点";
+  if (mode === "manual") return "手动检查点";
+  if (mode === "legacy_text") return "旧版摘要";
+  return "上下文检查点";
 }
 
 export function ActivityResultIcon({ running }: { running: boolean }) {

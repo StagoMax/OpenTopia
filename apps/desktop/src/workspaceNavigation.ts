@@ -1,14 +1,12 @@
 import type { ExperienceMode } from "./types";
 
 export type FlowPrimaryView =
-  | "conversation"
-  | "inbox"
-  | "connections"
-  | "knowledge";
+  "conversation" | "inbox" | "deployments" | "connections" | "knowledge";
 
 export type SidebarDestination =
   | "conversation"
   | "flow-inbox"
+  | "flow-deployments"
   | "flow-connections"
   | "flow-knowledge"
   | "plugins";

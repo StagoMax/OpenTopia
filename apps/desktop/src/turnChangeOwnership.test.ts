@@ -4,9 +4,10 @@ import test from "node:test";
 import type * as TurnChangeOwnershipModule from "./turnChangeOwnership";
 import type { AgentEvent } from "./types";
 
-const { shouldShowRecordedTurnChanges } = (await import(
-  "./turnChangeOwnership" + ".ts"
-)) as typeof TurnChangeOwnershipModule;
+const { isTurnChangeDisplaySettled, shouldShowRecordedTurnChanges } =
+  (await import(
+    "./turnChangeOwnership" + ".ts"
+  )) as typeof TurnChangeOwnershipModule;
 
 function event(seq: number, payload: AgentEvent["payload"]): AgentEvent {
   return {
@@ -99,4 +100,14 @@ test("recognizes canonical filesystem mutations without treating reads as writes
     ),
     true,
   );
+});
+
+test("keeps the undo card hidden until its turn is no longer active", () => {
+  const finished = event(3, { type: "turn_finished", summary: "Done." });
+  assert.equal(isTurnChangeDisplaySettled([], "turn-1", null), false);
+  assert.equal(
+    isTurnChangeDisplaySettled([finished], "turn-1", "turn-1"),
+    false,
+  );
+  assert.equal(isTurnChangeDisplaySettled([finished], "turn-1", null), true);
 });

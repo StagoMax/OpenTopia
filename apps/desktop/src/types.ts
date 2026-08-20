@@ -1,5 +1,6 @@
 export * from "./types/agent";
 export * from "./types/base";
+export * from "./types/connections";
 export * from "./types/flow";
 export * from "./types/git";
 export * from "./types/library";

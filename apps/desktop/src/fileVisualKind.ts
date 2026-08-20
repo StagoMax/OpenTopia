@@ -1,3 +1,5 @@
+import { spreadsheetFileExtensions } from "./spreadsheetFormats.ts";
+
 export type FileVisualKind =
   | "pdf"
   | "word"
@@ -17,10 +19,7 @@ const extensionsByKind: ReadonlyArray<
 > = [
   ["pdf", new Set(["pdf"])],
   ["word", new Set(["doc", "docx", "odt", "rtf"])],
-  [
-    "spreadsheet",
-    new Set(["csv", "tsv", "xls", "xlsx", "xlsm", "xlsb", "ods"]),
-  ],
+  ["spreadsheet", new Set(spreadsheetFileExtensions)],
   [
     "presentation",
     new Set(["ppt", "pptx", "pps", "ppsx", "pot", "potx", "odp"]),

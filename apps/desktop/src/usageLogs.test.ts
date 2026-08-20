@@ -105,8 +105,8 @@ test("aggregates API token, prompt cache, latency, retry, and tool metrics", () 
       endpoint: "https://api.example.test/responses",
     }),
     event(5, "2026-08-05T00:00:00.350Z", {
-      type: "model_delta",
-      text: "hello",
+      type: "provider_first_token_received",
+      request_id: "request-1",
     }),
     event(6, "2026-08-05T00:00:00.500Z", {
       type: "tool_call_started",
@@ -183,6 +183,41 @@ test("aggregates API token, prompt cache, latency, retry, and tool metrics", () 
   assert.equal(result.summary.totalToolDurationMs, 300);
 });
 
+test("correlates durable first-token metrics by request id", () => {
+  const result = aggregateUsageEvents([
+    event(1, "2026-08-05T00:00:00.000Z", {
+      type: "provider_request_sent",
+      request_id: "request-1",
+      round: 1,
+      attempt: 1,
+      adapter: "responses",
+      method: "POST",
+      endpoint: "https://api.example.test/responses",
+    }),
+    event(2, "2026-08-05T00:00:00.100Z", {
+      type: "provider_request_sent",
+      request_id: "request-2",
+      round: 2,
+      attempt: 1,
+      adapter: "responses",
+      method: "POST",
+      endpoint: "https://api.example.test/responses",
+    }),
+    event(3, "2026-08-05T00:00:00.300Z", {
+      type: "provider_first_token_received",
+      request_id: "request-1",
+    }),
+    event(4, "2026-08-05T00:00:00.500Z", {
+      type: "provider_first_token_received",
+      request_id: "request-2",
+    }),
+  ]);
+
+  const callsById = new Map(result.calls.map((call) => [call.id, call]));
+  assert.equal(callsById.get("request-1")?.ttftMs, 300);
+  assert.equal(callsById.get("request-2")?.ttftMs, 400);
+});
+
 test("prefers runtime-recorded tool duration over batched event timestamps", () => {
   const result = aggregateUsageEvents([
     event(1, "2026-08-05T00:00:00.500Z", {
@@ -201,6 +236,78 @@ test("prefers runtime-recorded tool duration over batched event timestamps", () 
 
   assert.equal(result.summary.averageToolDurationMs, 1_234);
   assert.equal(result.summary.totalToolDurationMs, 1_234);
+});
+
+test("hydrates legacy conversation roles before a later usage event replaces the breakdown", () => {
+  const flatBreakdown = {
+    baseInstructions: 0,
+    developerInstructions: 0,
+    repositoryInstructions: 0,
+    runtimeContext: 0,
+    skillInstructions: 0,
+    summaries: 0,
+    checkpoints: 0,
+    conversation: 25,
+    currentUser: 0,
+    toolCalls: 0,
+    toolResults: 0,
+    toolSchemas: 0,
+    providerState: 0,
+    other: 0,
+    total: 25,
+  };
+  const userHistory = {
+    ...contextItem("history:user", "user-history", 10, "conversation"),
+    role: "user" as const,
+    authority: "user" as const,
+  };
+  const assistantHistory = {
+    ...contextItem(
+      "history:assistant",
+      "assistant-history",
+      15,
+      "conversation",
+    ),
+    role: "assistant" as const,
+    authority: "assistant" as const,
+  };
+
+  const result = aggregateUsageEvents([
+    event(1, "2026-08-05T00:00:00.000Z", {
+      type: "model_context_built",
+      request_id: "request-legacy",
+      round: 2,
+      context_hash: "legacy-context",
+      token_estimate: 25,
+      token_breakdown: flatBreakdown,
+      items: [userHistory, assistantHistory],
+    }),
+    event(2, "2026-08-05T00:00:00.010Z", {
+      type: "provider_request_sent",
+      request_id: "request-legacy",
+      round: 2,
+      attempt: 1,
+      adapter: "responses",
+      method: "POST",
+      endpoint: "/responses",
+    }),
+    event(3, "2026-08-05T00:00:00.020Z", {
+      type: "token_usage",
+      request_id: "request-legacy",
+      input_tokens: 25,
+      output_tokens: 1,
+      total_tokens: 26,
+      input_breakdown: flatBreakdown,
+    }),
+  ]);
+
+  const conversation = result.calls[0].inputBreakdown?.details?.find(
+    (detail) => detail.id === "conversation",
+  );
+  assert.deepEqual(
+    conversation?.children?.map((detail) => detail.id),
+    ["user_messages", "assistant_messages"],
+  );
 });
 
 test("correlates usage by request id and attributes token modules and waste signals", () => {

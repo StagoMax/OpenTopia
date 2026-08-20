@@ -40,24 +40,28 @@ export const permissionModeOptions: Array<{
   label: string;
   detail: string;
   icon: typeof Hand;
+  appearance: "default" | "auto" | "full-access";
 }> = [
   {
     value: "approve",
     label: "请求批准",
     detail: "编辑外部文件和使用互联网时始终询问",
     icon: Hand,
+    appearance: "default",
   },
   {
     value: "auto",
     label: "替我审批",
     detail: "仅对检测到的风险操作请求批准",
     icon: ShieldCheck,
+    appearance: "auto",
   },
   {
-    value: "full_access",
-    label: "完全访问权限",
-    detail: "可不受限制地访问互联网和此电脑上的任何文件",
+    value: "unrestricted",
+    label: "完整系统访问",
+    detail: "无系统沙箱，并跳过所有工具审批",
     icon: ShieldAlert,
+    appearance: "full-access",
   },
 ];
 
@@ -82,5 +86,9 @@ export function sandboxModeLabel(
 export function normalizedPermissionMode(
   mode: AppSettings["permissionMode"],
 ): ExecutionPermissionMode {
-  return mode === "approve" || mode === "full_access" ? mode : "auto";
+  if (mode === "approve") return "approve";
+  if (mode === "full_access" || mode === "unrestricted") {
+    return "unrestricted";
+  }
+  return "auto";
 }

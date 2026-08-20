@@ -61,6 +61,11 @@ export type AgentEventPayload =
       [k: string]: unknown;
     }
   | {
+      request_id: string;
+      type: "provider_first_token_received";
+      [k: string]: unknown;
+    }
+  | {
       attempt: number;
       body?: unknown;
       request_id: string;
@@ -526,17 +531,25 @@ export interface TokenEstimateBreakdown {
   /**
    * Names/descriptions visible before a deferred tool is selected.
    */
-  deferredToolCatalog: number;
+  deferredToolCatalog?: number;
+  /**
+   * Hierarchical local attribution. Omitted when replaying legacy logs.
+   */
+  details?: TokenEstimateDetail[];
   developerInstructions: number;
   /**
-   * Full schemas sent directly on this request (including output schemas).
+   * Full input schemas sent directly in the request's tool surface.
    */
-  directToolSchemas: number;
+  directToolSchemas?: number;
   /**
    * Schemas appended by a provider Tool Search continuation.
    */
-  loadedToolSchemas: number;
+  loadedToolSchemas?: number;
   other: number;
+  /**
+   * A structured-output schema is a request field, not a tool definition.
+   */
+  outputSchema?: number;
   providerState: number;
   repositoryInstructions: number;
   runtimeContext: number;
@@ -549,6 +562,22 @@ export interface TokenEstimateBreakdown {
    */
   toolSchemas: number;
   total: number;
+  /**
+   * Provider-native assistant message items replayed inside the active turn. These are neither durable conversation history nor opaque continuation state, so they remain a separate, mutually exclusive bucket.
+   */
+  turnAssistantState?: number;
+  [k: string]: unknown;
+}
+/**
+ * One node in the local attribution tree for a logical model request.
+ *
+ * Providers report request-level usage totals. These nodes preserve the harness-owned structure used to assemble that request without presenting the individual values as provider-billed facts.
+ */
+export interface TokenEstimateDetail {
+  children?: TokenEstimateDetail[];
+  id: string;
+  label: string;
+  tokens: number;
   [k: string]: unknown;
 }
 export interface ToolCall {
@@ -716,12 +745,31 @@ export interface ContextCheckpointCoverage {
 }
 export interface ContextCompactionMetrics {
   activeConstraintRetentionPercent: number;
+  cacheHitPercent?: number;
+  cachedInputTokens?: number;
   checkpointTokens: number;
   factRetentionPercent: number;
+  /**
+   * Exact logical agent request before local compaction.
+   */
   inputTokens: number;
   latencyMs: number;
+  /**
+   * Exact logical agent request after the checkpoint starts a new epoch.
+   */
+  postCompactionTokens?: number;
+  /**
+   * Provider-reported usage for the auxiliary compaction model call.
+   */
+  providerInputTokens?: number;
+  providerOutputTokens?: number;
+  /**
+   * Percentage of the original request remaining after compaction.
+   */
+  remainingPercent?: number;
   source: string;
   tokenReductionPercent: number;
+  tokensRemoved?: number;
   [k: string]: unknown;
 }
 export interface ContextSummary {
@@ -748,6 +796,7 @@ export interface ContextCheckpoint {
   nextSteps?: ContextCheckpointStep[];
   openIssues?: ContextCheckpointFact[];
   pendingInteractions?: ContextCheckpointInteraction[];
+  phases?: ContextCheckpointPhase[];
   previousCheckpointId?: string | null;
   providerCompatibilityHash?: string | null;
   schemaVersion: number;
@@ -790,6 +839,36 @@ export interface ContextCheckpointInteraction {
   kind: string;
   sourceSeqs?: number[];
   summary: string;
+  [k: string]: unknown;
+}
+/**
+ * One evidence-backed stage in the task's durable history.
+ *
+ * `from_seq`/`through_seq` are the authoritative ordering keys. Timestamps are canonicalized from those events by the checkpoint service rather than trusted from model output.
+ */
+export interface ContextCheckpointPhase {
+  endedAt?: string | null;
+  fromSeq: number;
+  id: string;
+  metrics?: ContextCheckpointMetric[];
+  objective: string;
+  outcome?: string | null;
+  problem?: string | null;
+  remainingRisks?: string[];
+  resolution?: string | null;
+  rootCause?: string | null;
+  sourceSeqs?: number[];
+  startedAt?: string | null;
+  status: string;
+  throughSeq: number;
+  title: string;
+  [k: string]: unknown;
+}
+export interface ContextCheckpointMetric {
+  name: string;
+  sourceSeqs?: number[];
+  unit?: string | null;
+  value: string;
   [k: string]: unknown;
 }
 export interface ContextCheckpointWorkspace {

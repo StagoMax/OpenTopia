@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import {
   Bot,
   ChevronDown,
@@ -25,6 +25,7 @@ import type { ToolCall, ToolResult } from "../types";
 import {
   buildToolActivity,
   type ToolActivityBody,
+  type ToolActivityChip,
   type ToolActivityIconKind,
   type ToolActivityView,
 } from "../toolActivity";
@@ -36,6 +37,78 @@ export type ToolSandboxState = {
   detail: string;
   unsafe: boolean;
 };
+
+export function ActivityCallCard({
+  identity,
+  state,
+  kind,
+  icon,
+  title,
+  detail,
+  chips = [],
+  timing,
+  streaming = false,
+  defaultExpanded = false,
+  children,
+}: {
+  identity: string;
+  state: "running" | "complete" | "error";
+  kind: string;
+  icon: ReactNode;
+  title: string;
+  detail?: string;
+  chips?: ToolActivityChip[];
+  timing?: string;
+  streaming?: boolean;
+  defaultExpanded?: boolean;
+  children: ReactNode;
+}) {
+  const running = state === "running";
+  const [expanded, setExpanded] = useState(defaultExpanded);
+
+  useEffect(() => {
+    if (streaming) setExpanded(false);
+  }, [streaming, identity]);
+
+  return (
+    <div className="tool-activity" data-state={state} data-kind={kind}>
+      <button
+        className="tool-activity-header"
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((current) => !current)}
+      >
+        <span className="tool-activity-icon" aria-hidden="true">
+          {icon}
+        </span>
+        <span
+          className={`tool-activity-title${running ? " conversation-status-shimmer" : ""}`}
+          title={detail ? `${title} · ${detail}` : title}
+        >
+          {title}
+        </span>
+        <span className="tool-activity-meta">
+          {detail && <span className="tool-activity-detail">{detail}</span>}
+          {chips.map((chip) => (
+            <span
+              key={`${chip.label}:${chip.title ?? ""}`}
+              className="tool-activity-chip"
+              data-tone={chip.tone ?? "neutral"}
+              title={chip.title}
+            >
+              {chip.label}
+            </span>
+          ))}
+          {timing && <span className="tool-activity-timing">{timing}</span>}
+        </span>
+        <span className="tool-activity-chevron" aria-hidden="true">
+          {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+        </span>
+      </button>
+      {expanded && <div className="tool-activity-body">{children}</div>}
+    </div>
+  );
+}
 
 /**
  * One tool call rendered as a single line plus one panel. The line is built
@@ -60,73 +133,39 @@ export function ToolActivityCard({
 }) {
   const view = buildToolActivity(call, result);
   const running = !result;
-  const [expanded, setExpanded] = useState(defaultExpanded);
-
-  useEffect(() => {
-    if (streaming) setExpanded(false);
-  }, [streaming, call.id]);
+  const chips: ToolActivityChip[] = sandbox
+    ? [
+        ...view.chips,
+        {
+          label: sandbox.label,
+          tone: sandbox.unsafe ? "warning" : "neutral",
+          title: sandbox.detail,
+        },
+      ]
+    : view.chips;
 
   return (
-    <div
-      className="tool-activity"
-      data-state={view.failed ? "error" : running ? "running" : "complete"}
-      data-kind={view.kind}
+    <ActivityCallCard
+      identity={call.id}
+      state={view.failed ? "error" : running ? "running" : "complete"}
+      kind={view.kind}
+      icon={
+        view.detail &&
+        (view.kind === "attachment" || view.kind === "spreadsheet") ? (
+          <FileTypeIcon name={view.detail} size={14} />
+        ) : (
+          toolActivityIcon(view.iconKind ?? view.kind)
+        )
+      }
+      title={view.title}
+      detail={view.detail}
+      chips={chips}
+      timing={timing}
+      streaming={streaming}
+      defaultExpanded={defaultExpanded}
     >
-      <button
-        className="tool-activity-header"
-        type="button"
-        aria-expanded={expanded}
-        onClick={() => setExpanded((current) => !current)}
-      >
-        <span className="tool-activity-icon" aria-hidden="true">
-          {view.detail &&
-          (view.kind === "attachment" || view.kind === "spreadsheet") ? (
-            <FileTypeIcon name={view.detail} size={14} />
-          ) : (
-            toolActivityIcon(view.iconKind ?? view.kind)
-          )}
-        </span>
-        <span
-          className={`tool-activity-title${running ? " conversation-status-shimmer" : ""}`}
-          title={view.detail ? `${view.title} · ${view.detail}` : view.title}
-        >
-          {view.title}
-        </span>
-        <span className="tool-activity-meta">
-          {view.detail && (
-            <span className="tool-activity-detail">{view.detail}</span>
-          )}
-          {view.chips.map((chip) => (
-            <span
-              key={chip.label}
-              className="tool-activity-chip"
-              data-tone={chip.tone ?? "neutral"}
-              title={chip.title}
-            >
-              {chip.label}
-            </span>
-          ))}
-          {sandbox && (
-            <span
-              className="tool-activity-chip"
-              data-tone={sandbox.unsafe ? "warning" : "neutral"}
-              title={sandbox.detail}
-            >
-              {sandbox.label}
-            </span>
-          )}
-          {timing && <span className="tool-activity-timing">{timing}</span>}
-        </span>
-        <span className="tool-activity-chevron" aria-hidden="true">
-          {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-        </span>
-      </button>
-      {expanded && (
-        <div className="tool-activity-body">
-          <ToolActivityBodyView body={view.body} view={view} />
-        </div>
-      )}
-    </div>
+      <ToolActivityBodyView body={view.body} view={view} />
+    </ActivityCallCard>
   );
 }
 

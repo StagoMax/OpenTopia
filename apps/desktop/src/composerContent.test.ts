@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   composerContentText,
+  composerOrderedListContinuation,
   composerTextLength,
   composerUndoEntries,
+  composerUsesOrderedListIndentation,
   composerVisibleText,
   normalizeComposerContentParts,
   normalizeComposerImageDeletionSnapshot,
@@ -153,6 +155,56 @@ test("preserves intentional line breaks when no image was deleted", () => {
     ),
     after,
   );
+});
+
+test("continues an ordered list when the composer inserts a line break", () => {
+  const text = "1. ";
+  assert.equal(
+    composerOrderedListContinuation({
+      parts: [{ type: "text", text }],
+      caretOffset: composerTextLength(text),
+    }),
+    "\n2. ",
+  );
+});
+
+test("continues the current ordered-list line and preserves indentation", () => {
+  const text = "说明\n  9. 第九项";
+  assert.equal(
+    composerOrderedListContinuation({
+      parts: [{ type: "text", text }],
+      caretOffset: composerTextLength(text),
+    }),
+    "\n  10. ",
+  );
+});
+
+test("does not invent numbering for ordinary lines or image content", () => {
+  assert.equal(
+    composerOrderedListContinuation({
+      parts: [{ type: "text", text: "普通文本" }],
+      caretOffset: 4,
+    }),
+    null,
+  );
+  assert.equal(
+    composerOrderedListContinuation({
+      parts: [{ type: "image_ref", imageId }],
+      caretOffset: 1,
+    }),
+    null,
+  );
+});
+
+test("uses rendered Markdown indentation after an ordered-list marker", () => {
+  assert.equal(composerUsesOrderedListIndentation("1. "), true);
+  assert.equal(
+    composerUsesOrderedListIndentation("  1. 第一项\n  2. 第二项"),
+    true,
+  );
+  assert.equal(composerUsesOrderedListIndentation("1.还没有空格"), false);
+  assert.equal(composerUsesOrderedListIndentation("说明\n1. 第一项"), false);
+  assert.equal(composerUsesOrderedListIndentation("    1. 这是代码块"), false);
 });
 
 test("records inline image insertion in the custom undo history", () => {

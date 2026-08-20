@@ -83,7 +83,7 @@ export function ComposerToolbar({
         </div>
         <div className="composer-menu-wrap">
           <button
-            className={`composer-mode is-${activePermissionMode.replace("_", "-")}`}
+            className={`composer-mode is-${activePermissionOption.appearance}`}
             type="button"
             aria-expanded={openMenu === "permission"}
             onClick={() => onToggleMenu("permission")}
@@ -104,7 +104,7 @@ export function ComposerToolbar({
                 const selected = activePermissionMode === option.value;
                 return (
                   <button
-                    className={`permission-option is-${option.value.replace("_", "-")} ${selected ? "active" : ""}`}
+                    className={`permission-option is-${option.appearance} ${selected ? "active" : ""}`}
                     disabled={isRunning || isSending}
                     key={option.value}
                     role="menuitemradio"

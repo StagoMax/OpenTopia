@@ -7,6 +7,12 @@ const directWorkspaceWriteTools = new Set([
   "write_file",
 ]);
 
+const terminalTurnEventTypes = new Set([
+  "turn_finished",
+  "turn_cancelled",
+  "error",
+]);
+
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -51,10 +57,28 @@ export function shouldShowRecordedTurnChanges(
   events: AgentEvent[],
   turnId: string,
 ): boolean {
+  if (!turnHasTerminalEvent(events, turnId)) return false;
   if (turnHasSuccessfulWorkspaceWrite(events, turnId)) return true;
   return !events.some(
     (event) =>
       event.turnId === turnId &&
       ["turn_cancelled", "error"].includes(event.payload.type),
+  );
+}
+
+export function isTurnChangeDisplaySettled(
+  events: AgentEvent[],
+  turnId: string,
+  activeTurnId: string | null,
+): boolean {
+  if (activeTurnId === turnId) return false;
+  return turnHasTerminalEvent(events, turnId);
+}
+
+function turnHasTerminalEvent(events: AgentEvent[], turnId: string): boolean {
+  return events.some(
+    (event) =>
+      event.turnId === turnId &&
+      terminalTurnEventTypes.has(event.payload.type),
   );
 }

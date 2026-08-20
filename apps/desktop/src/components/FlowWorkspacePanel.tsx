@@ -5,6 +5,7 @@ import {
   CircleDot,
   Clock3,
   GitBranch,
+  Layers3,
   Library,
   MessageSquareText,
   Pause,
@@ -854,6 +855,16 @@ function FlowRuntimePanel({
 
           <div className="flow-review-panel__section-heading">
             <span>
+              <Layers3 aria-hidden="true" size={15} /> Superstep Checkpoints
+            </span>
+            <Badge variant={selectedRun.activeCheckpoint ? "info" : "neutral"}>
+              {selectedRun.superstep} committed
+            </Badge>
+          </div>
+          <WorkflowCheckpointTrace run={selectedRun} />
+
+          <div className="flow-review-panel__section-heading">
+            <span>
               <GitBranch aria-hidden="true" size={15} /> Node Trace
             </span>
             <Badge variant="neutral">
@@ -911,6 +922,70 @@ function FlowRuntimePanel({
       ) : null}
     </Panel>
   );
+}
+
+function WorkflowCheckpointTrace({ run }: { run: FlowRun }) {
+  const active = run.activeCheckpoint;
+  const history = run.checkpointHistory.slice(-12).toReversed();
+  if (!active && history.length === 0) {
+    return (
+      <p className="flow-runtime-panel__checkpoint-empty">
+        Run 启动后，每个已提交 superstep 会显示在这里。
+      </p>
+    );
+  }
+  return (
+    <ol
+      aria-label="Workflow superstep checkpoints"
+      className="flow-runtime-panel__checkpoints"
+    >
+      {active ? (
+        <li data-status="running">
+          <span className="flow-runtime-panel__checkpoint-step">
+            {active.superstep}
+          </span>
+          <div>
+            <span className="flow-runtime-panel__checkpoint-title">
+              <strong>活动检查点</strong>
+              <Badge variant="info">running</Badge>
+            </span>
+            <small>
+              {active.pendingWrites.length}/{active.nodes.length} pending writes
+              · {active.nodes.map((node) => node.nodeId).join(", ")}
+            </small>
+          </div>
+        </li>
+      ) : null}
+      {history.map((checkpoint) => (
+        <li data-status={checkpoint.status} key={checkpoint.id}>
+          <span className="flow-runtime-panel__checkpoint-step">
+            {checkpoint.superstep}
+          </span>
+          <div>
+            <span className="flow-runtime-panel__checkpoint-title">
+              <strong>{checkpoint.nodeIds.join(" + ")}</strong>
+              <Badge variant={checkpointBadgeVariant(checkpoint.status)}>
+                {checkpoint.status}
+              </Badge>
+            </span>
+            <small>
+              {checkpoint.pendingWriteCount} pending writes ·
+              {formatDuration(checkpoint.createdAt, checkpoint.completedAt)}
+            </small>
+          </div>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function checkpointBadgeVariant(
+  status: FlowRun["checkpointHistory"][number]["status"],
+) {
+  if (status === "committed") return "success" as const;
+  if (status === "failed") return "danger" as const;
+  if (status === "cancelled") return "warning" as const;
+  return "info" as const;
 }
 
 function TranscriptEntry({ entry }: { entry: FlowTranscriptEntry }) {
@@ -982,12 +1057,20 @@ function RunStatusBadge({ status }: { status: FlowRunStatus }) {
       ? "success"
       : status === "failed" || status === "cancelled"
         ? "danger"
-        : status === "waiting_approval" || status === "paused"
+        : status === "waiting_approval" ||
+            status === "waiting_human" ||
+            status === "paused"
           ? "warning"
-          : status === "running"
+          : status === "running" || status === "resuming"
             ? "info"
             : "neutral";
-  return <Badge variant={variant}>{status.replaceAll("_", " ")}</Badge>;
+  const label =
+    status === "waiting_human"
+      ? "等待人工处理"
+      : status === "resuming"
+        ? "正在恢复"
+        : status.replaceAll("_", " ");
+  return <Badge variant={variant}>{label}</Badge>;
 }
 
 function isTerminalRunStatus(status: FlowRunStatus) {

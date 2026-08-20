@@ -1,0 +1,15 @@
+{
+  "extensions": [
+    "xls",
+    "xlsx",
+    "xlsm",
+    "xlsb",
+    "xltx",
+    "xltm",
+    "ods",
+    "csv",
+    "tsv",
+    "tab"
+  ],
+  "delimitedExtensions": ["csv", "tsv", "tab"]
+}

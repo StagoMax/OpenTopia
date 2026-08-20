@@ -16,6 +16,7 @@ const { spawn, spawnSync } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const net = require("node:net");
+const spreadsheetFormats = require("./spreadsheet-formats.json");
 const updater = require("./updater.cjs");
 const { createDesktopBrowserHost } = require("./browser-host.cjs");
 const { createChromeBridge } = require("./chrome-bridge.cjs");
@@ -45,6 +46,10 @@ if (isDev) {
 const hasExplicitBackendUrl = Boolean(process.env.OPENTOPIA_SERVER_URL);
 let defaultBackendUrl =
   process.env.OPENTOPIA_SERVER_URL || "http://127.0.0.1:8787";
+// Keep this in lockstep with the health response in opentopia-server. A health
+// response is also the desktop client/server compatibility boundary: a server
+// from an earlier build must not be reused merely because it is listening.
+const desktopBackendApiVersion = 2;
 const backendApiToken = crypto.randomBytes(32).toString("base64url");
 const openTopiaProtocol = "opentopia";
 const {
@@ -102,6 +107,64 @@ const keyringProviderApiKeyEnvName = "OPENTOPIA_API_KEY";
 const maxRecentWorkspaces = 12;
 const maxContextSourceFiles = 20;
 const maxContextSourceBytes = 25 * 1024 * 1024;
+const spreadsheetContextExtensions = Object.freeze([
+  ...spreadsheetFormats.extensions,
+]);
+const delimitedSpreadsheetContextExtensions = new Set(
+  spreadsheetFormats.delimitedExtensions,
+);
+const workbookContextExtensions = new Set(
+  spreadsheetContextExtensions.filter(
+    (extension) => !delimitedSpreadsheetContextExtensions.has(extension),
+  ),
+);
+const supportedContextFileExtensions = Object.freeze([
+  "txt",
+  "md",
+  "json",
+  "jsonc",
+  "jsonl",
+  ...spreadsheetContextExtensions,
+  "yaml",
+  "yml",
+  "toml",
+  "xml",
+  "html",
+  "css",
+  "scss",
+  "less",
+  "js",
+  "jsx",
+  "ts",
+  "tsx",
+  "rs",
+  "py",
+  "go",
+  "java",
+  "kt",
+  "swift",
+  "rb",
+  "php",
+  "sql",
+  "graphql",
+  "gql",
+  "proto",
+  "diff",
+  "patch",
+  "c",
+  "h",
+  "cpp",
+  "hpp",
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "bmp",
+  "pdf",
+  "docx",
+  "pptx",
+]);
 const recentWorkspacesFile = "recent-workspaces.json";
 const openRequestHistoryLimit = 50;
 const openRequestHistory = [];
@@ -783,11 +846,14 @@ function normalizeWorkspaceRoot(rawPath) {
 }
 
 function contextSourceKind(filePath) {
-  const extension = path.extname(filePath).toLowerCase();
-  if ([".png", ".jpg", ".jpeg", ".gif", ".webp"].includes(extension)) {
+  const extension = path.extname(filePath).slice(1).toLowerCase();
+  if (["png", "jpg", "jpeg", "gif", "webp", "bmp"].includes(extension)) {
     return "image";
   }
-  if ([".pdf", ".docx", ".xlsx", ".pptx"].includes(extension)) {
+  if (
+    ["pdf", "docx", "pptx"].includes(extension) ||
+    workbookContextExtensions.has(extension)
+  ) {
     return "document";
   }
   return "text";
@@ -1201,7 +1267,7 @@ async function isBackendHealthy() {
     const identityVerified =
       health?.ok === true &&
       health?.service === "opentopia-server" &&
-      health?.apiVersion === 1;
+      health?.apiVersion === desktopBackendApiVersion;
     writeLog("info", "backend.health.checked", {
       backend: backendEndpointInfo(),
       ok: response.ok && identityVerified,
@@ -2237,55 +2303,7 @@ function registerIpc() {
       filters: [
         {
           name: "Supported context files",
-          extensions: [
-            "txt",
-            "md",
-            "json",
-            "jsonc",
-            "jsonl",
-            "csv",
-            "tsv",
-            "yaml",
-            "yml",
-            "toml",
-            "xml",
-            "html",
-            "css",
-            "scss",
-            "less",
-            "js",
-            "jsx",
-            "ts",
-            "tsx",
-            "rs",
-            "py",
-            "go",
-            "java",
-            "kt",
-            "swift",
-            "rb",
-            "php",
-            "sql",
-            "graphql",
-            "gql",
-            "proto",
-            "diff",
-            "patch",
-            "c",
-            "h",
-            "cpp",
-            "hpp",
-            "png",
-            "jpg",
-            "jpeg",
-            "gif",
-            "webp",
-            "bmp",
-            "pdf",
-            "docx",
-            "xlsx",
-            "pptx",
-          ],
+          extensions: supportedContextFileExtensions,
         },
       ],
     };
