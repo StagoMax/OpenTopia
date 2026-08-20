@@ -5,6 +5,9 @@
 //! delegates to the established `SpreadsheetTool`, keeping one validation and
 //! staging path for both the modern protocol and legacy calls.
 
+use super::spreadsheet_protocol_contract::{
+    SpreadsheetOperationContract, SpreadsheetProtocolOperation,
+};
 use super::{
     tool_resource_key, OfficeResourceRef, SpreadsheetTool, Tool, ToolExecutionPolicy,
     ToolInvocationContext, ToolSideEffect, TypedTool,
@@ -13,7 +16,6 @@ use crate::execution_authorization::ToolExecutionIntent;
 use crate::model::{ToolCall, ToolResult};
 use crate::office_runtime::OfficeRuntime;
 use crate::spreadsheet::DelimitedFormat;
-use anyhow::Context;
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -54,7 +56,7 @@ impl TypedTool for SpreadsheetInspectTool {
     }
 
     fn description(&self) -> &str {
-        "Stage 1 of spreadsheet work: bind and inspect one workspace file or user attachment. Use it before choosing a detailed read or mutation operation. liveSession is reserved for a future Excel integration and is reported as unavailable, never treated as a local path."
+        "Stage 1 of spreadsheet work: bind and inspect one workspace file or immutable user attachment. Use it before choosing a detailed read or mutation operation."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
@@ -70,9 +72,7 @@ impl TypedTool for SpreadsheetInspectTool {
             OfficeResourceRef::WorkspaceFile { path } => {
                 ToolExecutionIntent::observation([PathBuf::from(path)])
             }
-            OfficeResourceRef::Attachment { .. } | OfficeResourceRef::LiveSession { .. } => {
-                ToolExecutionIntent::observation([])
-            }
+            OfficeResourceRef::Attachment { .. } => ToolExecutionIntent::observation([]),
         }
     }
 
@@ -82,7 +82,6 @@ impl TypedTool for SpreadsheetInspectTool {
         input: Self::Input,
         ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
-        input.resource.ensure_available()?;
         let (binding_key, binding_value) = input.resource.read_binding()?;
         let inspection = input.inspection.unwrap_or(SpreadsheetInspection::Workbook);
         let mut legacy = Map::new();
@@ -112,86 +111,11 @@ impl TypedTool for SpreadsheetInspectTool {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum SpreadsheetProtocolOperation {
-    ListSheets,
-    ReadRange,
-    ReadRanges,
-    ReadRows,
-    ReadColumns,
-    Find,
-    FilterRows,
-    Validate,
-    FillTemplate,
-    ExportDelimited,
-    Write,
-    WriteRows,
-    WriteColumns,
-    CopyRows,
-    CopyColumns,
-    Batch,
-}
-
-impl SpreadsheetProtocolOperation {
-    fn legacy_action(self) -> &'static str {
-        match self {
-            Self::ListSheets => "list_sheets",
-            Self::ReadRange => "read_range",
-            Self::ReadRanges => "read_ranges",
-            Self::ReadRows => "read_rows",
-            Self::ReadColumns => "read_columns",
-            Self::Find => "find",
-            Self::FilterRows => "filter_rows",
-            Self::Validate => "validate",
-            Self::FillTemplate => "fill_template",
-            Self::ExportDelimited => "export_delimited",
-            Self::Write => "write",
-            Self::WriteRows => "write_rows",
-            Self::WriteColumns => "write_columns",
-            Self::CopyRows => "copy_rows",
-            Self::CopyColumns => "copy_columns",
-            Self::Batch => "batch",
-        }
-    }
-
-    fn is_mutation(self) -> bool {
-        !matches!(
-            self,
-            Self::ListSheets
-                | Self::ReadRange
-                | Self::ReadRanges
-                | Self::ReadRows
-                | Self::ReadColumns
-                | Self::Find
-                | Self::FilterRows
-                | Self::Validate
-        )
-    }
-
-    fn primary_binding(self) -> Option<&'static str> {
-        match self {
-            Self::ListSheets
-            | Self::ReadRange
-            | Self::ReadRanges
-            | Self::ReadRows
-            | Self::ReadColumns
-            | Self::Find
-            | Self::FilterRows
-            | Self::Validate
-            | Self::ExportDelimited => Some("path"),
-            Self::FillTemplate => Some("templatePath"),
-            Self::Write | Self::WriteRows | Self::WriteColumns | Self::Batch => Some("sourcePath"),
-            Self::CopyRows | Self::CopyColumns => Some("from"),
-        }
-    }
-}
-
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct SpreadsheetDescribeInput {
     resource: OfficeResourceRef,
-    #[serde(default)]
+    #[schemars(length(min = 1, max = 8))]
     operations: Vec<SpreadsheetProtocolOperation>,
 }
 
@@ -227,30 +151,38 @@ impl TypedTool for SpreadsheetDescribeTool {
         input: Self::Input,
         _ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
-        input.resource.ensure_available()?;
-        let operations = if input.operations.is_empty() {
-            all_protocol_operations()
-        } else {
-            input.operations
-        };
-        let resource = input.resource.descriptor();
+        let SpreadsheetDescribeInput {
+            resource,
+            operations,
+        } = input;
+        anyhow::ensure!(
+            resource.supports_mutation()
+                || operations.iter().all(|operation| !operation.is_mutation()),
+            "attachment resources are immutable; request observation contracts only, or use a workspaceFile resource for mutations"
+        );
+        let resource_descriptor = resource.descriptor();
         let contracts = operations
             .into_iter()
-            .map(|operation| {
-                let binding = operation.primary_binding();
-                json!({
+            .map(|operation| -> anyhow::Result<Value> {
+                let contract = SpreadsheetOperationContract::new(operation)?;
+                let primary_binding = if operation.is_mutation() {
+                    operation.primary_binding()
+                } else {
+                    resource.read_binding_key()
+                };
+                Ok(json!({
                     "operation": operation.legacy_action(),
                     "kind": if operation.is_mutation() { "mutation" } else { "observation" },
-                    "primaryResourceBinding": binding,
-                    "argumentsSchema": legacy_action_schema(operation.legacy_action()),
-                    "notes": operation_notes(operation, &resource)
-                })
+                    "primaryResourceBinding": primary_binding,
+                    "argumentsSchema": contract.arguments_schema(),
+                    "notes": operation_notes(operation, &resource_descriptor)
+                }))
             })
-            .collect::<Vec<_>>();
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let runtime = OfficeRuntime::shared().status();
         let payload = json!({
             "protocol": "spreadsheet/v2",
-            "resource": resource,
+            "resource": resource_descriptor,
             "operations": contracts,
             "managedRuntime": runtime_status_json(runtime),
             "execution": {
@@ -274,7 +206,8 @@ pub(super) struct SpreadsheetExecuteInput {
     resource: Option<OfficeResourceRef>,
     operation: SpreadsheetProtocolOperation,
     /// Fields from spreadsheet_describe.argumentsSchema, excluding action and the primary resource field.
-    arguments: Value,
+    #[schemars(with = "std::collections::BTreeMap<String, serde_json::Value>")]
+    arguments: Map<String, Value>,
 }
 
 pub struct SpreadsheetExecuteTool;
@@ -327,9 +260,7 @@ impl TypedTool for SpreadsheetExecuteTool {
             .as_ref()
             .and_then(|resource| match resource {
                 OfficeResourceRef::WorkspaceFile { path } => Some(vec![PathBuf::from(path)]),
-                OfficeResourceRef::Attachment { .. } | OfficeResourceRef::LiveSession { .. } => {
-                    None
-                }
+                OfficeResourceRef::Attachment { .. } => None,
             })
             .unwrap_or_default();
         reads.extend(
@@ -353,72 +284,42 @@ impl TypedTool for SpreadsheetExecuteTool {
         input: Self::Input,
         ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
-        let mut arguments = input
-            .arguments
-            .as_object()
-            .cloned()
-            .context("spreadsheet_execute.arguments must be an object")?;
-        anyhow::ensure!(
-            arguments.remove("action").is_none(),
-            "spreadsheet_execute.arguments must not include action"
-        );
-        if let Some(resource) = input.resource {
-            resource.ensure_available()?;
-            let binding = input
-                .operation
-                .primary_binding()
-                .expect("every protocol operation has a primary binding");
-            anyhow::ensure!(
-                arguments.get(binding).is_none(),
-                "spreadsheet_execute.arguments must not include {binding}; it is bound from resource"
-            );
-            if input.operation.is_mutation() {
+        let SpreadsheetExecuteInput {
+            resource,
+            operation,
+            arguments,
+        } = input;
+        let contract = SpreadsheetOperationContract::new(operation)?;
+        let arguments_value = Value::Object(arguments);
+        contract.validate_arguments(&arguments_value)?;
+        let Value::Object(mut arguments) = arguments_value else {
+            unreachable!("spreadsheet execute arguments are constructed as an object")
+        };
+
+        if let Some(resource) = resource {
+            let binding = operation.primary_binding();
+            if operation.is_mutation() {
                 let path = resource.offline_path()?;
                 arguments.insert(binding.to_string(), Value::String(path.to_string()));
             } else {
                 let (key, value) = resource.read_binding()?;
-                anyhow::ensure!(
-                    key == binding || arguments.get(key).is_none(),
-                    "spreadsheet_execute.arguments must not include {key}; it is bound from resource"
-                );
                 arguments.insert(key.to_string(), value);
             }
         } else {
             anyhow::ensure!(
-                input.operation == SpreadsheetProtocolOperation::Write,
+                operation == SpreadsheetProtocolOperation::Write,
                 "resource is required except when creating a new workbook with operation=write"
             );
         }
         arguments.insert(
             "action".to_string(),
-            Value::String(input.operation.legacy_action().to_string()),
+            Value::String(operation.legacy_action().to_string()),
         );
         execute_legacy_spreadsheet(call_id, Value::Object(arguments), ctx).await
     }
 }
 
-fn all_protocol_operations() -> Vec<SpreadsheetProtocolOperation> {
-    vec![
-        SpreadsheetProtocolOperation::ListSheets,
-        SpreadsheetProtocolOperation::ReadRange,
-        SpreadsheetProtocolOperation::ReadRanges,
-        SpreadsheetProtocolOperation::ReadRows,
-        SpreadsheetProtocolOperation::ReadColumns,
-        SpreadsheetProtocolOperation::Find,
-        SpreadsheetProtocolOperation::FilterRows,
-        SpreadsheetProtocolOperation::Validate,
-        SpreadsheetProtocolOperation::FillTemplate,
-        SpreadsheetProtocolOperation::ExportDelimited,
-        SpreadsheetProtocolOperation::Write,
-        SpreadsheetProtocolOperation::WriteRows,
-        SpreadsheetProtocolOperation::WriteColumns,
-        SpreadsheetProtocolOperation::CopyRows,
-        SpreadsheetProtocolOperation::CopyColumns,
-        SpreadsheetProtocolOperation::Batch,
-    ]
-}
-
-fn output_path_from_arguments(arguments: &Value) -> Option<&str> {
+fn output_path_from_arguments(arguments: &Map<String, Value>) -> Option<&str> {
     arguments
         .get("outputPath")
         .or_else(|| arguments.get("path"))
@@ -426,7 +327,7 @@ fn output_path_from_arguments(arguments: &Value) -> Option<&str> {
         .filter(|value| !value.trim().is_empty())
 }
 
-fn argument_read_paths(arguments: &Value) -> Vec<&str> {
+fn argument_read_paths(arguments: &Map<String, Value>) -> Vec<&str> {
     let mut paths = ["dataPath", "templatePath", "sourcePath", "path", "from"]
         .into_iter()
         .filter_map(|key| arguments.get(key).and_then(Value::as_str))
@@ -441,21 +342,6 @@ fn argument_read_paths(arguments: &Value) -> Vec<&str> {
         );
     }
     paths
-}
-
-fn legacy_action_schema(action: &str) -> Value {
-    let schema = SpreadsheetTool.schema();
-    schema["oneOf"]
-        .as_array()
-        .and_then(|branches| {
-            branches.iter().find(|branch| {
-                branch["properties"]["action"]["enum"]
-                    .as_array()
-                    .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(action)))
-            })
-        })
-        .cloned()
-        .unwrap_or_else(|| json!({ "type": "object", "description": "No schema was registered for this operation." }))
 }
 
 fn operation_notes(operation: SpreadsheetProtocolOperation, resource: &Value) -> Value {
@@ -477,21 +363,21 @@ fn operation_notes(operation: SpreadsheetProtocolOperation, resource: &Value) ->
 }
 
 fn runtime_status_json(status: crate::office_runtime::OfficeRuntimeStatus) -> Value {
-    match status {
-        crate::office_runtime::OfficeRuntimeStatus::Ready {
-            version,
-            root,
-            openpyxl_version,
-        } => {
-            json!({ "available": true, "version": version, "root": root, "openpyxl": openpyxl_version })
-        }
-        crate::office_runtime::OfficeRuntimeStatus::LegacyOverride { executable } => {
-            json!({ "available": true, "source": "legacyOverride", "executable": executable })
-        }
-        crate::office_runtime::OfficeRuntimeStatus::Unavailable { reason } => {
-            json!({ "available": false, "reason": reason })
-        }
-    }
+    let runtime = status.runtime.as_ref();
+    json!({
+        "available": runtime.is_some(),
+        "managedVersion": status.managed_version,
+        "managedStatus": status.managed_status,
+        "reason": status.managed_error,
+        "runtime": runtime.map(|runtime| json!({
+            "version": runtime.runtime_version,
+            "root": runtime.root,
+            "executable": runtime.executable,
+            "python": runtime.python_version,
+            "openpyxl": runtime.openpyxl_version,
+            "source": runtime.source,
+        })),
+    })
 }
 
 async fn execute_legacy_spreadsheet(

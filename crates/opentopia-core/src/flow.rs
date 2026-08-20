@@ -2,6 +2,7 @@ use crate::enterprise::{
     AgentRiskClassV1, CapabilityProjection, DataClassification, ENTERPRISE_SCHEMA_VERSION_V1,
 };
 use crate::model_context::content_fingerprint;
+use crate::workflow_state::validate_graph_state_writes;
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -281,6 +282,26 @@ pub struct FlowDefinitionV1 {
     pub content_hash: String,
     pub published_at: DateTime<Utc>,
     pub published_by: String,
+}
+
+impl FlowDefinitionV1 {
+    pub fn to_spec(&self) -> FlowSpecV1 {
+        FlowSpecV1 {
+            flow_id: self.flow_id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            owner: self.owner.clone(),
+            categories: self.categories.clone(),
+            source: self.source.clone(),
+            input_schema: self.input_schema.clone(),
+            output_schema: self.output_schema.clone(),
+            graph: self.graph.clone(),
+            requested_capabilities: self.capabilities.clone(),
+            budget: self.budget.clone(),
+            risk_class: self.risk_class,
+            pending_decisions: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -603,6 +624,21 @@ pub fn validate_flow_spec(
             );
         }
         validate_node(node, execution_capabilities, &mut error);
+    }
+
+    for (node_id, message) in validate_graph_state_writes(
+        spec.graph
+            .nodes
+            .iter()
+            .map(|node| (node.id.as_str(), &node.config)),
+    ) {
+        error(
+            "graph.state_channel.invalid",
+            message,
+            Some(node_id),
+            None,
+            "Use a stable channel name and one reducer contract; replace channels must have a single writer.",
+        );
     }
 
     if contains_unbounded_cycle(&spec.graph) {

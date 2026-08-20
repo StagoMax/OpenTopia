@@ -183,14 +183,14 @@ pub(super) async fn execute_portable_patch(
             PolicyDecision::Ask {
                 reason: "Deleting a file through apply_patch requires approval.".to_string(),
             },
-            ctx.approval_granted,
+            &ctx,
         )?;
     }
 
     enforce_policy_decision(
         ctx.policy
             .inspect_command("git apply --whitespace=nowarn -"),
-        ctx.approval_granted,
+        &ctx,
     )?;
     let mutation_scope = ctx.file_mutation_scope()?;
 
@@ -384,7 +384,7 @@ async fn execute_native_patch_batch(
     for operation in operations {
         let logical_path = validate_patch_operation_path(operation.path())?;
         let target = normalize_workspace_path(&ctx.workspace_root, &logical_path)?;
-        enforce_policy_decision(ctx.policy.inspect_write(&target), ctx.approval_granted)?;
+        enforce_policy_decision(ctx.policy.inspect_write(&target), ctx)?;
         if matches!(&operation, NativePatchOperation::DeleteFile { .. }) {
             enforce_policy_decision(
                 PolicyDecision::Ask {
@@ -393,7 +393,7 @@ async fn execute_native_patch_batch(
                         target.display()
                     ),
                 },
-                ctx.approval_granted,
+                ctx,
             )?;
         }
         let original = read_optional(ctx.environment.as_ref(), &target).await?;

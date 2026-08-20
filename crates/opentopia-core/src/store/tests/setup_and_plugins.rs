@@ -6,9 +6,65 @@ fn temporary_db_path(label: &str) -> PathBuf {
     ))
 }
 
-fn remove_post_legacy_agent_runtime_tables(conn: &Connection) {
+/// Tests that simulate a pre-v28 database start from the current canonical
+/// schema. Reverse the v28 journal widening as part of that fixture downgrade;
+/// otherwise the test would advertise an old user_version with a new schema.
+fn restore_pre_v28_effect_journal(conn: &Connection) {
     conn.execute_batch(
         r#"
+        PRAGMA foreign_keys = OFF;
+        ALTER TABLE effect_journal RENAME TO effect_journal_v28_source;
+        CREATE TABLE effect_journal (
+            effect_id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            turn_id TEXT NOT NULL,
+            agent_path TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            input_hash TEXT NOT NULL,
+            input_json TEXT NOT NULL,
+            result_json TEXT,
+            status TEXT NOT NULL,
+            side_effect_class TEXT NOT NULL,
+            idempotent INTEGER NOT NULL,
+            attempt INTEGER NOT NULL DEFAULT 0,
+            error TEXT,
+            created_at TEXT NOT NULL,
+            started_at TEXT,
+            completed_at TEXT,
+            updated_at TEXT NOT NULL,
+            UNIQUE(thread_id, turn_id, agent_path, idempotency_key),
+            CHECK(kind IN ('model_request', 'tool_call', 'approval', 'finalization')),
+            CHECK(status IN ('prepared', 'running', 'succeeded', 'failed', 'indeterminate')),
+            CHECK(side_effect_class IN ('none', 'workspace', 'external', 'unknown')),
+            CHECK(idempotent IN (0, 1)),
+            CHECK(attempt >= 0),
+            FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE,
+            FOREIGN KEY(turn_id) REFERENCES turns(turn_id) ON DELETE CASCADE
+        );
+        INSERT INTO effect_journal
+        SELECT * FROM effect_journal_v28_source;
+        DROP TABLE effect_journal_v28_source;
+        CREATE INDEX idx_effect_journal_turn
+            ON effect_journal(turn_id, created_at);
+        CREATE INDEX idx_effect_journal_recovery
+            ON effect_journal(status, updated_at);
+        PRAGMA foreign_keys = ON;
+        "#,
+    )
+    .expect("restore the pre-v28 effect journal constraint");
+}
+
+fn remove_post_legacy_agent_runtime_tables(conn: &Connection) {
+    restore_pre_v28_effect_journal(conn);
+    conn.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS workflow_deployments;
+        DROP TABLE IF EXISTS connection_capability_revisions;
+        DROP TABLE IF EXISTS connections;
+        DROP TABLE IF EXISTS integration_definitions;
+        DROP TABLE IF EXISTS human_tasks;
         DROP TABLE IF EXISTS agent_activity_state;
         DROP TABLE IF EXISTS agent_turn_checkpoints;
         DROP TABLE IF EXISTS agent_provider_states;
@@ -73,6 +129,7 @@ fn enterprise_template_spec(tools: &[&str]) -> AgentTemplateSpecV1 {
         delegate_template_ids: BTreeSet::new(),
         budget: AgentBudgetV1::default(),
         risk_class: AgentRiskClassV1::Medium,
+        connection_bindings: Vec::new(),
     }
 }
 

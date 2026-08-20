@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
@@ -94,20 +95,28 @@ pub enum ProviderInstructionEncoding {
     PortableChatEnvelope,
 }
 
-/// Provider-specific request fields used to control model reasoning. The
-/// negotiated profile owns this choice; request codecs never infer it again
-/// from a model id.
+/// Structural request envelope used to control model reasoning. Variant names
+/// describe wire behavior rather than vendors or model families. Capability
+/// negotiation owns this choice; request codecs never infer it from a model id.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderReasoningProtocol {
     #[default]
-    ReasoningEffort,
-    DeepSeekThinking,
-    GlmThinking,
+    Omit,
+    #[serde(alias = "reasoning_effort")]
+    ChatReasoningEffort,
+    #[serde(alias = "glm_thinking")]
+    ChatThinkingReasoningEffort,
+    #[serde(alias = "deep_seek_thinking", alias = "deepseek_thinking")]
+    ChatThinkingHighMaxNoToolChoice,
+    ResponsesReasoning,
 }
 
-pub const PROVIDER_ADAPTER_PROFILE_VERSION: u32 = 5;
-const MIN_MIGRATABLE_PROVIDER_ADAPTER_PROFILE_VERSION: u32 = 2;
+pub const PROVIDER_ADAPTER_PROFILE_VERSION: u32 = 7;
+// v6 is the first profile that persisted a reasoning envelope. Older profiles
+// cannot be upgraded without guessing from a model name, so they deliberately
+// expire and are renegotiated.
+const MIN_MIGRATABLE_PROVIDER_ADAPTER_PROFILE_VERSION: u32 = 6;
 #[cfg(test)]
 pub(super) const PREVIOUS_PROVIDER_ADAPTER_PROFILE_VERSION: u32 =
     PROVIDER_ADAPTER_PROFILE_VERSION - 1;
@@ -183,8 +192,10 @@ impl ProviderAdapterProfile {
             PROVIDER_ADAPTER_PROFILE_VERSION => Some(self),
             MIN_MIGRATABLE_PROVIDER_ADAPTER_PROFILE_VERSION..PROVIDER_ADAPTER_PROFILE_VERSION => {
                 self.profile_version = PROVIDER_ADAPTER_PROFILE_VERSION;
+                if self.adapter == ProviderAdapterKind::OpenAiResponses {
+                    self.reasoning_protocol = ProviderReasoningProtocol::ResponsesReasoning;
+                }
                 if self.adapter == ProviderAdapterKind::OpenAiChat {
-                    self.reasoning_protocol = chat_reasoning_protocol_for_model(model);
                     self.message_protocol = self
                         .message_protocol
                         .union(trusted_chat_message_protocol_contract(base_url, model)?);
@@ -193,6 +204,30 @@ impl ProviderAdapterProfile {
             }
             _ => None,
         }
+    }
+
+    /// Scores only capabilities that were proven for this endpoint/model
+    /// profile. The required function-tool contract is a gate, not a bonus.
+    /// Optional protocol features then decide between otherwise viable
+    /// adapters without coupling routing to a provider hostname.
+    pub(crate) fn agent_capability_score(&self) -> Option<u16> {
+        if self.tool_protocol.function_tools != ProviderFeatureSupport::Supported {
+            return None;
+        }
+        let supported = |feature| u16::from(feature == ProviderFeatureSupport::Supported);
+        Some(
+            1_000
+                + 100 * supported(self.tool_protocol.streaming_tools)
+                + 20 * supported(self.tool_protocol.strict_function_tools)
+                + 10 * supported(self.tool_protocol.parallel_tool_calls)
+                + 8 * supported(self.output_protocol.json_schema)
+                + 6 * supported(self.tool_protocol.freeform_tools)
+                + 5 * supported(self.tool_protocol.hosted_apply_patch)
+                + 4 * supported(self.tool_protocol.hosted_web_search)
+                + 3 * supported(self.tool_protocol.hosted_tool_search)
+                + 2 * supported(self.tool_protocol.deferred_tool_loading)
+                + supported(self.tool_protocol.namespace_tools),
+        )
     }
 }
 
@@ -223,6 +258,10 @@ pub struct OpenAiCompatibilityReport {
     /// Assistant-message replay requirements discovered for Chat Completions.
     #[serde(default)]
     pub chat_message_protocol: ProviderMessageProtocolCapabilities,
+    /// Reasoning request envelope proven together with the Chat function-tool
+    /// round trip. `None` is reserved for reports written before v7.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_reasoning_protocol: Option<ProviderReasoningProtocol>,
     pub responses: ProviderFeatureSupport,
     #[serde(default)]
     pub responses_native_tools: ProviderFeatureSupport,
@@ -251,6 +290,10 @@ pub struct OpenAiCompatibilityReport {
     /// vendor or model-name table.
     #[serde(default)]
     pub responses_apply_patch: ProviderFeatureSupport,
+    /// Reasoning request envelope proven together with the Responses
+    /// function-tool round trip. `None` is reserved for legacy reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_reasoning_protocol: Option<ProviderReasoningProtocol>,
     pub developer_messages: ProviderFeatureSupport,
     pub message_compatibility: bool,
     pub checked_at: DateTime<Utc>,
@@ -299,6 +342,7 @@ impl OpenAiCompatibilityReport {
                     parallel_tool_calls: self.responses_parallel_tool_calls,
                     freeform_tools: self.responses_custom_tools,
                     hosted_apply_patch: self.responses_apply_patch,
+                    hosted_web_search: self.responses_native_tools,
                     deferred_tool_loading: official_openai_tool_search_support(
                         &self.base_url,
                         &self.model,
@@ -321,10 +365,13 @@ impl OpenAiCompatibilityReport {
             model: self.model.clone(),
             adapter,
             instruction_encoding,
-            reasoning_protocol: if protocol == OpenAiProtocol::ChatCompletions {
-                chat_reasoning_protocol_for_model(&self.model)
-            } else {
-                ProviderReasoningProtocol::ReasoningEffort
+            reasoning_protocol: match protocol {
+                OpenAiProtocol::ChatCompletions => self
+                    .chat_reasoning_protocol
+                    .unwrap_or(ProviderReasoningProtocol::ChatReasoningEffort),
+                OpenAiProtocol::Responses => self
+                    .responses_reasoning_protocol
+                    .unwrap_or(ProviderReasoningProtocol::ResponsesReasoning),
             },
             message_protocol: if protocol == OpenAiProtocol::ChatCompletions {
                 self.chat_message_protocol.union(
@@ -353,7 +400,6 @@ impl OpenAiCompatibilityReport {
         }
         if self.responses == ProviderFeatureSupport::Supported
             && self.responses_function_tools == ProviderFeatureSupport::Supported
-            && self.responses_native_tools == ProviderFeatureSupport::Supported
         {
             profiles.push(self.profile_for_protocol(OpenAiProtocol::Responses));
         }
@@ -365,6 +411,24 @@ impl OpenAiCompatibilityReport {
     /// [`Self::adapter_profiles`].
     pub fn adapter_profile(&self) -> ProviderAdapterProfile {
         self.profile_for_protocol(self.selected_protocol)
+    }
+
+    /// Selects the strongest proven agent contract without consulting endpoint
+    /// identity. Stable ties keep Chat first because it is the smaller portable
+    /// contract; Responses wins when its independently proven capabilities are
+    /// strictly richer.
+    pub(crate) fn recommended_protocol(&self) -> Option<OpenAiProtocol> {
+        let mut best = None;
+        for protocol in [OpenAiProtocol::ChatCompletions, OpenAiProtocol::Responses] {
+            let profile = self.profile_for_protocol(protocol);
+            let Some(score) = profile.agent_capability_score() else {
+                continue;
+            };
+            if best.is_none_or(|(_, best_score)| score > best_score) {
+                best = Some((protocol, score));
+            }
+        }
+        best.map(|(protocol, _)| protocol)
     }
 }
 
@@ -416,6 +480,9 @@ pub struct ProviderToolProtocolCapabilities {
     pub parallel_tool_calls: ProviderFeatureSupport,
     pub freeform_tools: ProviderFeatureSupport,
     pub hosted_apply_patch: ProviderFeatureSupport,
+    /// The endpoint/model can execute the Responses hosted `web_search` tool.
+    /// Compatible relays must prove this independently from function tools.
+    pub hosted_web_search: ProviderFeatureSupport,
     pub assistant_phase: ProviderFeatureSupport,
     /// Function definitions may be advertised with `defer_loading`.
     pub deferred_tool_loading: ProviderFeatureSupport,
@@ -508,22 +575,6 @@ pub(crate) fn trusted_chat_message_protocol_contract(
         });
     }
     is_official_openai_endpoint(base_url).then_some(ProviderMessageProtocolCapabilities::default())
-}
-
-pub(crate) fn chat_reasoning_protocol_for_model(model: &str) -> ProviderReasoningProtocol {
-    let model = model.trim().to_ascii_lowercase();
-    let model = model.rsplit('/').next().unwrap_or(&model);
-    let model = model.split(':').next().unwrap_or(model);
-    if model.starts_with("deepseek-v4-flash")
-        || model.starts_with("deepseek-v4-pro")
-        || model.starts_with("deepseek-reasoner")
-    {
-        ProviderReasoningProtocol::DeepSeekThinking
-    } else if model.starts_with("glm") || model.starts_with("chatglm") {
-        ProviderReasoningProtocol::GlmThinking
-    } else {
-        ProviderReasoningProtocol::ReasoningEffort
-    }
 }
 
 pub(crate) fn official_openai_tool_search_support(
@@ -894,17 +945,22 @@ impl ProviderSettings {
     }
 
     /// Persists deterministic schema upgrades once during settings load/save,
-    /// so provider construction consumes the stored v5 profile verbatim.
+    /// so provider construction consumes only complete current contracts.
+    /// Profiles older than the migratable floor are removed instead of being
+    /// reconstructed from model-name guesses.
     pub fn migrate_adapter_profiles(&mut self) {
         for (model, profiles) in &mut self.adapter_profiles {
-            for profile in profiles.values_mut() {
-                if let Some(normalized) =
-                    profile.clone().normalized_for(&self.base_url, model.trim())
-                {
-                    *profile = normalized;
-                }
-            }
+            profiles.retain(|_, profile| {
+                let Some(normalized) = profile.clone().normalized_for(&self.base_url, model.trim())
+                else {
+                    return false;
+                };
+                *profile = normalized;
+                true
+            });
         }
+        self.adapter_profiles
+            .retain(|_, profiles| !profiles.is_empty());
     }
 
     pub fn adapter_profile_for_model_and_adapter(
@@ -932,24 +988,46 @@ impl ProviderSettings {
         let model = model.trim();
         let allowed = self.effective_allowed_adapters();
         let allowed_contains = |adapter: ProviderAdapterKind| allowed.contains(&adapter);
+        let has_negotiated_profiles = self
+            .adapter_profiles
+            .get(model)
+            .is_some_and(|profiles| !profiles.is_empty());
+        let preference_is_usable = |adapter: ProviderAdapterKind| {
+            allowed_contains(adapter)
+                && (!has_negotiated_profiles
+                    || self
+                        .adapter_profile_for_model_and_adapter(model, adapter)
+                        .is_some())
+        };
         if let Some(adapter) = self
             .model_settings
             .get(model)
             .and_then(|settings| settings.preferred_adapter)
-            .filter(|adapter| allowed_contains(*adapter))
+            .filter(|adapter| preference_is_usable(*adapter))
         {
             return adapter;
         }
         if let Some(adapter) = self
             .preferred_adapter
-            .filter(|adapter| allowed_contains(*adapter))
+            .filter(|adapter| preference_is_usable(*adapter))
         {
             return adapter;
         }
-        if let Some(adapter) = allowed.iter().copied().find(|adapter| {
-            self.adapter_profile_for_model_and_adapter(model, *adapter)
-                .is_some()
-        }) {
+        let mut best_profile = None;
+        for adapter in allowed.iter().copied() {
+            let Some(profile) = self.adapter_profile_for_model_and_adapter(model, adapter) else {
+                continue;
+            };
+            let Some(score) = profile.agent_capability_score() else {
+                continue;
+            };
+            // `allowed` is sorted, so strict improvement preserves the stable
+            // Chat-first tie break for equally capable OpenAI wire contracts.
+            if best_profile.is_none_or(|(_, best_score)| score > best_score) {
+                best_profile = Some((adapter, score));
+            }
+        }
+        if let Some((adapter, _)) = best_profile {
             return adapter;
         }
         let legacy = self.kind.legacy_preferred_adapter();
@@ -974,6 +1052,14 @@ impl ProviderSettings {
             OpenAiProtocol::ChatCompletions => ProviderAdapterKind::OpenAiChat,
             OpenAiProtocol::Responses => ProviderAdapterKind::OpenAiResponses,
         };
+        let previous_recommendation = self
+            .openai_compatibility
+            .as_ref()
+            .filter(|previous| previous.applies_to(&self.base_url, &model))
+            .map(|previous| match previous.selected_protocol {
+                OpenAiProtocol::ChatCompletions => ProviderAdapterKind::OpenAiChat,
+                OpenAiProtocol::Responses => ProviderAdapterKind::OpenAiResponses,
+            });
         if let Some(profiles) = self.adapter_profiles.get_mut(report.model.trim()) {
             profiles.remove(&ProviderAdapterKind::OpenAiChat);
             profiles.remove(&ProviderAdapterKind::OpenAiResponses);
@@ -982,11 +1068,14 @@ impl ProviderSettings {
             self.apply_adapter_profile(profile);
         }
         if self.preferred_adapter.is_none() {
-            self.model_settings
+            let preferred_adapter = &mut self
+                .model_settings
                 .entry(model)
                 .or_default()
-                .preferred_adapter
-                .get_or_insert(selected_adapter);
+                .preferred_adapter;
+            if preferred_adapter.is_none() || *preferred_adapter == previous_recommendation {
+                *preferred_adapter = Some(selected_adapter);
+            }
         }
         self.openai_compatibility = Some(report);
     }
@@ -1044,6 +1133,16 @@ impl ProviderSettings {
                             .as_ref()
                             .map(|profile| profile.tool_protocol.hosted_apply_patch)
                             .unwrap_or_default(),
+                        hosted_web_search: negotiated
+                            .as_ref()
+                            .map(|profile| profile.tool_protocol.hosted_web_search)
+                            .unwrap_or_else(|| {
+                                if is_official_openai_endpoint(&self.base_url) {
+                                    ProviderFeatureSupport::Supported
+                                } else {
+                                    ProviderFeatureSupport::Unknown
+                                }
+                            }),
                         // Phase is optional on the wire and cannot be proven
                         // without observing an assistant message. Parsing is
                         // always tolerant; replayed items are authoritative.
@@ -1269,15 +1368,101 @@ impl ProviderSettings {
 /// not report a window. Entries are matched against the model id with vendor
 /// prefixes stripped, because relays rename freely (`openai/gpt-5.6`).
 ///
-/// Unmatched models deliberately return `None` so the caller applies its
-/// conservative default instead of guessing high and overflowing the context.
+/// An unlisted newer generation may inherit its same-series, same-variant
+/// predecessor. This lets a newly released `deepseek-v5-flash` use the known
+/// `deepseek-v4-flash` window, but never borrows across variants such as Pro,
+/// Image, or Coder. Models that do not meet that narrow rule return `None` so
+/// the caller applies its conservative default.
 pub fn known_model_context_window_tokens(model: &str) -> Option<usize> {
-    model_bases(model).iter().find_map(|base| {
-        known_model_capability_registry()
-            .models
-            .get(base)
-            .map(|capabilities| capabilities.context_window_tokens)
-    })
+    let bases = model_bases(model);
+    bases
+        .iter()
+        .find_map(|base| {
+            known_model_capability_registry()
+                .models
+                .get(base)
+                .map(|capabilities| capabilities.context_window_tokens)
+        })
+        .or_else(|| {
+            bases
+                .iter()
+                .find_map(|base| inferred_model_context_window_tokens(base))
+        })
+}
+
+fn inferred_model_context_window_tokens(model: &str) -> Option<usize> {
+    let target = model_generation(model)?;
+    known_model_capability_registry()
+        .models
+        .iter()
+        .filter_map(|(model_id, capabilities)| {
+            let candidate = model_generation(model_id)?;
+            (candidate.prefix == target.prefix
+                && candidate.suffix == target.suffix
+                && compare_model_generations(&candidate.version, &target.version) == Ordering::Less)
+                .then_some((candidate.version, capabilities.context_window_tokens))
+        })
+        .max_by(|(left, _), (right, _)| compare_model_generations(left, right))
+        .map(|(_, tokens)| tokens)
+}
+
+#[derive(Debug)]
+struct ModelGeneration<'a> {
+    prefix: &'a str,
+    version: Vec<usize>,
+    suffix: &'a str,
+}
+
+fn model_generation(model: &str) -> Option<ModelGeneration<'_>> {
+    let bytes = model.as_bytes();
+    for start in 0..bytes.len() {
+        if !bytes[start].is_ascii_digit() {
+            continue;
+        }
+
+        let mut version = Vec::new();
+        let mut cursor = start;
+        loop {
+            let part_start = cursor;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+                cursor += 1;
+            }
+            version.push(model[part_start..cursor].parse().ok()?);
+
+            if cursor + 1 >= bytes.len()
+                || bytes[cursor] != b'.'
+                || !bytes[cursor + 1].is_ascii_digit()
+            {
+                break;
+            }
+            cursor += 1;
+        }
+
+        if cursor < bytes.len() && bytes[cursor].is_ascii_alphabetic() {
+            continue;
+        }
+        return Some(ModelGeneration {
+            prefix: &model[..start],
+            version,
+            suffix: &model[cursor..],
+        });
+    }
+    None
+}
+
+fn compare_model_generations(left: &[usize], right: &[usize]) -> Ordering {
+    for index in 0..left.len().max(right.len()) {
+        match left
+            .get(index)
+            .copied()
+            .unwrap_or_default()
+            .cmp(&right.get(index).copied().unwrap_or_default())
+        {
+            Ordering::Equal => continue,
+            ordering => return ordering,
+        }
+    }
+    Ordering::Equal
 }
 
 const KNOWN_MODEL_CAPABILITY_REGISTRY_JSON: &str = include_str!("../../model-capabilities.json");

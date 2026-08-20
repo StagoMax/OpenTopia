@@ -1,4 +1,5 @@
 use super::{AgentSpawnPolicy, CollaborationDomainError};
+use crate::RuntimeConnectionAuthorityV1;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -111,6 +112,7 @@ pub struct RuntimeSnapshotV1 {
     pub sandbox: Option<Value>,
     pub agent_runtime: Option<Value>,
     pub capability_projection: Option<Value>,
+    pub connection_authority: RuntimeConnectionAuthorityV1,
     #[serde(default)]
     pub tools: Vec<String>,
     #[serde(default)]
@@ -134,6 +136,7 @@ impl RuntimeSnapshotV1 {
         if legacy {
             upgrade_legacy_snapshot(&mut normalized)?;
         }
+        normalize_missing_connection_authority(&mut normalized);
         let snapshot: Self =
             serde_json::from_value(Value::Object(normalized)).map_err(|error| {
                 invalid_snapshot(format!("runtime snapshot V1 is malformed: {error}"))
@@ -206,6 +209,37 @@ impl RuntimeSnapshotV1 {
                 )));
             }
         }
+        if let RuntimeConnectionAuthorityV1::Structured { operations } = &self.connection_authority
+        {
+            let mut operation_routes = std::collections::BTreeSet::new();
+            let mut model_tool_names = std::collections::BTreeSet::new();
+            for operation in operations {
+                if operation.connection_id.is_nil()
+                    || operation.mcp_server_id.is_nil()
+                    || operation.capability_revision == 0
+                    || operation.operation_id.trim().is_empty()
+                    || operation.provider_tool_name.trim().is_empty()
+                    || operation.model_tool_name.trim().is_empty()
+                    || operation.pinned_operation_fingerprint.trim().is_empty()
+                {
+                    return Err(invalid_snapshot(
+                        "structured Connection authority contains an invalid operation",
+                    ));
+                }
+                if !operation_routes
+                    .insert((operation.connection_id, operation.operation_id.as_str()))
+                {
+                    return Err(invalid_snapshot(
+                        "structured Connection authority contains a duplicate operation",
+                    ));
+                }
+                if !model_tool_names.insert(operation.model_tool_name.as_str()) {
+                    return Err(invalid_snapshot(
+                        "structured Connection authority contains a duplicate model tool name",
+                    ));
+                }
+            }
+        }
         if let RuntimeWorkspaceAssignmentV1::IsolatedWorktree {
             repository_root,
             branch,
@@ -229,6 +263,31 @@ impl RuntimeSnapshotV1 {
         }
         Ok(())
     }
+}
+
+fn normalize_missing_connection_authority(snapshot: &mut Map<String, Value>) {
+    if snapshot.contains_key("connectionAuthority") {
+        return;
+    }
+    let legacy_mcp = snapshot
+        .get("capabilityProjection")
+        .and_then(Value::as_object)
+        .is_some_and(|projection| {
+            projection
+                .get("allowAllMcpServers")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || projection
+                    .get("mcpServers")
+                    .and_then(Value::as_array)
+                    .is_some_and(|servers| !servers.is_empty())
+        });
+    snapshot.insert(
+        "connectionAuthority".to_string(),
+        serde_json::json!({
+            "mode": if legacy_mcp { "legacy_mcp" } else { "deny_all" }
+        }),
+    );
 }
 
 fn upgrade_legacy_snapshot(
@@ -358,6 +417,7 @@ pub(crate) fn test_runtime_snapshot(
         sandbox: Some(serde_json::to_value(LocalSandboxConfig::default()).unwrap()),
         agent_runtime: None,
         capability_projection: Some(serde_json::to_value(capability_projection).unwrap()),
+        connection_authority: RuntimeConnectionAuthorityV1::DenyAll,
         tools: Vec::new(),
         tool_catalog: Vec::new(),
         plugin_contributions: Vec::new(),
@@ -395,6 +455,46 @@ mod tests {
         );
         assert!(!decoded.spawn_policy.allow_child_spawns);
         assert_eq!(decoded.spawn_policy.max_direct_children, 0);
+        assert_eq!(
+            decoded.connection_authority,
+            RuntimeConnectionAuthorityV1::DenyAll
+        );
+    }
+
+    #[test]
+    fn old_snapshots_infer_legacy_mcp_only_from_explicit_mcp_projection() {
+        let mut value = test_runtime_snapshot("default", RuntimeWorkspaceModeV1::SharedCoordinated);
+        value
+            .as_object_mut()
+            .expect("snapshot object")
+            .remove("connectionAuthority");
+        value["capabilityProjection"] = json!({
+            "allowAllMcpServers": false,
+            "mcpServers": ["47f13832-e1a7-4eb4-b76a-0a5d586e159f"]
+        });
+
+        let decoded = RuntimeSnapshotV1::decode(&value).expect("old V1 snapshot should decode");
+        assert_eq!(
+            decoded.connection_authority,
+            RuntimeConnectionAuthorityV1::LegacyMcp
+        );
+    }
+
+    #[test]
+    fn explicitly_empty_structured_authority_is_not_coerced_to_legacy_or_deny_all() {
+        let mut value = test_runtime_snapshot("default", RuntimeWorkspaceModeV1::SharedCoordinated);
+        value["connectionAuthority"] = json!({
+            "mode": "structured",
+            "operations": []
+        });
+
+        let decoded = RuntimeSnapshotV1::decode(&value).expect("structured snapshot");
+        assert_eq!(
+            decoded.connection_authority,
+            RuntimeConnectionAuthorityV1::Structured {
+                operations: Vec::new()
+            }
+        );
     }
 
     #[test]

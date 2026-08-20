@@ -10,10 +10,34 @@ const PROVIDER_NETWORK_RETRY_DELAYS: [Duration; PROVIDER_NETWORK_RETRY_LIMIT] = 
     Duration::from_secs(8),
     Duration::from_secs(16),
 ];
+const PROVIDER_RATE_LIMIT_RETRY_DELAYS: [Duration; PROVIDER_NETWORK_RETRY_LIMIT] = [
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+    Duration::from_secs(30),
+];
 
 fn retryable_provider_status(status: reqwest::StatusCode) -> bool {
-    status == reqwest::StatusCode::REQUEST_TIMEOUT
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
         || (status.is_server_error() && status != reqwest::StatusCode::NOT_IMPLEMENTED)
+}
+
+fn provider_retry_delay(response: &reqwest::Response, retry_index: usize) -> Duration {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|seconds| Duration::from_secs(seconds.min(60)))
+        .unwrap_or_else(|| {
+            if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                PROVIDER_RATE_LIMIT_RETRY_DELAYS[retry_index - 1]
+            } else {
+                PROVIDER_NETWORK_RETRY_DELAYS[retry_index - 1]
+            }
+        })
 }
 
 fn retryable_provider_network_error(error: &reqwest::Error) -> bool {
@@ -40,15 +64,24 @@ where
                 retry_index += 1;
                 attempt += 1;
                 let status = response.status();
+                let delay = provider_retry_delay(&response, retry_index);
+                let reason = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    format!(
+                        "provider rate limited the request; retrying after {} second(s)",
+                        delay.as_secs()
+                    )
+                } else {
+                    format!("provider returned transient HTTP {status}; reconnecting")
+                };
                 on_transport(ProviderTransportEvent::Retry {
                     attempt,
                     retry_kind: ProviderRetryKind::Network,
                     retry_index: Some(retry_index),
                     retry_limit: Some(PROVIDER_NETWORK_RETRY_LIMIT),
-                    reason: format!("provider returned transient HTTP {status}; reconnecting"),
+                    reason,
                     body: observation_body.clone(),
                 })?;
-                tokio::time::sleep(PROVIDER_NETWORK_RETRY_DELAYS[retry_index - 1]).await;
+                tokio::time::sleep(delay).await;
             }
             Ok(response) => return Ok((response, attempt)),
             Err(error)

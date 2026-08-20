@@ -9,6 +9,7 @@ use crate::{
 use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use opentopia_core::{NetworkPolicy, SandboxEnforcement, SandboxMode};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -112,6 +113,7 @@ async fn update_settings(
     if let Some(sandbox) = request.sandbox {
         settings.sandbox = sandbox;
     }
+    apply_permission_sandbox_invariant(settings.permission_mode, &mut settings.sandbox);
     validate_provider_settings(&settings.providers)?;
     if !settings
         .providers
@@ -124,6 +126,21 @@ async fn update_settings(
     }
     let settings = save_settings_and_refresh_runtime(&state, settings)?;
     Ok(Json(settings))
+}
+
+fn apply_permission_sandbox_invariant(
+    permission_mode: PermissionMode,
+    sandbox: &mut SandboxSettings,
+) {
+    if !matches!(
+        permission_mode,
+        PermissionMode::FullAccess | PermissionMode::Unrestricted
+    ) {
+        return;
+    }
+    sandbox.sandbox_mode = SandboxMode::DangerFullAccess;
+    sandbox.enforcement = SandboxEnforcement::Disabled;
+    sandbox.network = NetworkPolicy::Allow;
 }
 
 async fn provider_health(State(state): State<AppState>) -> Json<Vec<ProviderHealth>> {
@@ -465,4 +482,20 @@ struct ProviderTestRequest {
 struct CodexLoginRequest {
     #[serde(default)]
     device_code: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_access_permission_modes_force_an_unrestricted_sandbox() {
+        for permission_mode in [PermissionMode::FullAccess, PermissionMode::Unrestricted] {
+            let mut sandbox = SandboxSettings::default();
+            apply_permission_sandbox_invariant(permission_mode, &mut sandbox);
+            assert_eq!(sandbox.sandbox_mode, SandboxMode::DangerFullAccess);
+            assert_eq!(sandbox.enforcement, SandboxEnforcement::Disabled);
+            assert_eq!(sandbox.network, NetworkPolicy::Allow);
+        }
+    }
 }

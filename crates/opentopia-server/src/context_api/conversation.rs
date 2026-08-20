@@ -757,19 +757,3 @@ pub(crate) fn model_content_part_token_estimate(part: &ModelContentPart) -> usiz
             .saturating_add(32),
     }
 }
-
-pub(crate) fn message_token_estimate(message: &Message) -> usize {
-    message
-        .parts
-        .iter()
-        .map(|part| match part {
-            MessagePart::Text { text } => estimate_tokens(text),
-            MessagePart::ToolResult { result } => estimate_tokens(&result.output),
-            MessagePart::ToolCall { call } => estimate_tokens(&call.name)
-                .saturating_add(estimate_tokens(&call.input.to_string()))
-                .saturating_add(16),
-            _ => 16,
-        })
-        .sum::<usize>()
-        .saturating_add(12)
-}

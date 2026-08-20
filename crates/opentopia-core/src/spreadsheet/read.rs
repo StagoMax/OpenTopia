@@ -1,21 +1,21 @@
 use super::{
     add_used_positions, cell_value_from_data, collect_sheet_stats, ensure_return_size,
-    ensure_sheet_count, ensure_workbook_cell_count, open_xlsx, sheet_info, validate_address,
-    validate_read_range, validate_return_text, worksheet_formulas, worksheet_values, CellAddress,
-    CellRange, FilterRowsRequest, FilterRowsResult, FindCellsRequest, FindCellsResult,
-    InspectWorkbookRequest, InspectWorkbookResult, ListSheetsRequest, ListSheetsResult,
-    ReadRangeRequest, ReadRangeResult, ReadRangesRequest, ReadRangesResult, SheetInspection,
-    SheetKind, SheetStats, SpreadsheetCell, SpreadsheetCellMatch, SpreadsheetCellValue,
-    SpreadsheetError, SpreadsheetFilterCondition, SpreadsheetFilterMatchMode,
-    SpreadsheetFilterOperator, SpreadsheetFilterValue, SpreadsheetTextMatchMode,
-    MAX_FILTER_CONDITIONS, MAX_FILTER_RESULTS, MAX_FIND_RESULTS, MAX_READ_CELLS, MAX_READ_COLUMNS,
-    MAX_READ_RANGES, MAX_READ_ROWS, MAX_WORKBOOK_CELLS,
+    ensure_sheet_count, ensure_workbook_cell_count, open_workbook_reader, sheet_info,
+    validate_address, validate_read_range, validate_return_text, worksheet_formulas,
+    worksheet_values, CellAddress, CellRange, FilterRowsRequest, FilterRowsResult,
+    FindCellsRequest, FindCellsResult, InspectWorkbookRequest, InspectWorkbookResult,
+    ListSheetsRequest, ListSheetsResult, ReadRangeRequest, ReadRangeResult, ReadRangesRequest,
+    ReadRangesResult, SheetInspection, SheetKind, SheetStats, SpreadsheetCell,
+    SpreadsheetCellMatch, SpreadsheetCellValue, SpreadsheetError, SpreadsheetFilterCondition,
+    SpreadsheetFilterMatchMode, SpreadsheetFilterOperator, SpreadsheetFilterValue,
+    SpreadsheetTextMatchMode, MAX_FILTER_CONDITIONS, MAX_FILTER_RESULTS, MAX_FIND_RESULTS,
+    MAX_READ_CELLS, MAX_READ_COLUMNS, MAX_READ_RANGES, MAX_READ_ROWS, MAX_WORKBOOK_CELLS,
 };
 use calamine::{Data, Reader};
 use std::collections::HashSet;
 
 pub fn list_sheets(request: &ListSheetsRequest) -> Result<ListSheetsResult, SpreadsheetError> {
-    let (workbook, file_size_bytes) = open_xlsx(&request.path)?;
+    let (workbook, file_size_bytes) = open_workbook_reader(&request.path)?;
     let sheets = workbook
         .sheets_metadata()
         .iter()
@@ -35,7 +35,7 @@ pub fn list_sheets(request: &ListSheetsRequest) -> Result<ListSheetsResult, Spre
 pub fn inspect_workbook(
     request: &InspectWorkbookRequest,
 ) -> Result<InspectWorkbookResult, SpreadsheetError> {
-    let (mut workbook, file_size_bytes) = open_xlsx(&request.path)?;
+    let (mut workbook, file_size_bytes) = open_workbook_reader(&request.path)?;
     let metadata = workbook.sheets_metadata().to_vec();
     ensure_sheet_count(metadata.len())?;
 
@@ -78,7 +78,7 @@ pub fn inspect_workbook(
 
 pub fn read_range(request: &ReadRangeRequest) -> Result<ReadRangeResult, SpreadsheetError> {
     validate_read_range(request.range)?;
-    let (mut workbook, _) = open_xlsx(&request.path)?;
+    let (mut workbook, _) = open_workbook_reader(&request.path)?;
     let metadata = workbook.sheets_metadata().to_vec();
     ensure_sheet_count(metadata.len())?;
     let sheet = metadata
@@ -212,7 +212,7 @@ pub fn find_cells(request: &FindCellsRequest) -> Result<FindCellsResult, Spreads
         validate_read_range(range)?;
     }
 
-    let (mut workbook, _) = open_xlsx(&request.path)?;
+    let (mut workbook, _) = open_workbook_reader(&request.path)?;
     let metadata = workbook.sheets_metadata().to_vec();
     ensure_sheet_count(metadata.len())?;
     if let Some(sheet) = request.sheet.as_deref() {

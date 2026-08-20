@@ -4,8 +4,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use opentopia_core::{
-    prepare_flow_resume, resolve_flow_approval, spawn_flow_run, FlowRunStatusV1, HumanTaskActionV1,
-    HumanTaskStatusV1, HumanTaskStoreError, HumanTaskTypeV1, HumanTaskV1, SessionStore,
+    prepare_flow_interrupt_resume, prepare_flow_resume, resolve_flow_approval, spawn_flow_run,
+    FlowRunStatusV1, HumanTaskActionV1, HumanTaskStatusV1, HumanTaskStoreError, HumanTaskTypeV1,
+    HumanTaskV1, SessionStore,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,8 @@ pub(crate) fn router() -> Router<AppState> {
             "/api/human-tasks/:task_id/resolve",
             post(resolve_human_task),
         )
+        .route("/api/human-tasks/:task_id/claim", post(claim_human_task))
+        .route("/api/human-tasks/:task_id/assign", post(assign_human_task))
 }
 
 async fn list_human_tasks(
@@ -61,14 +64,34 @@ async fn resolve_human_task(
 ) -> Result<Json<ResolveHumanTaskResponse>, ApiError> {
     flows_api::ensure_enterprise(&state)?;
     let mut task = human_task_for_request(&state, task_id)?;
+    let idempotency_key = request
+        .idempotency_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            format!(
+                "legacy:{}:{}:{:?}",
+                task.id, request.expected_revision, request.action
+            )
+        });
+    if task.status != HumanTaskStatusV1::Pending {
+        if resolution_matches(&task, request.action, &idempotency_key) {
+            let run = state
+                .store
+                .get_flow_run(task.source_id)
+                .map_err(human_task_error)?
+                .ok_or_else(|| ApiError::not_found("Flow run not found"))?;
+            return Ok(Json(ResolveHumanTaskResponse { task, run }));
+        }
+        return Err(ApiError::conflict("Human task is no longer pending"));
+    }
     if task.revision != request.expected_revision {
         return Err(ApiError::conflict(format!(
             "Human task revision conflict; current revision is {}",
             task.revision
         )));
-    }
-    if task.status != HumanTaskStatusV1::Pending {
-        return Err(ApiError::conflict("Human task is no longer pending"));
     }
     let mut run = state
         .store
@@ -82,8 +105,20 @@ async fn resolve_human_task(
         ));
     }
     let expected_run_revision = run.revision;
+    let actor = "local_operator";
+    if task
+        .claimed_by
+        .as_deref()
+        .is_some_and(|claimed_by| claimed_by != actor)
+    {
+        return Err(ApiError::conflict(format!(
+            "Human task is claimed by {}",
+            task.claimed_by.as_deref().unwrap_or_default()
+        )));
+    }
+    let mut resume_command_id = None;
     match task.task_type {
-        HumanTaskTypeV1::Approval => match request.action {
+        HumanTaskTypeV1::Approval if task.continuation_id.is_none() => match request.action {
             HumanTaskActionV1::Approve | HumanTaskActionV1::Reject => {
                 resolve_flow_approval(
                     &mut run,
@@ -98,10 +133,70 @@ async fn resolve_human_task(
                 ))
             }
         },
+        HumanTaskTypeV1::Approval
+        | HumanTaskTypeV1::InputRequest
+        | HumanTaskTypeV1::Reconnect
+        | HumanTaskTypeV1::Reconciliation => {
+            if request.action == HumanTaskActionV1::Cancel {
+                run.status = FlowRunStatusV1::Cancelled;
+                run.error = request
+                    .note
+                    .clone()
+                    .or_else(|| Some("Human task cancelled by operator".to_string()));
+                run.active_human_task_id = None;
+                run.completed_at = Some(Utc::now());
+                run.touch();
+            } else {
+                let command = prepare_flow_interrupt_resume(
+                    &mut run,
+                    &task,
+                    request.action,
+                    request.response.clone(),
+                    request.note.as_deref(),
+                    actor,
+                    &idempotency_key,
+                )
+                .map_err(ApiError::from)?;
+                resume_command_id = Some(command.id);
+            }
+        }
+        HumanTaskTypeV1::Recovery if task.continuation_id.is_some() => {
+            if request.action == HumanTaskActionV1::Cancel {
+                run.status = FlowRunStatusV1::Cancelled;
+                run.error = request
+                    .note
+                    .clone()
+                    .or_else(|| Some("Agent continuation retry cancelled".to_string()));
+                run.active_human_task_id = None;
+                run.completed_at = Some(Utc::now());
+                run.touch();
+            } else {
+                let command = prepare_flow_interrupt_resume(
+                    &mut run,
+                    &task,
+                    request.action,
+                    request.response.clone(),
+                    request.note.as_deref(),
+                    actor,
+                    &idempotency_key,
+                )
+                .map_err(ApiError::from)?;
+                resume_command_id = Some(command.id);
+            }
+        }
         HumanTaskTypeV1::Recovery => match request.action {
             HumanTaskActionV1::Retry => {
-                prepare_flow_resume(&mut run, true).map_err(ApiError::from)?;
-                run.status = FlowRunStatusV1::Running;
+                if run.pending_resume_command_id().is_some() {
+                    run.status = FlowRunStatusV1::Resuming;
+                    for node in &mut run.node_runs {
+                        if node.status == opentopia_core::FlowNodeRunStatusV1::Resuming {
+                            node.error = None;
+                        }
+                    }
+                } else {
+                    prepare_flow_resume(&mut run, true).map_err(ApiError::from)?;
+                    run.status = FlowRunStatusV1::Running;
+                }
                 run.error = None;
                 run.active_human_task_id = None;
                 run.touch();
@@ -122,31 +217,145 @@ async fn resolve_human_task(
                 ))
             }
         },
-        _ => {
+        HumanTaskTypeV1::OutputReview => match request.action {
+            HumanTaskActionV1::Approve => {
+                run.output_reviewed = true;
+                run.status = FlowRunStatusV1::Succeeded;
+                run.active_human_task_id = None;
+                run.error = None;
+                run.completed_at = Some(Utc::now());
+                run.touch();
+            }
+            HumanTaskActionV1::Reject => {
+                run.status = FlowRunStatusV1::Cancelled;
+                run.active_human_task_id = None;
+                run.error = request
+                    .note
+                    .clone()
+                    .or_else(|| Some("Flow output rejected by operator".to_string()));
+                run.completed_at = Some(Utc::now());
+                run.touch();
+            }
+            _ => {
+                return Err(ApiError::bad_request(
+                    "output review only accepts approve or reject",
+                ))
+            }
+        },
+        HumanTaskTypeV1::DataCorrection | HumanTaskTypeV1::Manual => {
             return Err(ApiError::bad_request(
                 "Human task kind is not supported yet",
             ))
         }
     }
-    task.resolve(request.action, request.note.as_deref(), "local_operator")
-        .map_err(ApiError::from)?;
+    let audit_command_id =
+        resume_command_id.or_else(|| Some(Uuid::new_v5(&task.id, idempotency_key.as_bytes())));
+    task.resolve_with_command(
+        request.action,
+        request.note.as_deref(),
+        actor,
+        audit_command_id,
+        Some(&idempotency_key),
+        request.response.clone(),
+    )
+    .map_err(ApiError::from)?;
     let expected_task_revision = request.expected_revision;
-    let (run, task) = state
-        .store
-        .update_flow_run_and_human_task(
-            &run,
-            expected_run_revision,
-            &task,
-            Some(expected_task_revision),
+    let updated = state.store.update_flow_run_and_human_task(
+        &run,
+        expected_run_revision,
+        &task,
+        Some(expected_task_revision),
+    );
+    let (run, task) = match updated {
+        Ok(updated) => updated,
+        Err(error)
+            if matches!(
+                error.downcast_ref::<HumanTaskStoreError>(),
+                Some(HumanTaskStoreError::RevisionConflict(_))
+            ) =>
+        {
+            let current = human_task_for_request(&state, task_id)?;
+            if !resolution_matches(&current, request.action, &idempotency_key) {
+                return Err(human_task_error(error));
+            }
+            let current_run = state
+                .store
+                .get_flow_run(current.source_id)
+                .map_err(human_task_error)?
+                .ok_or_else(|| ApiError::not_found("Flow run not found"))?;
+            return Ok(Json(ResolveHumanTaskResponse {
+                task: current,
+                run: current_run,
+            }));
+        }
+        Err(error) => return Err(human_task_error(error)),
+    };
+    if matches!(
+        run.status,
+        FlowRunStatusV1::Running | FlowRunStatusV1::Resuming
+    ) {
+        let context = flows_api::flow_runtime_context(
+            &state,
+            &thread,
+            run.id,
+            run.harness_capabilities(),
+            run.harness_connection_authority(),
         )
-        .map_err(human_task_error)?;
-    if run.status == FlowRunStatusV1::Running {
-        let capabilities = run.effective_capabilities.clone();
-        let context =
-            flows_api::flow_runtime_context(&state, &thread, run.id, capabilities).await?;
+        .await?;
         spawn_flow_run(run.id, context).map_err(ApiError::from)?;
     }
     Ok(Json(ResolveHumanTaskResponse { task, run }))
+}
+
+async fn claim_human_task(
+    State(state): State<AppState>,
+    Path(task_id): Path<Uuid>,
+    Json(request): Json<ClaimHumanTaskRequest>,
+) -> Result<Json<HumanTaskV1>, ApiError> {
+    flows_api::ensure_enterprise(&state)?;
+    let mut task = human_task_for_request(&state, task_id)?;
+    if task.revision != request.expected_revision {
+        return Err(ApiError::conflict(format!(
+            "Human task revision conflict; current revision is {}",
+            task.revision
+        )));
+    }
+    task.claim("local_operator").map_err(ApiError::from)?;
+    Ok(Json(
+        state
+            .store
+            .update_human_task(&task, request.expected_revision)
+            .map_err(human_task_error)?,
+    ))
+}
+
+async fn assign_human_task(
+    State(state): State<AppState>,
+    Path(task_id): Path<Uuid>,
+    Json(request): Json<AssignHumanTaskRequest>,
+) -> Result<Json<HumanTaskV1>, ApiError> {
+    flows_api::ensure_enterprise(&state)?;
+    let mut task = human_task_for_request(&state, task_id)?;
+    if task.revision != request.expected_revision {
+        return Err(ApiError::conflict(format!(
+            "Human task revision conflict; current revision is {}",
+            task.revision
+        )));
+    }
+    task.assign(request.assignee.as_deref())
+        .map_err(ApiError::from)?;
+    Ok(Json(
+        state
+            .store
+            .update_human_task(&task, request.expected_revision)
+            .map_err(human_task_error)?,
+    ))
+}
+
+fn resolution_matches(task: &HumanTaskV1, action: HumanTaskActionV1, key: &str) -> bool {
+    task.resolution.as_ref().is_some_and(|resolution| {
+        resolution.action == action && resolution.idempotency_key.as_deref() == Some(key)
+    })
 }
 
 fn human_task_for_request(state: &AppState, task_id: Uuid) -> Result<HumanTaskV1, ApiError> {
@@ -189,6 +398,24 @@ struct ResolveHumanTaskRequest {
     action: HumanTaskActionV1,
     #[serde(default)]
     note: Option<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    response: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaimHumanTaskRequest {
+    expected_revision: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AssignHumanTaskRequest {
+    expected_revision: u32,
+    #[serde(default)]
+    assignee: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]

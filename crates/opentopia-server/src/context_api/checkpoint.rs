@@ -5,8 +5,9 @@ use chrono::Utc;
 use opentopia_core::{
     AgentEvent, AgentEventPayload, ContextCheckpoint, ContextCheckpointArtifact,
     ContextCheckpointCommand, ContextCheckpointCoverage, ContextCheckpointFact,
-    ContextCheckpointInteraction, ContextCheckpointMode, ContextCheckpointStep,
-    ContextCheckpointWorkspace, ContextFactStatus, CONTEXT_CHECKPOINT_SCHEMA_VERSION,
+    ContextCheckpointInteraction, ContextCheckpointMode, ContextCheckpointPhase,
+    ContextCheckpointStep, ContextCheckpointWorkspace, ContextFactStatus,
+    CONTEXT_CHECKPOINT_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -14,13 +15,15 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use uuid::Uuid;
 
 pub(crate) fn context_summary_system_prompt() -> &'static str {
-    "You merge an AI coding-agent session into a durable structured checkpoint. Return only JSON matching the supplied schema. The server deterministically merges entries by stable id or natural key, so unchanged entries from the previous checkpoint may be omitted. Include every new or changed fact needed to update it. Preserve exact file paths, commands, errors, identifiers, active user constraints, unresolved risks, pending interactions, and artifact references. Source sequence numbers must refer only to supplied event seq values. Mark resolved or superseded facts explicitly instead of silently deleting them. Omit greetings, repetition, transient progress narration, large raw tool output, and secrets. Never claim unfinished work or failed validation is completed."
+    "You compress the complete current context of an AI coding-agent session into one durable structured checkpoint. Return only JSON matching the supplied schema. The response is a complete self-contained replacement checkpoint: if the context contains an earlier checkpoint, retain every still-relevant fact and phase from it, then incorporate the later history. Maintain an evidence-backed phase history: each phase records when it happened by event sequence range, the objective, problem encountered, root cause, resolution, outcome, remaining risks, and measurable results. Do not create a phase merely because compaction occurred. Preserve exact file paths, commands, errors, identifiers, active user constraints, unresolved risks, pending interactions, artifact references, and verification metrics. Source sequence numbers must refer only to supplied event seq values. Mark resolved or superseded facts explicitly instead of silently deleting them. Omit greetings, repetition, transient progress narration, large raw tool output, and secrets. Never claim unfinished work or failed validation is completed."
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ContextCheckpointDraft {
     goal: String,
+    #[serde(default)]
+    phases: Vec<ContextCheckpointPhase>,
     #[serde(default)]
     user_constraints: Vec<ContextCheckpointFact>,
     #[serde(default)]
@@ -49,12 +52,13 @@ pub(crate) fn context_checkpoint_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "required": [
-            "goal", "userConstraints", "decisions", "workspaceState",
+            "goal", "phases", "userConstraints", "decisions", "workspaceState",
             "commandsAndValidation", "openIssues", "nextSteps",
             "pendingInteractions", "artifacts"
         ],
         "properties": {
             "goal": { "type": "string", "maxLength": 12000 },
+            "phases": { "type": "array", "maxItems": 96, "items": { "$ref": "#/$defs/phase" } },
             "userConstraints": { "type": "array", "maxItems": 96, "items": { "$ref": "#/$defs/fact" } },
             "decisions": { "type": "array", "maxItems": 96, "items": { "$ref": "#/$defs/fact" } },
             "workspaceState": { "$ref": "#/$defs/workspace" },
@@ -65,6 +69,43 @@ pub(crate) fn context_checkpoint_schema() -> Value {
             "artifacts": { "type": "array", "maxItems": 96, "items": { "$ref": "#/$defs/artifact" } }
         },
         "$defs": {
+            "metric": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "value", "unit", "sourceSeqs"],
+                "properties": {
+                    "name": { "type": "string", "maxLength": 160 },
+                    "value": { "type": "string", "maxLength": 1000 },
+                    "unit": { "type": ["string", "null"], "maxLength": 160 },
+                    "sourceSeqs": source_seqs.clone()
+                }
+            },
+            "phase": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "id", "title", "status", "fromSeq", "throughSeq", "startedAt",
+                    "endedAt", "objective", "problem", "rootCause", "resolution",
+                    "outcome", "metrics", "remainingRisks", "sourceSeqs"
+                ],
+                "properties": {
+                    "id": { "type": "string", "maxLength": 160 },
+                    "title": { "type": "string", "maxLength": 500 },
+                    "status": { "type": "string", "maxLength": 160 },
+                    "fromSeq": { "type": "integer", "minimum": 0 },
+                    "throughSeq": { "type": "integer", "minimum": 0 },
+                    "startedAt": { "type": ["string", "null"], "format": "date-time" },
+                    "endedAt": { "type": ["string", "null"], "format": "date-time" },
+                    "objective": { "type": "string", "maxLength": 4000 },
+                    "problem": { "type": ["string", "null"], "maxLength": 4000 },
+                    "rootCause": { "type": ["string", "null"], "maxLength": 4000 },
+                    "resolution": { "type": ["string", "null"], "maxLength": 4000 },
+                    "outcome": { "type": ["string", "null"], "maxLength": 4000 },
+                    "metrics": { "type": "array", "maxItems": 32, "items": { "$ref": "#/$defs/metric" } },
+                    "remainingRisks": { "type": "array", "maxItems": 32, "items": { "type": "string", "maxLength": 2000 } },
+                    "sourceSeqs": source_seqs.clone()
+                }
+            },
             "fact": {
                 "type": "object",
                 "additionalProperties": false,
@@ -165,12 +206,14 @@ pub(crate) fn parse_checkpoint_response(text: &str) -> Result<Value, ApiError> {
 pub(crate) fn sanitize_checkpoint_draft(
     draft: &mut ContextCheckpointDraft,
     covered_through_seq: i64,
+    events: &[AgentEvent],
 ) -> Result<(), ApiError> {
     draft.goal = truncate_chars(draft.goal.trim(), 12_000);
     if draft.goal.is_empty() {
         return Err(ApiError::bad_gateway("checkpoint goal cannot be empty"));
     }
     draft.user_constraints.truncate(96);
+    draft.phases.truncate(96);
     draft.decisions.truncate(96);
     draft.commands_and_validation.truncate(96);
     draft.open_issues.truncate(96);
@@ -178,6 +221,86 @@ pub(crate) fn sanitize_checkpoint_draft(
     draft.pending_interactions.truncate(64);
     draft.artifacts.truncate(96);
     draft.workspace_state.files_changed.truncate(160);
+
+    for phase in &mut draft.phases {
+        phase.id = truncate_chars(phase.id.trim(), 160);
+        phase.title = truncate_chars(phase.title.trim(), 500);
+        phase.status = truncate_chars(phase.status.trim(), 160);
+        phase.objective = truncate_chars(phase.objective.trim(), 4_000);
+        phase.problem = phase
+            .problem
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| truncate_chars(value, 4_000));
+        phase.root_cause = phase
+            .root_cause
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| truncate_chars(value, 4_000));
+        phase.resolution = phase
+            .resolution
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| truncate_chars(value, 4_000));
+        phase.outcome = phase
+            .outcome
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| truncate_chars(value, 4_000));
+        phase.remaining_risks.truncate(32);
+        for risk in &mut phase.remaining_risks {
+            *risk = truncate_chars(risk.trim(), 2_000);
+        }
+        phase.remaining_risks.retain(|risk| !risk.is_empty());
+        phase.metrics.truncate(32);
+        for metric in &mut phase.metrics {
+            metric.name = truncate_chars(metric.name.trim(), 160);
+            metric.value = truncate_chars(metric.value.trim(), 1_000);
+            metric.unit = metric
+                .unit
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| truncate_chars(value, 160));
+            sanitize_source_seqs(&mut metric.source_seqs, covered_through_seq);
+        }
+        phase
+            .metrics
+            .retain(|metric| !metric.name.is_empty() && !metric.value.is_empty());
+        sanitize_source_seqs(&mut phase.source_seqs, covered_through_seq);
+        phase.from_seq = phase.from_seq.clamp(0, covered_through_seq);
+        phase.through_seq = phase.through_seq.clamp(phase.from_seq, covered_through_seq);
+        let started = events
+            .iter()
+            .find(|event| event.seq == phase.from_seq)
+            .map(|event| event.created_at);
+        let ended = events
+            .iter()
+            .find(|event| event.seq == phase.through_seq)
+            .map(|event| event.created_at);
+        if phase.id.is_empty()
+            || phase.title.is_empty()
+            || phase.objective.is_empty()
+            || phase.from_seq <= 0
+            || phase.through_seq < phase.from_seq
+            || started.is_none()
+            || ended.is_none()
+        {
+            return Err(ApiError::bad_gateway(
+                "checkpoint phases require a stable id, objective, and valid event sequence range",
+            ));
+        }
+        // Event timestamps are durable evidence; never trust model-authored
+        // timestamps when an authoritative sequence range exists.
+        phase.started_at = started;
+        phase.ended_at = checkpoint_phase_is_terminal(&phase.status)
+            .then_some(ended)
+            .flatten();
+    }
 
     for fact in draft
         .user_constraints
@@ -332,6 +455,14 @@ fn checkpoint_status_is_resolved(status: &str) -> bool {
     )
 }
 
+fn checkpoint_phase_is_terminal(status: &str) -> bool {
+    checkpoint_status_is_resolved(status)
+        || matches!(
+            status.trim().to_ascii_lowercase().as_str(),
+            "failed" | "blocked" | "cancelled" | "canceled" | "superseded"
+        )
+}
+
 pub(crate) fn checkpoint_token_budget(context_window: usize) -> usize {
     (context_window / 10)
         .clamp(1_024, 16_384)
@@ -355,6 +486,7 @@ pub(crate) fn merge_context_checkpoint(
         coverage: ContextCheckpointCoverage::default(),
         provider_compatibility_hash: None,
         goal: String::new(),
+        phases: Vec::new(),
         user_constraints: Vec::new(),
         decisions: Vec::new(),
         workspace_state: ContextCheckpointWorkspace::default(),
@@ -378,6 +510,8 @@ pub(crate) fn merge_context_checkpoint(
     if !draft.goal.trim().is_empty() {
         checkpoint.goal = draft.goal;
     }
+
+    checkpoint.phases = merge_checkpoint_phases(checkpoint.phases, draft.phases);
 
     checkpoint.user_constraints = merge_checkpoint_entries(
         checkpoint.user_constraints,
@@ -455,6 +589,53 @@ fn checkpoint_fact_key(fact: &ContextCheckpointFact) -> String {
     }
 }
 
+fn merge_checkpoint_phases(
+    mut previous: Vec<ContextCheckpointPhase>,
+    current: Vec<ContextCheckpointPhase>,
+) -> Vec<ContextCheckpointPhase> {
+    let mut indexes = previous
+        .iter()
+        .enumerate()
+        .map(|(index, phase)| (phase.id.trim().to_owned(), index))
+        .collect::<BTreeMap<_, _>>();
+    for mut phase in current {
+        let key = phase.id.trim().to_owned();
+        let Some(index) = indexes.get(&key).copied() else {
+            indexes.insert(key, previous.len());
+            previous.push(phase);
+            continue;
+        };
+        let prior = &previous[index];
+        if prior.from_seq <= phase.from_seq {
+            phase.from_seq = prior.from_seq;
+            phase.started_at = prior.started_at.or(phase.started_at);
+        }
+        phase.ended_at = if !checkpoint_phase_is_terminal(&phase.status) {
+            phase.through_seq = phase.through_seq.max(prior.through_seq);
+            None
+        } else if prior.through_seq > phase.through_seq {
+            phase.through_seq = prior.through_seq;
+            prior.ended_at.or(phase.ended_at)
+        } else if prior.through_seq == phase.through_seq {
+            phase.ended_at.or(prior.ended_at)
+        } else {
+            phase.ended_at
+        };
+        phase.problem = phase.problem.or_else(|| prior.problem.clone());
+        phase.root_cause = phase.root_cause.or_else(|| prior.root_cause.clone());
+        phase.resolution = phase.resolution.or_else(|| prior.resolution.clone());
+        phase.outcome = phase.outcome.or_else(|| prior.outcome.clone());
+        phase.metrics = merge_checkpoint_entries(prior.metrics.clone(), phase.metrics, |metric| {
+            metric.name.trim().to_owned()
+        });
+        phase.source_seqs.extend(prior.source_seqs.iter().copied());
+        phase.source_seqs.sort_unstable();
+        phase.source_seqs.dedup();
+        previous[index] = phase;
+    }
+    previous
+}
+
 pub(crate) fn checkpoint_retention_percentages(
     previous: Option<&ContextCheckpoint>,
     current: &ContextCheckpoint,
@@ -485,6 +666,9 @@ fn checkpoint_retention_keys(
             .collect();
     }
     let mut keys = HashSet::new();
+    for phase in &checkpoint.phases {
+        keys.insert(format!("phase:{}", phase.id.trim()));
+    }
     for fact in &checkpoint.user_constraints {
         keys.insert(format!("constraint:{}", checkpoint_fact_key(fact)));
     }
@@ -577,6 +761,32 @@ fn compact_checkpoint_text(
     goal_char_limit: usize,
 ) {
     checkpoint.goal = truncate_chars(&checkpoint.goal, goal_char_limit);
+    for phase in &mut checkpoint.phases {
+        phase.title = truncate_chars(&phase.title, item_char_limit);
+        phase.objective = truncate_chars(&phase.objective, item_char_limit);
+        phase.problem = phase
+            .problem
+            .as_deref()
+            .map(|value| truncate_chars(value, item_char_limit));
+        phase.root_cause = phase
+            .root_cause
+            .as_deref()
+            .map(|value| truncate_chars(value, item_char_limit));
+        phase.resolution = phase
+            .resolution
+            .as_deref()
+            .map(|value| truncate_chars(value, item_char_limit));
+        phase.outcome = phase
+            .outcome
+            .as_deref()
+            .map(|value| truncate_chars(value, item_char_limit));
+        for risk in &mut phase.remaining_risks {
+            *risk = truncate_chars(risk, item_char_limit / 2);
+        }
+        for metric in &mut phase.metrics {
+            metric.value = truncate_chars(&metric.value, item_char_limit / 2);
+        }
+    }
     checkpoint.workspace_state.git_status = checkpoint
         .workspace_state
         .git_status
@@ -620,6 +830,20 @@ fn remove_lowest_priority_checkpoint_entry(checkpoint: &mut ContextCheckpoint) -
     if checkpoint.pending_interactions.pop().is_some() {
         return true;
     }
+    for phase in &mut checkpoint.phases {
+        if phase.metrics.pop().is_some() || phase.remaining_risks.pop().is_some() {
+            return true;
+        }
+    }
+    if let Some(index) = checkpoint.phases.iter().position(|phase| {
+        matches!(
+            phase.status.trim().to_ascii_lowercase().as_str(),
+            "completed" | "resolved" | "superseded"
+        )
+    }) {
+        checkpoint.phases.remove(index);
+        return true;
+    }
     false
 }
 
@@ -649,7 +873,7 @@ mod tests {
     use opentopia_core::{
         AgentEvent, AgentEventPayload, ContextCheckpoint, ContextCheckpointArtifact,
         ContextCheckpointCommand, ContextCheckpointCoverage, ContextCheckpointFact,
-        ContextFactStatus, ToolCall, ToolResult,
+        ContextCheckpointMetric, ContextCheckpointPhase, ContextFactStatus, ToolCall, ToolResult,
     };
     use serde_json::json;
     use std::path::PathBuf;
@@ -678,7 +902,7 @@ mod tests {
         let value = parse_checkpoint_response(&fenced).expect("parse fenced JSON");
         let mut draft: ContextCheckpointDraft =
             serde_json::from_value(value).expect("deserialize draft");
-        sanitize_checkpoint_draft(&mut draft, 10).expect("sanitize draft");
+        sanitize_checkpoint_draft(&mut draft, 10, &[]).expect("sanitize draft");
 
         assert_eq!(draft.goal, "preserve the current implementation");
         assert_eq!(draft.user_constraints[0].source_seqs, vec![4]);
@@ -725,6 +949,109 @@ mod tests {
         let error = validate_checkpoint_draft(&draft, &events)
             .expect_err("failed command must remain failed");
         assert!(error.message.contains("marks failed command"));
+    }
+
+    #[test]
+    fn checkpoint_phases_use_event_time_and_merge_by_stable_id() {
+        let thread_id = Uuid::new_v4();
+        let events = vec![
+            AgentEvent::new(
+                thread_id,
+                None,
+                7,
+                AgentEventPayload::ContextWarning {
+                    stage: "investigation".to_string(),
+                    message: "provider rejected an oversized request".to_string(),
+                },
+            ),
+            AgentEvent::new(
+                thread_id,
+                None,
+                8,
+                AgentEventPayload::ContextWarning {
+                    stage: "verification".to_string(),
+                    message: "request admitted below the target".to_string(),
+                },
+            ),
+        ];
+        let mut draft = ContextCheckpointDraft {
+            goal: "unify context compaction".to_string(),
+            phases: vec![ContextCheckpointPhase {
+                id: "phase-round-admission".to_string(),
+                title: "Unify round admission".to_string(),
+                status: "completed".to_string(),
+                from_seq: 7,
+                through_seq: 8,
+                started_at: None,
+                ended_at: None,
+                objective: "Check pressure before every provider round".to_string(),
+                problem: Some("Separate paths made Round 0 inconsistent".to_string()),
+                root_cause: Some("Round 0 bypassed the provider-loop helper".to_string()),
+                resolution: Some("Route every round through one admission boundary".to_string()),
+                outcome: Some("Round 0 and later rounds share the same policy".to_string()),
+                metrics: vec![ContextCheckpointMetric {
+                    name: "admission paths".to_string(),
+                    value: "1".to_string(),
+                    unit: Some("path".to_string()),
+                    source_seqs: vec![8, 99],
+                }],
+                remaining_risks: vec!["Provider estimates can still differ".to_string()],
+                source_seqs: vec![7, 8, 99],
+            }],
+            ..ContextCheckpointDraft::default()
+        };
+
+        sanitize_checkpoint_draft(&mut draft, 8, &events).expect("sanitize phase");
+        let phase = &draft.phases[0];
+        assert_eq!(phase.started_at, Some(events[0].created_at));
+        assert_eq!(phase.ended_at, Some(events[1].created_at));
+        assert_eq!(phase.source_seqs, vec![7, 8]);
+        assert_eq!(phase.metrics[0].source_seqs, vec![8]);
+
+        let previous = merge_context_checkpoint(
+            None,
+            draft,
+            thread_id,
+            ContextCheckpointCoverage {
+                through_seq: 8,
+                through_message_count: 2,
+            },
+            None,
+        );
+        let updated = merge_context_checkpoint(
+            Some(&previous),
+            ContextCheckpointDraft {
+                goal: "unify context compaction".to_string(),
+                phases: vec![ContextCheckpointPhase {
+                    id: "phase-round-admission".to_string(),
+                    title: "Unify round admission".to_string(),
+                    status: "completed".to_string(),
+                    from_seq: 7,
+                    through_seq: 8,
+                    objective: "Check pressure before every provider round".to_string(),
+                    outcome: Some("Verified one admission path".to_string()),
+                    ..ContextCheckpointPhase::default()
+                }],
+                ..ContextCheckpointDraft::default()
+            },
+            thread_id,
+            ContextCheckpointCoverage {
+                through_seq: 8,
+                through_message_count: 2,
+            },
+            None,
+        );
+
+        assert_eq!(updated.phases.len(), 1);
+        assert_eq!(
+            updated.phases[0].root_cause.as_deref(),
+            Some("Round 0 bypassed the provider-loop helper")
+        );
+        assert_eq!(updated.phases[0].metrics.len(), 1);
+        assert_eq!(
+            updated.phases[0].outcome.as_deref(),
+            Some("Verified one admission path")
+        );
     }
 
     #[test]

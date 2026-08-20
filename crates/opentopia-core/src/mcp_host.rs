@@ -3,6 +3,7 @@ use crate::mcp::{
     mcp_public_tool_name, McpCallResult, McpLifecycleStatus, McpServerConfig, McpServerStatus,
     McpToolDescriptor,
 };
+use crate::mcp_operation_fingerprint;
 #[cfg(test)]
 use async_trait::async_trait;
 #[cfg(test)]
@@ -86,8 +87,14 @@ pub enum McpHostError {
     ServerNotFound(Uuid),
     #[error("MCP tool not found: {0}")]
     ToolNotFound(String),
+    #[error(
+        "MCP tool {tool_name} on server {server_id} changed after its Connection grant was reviewed"
+    )]
+    ToolFingerprintChanged { server_id: Uuid, tool_name: String },
     #[error("duplicate public MCP tool name: {0}")]
     DuplicateToolName(String),
+    #[error("ambiguous public MCP tool name: {0}")]
+    AmbiguousToolName(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -300,9 +307,7 @@ impl McpExtensionHost {
     async fn stop_server_locked(&self, server_id: Uuid) -> Result<(), McpHostError> {
         let runtime = {
             let mut inner = self.inner.write().await;
-            inner
-                .tool_routes
-                .retain(|_, route| route.server_id != server_id);
+            remove_server_routes(&mut inner.tool_routes, server_id);
             inner.servers.remove(&server_id)
         };
 
@@ -390,20 +395,16 @@ impl McpExtensionHost {
         public_name: &str,
         arguments: Value,
     ) -> Result<McpCallResult, McpHostError> {
-        let server_ids = {
+        // Resolve the already-disclosed route first. A tool call must never scan
+        // or refresh unrelated account runtimes on its latency-sensitive path.
+        let server_id = {
             let inner = self.inner.read().await;
-            inner.servers.keys().copied().collect::<Vec<_>>()
+            unique_public_route(&inner.tool_routes, public_name)?.server_id
         };
-        for server_id in server_ids {
-            self.refresh_tools_if_invalidated(server_id).await?;
-        }
+        self.refresh_tools_if_invalidated(server_id).await?;
         let (route, client) = {
             let inner = self.inner.read().await;
-            let route = inner
-                .tool_routes
-                .get(public_name)
-                .cloned()
-                .ok_or_else(|| McpHostError::ToolNotFound(public_name.to_string()))?;
+            let route = unique_public_route(&inner.tool_routes, public_name)?.clone();
             let runtime = inner
                 .servers
                 .get(&route.server_id)
@@ -416,6 +417,51 @@ impl McpExtensionHost {
             route.server_id,
             route.public_name,
             route.tool_name,
+            response,
+        ))
+    }
+
+    /// Calls one provider-native tool on one exact server after confirming the
+    /// live descriptor still matches the immutable operation reviewed by the
+    /// Agent template. This is the structured Connection execution boundary;
+    /// unlike the legacy public-name route, it cannot be redirected by a name
+    /// collision or an editable server display name.
+    pub async fn call_server_tool(
+        &self,
+        server_id: Uuid,
+        provider_tool_name: &str,
+        expected_operation_fingerprint: &str,
+        arguments: Value,
+    ) -> Result<McpCallResult, McpHostError> {
+        self.refresh_tools_if_invalidated(server_id).await?;
+        let (descriptor, client) = {
+            let inner = self.inner.read().await;
+            let runtime = inner
+                .servers
+                .get(&server_id)
+                .ok_or(McpHostError::ServerNotFound(server_id))?;
+            let descriptor = runtime
+                .tools
+                .iter()
+                .find(|descriptor| descriptor.tool_name == provider_tool_name)
+                .cloned()
+                .ok_or_else(|| {
+                    McpHostError::ToolNotFound(format!("{server_id}:{provider_tool_name}"))
+                })?;
+            (descriptor, runtime.client.clone())
+        };
+        if mcp_operation_fingerprint(&descriptor) != expected_operation_fingerprint {
+            return Err(McpHostError::ToolFingerprintChanged {
+                server_id,
+                tool_name: provider_tool_name.to_string(),
+            });
+        }
+
+        let response = client.call_tool(provider_tool_name, arguments).await?;
+        Ok(call_result_from_response(
+            server_id,
+            descriptor.public_name,
+            descriptor.tool_name,
             response,
         ))
     }
@@ -439,13 +485,17 @@ impl McpExtensionHost {
             )
         };
 
-        if client.tools_generation() <= cached_generation {
+        let invalidated_generation = client.tools_generation();
+        if invalidated_generation <= cached_generation {
             return Ok(());
         }
 
         let raw_tools = client.list_tools().await?;
         let descriptors = descriptors_from_raw_tools(&config, raw_tools)?;
-        let observed_generation = client.tools_generation();
+        // Do not absorb a second notification that races with tools/list. A
+        // later call must refresh again instead of treating a potentially
+        // stale response as the newest generation.
+        let observed_generation = invalidated_generation;
 
         let mut inner = self.inner.write().await;
         let Some(runtime) = inner.servers.get(&server_id) else {
@@ -456,30 +506,17 @@ impl McpExtensionHost {
             return Ok(());
         }
 
+        remove_server_routes(&mut inner.tool_routes, server_id);
         for descriptor in &descriptors {
-            if inner
+            inner
                 .tool_routes
-                .get(&descriptor.public_name)
-                .is_some_and(|route| route.server_id != server_id)
-            {
-                return Err(McpHostError::DuplicateToolName(
-                    descriptor.public_name.clone(),
-                ));
-            }
-        }
-
-        inner
-            .tool_routes
-            .retain(|_, route| route.server_id != server_id);
-        for descriptor in &descriptors {
-            inner.tool_routes.insert(
-                descriptor.public_name.clone(),
-                McpToolRoute {
+                .entry(descriptor.public_name.clone())
+                .or_default()
+                .push(McpToolRoute {
                     server_id,
                     public_name: descriptor.public_name.clone(),
                     tool_name: descriptor.tool_name.clone(),
-                },
-            );
+                });
         }
 
         if let Some(runtime) = inner.servers.get_mut(&server_id) {
@@ -534,27 +571,18 @@ impl McpExtensionHost {
         };
 
         let mut inner = self.inner.write().await;
-        inner
-            .tool_routes
-            .retain(|_, route| route.server_id != config.server_id);
+        remove_server_routes(&mut inner.tool_routes, config.server_id);
 
         for descriptor in &descriptors {
-            if inner.tool_routes.contains_key(&descriptor.public_name) {
-                return Err(McpHostError::DuplicateToolName(
-                    descriptor.public_name.clone(),
-                ));
-            }
-        }
-
-        for descriptor in &descriptors {
-            inner.tool_routes.insert(
-                descriptor.public_name.clone(),
-                McpToolRoute {
+            inner
+                .tool_routes
+                .entry(descriptor.public_name.clone())
+                .or_default()
+                .push(McpToolRoute {
                     server_id: config.server_id,
                     public_name: descriptor.public_name.clone(),
                     tool_name: descriptor.tool_name.clone(),
-                },
-            );
+                });
         }
 
         inner.servers.insert(
@@ -590,7 +618,7 @@ impl McpExtensionHost {
 struct McpExtensionHostInner {
     servers: HashMap<Uuid, McpServerRuntime>,
     statuses: HashMap<Uuid, McpServerStatus>,
-    tool_routes: HashMap<String, McpToolRoute>,
+    tool_routes: HashMap<String, Vec<McpToolRoute>>,
     /// Last known catalog per server, restored from the durable mirror at startup. Only read
     /// for servers with no live runtime; a live runtime is always authoritative.
     persisted_tools: HashMap<Uuid, Vec<McpToolDescriptor>>,
@@ -608,6 +636,26 @@ pub struct McpToolRoute {
     pub server_id: Uuid,
     pub public_name: String,
     pub tool_name: String,
+}
+
+fn remove_server_routes(routes: &mut HashMap<String, Vec<McpToolRoute>>, server_id: Uuid) {
+    for candidates in routes.values_mut() {
+        candidates.retain(|route| route.server_id != server_id);
+    }
+    routes.retain(|_, candidates| !candidates.is_empty());
+}
+
+fn unique_public_route<'a>(
+    routes: &'a HashMap<String, Vec<McpToolRoute>>,
+    public_name: &str,
+) -> Result<&'a McpToolRoute, McpHostError> {
+    let candidates = routes
+        .get(public_name)
+        .ok_or_else(|| McpHostError::ToolNotFound(public_name.to_string()))?;
+    match candidates.as_slice() {
+        [route] => Ok(route),
+        _ => Err(McpHostError::AmbiguousToolName(public_name.to_string())),
+    }
 }
 
 mod stdio_transport;
@@ -1127,6 +1175,212 @@ mod tests {
         server.await.expect("mock server task should finish");
     }
 
+    #[tokio::test]
+    async fn exact_route_disambiguates_same_public_name_across_account_servers() {
+        let host = McpExtensionHost::new();
+        let mut runtimes = Vec::new();
+
+        for _ in 0..2 {
+            let (client_stdin, server_stdin) = duplex(16 * 1024);
+            let (server_stdout, client_stdout) = duplex(16 * 1024);
+            let server = tokio::spawn(run_mock_mcp_server(server_stdin, server_stdout));
+            let mut config = McpServerConfig::new("Shared CRM".to_string(), "mock".to_string());
+            config.timeout_ms = 5_000;
+            let client = Arc::new(McpStdioClient::from_io_for_test(
+                config.clone(),
+                client_stdout,
+                client_stdin,
+            ));
+            client
+                .initialize()
+                .await
+                .expect("initialize should succeed");
+            host.install_client_for_test(config.clone(), client)
+                .await
+                .expect("same public name on a distinct account server should install");
+            runtimes.push((config, server));
+        }
+
+        let public_name = mcp_public_tool_name("Shared CRM", "echo");
+        assert!(matches!(
+            host.call_tool(&public_name, json!({ "text": "legacy" }))
+                .await,
+            Err(McpHostError::AmbiguousToolName(name)) if name == public_name
+        ));
+
+        for (index, (config, _)) in runtimes.iter().enumerate() {
+            let descriptor = host
+                .list_tools(config.server_id)
+                .await
+                .expect("exact server catalog")
+                .into_iter()
+                .next()
+                .expect("echo descriptor");
+            let result = host
+                .call_server_tool(
+                    config.server_id,
+                    "echo",
+                    &mcp_operation_fingerprint(&descriptor),
+                    json!({ "text": format!("account-{index}") }),
+                )
+                .await
+                .expect("exact account route should succeed");
+            assert_eq!(result.output, format!("echo: account-{index}"));
+            assert_eq!(result.server_id, config.server_id);
+        }
+
+        for (config, server) in runtimes {
+            host.stop_server(config.server_id)
+                .await
+                .expect("stop should succeed");
+            server.await.expect("mock server task should finish");
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_route_refreshes_only_target_and_changed_tool_makes_zero_wire_calls() {
+        let host = McpExtensionHost::new();
+        let mut runtimes = Vec::new();
+
+        for name in ["Target", "Unrelated"] {
+            let (client_stdin, server_stdin) = duplex(16 * 1024);
+            let (server_stdout, client_stdout) = duplex(16 * 1024);
+            let (change_sender, change_receiver) = oneshot::channel();
+            let list_calls = Arc::new(AtomicUsize::new(0));
+            let tool_calls = Arc::new(AtomicUsize::new(0));
+            let server = tokio::spawn(run_guarded_route_server(
+                server_stdin,
+                server_stdout,
+                change_receiver,
+                GuardedRouteChange::Schema,
+                list_calls.clone(),
+                tool_calls.clone(),
+            ));
+            let mut config = McpServerConfig::new(name.to_string(), "mock".to_string());
+            config.timeout_ms = 5_000;
+            let client = Arc::new(McpStdioClient::from_io_for_test(
+                config.clone(),
+                client_stdout,
+                client_stdin,
+            ));
+            client
+                .initialize()
+                .await
+                .expect("initialize should succeed");
+            host.install_client_for_test(config.clone(), client.clone())
+                .await
+                .expect("initial tool list should install");
+            let descriptor = host.list_tools(config.server_id).await.unwrap()[0].clone();
+            runtimes.push((
+                config,
+                client,
+                descriptor,
+                change_sender,
+                list_calls,
+                tool_calls,
+                server,
+            ));
+        }
+
+        for (_, client, _, sender, _, _, _) in &mut runtimes {
+            let sender = std::mem::replace(sender, oneshot::channel().0);
+            sender.send(()).expect("change signal should send");
+            timeout(Duration::from_secs(2), async {
+                while client.tools_generation() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("list_changed notification should arrive");
+        }
+
+        let (target, _, pinned, _, target_lists, target_calls, _) = &runtimes[0];
+        let unrelated_lists_before = runtimes[1].4.load(Ordering::SeqCst);
+        let err = host
+            .call_server_tool(
+                target.server_id,
+                "echo",
+                &mcp_operation_fingerprint(pinned),
+                json!({}),
+            )
+            .await
+            .expect_err("changed schema must fail before the provider call");
+        assert!(matches!(err, McpHostError::ToolFingerprintChanged { .. }));
+        assert_eq!(target_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(target_lists.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            runtimes[1].4.load(Ordering::SeqCst),
+            unrelated_lists_before,
+            "calling one Connection must not refresh an unrelated account runtime"
+        );
+
+        for (config, _, _, _, _, _, server) in runtimes {
+            host.stop_server(config.server_id)
+                .await
+                .expect("stop should succeed");
+            server.await.expect("mock server task should finish");
+        }
+    }
+
+    #[tokio::test]
+    async fn removed_exact_route_makes_zero_wire_calls() {
+        let (client_stdin, server_stdin) = duplex(16 * 1024);
+        let (server_stdout, client_stdout) = duplex(16 * 1024);
+        let (change_sender, change_receiver) = oneshot::channel();
+        let list_calls = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(run_guarded_route_server(
+            server_stdin,
+            server_stdout,
+            change_receiver,
+            GuardedRouteChange::Removed,
+            list_calls,
+            tool_calls.clone(),
+        ));
+        let mut config = McpServerConfig::new("Removed Tool".to_string(), "mock".to_string());
+        config.timeout_ms = 5_000;
+        let client = Arc::new(McpStdioClient::from_io_for_test(
+            config.clone(),
+            client_stdout,
+            client_stdin,
+        ));
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        let host = McpExtensionHost::new();
+        host.install_client_for_test(config.clone(), client.clone())
+            .await
+            .expect("initial tool list should install");
+        let pinned = host.list_tools(config.server_id).await.unwrap()[0].clone();
+
+        change_sender.send(()).expect("change signal should send");
+        timeout(Duration::from_secs(2), async {
+            while client.tools_generation() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("list_changed notification should arrive");
+
+        let err = host
+            .call_server_tool(
+                config.server_id,
+                "echo",
+                &mcp_operation_fingerprint(&pinned),
+                json!({}),
+            )
+            .await
+            .expect_err("removed tool must fail before the provider call");
+        assert!(matches!(err, McpHostError::ToolNotFound(_)));
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+
+        host.stop_server(config.server_id)
+            .await
+            .expect("stop should succeed");
+        server.await.expect("mock server task should finish");
+    }
+
     #[derive(Default)]
     struct RecordingCatalogStore {
         tools: std::sync::Mutex<HashMap<Uuid, Vec<McpToolDescriptor>>>,
@@ -1539,6 +1793,111 @@ mod tests {
                                             "description": "Changes after notification",
                                             "inputSchema": { "type": "object" }
                                         }]
+                                    }
+                                }),
+                            )
+                            .await;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum GuardedRouteChange {
+        Schema,
+        Removed,
+    }
+
+    async fn run_guarded_route_server(
+        stdin: tokio::io::DuplexStream,
+        mut stdout: tokio::io::DuplexStream,
+        mut change: oneshot::Receiver<()>,
+        change_kind: GuardedRouteChange,
+        list_calls: Arc<AtomicUsize>,
+        tool_calls: Arc<AtomicUsize>,
+    ) {
+        let mut lines = BufReader::new(stdin).lines();
+        let mut changed = false;
+        let mut notification_sent = false;
+
+        loop {
+            tokio::select! {
+                signal = &mut change, if !notification_sent => {
+                    if signal.is_ok() {
+                        changed = true;
+                        write_json_line(
+                            &mut stdout,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "method": "notifications/tools/list_changed"
+                            }),
+                        )
+                        .await;
+                    }
+                    notification_sent = true;
+                }
+                line = lines.next_line() => {
+                    let Some(line) = line.expect("mock read should succeed") else {
+                        break;
+                    };
+                    let value: Value = serde_json::from_str(&line)
+                        .expect("client message should be JSON");
+                    match value.get("method").and_then(Value::as_str).unwrap_or("") {
+                        "initialize" => {
+                            write_json_line(
+                                &mut stdout,
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": value.get("id").cloned().unwrap_or(Value::Null),
+                                    "result": {
+                                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                                        "capabilities": { "tools": { "listChanged": true } },
+                                        "serverInfo": { "name": "guarded", "version": "0.0.0" }
+                                    }
+                                }),
+                            )
+                            .await;
+                        }
+                        "notifications/initialized" => {}
+                        "tools/list" => {
+                            list_calls.fetch_add(1, Ordering::SeqCst);
+                            let tools = if changed && matches!(change_kind, GuardedRouteChange::Removed) {
+                                json!([])
+                            } else {
+                                let schema = if changed {
+                                    json!({ "type": "object", "required": ["id"] })
+                                } else {
+                                    json!({ "type": "object" })
+                                };
+                                json!([{
+                                    "name": "echo",
+                                    "description": "Guarded echo",
+                                    "inputSchema": schema
+                                }])
+                            };
+                            write_json_line(
+                                &mut stdout,
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": value.get("id").cloned().unwrap_or(Value::Null),
+                                    "result": { "tools": tools }
+                                }),
+                            )
+                            .await;
+                        }
+                        "tools/call" => {
+                            tool_calls.fetch_add(1, Ordering::SeqCst);
+                            write_json_line(
+                                &mut stdout,
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": value.get("id").cloned().unwrap_or(Value::Null),
+                                    "result": {
+                                        "content": [{ "type": "text", "text": "called" }],
+                                        "isError": false
                                     }
                                 }),
                             )

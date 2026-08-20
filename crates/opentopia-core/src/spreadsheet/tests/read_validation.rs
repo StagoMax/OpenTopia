@@ -237,11 +237,17 @@ fn rejects_oversized_files_and_return_content() {
 #[test]
 fn reports_unsupported_format_missing_sheet_and_duplicate_update() {
     let directory = TestDirectory::new();
+    let unsupported = directory.path("legacy.bin");
+    fs::write(&unsupported, b"not a spreadsheet").expect("write unsupported file");
+    let error = list_sheets(&ListSheetsRequest { path: unsupported })
+        .expect_err("unknown format must be rejected");
+    assert_eq!(error.code(), SpreadsheetErrorCode::UnsupportedFormat);
+
     let xls = directory.path("legacy.xls");
     fs::write(&xls, b"not an xls file").expect("write legacy file");
-    let error =
-        list_sheets(&ListSheetsRequest { path: xls }).expect_err("legacy format must be rejected");
-    assert_eq!(error.code(), SpreadsheetErrorCode::UnsupportedFormat);
+    let error = list_sheets(&ListSheetsRequest { path: xls })
+        .expect_err("malformed legacy workbook must be rejected as invalid");
+    assert_eq!(error.code(), SpreadsheetErrorCode::InvalidWorkbook);
 
     let workbook = directory.path("errors.xlsx");
     write_workbook(&WriteWorkbookRequest {

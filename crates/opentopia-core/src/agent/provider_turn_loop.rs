@@ -19,7 +19,7 @@ impl AgentCore {
         thread_id: Uuid,
         user_message_id: Uuid,
         workspace_root: PathBuf,
-        context_summary: Option<String>,
+        mut context_summary: Option<String>,
         mut conversation: Vec<ModelConversationMessage>,
         permission_mode: PermissionMode,
         mut budget: Option<ContextBudget>,
@@ -549,6 +549,61 @@ impl AgentCore {
                             .cloned()
                             .map(serde_json::from_value::<UserInputRequest>)
                             .transpose()?;
+                        if result
+                            .metadata
+                            .get("reconciliationRequired")
+                            .and_then(Value::as_bool)
+                            == Some(true)
+                        {
+                            let reason = result.output.clone();
+                            return Ok(AgentTurnResult {
+                                events: std::mem::replace(events, TurnEvents::new(None)).into_vec(),
+                                outcome: AgentTurnOutcome::WaitingUserAction {
+                                    action: "reconcile_effect".to_string(),
+                                    reason,
+                                    url: None,
+                                    continuation: AgentContinuation {
+                                        thread_id,
+                                        turn_id: self.turn_id(user_message_id),
+                                        invocation_id: self.invocation_id,
+                                        user_message_id,
+                                        workspace_root: workspace_root.clone(),
+                                        context_summary,
+                                        conversation,
+                                        permission_mode,
+                                        execution_authority: Some(ExecutionAuthority::new(
+                                            workspace_root.clone(),
+                                            permission_mode,
+                                            turn_sandbox_config.clone(),
+                                            self.capability_projection.clone(),
+                                        )?),
+                                        context_budget: budget,
+                                        rollout_budget,
+                                        model_context,
+                                        collaboration_mode: self.collaboration_mode,
+                                        goal: self.goal.clone(),
+                                        state: AgentContinuationState::Provider {
+                                            model_user_message,
+                                            model_user_content,
+                                            tool_candidates,
+                                            provider_tool_calls,
+                                            provider_tool_results,
+                                            // The uncertain call remains pending. A human
+                                            // observation consumes it; automatic retry never does.
+                                            pending_tool_calls,
+                                            compacted_tool_history,
+                                            provider_response_items,
+                                            model_rounds,
+                                            rollout_reviews,
+                                            runtime_state: runtime_state.clone(),
+                                            branch_developer_instructions,
+                                            provider_compatibility_hash: compatibility_hash,
+                                        },
+                                    },
+                                },
+                                provider_cursor: None,
+                            });
+                        }
                         if let Some(ref mut budget) = budget {
                             budget.record_tokens(ContextBudget::estimate_tokens(&result.output));
                         }
@@ -923,7 +978,7 @@ impl AgentCore {
                 .complete_provider_round(
                     thread_id,
                     user_message_id,
-                    context_summary.as_deref(),
+                    &mut context_summary,
                     &mut conversation,
                     &mut budget,
                     &mut rollout_budget,
@@ -942,7 +997,7 @@ impl AgentCore {
                     &mut compacted_tool_history,
                     &mut provider_response_items,
                     branch_developer_instructions.as_deref(),
-                    &compatibility_hash,
+                    &mut compatibility_hash,
                     &mut completion_guard_delivery,
                     events,
                 )

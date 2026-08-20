@@ -75,9 +75,16 @@ fn completed_assistant_message_replaces_historical_stream_in_conversation_view()
         .create_thread(None, PathBuf::from("C:/workspace/conversation-snapshot"))
         .expect("create thread");
     let turn_id = Uuid::new_v4();
+    let request_id = Uuid::new_v4();
     let message = Message::text(thread.id, MessageRole::Assistant, "complete answer");
     store
         .append_events(vec![
+            AgentEvent::new(
+                thread.id,
+                Some(turn_id),
+                0,
+                AgentEventPayload::ProviderFirstTokenReceived { request_id },
+            ),
             AgentEvent::new(
                 thread.id,
                 Some(turn_id),
@@ -98,13 +105,19 @@ fn completed_assistant_message_replaces_historical_stream_in_conversation_view()
     let diagnostic_events = store
         .list_events(thread.id, None)
         .expect("list full events");
-    assert_eq!(diagnostic_events.len(), 2);
+    assert_eq!(diagnostic_events.len(), 3);
     let conversation_events = store
         .list_conversation_events(thread.id, None)
         .expect("list conversation projection");
-    assert_eq!(conversation_events.len(), 1);
+    assert_eq!(conversation_events.len(), 2);
     assert!(matches!(
         conversation_events[0].payload,
+        AgentEventPayload::ProviderFirstTokenReceived {
+            request_id: projected_request_id
+        } if projected_request_id == request_id
+    ));
+    assert!(matches!(
+        conversation_events[1].payload,
         AgentEventPayload::AssistantMessage { .. }
     ));
 }
@@ -477,6 +490,34 @@ fn effect_journal_deduplicates_intent_and_recovers_running_effects() {
     assert_eq!(uncertain.status, EffectStatus::Indeterminate);
     assert!(uncertain.requires_reconciliation());
     assert_eq!(store.list_turn_effects(turn.turn_id).unwrap().len(), 1);
+}
+
+#[test]
+fn effect_journal_accepts_a_workflow_execution_scope_without_a_synthetic_turn() {
+    let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+    let thread = store
+        .create_thread(None, PathBuf::from("C:/workspace/workflow-effect"))
+        .expect("create thread");
+    let flow_run_scope = Uuid::new_v4();
+    let intent = EffectIntent {
+        thread_id: thread.id,
+        turn_id: flow_run_scope,
+        agent_path: "/root/workflow-agent".to_string(),
+        idempotency_key: format!("{flow_run_scope}/send/call-1"),
+        kind: EffectKind::ToolCall,
+        operation: "send_message".to_string(),
+        input_hash: "workflow-input-v1".to_string(),
+        input: serde_json::json!({ "message": "hello" }),
+        side_effect_class: EffectSideEffectClass::External,
+        idempotent: false,
+    };
+
+    let receipt = store
+        .prepare_effect(&intent)
+        .expect("prepare Workflow activity receipt");
+    assert_eq!(receipt.turn_id, flow_run_scope);
+    assert!(store.get_turn(flow_run_scope).unwrap().is_none());
+    assert_eq!(store.list_turn_effects(flow_run_scope).unwrap().len(), 1);
 }
 
 #[test]

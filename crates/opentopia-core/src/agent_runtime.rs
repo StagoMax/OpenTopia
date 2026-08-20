@@ -234,6 +234,9 @@ mod tests {
                 AgentEventPayload::ModelContextBuilt { .. } => "model_context_built",
                 AgentEventPayload::ModelRequest { .. } => "model_request",
                 AgentEventPayload::ProviderRequestSent { .. } => "provider_request_sent",
+                AgentEventPayload::ProviderFirstTokenReceived { .. } => {
+                    "provider_first_token_received"
+                }
                 AgentEventPayload::ModelDelta { .. } => "model_delta",
                 AgentEventPayload::ProviderResponseReceived { .. } => "provider_response_received",
                 AgentEventPayload::AssistantMessage { .. } => "assistant_message",
@@ -248,6 +251,7 @@ mod tests {
                 "model_context_built",
                 "model_request",
                 "provider_request_sent",
+                "provider_first_token_received",
                 "model_delta",
                 "provider_response_received",
                 "assistant_message",

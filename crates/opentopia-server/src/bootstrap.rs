@@ -16,12 +16,12 @@ use opentopia_core::collaboration::{
 use opentopia_core::mcp_host::McpExtensionHost;
 use opentopia_core::{
     bundled_plugins_path, compact_database_copy, ensure_bundled_plugins_installed,
-    initialize_shell_runtime, start_managed_powershell_install, AppSettings,
-    BackgroundProcessRegistry, BrowserRuntime, BrowserRuntimeConfig, BrowserRuntimeRouter,
-    BufferedTurnInbox, ChromeExtensionBrowserRuntime, ChromeExtensionBrowserRuntimeConfig,
-    CodexAccountManager, ComputerRuntime, ComputerRuntimeConfig, DesktopBrowserRuntime,
-    LocalBrowserRuntime, LocalComputerRuntime, LocalExecutionEnvironment, SessionStore,
-    SqliteSessionStore, TurnInbox,
+    initialize_office_runtime, initialize_shell_runtime, start_managed_office_runtime_install,
+    start_managed_powershell_install, AppSettings, BackgroundProcessRegistry, BrowserRuntime,
+    BrowserRuntimeConfig, BrowserRuntimeRouter, BufferedTurnInbox, ChromeExtensionBrowserRuntime,
+    ChromeExtensionBrowserRuntimeConfig, CodexAccountManager, ComputerRuntime,
+    ComputerRuntimeConfig, DesktopBrowserRuntime, LocalBrowserRuntime, LocalComputerRuntime,
+    LocalExecutionEnvironment, SessionStore, SqliteSessionStore, TurnInbox,
 };
 use serde_json::json;
 use std::net::SocketAddr;
@@ -104,9 +104,23 @@ pub(super) async fn run(args: Args) -> anyhow::Result<()> {
         path = %shell.runtime.program.display(),
         "resolved shell runtime"
     );
+    let office_initialization = tokio::task::spawn_blocking(initialize_office_runtime);
 
     let state = assemble_application(&args).await?;
+    let office = office_initialization
+        .await
+        .map_err(|error| anyhow::anyhow!("Office runtime initialization task failed: {error}"))?;
+    info!(
+        managed_status = ?office.managed_status,
+        python_version = office
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.python_version.as_str())
+            .unwrap_or("pending"),
+        "resolved Office Python runtime"
+    );
     let _managed_powershell_install = start_managed_powershell_install();
+    let _managed_office_runtime_install = start_managed_office_runtime_install();
     start_recovery_workers(&state).await?;
 
     let app = routes::build_router(state);

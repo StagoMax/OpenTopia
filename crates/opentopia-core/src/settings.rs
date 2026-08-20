@@ -491,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn context_window_table_uses_verified_exact_model_ids() {
+    fn context_window_table_uses_verified_models_and_previous_generations() {
         assert_eq!(
             known_model_context_window_tokens("gpt-5.6-sol"),
             Some(1_050_000)
@@ -594,6 +594,15 @@ mod tests {
             Some(204_800)
         );
         assert_eq!(known_model_context_window_tokens("glm-4.6"), Some(204_800));
+        assert_eq!(
+            known_model_context_window_tokens("deepseek-v5-flash"),
+            Some(1_048_576)
+        );
+        assert_eq!(
+            known_model_context_window_tokens("gemini-3.8-flash"),
+            Some(1_048_576)
+        );
+        assert_eq!(known_model_context_window_tokens("deepseek-v5-image"), None);
         assert_eq!(
             known_model_context_window_tokens("qwen3-14b-unpublished"),
             None
@@ -894,6 +903,7 @@ mod tests {
             chat_parallel_tool_calls: ProviderFeatureSupport::Unsupported,
             chat_json_schema_output: ProviderFeatureSupport::Unsupported,
             chat_message_protocol: ProviderMessageProtocolCapabilities::default(),
+            chat_reasoning_protocol: Some(ProviderReasoningProtocol::ChatReasoningEffort),
             responses: ProviderFeatureSupport::Unsupported,
             responses_native_tools: ProviderFeatureSupport::Unsupported,
             responses_function_tools: ProviderFeatureSupport::Unknown,
@@ -903,6 +913,7 @@ mod tests {
             responses_json_schema_output: ProviderFeatureSupport::Unknown,
             responses_custom_tools: ProviderFeatureSupport::Unknown,
             responses_apply_patch: ProviderFeatureSupport::Unknown,
+            responses_reasoning_protocol: Some(ProviderReasoningProtocol::ResponsesReasoning),
             developer_messages: ProviderFeatureSupport::Unsupported,
             message_compatibility: true,
             checked_at: Utc::now(),
@@ -919,6 +930,7 @@ mod tests {
             chat_parallel_tool_calls: ProviderFeatureSupport::Unsupported,
             chat_json_schema_output: ProviderFeatureSupport::Unsupported,
             chat_message_protocol: ProviderMessageProtocolCapabilities::default(),
+            chat_reasoning_protocol: Some(ProviderReasoningProtocol::ChatReasoningEffort),
             responses: ProviderFeatureSupport::Supported,
             responses_native_tools: ProviderFeatureSupport::Supported,
             responses_function_tools: ProviderFeatureSupport::Supported,
@@ -928,6 +940,7 @@ mod tests {
             responses_json_schema_output: ProviderFeatureSupport::Supported,
             responses_custom_tools: ProviderFeatureSupport::Supported,
             responses_apply_patch: ProviderFeatureSupport::Supported,
+            responses_reasoning_protocol: Some(ProviderReasoningProtocol::ResponsesReasoning),
             developer_messages: ProviderFeatureSupport::Unsupported,
             message_compatibility: false,
             checked_at: Utc::now(),
@@ -1093,7 +1106,7 @@ mod tests {
             model: model.to_string(),
             adapter: ProviderAdapterKind::OpenAiChat,
             instruction_encoding: ProviderInstructionEncoding::PortableChatEnvelope,
-            reasoning_protocol: ProviderReasoningProtocol::ReasoningEffort,
+            reasoning_protocol: ProviderReasoningProtocol::ChatReasoningEffort,
             message_protocol: ProviderMessageProtocolCapabilities::default(),
             output_protocol: ProviderOutputProtocolCapabilities::default(),
             tool_protocol: ProviderToolProtocolCapabilities::default(),
@@ -1131,6 +1144,7 @@ mod tests {
             chat_parallel_tool_calls: ProviderFeatureSupport::Unknown,
             chat_json_schema_output: ProviderFeatureSupport::Unknown,
             chat_message_protocol: ProviderMessageProtocolCapabilities::default(),
+            chat_reasoning_protocol: None,
             responses: ProviderFeatureSupport::Unknown,
             responses_native_tools: ProviderFeatureSupport::Unknown,
             responses_function_tools: ProviderFeatureSupport::Unknown,
@@ -1140,12 +1154,29 @@ mod tests {
             responses_json_schema_output: ProviderFeatureSupport::Unknown,
             responses_custom_tools: ProviderFeatureSupport::Unknown,
             responses_apply_patch: ProviderFeatureSupport::Unknown,
+            responses_reasoning_protocol: None,
             developer_messages: ProviderFeatureSupport::Unknown,
             message_compatibility: true,
             checked_at: Utc::now(),
             notes: Vec::new(),
         });
         assert!(relay.active_adapter_profile().is_none());
+    }
+
+    #[test]
+    fn legacy_vendor_reasoning_names_deserialize_to_structural_protocols() {
+        assert_eq!(
+            serde_json::from_str::<ProviderReasoningProtocol>(r#""glm_thinking""#).unwrap(),
+            ProviderReasoningProtocol::ChatThinkingReasoningEffort
+        );
+        assert_eq!(
+            serde_json::from_str::<ProviderReasoningProtocol>(r#""deep_seek_thinking""#).unwrap(),
+            ProviderReasoningProtocol::ChatThinkingHighMaxNoToolChoice
+        );
+        assert_eq!(
+            serde_json::from_str::<ProviderReasoningProtocol>(r#""reasoning_effort""#).unwrap(),
+            ProviderReasoningProtocol::ChatReasoningEffort
+        );
     }
 
     #[test]
@@ -1326,6 +1357,7 @@ mod tests {
             chat_parallel_tool_calls: ProviderFeatureSupport::Unknown,
             chat_json_schema_output: ProviderFeatureSupport::Unknown,
             chat_message_protocol: ProviderMessageProtocolCapabilities::default(),
+            chat_reasoning_protocol: None,
             responses: ProviderFeatureSupport::Supported,
             responses_native_tools: ProviderFeatureSupport::Supported,
             responses_function_tools: ProviderFeatureSupport::Supported,
@@ -1335,6 +1367,7 @@ mod tests {
             responses_json_schema_output: ProviderFeatureSupport::Unknown,
             responses_custom_tools: ProviderFeatureSupport::Supported,
             responses_apply_patch: ProviderFeatureSupport::Unsupported,
+            responses_reasoning_protocol: Some(ProviderReasoningProtocol::ResponsesReasoning),
             developer_messages: ProviderFeatureSupport::Unknown,
             message_compatibility: false,
             checked_at: Utc::now(),

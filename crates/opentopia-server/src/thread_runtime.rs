@@ -1,20 +1,23 @@
 use super::{current_settings, load_bound_agent_context, plugins_api, AppState};
+use crate::connection_operation_runtime::StoreConnectionOperationInvocationGate;
 use anyhow::Context;
 use opentopia_core::collaboration::{
     AgentCollaborationInvocation, AgentInvocationIdentity, AgentSpawnPolicy, AgentThreadRecord,
     AgentTurnId, AgentTurnRecord as CollaborationTurnRecord, AgentTurnStatus,
     CollaborationRegistry, CollaborationSessionPolicy, CreateCollaborationSession,
-    RuntimeSnapshotSeed,
+    RuntimeConnectionAuthorityV1, RuntimeSnapshotSeed,
 };
 use opentopia_core::mcp_host::McpExtensionHost;
 use opentopia_core::{
-    discover_plugins, AgentCore, AgentProfileRegistry, ContributionKind, ExperienceMode,
-    ExperienceSurfaceProfile, LoadedSkill, Message, MessagePart, ProviderSettings, SessionStore,
+    discover_plugins, AgentCore, AgentProfileRegistry, ConnectionOperationInvocationGate,
+    ContributionKind, ExecutionConnectionOperationV1, ExperienceMode, ExperienceSurfaceProfile,
+    LoadedSkill, Message, MessagePart, ProviderSettings, SessionStore, SpreadsheetFileFormat,
     SqliteSessionStore, TurnInboxItem, GIT_NONINTERACTIVE_ENVIRONMENT,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path as FsPath;
+use std::sync::Arc;
 use tokio::process::Command;
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -97,6 +100,70 @@ pub(super) async fn sync_thread_mcp_tools(
     agent.sync_mcp_tools_for_servers(&ready_server_ids).await;
 }
 
+/// Synchronizes the structured Connection surface frozen into a bound Agent.
+///
+/// This is intentionally independent from `thread_mcp_servers` and plugin
+/// activation. Those are legacy/user-thread catalog switches; applying them a
+/// second time would make an approved Agent operation disappear or, worse,
+/// broaden a server-level grant back to every provider tool on that server.
+pub(super) async fn sync_connection_operation_tools(
+    store: &Arc<SqliteSessionStore>,
+    host: &McpExtensionHost,
+    operations: &[ExecutionConnectionOperationV1],
+    agent: &mut AgentCore,
+) -> anyhow::Result<Vec<String>> {
+    let gate = Arc::new(StoreConnectionOperationInvocationGate::new(store.clone()));
+    for operation in operations {
+        // A revoked or stale Connection must fail before catalog discovery can
+        // start its runtime or send tools/list. The wrapper repeats this gate
+        // immediately before tools/call to close the long-Turn TOCTOU window.
+        gate.authorize(operation).await?;
+    }
+
+    let server_ids = operations
+        .iter()
+        .map(|operation| operation.mcp_server_id)
+        .collect::<BTreeSet<_>>();
+    for server_id in server_ids {
+        let server = store
+            .get_mcp_server(server_id)?
+            .with_context(|| format!("Connection MCP runtime {server_id} no longer exists"))?;
+        anyhow::ensure!(
+            server.enabled,
+            "Connection MCP runtime {server_id} is disabled"
+        );
+        host.ensure_server(server)
+            .await
+            .with_context(|| format!("failed to start Connection MCP runtime {server_id}"))?;
+    }
+
+    agent.sync_connection_operations(operations, gate).await
+}
+
+/// Applies the complete frozen Connection authority without re-inferring its
+/// mode from mutable thread state. All new, resumed, and child runtimes should
+/// consume this one dispatcher.
+pub(super) async fn sync_runtime_connection_tools(
+    store: &Arc<SqliteSessionStore>,
+    host: &McpExtensionHost,
+    thread_id: Uuid,
+    authority: &RuntimeConnectionAuthorityV1,
+    agent: &mut AgentCore,
+) -> anyhow::Result<()> {
+    match authority {
+        RuntimeConnectionAuthorityV1::DenyAll => {
+            sync_connection_operation_tools(store, host, &[], agent).await?;
+        }
+        RuntimeConnectionAuthorityV1::LegacyMcp => {
+            sync_thread_mcp_tools(store, host, thread_id, agent).await;
+        }
+        RuntimeConnectionAuthorityV1::Structured { operations } => {
+            sync_connection_operation_tools(store, host, operations, agent).await?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn sync_thread_bundled_plugin_activations(
     store: &SqliteSessionStore,
     thread_id: Uuid,
@@ -176,7 +243,6 @@ pub(super) fn computer_allowed_applications(settings: &Value) -> anyhow::Result<
 pub(super) fn attachment_preloaded_tools(messages: &[Message]) -> BTreeSet<&'static str> {
     const PDF: &str = "application/pdf";
     const DOCX: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-    const XLSX: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 
     let mut tools = BTreeSet::new();
     for source in messages.iter().rev().flat_map(|message| {
@@ -206,8 +272,11 @@ pub(super) fn attachment_preloaded_tools(messages: &[Message]) -> BTreeSet<&'sta
             (DOCX, _) | (_, "docx") => {
                 tools.insert("document");
             }
-            (XLSX, _) | (_, "xlsx") => {
-                tools.insert("spreadsheet");
+            (content_type, extension)
+                if SpreadsheetFileFormat::from_content_type(content_type).is_some()
+                    || SpreadsheetFileFormat::from_extension(extension).is_some() =>
+            {
+                tools.insert("spreadsheet_inspect");
             }
             _ => {}
         }
@@ -331,18 +400,25 @@ pub(super) fn load_agent_profiles_for_thread(
     ))
 }
 
-pub(super) async fn bind_root_collaboration(
+pub(super) async fn bind_root_collaboration_with_connection_authority(
     state: &AppState,
     thread: &opentopia_core::Thread,
     turn_id: Uuid,
     invocation_id: u64,
     task_message: &str,
     selected_provider: &ProviderSettings,
+    connection_authority: RuntimeConnectionAuthorityV1,
     agent: &mut AgentCore,
 ) -> anyhow::Result<(AgentThreadRecord, CollaborationTurnRecord)> {
     let collaboration_turn_id = AgentTurnId::from_uuid(turn_id);
-    let (runtime_snapshot, spawn_policy) =
-        freeze_root_runtime_snapshot(state, thread, selected_provider, agent).await?;
+    let (runtime_snapshot, spawn_policy) = freeze_root_runtime_snapshot_with_connection_authority(
+        state,
+        thread,
+        selected_provider,
+        agent,
+        connection_authority,
+    )
+    .await?;
     let (root, collaboration_turn) = match state
         .collaboration_repository
         .find_session_by_user_task_id(thread.id)?
@@ -400,11 +476,12 @@ pub(super) async fn bind_root_collaboration(
     Ok((root, collaboration_turn))
 }
 
-pub(super) async fn freeze_root_runtime_snapshot(
+pub(super) async fn freeze_root_runtime_snapshot_with_connection_authority(
     state: &AppState,
     thread: &opentopia_core::Thread,
     selected_provider: &ProviderSettings,
     agent: &AgentCore,
+    connection_authority: RuntimeConnectionAuthorityV1,
 ) -> anyhow::Result<(RuntimeSnapshotSeed, AgentSpawnPolicy)> {
     let profiles = load_agent_profiles_for_thread(&state.store, thread)?;
     let agent_profiles = profiles.list();
@@ -451,6 +528,7 @@ pub(super) async fn freeze_root_runtime_snapshot(
             "sandbox": settings.sandbox,
             "agentRuntime": settings.agent_runtime,
             "capabilityProjection": agent.capability_projection(),
+            "connectionAuthority": connection_authority,
             "tools": tool_names,
             "toolCatalog": tool_catalog,
             "pluginContributions": plugin_contributions,

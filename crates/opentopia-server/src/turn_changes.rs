@@ -208,6 +208,48 @@ impl TurnChangeManager {
         Ok(change_set)
     }
 
+    /// Continues the journal for the same logical Turn after an approval,
+    /// user-input, or external-action pause. Older builds finalized at those
+    /// pause boundaries, so ready/empty records are reopened without losing
+    /// their first observed file state.
+    pub async fn resume_capture(
+        &self,
+        turn_id: Uuid,
+        thread_id: Uuid,
+        workspace_root: &Path,
+    ) -> anyhow::Result<TurnChangeSet> {
+        let Some(mut change_set) = self.store.get_turn_change_set(turn_id)? else {
+            return self.begin_capture(turn_id, thread_id, workspace_root).await;
+        };
+        anyhow::ensure!(
+            change_set.thread_id == thread_id,
+            "turn change capture belongs to a different thread"
+        );
+        anyhow::ensure!(
+            normalize_workspace_key(&change_set.workspace_root)
+                == normalize_workspace_key(workspace_root),
+            "turn change capture belongs to a different workspace"
+        );
+        if change_set.status == TurnChangeSetStatus::Capturing
+            || change_set.status == TurnChangeSetStatus::Failed
+        {
+            return Ok(change_set);
+        }
+        anyhow::ensure!(
+            change_set.reverted_at.is_none(),
+            "cannot resume a reverted turn change capture"
+        );
+        change_set.status = TurnChangeSetStatus::Capturing;
+        change_set.before_tree = None;
+        change_set.after_tree = None;
+        change_set.additions = 0;
+        change_set.deletions = 0;
+        change_set.error = None;
+        change_set.finalized_at = None;
+        self.store.upsert_turn_change_set(&change_set)?;
+        Ok(change_set)
+    }
+
     #[cfg(test)]
     pub async fn finalize_capture(&self, turn_id: Uuid) -> anyhow::Result<TurnChangeSet> {
         self.finalize_capture_scoped(turn_id, None).await
@@ -1887,6 +1929,102 @@ mod tests {
             vec![PreparedFileMutation::delete(target, original)],
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn resumed_capture_keeps_one_journal_across_pause_boundary() {
+        let repo = TestRepo::new();
+        repo.write("first.txt", "before first\n");
+        repo.write("second.txt", "before second\n");
+        repo.commit_all();
+        let (manager, store, thread_id) = manager(&repo);
+        let turn_id = insert_turn(&store, thread_id);
+
+        manager
+            .begin_capture(turn_id, thread_id, &repo.root)
+            .await
+            .unwrap();
+        journal_write(
+            &manager,
+            &repo,
+            thread_id,
+            turn_id,
+            "first.txt",
+            "after first\n",
+        )
+        .await;
+        let resumed = manager
+            .resume_capture(turn_id, thread_id, &repo.root)
+            .await
+            .unwrap();
+        assert_eq!(resumed.status, TurnChangeSetStatus::Capturing);
+        assert_eq!(resumed.files.len(), 1);
+        journal_write(
+            &manager,
+            &repo,
+            thread_id,
+            turn_id,
+            "second.txt",
+            "after second\n",
+        )
+        .await;
+
+        let changes = manager.finalize_capture(turn_id).await.unwrap();
+        assert_eq!(changes.status, TurnChangeSetStatus::Ready);
+        assert_eq!(changes.files.len(), 2);
+        let undo = manager.undo(changes).await.unwrap();
+        assert!(undo.applied, "conflicts: {:?}", undo.preview.conflicts);
+        assert_eq!(repo.read("first.txt"), "before first\n");
+        assert_eq!(repo.read("second.txt"), "before second\n");
+    }
+
+    #[tokio::test]
+    async fn resume_reopens_legacy_pause_snapshot_without_losing_changes() {
+        let repo = TestRepo::new();
+        repo.write("first.txt", "before first\n");
+        repo.write("second.txt", "before second\n");
+        repo.commit_all();
+        let (manager, store, thread_id) = manager(&repo);
+        let turn_id = insert_turn(&store, thread_id);
+
+        manager
+            .begin_capture(turn_id, thread_id, &repo.root)
+            .await
+            .unwrap();
+        journal_write(
+            &manager,
+            &repo,
+            thread_id,
+            turn_id,
+            "first.txt",
+            "after first\n",
+        )
+        .await;
+        assert_eq!(
+            manager.finalize_capture(turn_id).await.unwrap().status,
+            TurnChangeSetStatus::Ready
+        );
+        let resumed = manager
+            .resume_capture(turn_id, thread_id, &repo.root)
+            .await
+            .unwrap();
+        assert_eq!(resumed.status, TurnChangeSetStatus::Capturing);
+        journal_write(
+            &manager,
+            &repo,
+            thread_id,
+            turn_id,
+            "second.txt",
+            "after second\n",
+        )
+        .await;
+
+        let changes = manager.finalize_capture(turn_id).await.unwrap();
+        assert_eq!(changes.files.len(), 2);
+        let undo = manager.undo(changes).await.unwrap();
+        assert!(undo.applied, "conflicts: {:?}", undo.preview.conflicts);
+        assert_eq!(repo.read("first.txt"), "before first\n");
+        assert_eq!(repo.read("second.txt"), "before second\n");
     }
 
     #[tokio::test]

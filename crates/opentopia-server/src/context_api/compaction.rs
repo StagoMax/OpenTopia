@@ -4,15 +4,22 @@ use super::{
     render_context_checkpoint, sanitize_checkpoint_draft, trim_checkpoint_to_budget,
     validate_checkpoint_draft, ContextCheckpointDraft, ContextStatusResponse, ContextUsageMetrics,
 };
-use super::{estimate_tokens, historical_tool_artifact_reference, recent_conversation_tail};
+use super::{
+    estimate_tokens, historical_tool_artifact_reference, project_model_conversation,
+    recent_conversation_tail,
+};
 use crate::{
-    assemble_one_shot_model_request, configured_provider_from_settings, current_settings,
-    publish_payload, redact_model_observation, AgentEvent, AgentEventPayload, ApiError, AppState,
-    ContextCheckpointCoverage, ContextCheckpointMode, ContextCompactionDetails,
-    ContextCompactionMetrics, ContextProjection, ContextSummary, Message, MessagePart,
-    ModelCallPurpose, ModelGateway, ModelStreamDelta, ProviderConversationState,
-    ProviderModelGateway, ProviderSettings, ProviderTransportEvent, ProviderTransportKind,
-    SessionStore, CONTEXT_CHECKPOINT_SCHEMA_VERSION,
+    configured_provider_from_settings, current_settings, publish_payload, redact_model_observation,
+    AgentEvent, AgentEventPayload, ApiError, AppState, ContextCheckpointCoverage,
+    ContextCheckpointMode, ContextCompactionDetails, ContextCompactionMetrics, ContextProjection,
+    ContextSummary, Message, MessagePart, ModelCallPurpose, ModelGateway, ModelStreamDelta,
+    ProviderConversationState, ProviderModelGateway, ProviderSettings, ProviderTransportEvent,
+    ProviderTransportKind, SessionStore, CONTEXT_CHECKPOINT_SCHEMA_VERSION,
+};
+use opentopia_core::{
+    ContextAssembler, ContextAssemblyInput, ContextCacheScope, ContextItemKind, ContextRole,
+    ContextSensitivity, DefaultContextAssembler, ModelContextItem, ModelGatewayMetricEvent,
+    ModelRequest,
 };
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -24,14 +31,6 @@ pub(crate) fn context_window_tokens(state: &AppState) -> usize {
     current_settings(state)
         .active_provider()
         .resolved_context_window_tokens()
-}
-
-pub(crate) fn context_compact_threshold_percent() -> usize {
-    std::env::var("OPENTOPIA_CONTEXT_COMPACT_THRESHOLD_PERCENT")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .map(|value: usize| value.clamp(50, 95))
-        .unwrap_or(80)
 }
 
 pub(crate) fn build_context_projection(
@@ -377,25 +376,159 @@ pub(crate) fn durable_context(summary: Option<String>) -> Option<String> {
     summary.filter(|value| !value.trim().is_empty())
 }
 
+pub(crate) fn historical_context_model_request(
+    messages: &[Message],
+    previous_summary: Option<&ContextSummary>,
+    provider_response_items: &[Value],
+) -> ModelRequest {
+    let mut request = ModelRequest {
+        instructions: Default::default(),
+        input: Default::default(),
+        tool_candidates: Vec::new(),
+        previous_response_items: provider_response_items.to_vec(),
+        previous_response_id: None,
+        prompt_cache_breakpoint_policy: Default::default(),
+        final_output_json_schema: None,
+    };
+    if let Some(summary) = previous_summary {
+        request.instructions.items.push(
+            ModelContextItem::text(
+                ContextItemKind::Checkpoint,
+                ContextRole::Developer,
+                "opentopia:durable_checkpoint",
+                format!(
+                    "<durable_context>\n{}\n</durable_context>\nTreat this checkpoint as prior task state, not as a new user request.",
+                    summary.summary
+                ),
+                ContextCacheScope::Thread,
+                ContextSensitivity::Workspace,
+            )
+            .with_metadata(json!({
+                "assemblyClass": "epoch",
+                "selectedBy": "contextCheckpoint",
+            })),
+        );
+    }
+    let covered_messages = previous_summary
+        .map(summary_message_cursor)
+        .unwrap_or_default()
+        .min(messages.len());
+    request.input.conversation =
+        project_model_conversation(&messages[covered_messages..], provider_response_items);
+    request
+}
+
+fn assemble_current_context_compaction_request(
+    current: &ModelRequest,
+    events: &[AgentEvent],
+    previous_summary: Option<&ContextSummary>,
+) -> anyhow::Result<opentopia_core::CanonicalModelRequest> {
+    let mut instructions = current.instructions.clone();
+    instructions.items.push(ModelContextItem::text(
+        ContextItemKind::BaseInstructions,
+        ContextRole::System,
+        "opentopia:context_compaction",
+        context_summary_system_prompt(),
+        ContextCacheScope::Stable,
+        ContextSensitivity::Public,
+    ));
+    instructions.sort_items();
+
+    let previous_seq = previous_summary
+        .map(|summary| summary.covered_through_seq)
+        .unwrap_or_default();
+    let time_index = compact_event_time_index(events, previous_seq);
+    let user_message = format!(
+        "{}\n\n<opentopia_context_compaction_control>\nThe complete current model context above is the only semantic source to compress. Produce one replacement checkpoint for it. The following sampled durable time index is metadata for phase ordering and timestamps, not a second history to catch up.\n{}\n</opentopia_context_compaction_control>",
+        current.input.current_user.message,
+        time_index,
+    );
+
+    DefaultContextAssembler.compile(ContextAssemblyInput {
+        model_context: &instructions,
+        context_summary: None,
+        conversation: current.input.conversation.clone(),
+        user_message,
+        user_content: current.input.current_user.content.clone(),
+        // Compaction is observational. Tool schemas contributed to the source
+        // request's pressure estimate, but the summarizer must not execute
+        // tools while creating the checkpoint.
+        tool_candidates: Vec::new(),
+        previous_tool_calls: current.input.tool_calls.clone(),
+        tool_results: current.input.tool_results.clone(),
+        previous_response_items: current.previous_response_items.clone(),
+        // Always fork into a fresh provider call. The resulting checkpoint
+        // starts another fresh provider epoch in Agent Core.
+        previous_response_id: None,
+        branch_developer_instructions: None,
+        prompt_cache_breakpoint_policy: current.prompt_cache_breakpoint_policy,
+        final_output_json_schema: Some(context_checkpoint_schema()),
+    })
+}
+
+fn compact_event_time_index(events: &[AgentEvent], after_seq: i64) -> String {
+    const MAX_INDEXED_EVENTS: usize = 256;
+    let mut indexed = events
+        .iter()
+        .filter(|event| event.seq > after_seq)
+        .filter(|event| {
+            !matches!(
+                event.payload,
+                AgentEventPayload::ModelContextBuilt { .. }
+                    | AgentEventPayload::ModelRequest { .. }
+                    | AgentEventPayload::ProviderRequestSent { .. }
+                    | AgentEventPayload::ProviderRequestRetried { .. }
+                    | AgentEventPayload::ProviderFirstTokenReceived { .. }
+                    | AgentEventPayload::ProviderResponseReceived { .. }
+                    | AgentEventPayload::ModelDelta { .. }
+                    | AgentEventPayload::ReasoningDelta { .. }
+                    | AgentEventPayload::TokenUsage { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    if indexed.len() > MAX_INDEXED_EVENTS {
+        let mut sampled = indexed.drain(..MAX_INDEXED_EVENTS / 2).collect::<Vec<_>>();
+        sampled.extend(indexed.into_iter().rev().take(MAX_INDEXED_EVENTS / 2).rev());
+        indexed = sampled;
+    }
+    if indexed.is_empty() {
+        return "No new durable event timestamps were available.".to_string();
+    }
+    indexed
+        .into_iter()
+        .map(|event| {
+            format!(
+                "seq={} at={} kind={}",
+                event.seq,
+                event.created_at.to_rfc3339(),
+                event.payload.kind(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub(crate) async fn generate_context_summary(
     state: &AppState,
     thread_id: Uuid,
+    turn_id: Option<Uuid>,
+    agent_path: &str,
     messages: &[Message],
     events: &[AgentEvent],
     source: &str,
     previous_summary_override: Option<&ContextSummary>,
+    provider_override: Option<&ProviderSettings>,
+    model_request: &ModelRequest,
 ) -> Result<ContextSummary, ApiError> {
     let settings = current_settings(state);
-    let mut active = settings.active_provider().clone();
+    let active = provider_override
+        .cloned()
+        .unwrap_or_else(|| settings.active_provider().clone());
     if active.effective_transport() == ProviderTransportKind::Mock {
         return Err(ApiError::bad_request(
             "real context summarization requires an OpenAI-compatible provider",
         ));
     }
-    // Compaction is an exceptional one-shot boundary; the resulting
-    // checkpoint starts a new agent cache lineage instead of caching this
-    // summarizer's changing input.
-    active.prompt_cache_policy = None;
     let provider = configured_provider_from_settings(&active).ok_or_else(|| {
         ApiError::bad_request(format!(
             "provider '{}' has no configured API key",
@@ -405,19 +538,14 @@ pub(crate) async fn generate_context_summary(
     let previous_summary = previous_summary_override
         .cloned()
         .or_else(|| latest_context_summary_event(events));
-    let snapshot = build_context_snapshot_with_limit(
-        messages,
+    let covered_message_count = messages.len();
+    let covered_through_seq = events.last().map(|event| event.seq).unwrap_or_default();
+    let compaction_started = Instant::now();
+    let snapshot_input_tokens = model_request.token_estimate_breakdown().total;
+    let request = assemble_current_context_compaction_request(
+        model_request,
         events,
         previous_summary.as_ref(),
-        context_snapshot_char_budget(active.resolved_context_window_tokens()),
-    );
-    let snapshot_input_tokens = estimate_tokens(&snapshot.prompt);
-    let compaction_started = Instant::now();
-    let request = assemble_one_shot_model_request(
-        "opentopia:context_compaction",
-        context_summary_system_prompt(),
-        snapshot.prompt,
-        Some(context_checkpoint_schema()),
     )
     .map_err(|error| ApiError::internal(format!("context request assembly failed: {error}")))?;
     let request_id = Uuid::new_v4();
@@ -425,7 +553,7 @@ pub(crate) async fn generate_context_summary(
     publish_payload(
         state,
         thread_id,
-        None,
+        turn_id,
         AgentEventPayload::ModelContextBuilt {
             request_id,
             round: 0,
@@ -444,7 +572,7 @@ pub(crate) async fn generate_context_summary(
     publish_payload(
         state,
         thread_id,
-        None,
+        turn_id,
         AgentEventPayload::ModelRequest {
             request_id,
             round: 0,
@@ -458,7 +586,7 @@ pub(crate) async fn generate_context_summary(
     publish_payload(
         state,
         thread_id,
-        None,
+        turn_id,
         AgentEventPayload::ProviderRequestSent {
             request_id,
             round: 0,
@@ -471,7 +599,23 @@ pub(crate) async fn generate_context_summary(
     );
     let mut transport_events = Vec::new();
     let mut streamed_usage = None;
-    let mut on_delta = |delta| {
+    let mut on_metric = |metric| {
+        match metric {
+            ModelGatewayMetricEvent::FirstOutputTokenReceived {
+                request_id: metric_request_id,
+            } => {
+                debug_assert_eq!(metric_request_id, request_id);
+                publish_payload(
+                    state,
+                    thread_id,
+                    turn_id,
+                    AgentEventPayload::ProviderFirstTokenReceived { request_id },
+                );
+            }
+        }
+        Ok(())
+    };
+    let mut on_delta = |delta: ModelStreamDelta| {
         if let ModelStreamDelta::Usage { usage } = delta {
             streamed_usage = Some(usage);
         }
@@ -481,9 +625,13 @@ pub(crate) async fn generate_context_summary(
         transport_events.push(event);
         Ok(())
     };
+    // Long-history structured checkpoints can legitimately require more than
+    // a normal round's latency, especially on reasoning-capable models. Keep
+    // the call bounded, but do not abort a healthy 60k+ token compression at
+    // the former 90-second boundary.
     let response_result = timeout(
-        Duration::from_secs(90),
-        gateway.stream_prepared(prepared, &mut on_delta, &mut on_transport),
+        Duration::from_secs(180),
+        gateway.stream_prepared(prepared, &mut on_delta, &mut on_transport, &mut on_metric),
     )
     .await;
     drop(on_delta);
@@ -500,7 +648,7 @@ pub(crate) async fn generate_context_summary(
             } => publish_payload(
                 state,
                 thread_id,
-                None,
+                turn_id,
                 AgentEventPayload::ProviderRequestRetried {
                     request_id,
                     round: 0,
@@ -520,7 +668,7 @@ pub(crate) async fn generate_context_summary(
             } => publish_payload(
                 state,
                 thread_id,
-                None,
+                turn_id,
                 AgentEventPayload::ProviderResponseReceived {
                     request_id,
                     round: 0,
@@ -535,12 +683,12 @@ pub(crate) async fn generate_context_summary(
     let response = response_result
         .map_err(|_| ApiError::gateway_timeout("context summarization timed out"))?
         .map_err(|err| ApiError::bad_gateway(format!("context summarization failed: {err}")))?;
-    let usage = response.usage.as_ref().or(streamed_usage.as_ref());
-    if let Some(usage) = usage {
+    let usage = response.usage.as_ref().or(streamed_usage.as_ref()).cloned();
+    if let Some(usage) = usage.as_ref() {
         publish_payload(
             state,
             thread_id,
-            None,
+            turn_id,
             AgentEventPayload::TokenUsage {
                 request_id: Some(request_id),
                 round: Some(0),
@@ -566,29 +714,38 @@ pub(crate) async fn generate_context_summary(
     let checkpoint_value = redact_model_observation(&checkpoint_value);
     let mut draft: ContextCheckpointDraft = serde_json::from_value(checkpoint_value)
         .map_err(|error| ApiError::bad_gateway(format!("invalid checkpoint payload: {error}")))?;
-    sanitize_checkpoint_draft(&mut draft, snapshot.covered_through_seq)?;
+    sanitize_checkpoint_draft(&mut draft, covered_through_seq, events)?;
     validate_checkpoint_draft(&draft, events)?;
     let provider_compatibility_hash = state
         .store
-        .get_provider_conversation_state(thread_id, "/root")
+        .get_provider_conversation_state(thread_id, agent_path)
         .ok()
         .flatten()
         .filter(|provider_state| {
             provider_state.provider_id == active.id && provider_state.model == active.model
         })
         .map(|provider_state| provider_state.compatibility_hash);
+    let previous_checkpoint = previous_summary
+        .as_ref()
+        .and_then(|summary| summary.checkpoint.as_ref());
+    // The exact current request already contains the previous checkpoint and
+    // every later history item. The model therefore returns one complete
+    // replacement checkpoint; merging the old object again here would create
+    // a second, hidden old-history path and could resurrect superseded state.
     let mut checkpoint = merge_context_checkpoint(
-        previous_summary
-            .as_ref()
-            .and_then(|summary| summary.checkpoint.as_ref()),
+        None,
         draft,
         thread_id,
         ContextCheckpointCoverage {
-            through_seq: snapshot.covered_through_seq,
-            through_message_count: snapshot.covered_message_count,
+            through_seq: covered_through_seq,
+            through_message_count: covered_message_count,
         },
-        provider_compatibility_hash,
+        provider_compatibility_hash.or_else(|| {
+            previous_checkpoint
+                .and_then(|checkpoint| checkpoint.provider_compatibility_hash.clone())
+        }),
     );
+    checkpoint.previous_checkpoint_id = previous_checkpoint.map(|checkpoint| checkpoint.id);
     let checkpoint_budget = checkpoint_token_budget(active.resolved_context_window_tokens());
     trim_checkpoint_to_budget(&mut checkpoint, checkpoint_budget);
     let checkpoint_tokens =
@@ -600,30 +757,46 @@ pub(crate) async fn generate_context_summary(
             "checkpoint exceeds its token budget ({checkpoint_tokens} > {checkpoint_budget})"
         )));
     }
-    let (fact_retention_percent, active_constraint_retention_percent) =
-        checkpoint_retention_percentages(
-            previous_summary
-                .as_ref()
-                .and_then(|summary| summary.checkpoint.as_ref()),
-            &checkpoint,
-        );
     let rendered_summary = render_context_checkpoint(&checkpoint);
+    // This is the representation that the next logical request actually
+    // materializes. Keep the raw checkpoint JSON size as a budget metric, but
+    // use the rendered checkpoint for before/after request reduction.
+    let rendered_checkpoint_tokens = estimate_tokens(&rendered_summary);
+    let (fact_retention_percent, active_constraint_retention_percent) =
+        checkpoint_retention_percentages(previous_checkpoint, &checkpoint);
     let latency_ms = compaction_started
         .elapsed()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64;
     let token_reduction_percent = snapshot_input_tokens
-        .saturating_sub(checkpoint_tokens)
+        .saturating_sub(rendered_checkpoint_tokens)
         .saturating_mul(100)
         / snapshot_input_tokens.max(1);
+    let post_compaction_tokens = rendered_checkpoint_tokens;
+    let tokens_removed = snapshot_input_tokens.saturating_sub(post_compaction_tokens);
+    let remaining_percent =
+        post_compaction_tokens.saturating_mul(100) / snapshot_input_tokens.max(1);
+    let provider_input_tokens = usage
+        .as_ref()
+        .map(|usage| usage.input_tokens as usize)
+        .unwrap_or_default();
+    let provider_output_tokens = usage
+        .as_ref()
+        .map(|usage| usage.output_tokens as usize)
+        .unwrap_or_default();
+    let cached_input_tokens = usage
+        .as_ref()
+        .and_then(|usage| usage.cached_input_tokens)
+        .unwrap_or_default() as usize;
+    let cache_hit_percent = cached_input_tokens.saturating_mul(100) / provider_input_tokens.max(1);
 
     let mut summary = ContextSummary::new(
         thread_id,
-        snapshot.covered_through_seq,
-        snapshot.covered_message_count,
+        covered_through_seq,
+        covered_message_count,
         rendered_summary,
     );
-    summary.token_estimate = Some(estimate_tokens(&summary.summary));
+    summary.token_estimate = Some(rendered_checkpoint_tokens);
     summary.metadata = json!({
         "mode": "structured_local",
         "schemaVersion": CONTEXT_CHECKPOINT_SCHEMA_VERSION,
@@ -631,15 +804,22 @@ pub(crate) async fn generate_context_summary(
         "checkpointTokens": checkpoint_tokens,
         "checkpointBudgetTokens": checkpoint_budget,
         "inputTokens": snapshot_input_tokens,
+        "postCompactionTokens": post_compaction_tokens,
+        "tokensRemoved": tokens_removed,
+        "remainingPercent": remaining_percent,
         "tokenReductionPercent": token_reduction_percent,
+        "providerInputTokens": provider_input_tokens,
+        "providerOutputTokens": provider_output_tokens,
+        "cachedInputTokens": cached_input_tokens,
+        "cacheHitPercent": cache_hit_percent,
         "latencyMs": latency_ms,
         "factRetentionPercent": fact_retention_percent,
         "activeConstraintRetentionPercent": active_constraint_retention_percent,
         "source": source,
         "providerId": active.id,
         "model": active.model,
-        "coveredThroughSeq": snapshot.covered_through_seq,
-        "coveredMessageCount": snapshot.covered_message_count,
+        "coveredThroughSeq": covered_through_seq,
+        "coveredMessageCount": covered_message_count,
         "previousSummaryId": previous_summary.as_ref().map(|summary| summary.id),
     });
     summary.checkpoint = Some(checkpoint);
@@ -666,9 +846,16 @@ pub(crate) fn context_compaction_details(
         .map(|source| ContextCompactionMetrics {
             source: source.to_string(),
             input_tokens: number("inputTokens"),
+            post_compaction_tokens: number("postCompactionTokens"),
             checkpoint_tokens: number("checkpointTokens")
                 .max(summary.token_estimate.unwrap_or_default()),
+            tokens_removed: number("tokensRemoved"),
+            remaining_percent: number("remainingPercent"),
             token_reduction_percent: number("tokenReductionPercent"),
+            provider_input_tokens: number("providerInputTokens"),
+            provider_output_tokens: number("providerOutputTokens"),
+            cached_input_tokens: number("cachedInputTokens"),
+            cache_hit_percent: number("cacheHitPercent"),
             latency_ms: summary
                 .metadata
                 .get("latencyMs")
@@ -696,120 +883,6 @@ pub(crate) fn context_compaction_details(
             .and_then(|provider_state| provider_state.checkpoint_id),
         metrics,
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ContextSnapshotInput {
-    pub(crate) prompt: String,
-    pub(crate) covered_message_count: usize,
-    pub(crate) covered_through_seq: i64,
-}
-
-#[cfg(test)]
-pub(crate) fn build_context_snapshot(
-    messages: &[Message],
-    events: &[AgentEvent],
-    previous_summary: Option<&ContextSummary>,
-) -> ContextSnapshotInput {
-    build_context_snapshot_with_limit(messages, events, previous_summary, 96_000)
-}
-
-fn build_context_snapshot_with_limit(
-    messages: &[Message],
-    events: &[AgentEvent],
-    previous_summary: Option<&ContextSummary>,
-    max_snapshot_chars: usize,
-) -> ContextSnapshotInput {
-    let max_snapshot_chars = max_snapshot_chars.max(2_048);
-    let mut sections = Vec::new();
-    let mut used = 0usize;
-    let message_cursor = previous_summary
-        .map(summary_message_cursor)
-        .unwrap_or_default()
-        .min(messages.len());
-    let event_cursor = previous_summary
-        .map(|summary| summary.covered_through_seq)
-        .unwrap_or_default();
-
-    if let Some(previous) = previous_summary {
-        let previous_state = previous
-            .checkpoint
-            .as_ref()
-            .and_then(|checkpoint| serde_json::to_string(checkpoint).ok())
-            .unwrap_or_else(|| previous.summary.clone());
-        let rendered = format!(
-            "PREVIOUS DURABLE CHECKPOINT (merge with new evidence; preserve unresolved facts and statuses)\n{}",
-            truncate_chars(&previous_state, max_snapshot_chars / 4)
-        );
-        used = rendered.chars().count();
-        sections.push(rendered);
-    }
-
-    let mut covered_message_count = message_cursor;
-    for message in messages.iter().skip(message_cursor) {
-        let rendered = truncate_chars(&render_message_for_summary(message), max_snapshot_chars / 2);
-        let chars = rendered.chars().count();
-        let remaining = max_snapshot_chars.saturating_sub(used);
-        if remaining == 0 || chars > remaining {
-            break;
-        }
-        used = used.saturating_add(chars);
-        sections.push(rendered);
-        covered_message_count += 1;
-    }
-
-    let mut event_lines = Vec::new();
-    let mut covered_through_seq = event_cursor;
-    for event in events
-        .iter()
-        .filter(|event| event.seq > event_cursor)
-        .take(160)
-    {
-        let rendered = match &event.payload {
-            AgentEventPayload::ThreadContextSnapshot { .. }
-            | AgentEventPayload::TurnContextSnapshot { .. }
-            | AgentEventPayload::ModelContextBuilt { .. }
-            | AgentEventPayload::ModelRequest { .. }
-            | AgentEventPayload::ProviderRequestSent { .. }
-            | AgentEventPayload::ProviderRequestRetried { .. }
-            | AgentEventPayload::ProviderResponseReceived { .. }
-            | AgentEventPayload::ModelDelta { .. }
-            | AgentEventPayload::ReasoningDelta { .. }
-            | AgentEventPayload::AssistantMessage { .. }
-            | AgentEventPayload::TurnStarted { .. }
-            | AgentEventPayload::ContextCompacted { .. }
-            | AgentEventPayload::ContextProjectionBuilt { .. }
-            | AgentEventPayload::ProviderContextStateUpdated { .. }
-            | AgentEventPayload::ContextWarning { .. } => {
-                covered_through_seq = event.seq;
-                continue;
-            }
-            payload => serde_json::to_string(payload)
-                .unwrap_or_else(|_| format!("{{\"type\":\"{}\"}}", payload.kind())),
-        };
-        let line = format!("seq={} {}", event.seq, truncate_chars(&rendered, 2_000));
-        let line_chars = line.chars().count();
-        if used.saturating_add(line_chars) > max_snapshot_chars {
-            break;
-        }
-        used = used.saturating_add(line_chars);
-        covered_through_seq = event.seq;
-        event_lines.push(line);
-    }
-
-    ContextSnapshotInput {
-        prompt: format!(
-            "Update the durable summary from this contiguous session snapshot. New messages and events are ordered oldest to newest.\n\nSUMMARY AND NEW MESSAGES\n{}\n\nNEW IMPORTANT EVENTS\n{}",
-            sections.join("\n\n"),
-            event_lines.join("\n")
-        ),
-        covered_message_count,
-        covered_through_seq,
-    }
-}
-
-fn context_snapshot_char_budget(context_window: usize) -> usize {
-    (context_window / 2).clamp(2_048, 384_000)
 }
 
 pub(crate) fn render_message_for_summary(message: &Message) -> String {
@@ -894,4 +967,53 @@ pub(crate) fn truncate_with_flag(value: &str, max_bytes: usize) -> (String, bool
     let mut truncated = value[..end].to_string();
     truncated.push_str("\n\n[output truncated]");
     (truncated, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{assemble_current_context_compaction_request, historical_context_model_request};
+    use crate::{
+        ContextCheckpoint, ContextCheckpointCoverage, ContextSummary, Message, MessageRole,
+    };
+    use uuid::Uuid;
+
+    #[test]
+    fn repeated_compaction_request_contains_checkpoint_and_all_later_history_once() {
+        let thread_id = Uuid::new_v4();
+        let messages = vec![
+            Message::text(thread_id, MessageRole::User, "old user"),
+            Message::text(thread_id, MessageRole::Assistant, "old assistant"),
+            Message::text(thread_id, MessageRole::User, "new user"),
+        ];
+        let mut previous = ContextSummary::new(thread_id, 10, 2, "checkpoint one");
+        previous.checkpoint = Some(ContextCheckpoint::manual(
+            thread_id,
+            ContextCheckpointCoverage {
+                through_seq: 10,
+                through_message_count: 2,
+            },
+            "checkpoint one",
+        ));
+
+        let current = historical_context_model_request(&messages, Some(&previous), &[]);
+        assert_eq!(current.input.conversation.len(), 1);
+        assert_eq!(current.input.conversation[0].content, "new user");
+        assert!(current
+            .instructions
+            .items
+            .iter()
+            .any(|item| item.text_content().contains("checkpoint one")));
+
+        let compaction =
+            assemble_current_context_compaction_request(&current, &[], Some(&previous))
+                .expect("compaction request");
+        assert!(compaction.logical().previous_response_id.is_none());
+        assert_eq!(compaction.logical().input.conversation.len(), 1);
+        assert!(compaction
+            .logical()
+            .instructions
+            .items
+            .iter()
+            .any(|item| item.source == "opentopia:context_compaction"));
+    }
 }

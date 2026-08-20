@@ -591,7 +591,7 @@ pub(super) fn validate_workbook(
 pub(super) fn export_delimited(
     request: &ExportDelimitedRequest,
 ) -> Result<ExportDelimitedResult, SpreadsheetError> {
-    super::validate_xlsx_path(&request.path)?;
+    super::validate_workbook_path(&request.path)?;
     let format = DelimitedFormat::resolve(&request.output, request.format)?;
     let workbook = load_workbook(&request.path)?;
     let sheet = workbook

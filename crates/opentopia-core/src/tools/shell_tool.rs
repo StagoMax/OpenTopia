@@ -37,7 +37,7 @@ pub(super) const DEFAULT_BACKGROUND_TIMEOUT_SECONDS: u64 = 3_600;
 /// Keep ordinary commands feeling synchronous, then yield the model instead of
 /// letting one slow process hold an entire parallel tool batch hostage.
 pub(super) const DEFAULT_FOREGROUND_YIELD_MILLISECONDS: u64 = 30_000;
-pub(super) const MAX_FOREGROUND_YIELD_MILLISECONDS: u64 = 60_000;
+pub(super) const MAX_FOREGROUND_YIELD_MILLISECONDS: u64 = 120_000;
 
 pub(super) fn background_scope(ctx: &ToolInvocationContext) -> anyhow::Result<BackgroundScope> {
     Ok(BackgroundScope {
@@ -321,7 +321,7 @@ pub(super) struct ShellInput {
     /// How long an ordinary command may stay in the foreground before it
     /// automatically continues as a background job.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 60000))]
+    #[schemars(range(min = 1, max = 120000))]
     yield_time_ms: Option<u64>,
     /// Keep stdin open as a persistent stdio session.
     #[serde(default)]
@@ -397,7 +397,7 @@ impl TypedTool for ShellTool {
         if analysis.is_unreviewable_destructive_action() {
             return Ok(unreviewable_shell_action_result(call_id, command));
         }
-        enforce_policy_decision(ctx.policy.inspect_command(command), ctx.approval_granted)?;
+        enforce_policy_decision(ctx.policy.inspect_command(command), &ctx)?;
 
         let interactive = input.interactive;
         let background = interactive || input.background;

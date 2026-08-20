@@ -6,6 +6,11 @@ pub struct ContextBudget {
     pub max_tokens: usize,
     pub used_tokens: usize,
     pub warnings: Vec<String>,
+    /// Output, reasoning, and provider-framing headroom reserved before every
+    /// provider round. It participates in pressure admission but is not part of
+    /// the logical input estimate reported as `used_tokens`.
+    #[serde(default)]
+    pub reserved_generation_tokens: usize,
 }
 
 impl ContextBudget {
@@ -14,17 +19,37 @@ impl ContextBudget {
             max_tokens,
             used_tokens: 0,
             warnings: Vec::new(),
+            reserved_generation_tokens: 0,
         }
+    }
+
+    pub fn set_round_pressure(&mut self, reserved_generation_tokens: usize) {
+        self.reserved_generation_tokens = reserved_generation_tokens;
+    }
+
+    pub fn pressure_tokens(&self) -> usize {
+        self.used_tokens
+            .saturating_add(self.reserved_generation_tokens)
+    }
+
+    pub fn pressure_percent(&self) -> usize {
+        self.pressure_tokens().saturating_mul(100) / self.max_tokens.max(1)
+    }
+
+    pub fn requires_compaction(&self, threshold_percent: usize) -> bool {
+        self.pressure_tokens().saturating_mul(100)
+            >= self.max_tokens.saturating_mul(threshold_percent)
     }
 
     pub fn record_tokens(&mut self, tokens: usize) {
         self.used_tokens += tokens;
-        let usage_pct = self.used_tokens as f64 / self.max_tokens as f64;
+        let pressure_tokens = self.pressure_tokens();
+        let usage_pct = pressure_tokens as f64 / self.max_tokens as f64;
         if usage_pct >= 0.90 && usage_pct < 0.95 {
             let msg = format!(
                 "Context budget at {:.1}% (used {} / max {} tokens)",
                 usage_pct * 100.0,
-                self.used_tokens,
+                pressure_tokens,
                 self.max_tokens
             );
             if !self.warnings.iter().any(|w| w.contains("90%")) {
@@ -34,7 +59,7 @@ impl ContextBudget {
             let msg = format!(
                 "Context budget critically high at {:.1}% (used {} / max {} tokens)",
                 usage_pct * 100.0,
-                self.used_tokens,
+                pressure_tokens,
                 self.max_tokens
             );
             if !self.warnings.iter().any(|w| w.contains("95%")) {

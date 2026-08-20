@@ -150,6 +150,17 @@ pub(super) struct StoredAttachmentFile {
 }
 
 impl StoredAttachmentFile {
+    pub(super) fn original_logical_path(&self, fallback_extension: &str) -> PathBuf {
+        let name = PathBuf::from(&self.name);
+        if name.extension().is_some() {
+            return name;
+        }
+        if self.path.extension().is_some() {
+            return self.path.clone();
+        }
+        PathBuf::from(format!("attachment-{}.{}", self.id, fallback_extension))
+    }
+
     pub(super) fn logical_path(&self, expected_extension: &str) -> PathBuf {
         let name = PathBuf::from(&self.name);
         if name.extension().is_some_and(|extension| {
@@ -752,17 +763,31 @@ async fn inspect_attachment_through_mcp(
     );
     let (descriptor, binding) = select_mcp_image_inspector(&ctx.mcp_tools)?;
     let permission = ToolPermissionDescriptor::from(&descriptor);
-    enforce_policy_decision(
-        ctx.policy.inspect_mcp_tool_call(&permission),
-        ctx.approval_granted,
-    )?;
+    enforce_policy_decision(ctx.policy.inspect_mcp_tool_call(&permission), ctx)?;
     let host = ctx
         .mcp_host
         .clone()
         .context("the configured MCP attachment-inspection host is unavailable")?;
     let arguments =
         mcp_image_inspection_arguments(&binding, focus, attachment.name(), content_type, data)?;
-    let result = host.call_tool(&descriptor.public_name, arguments).await?;
+    let result = if let Some(route) = ctx.connection_operations.get(&descriptor.public_name) {
+        // Indirect consumers cross the same live boundary as a direct model
+        // tool call. An approved view_attachment replay cannot bypass a
+        // disabled/changed Connection operation.
+        route.authorize().await?;
+        let operation = route.operation();
+        host.call_server_tool(
+            operation.mcp_server_id,
+            &operation.provider_tool_name,
+            &operation.pinned_operation_fingerprint,
+            arguments,
+        )
+        .await?
+    } else if !ctx.connection_operations.is_empty() {
+        anyhow::bail!("attachment inspector is outside the frozen Connection operation authority");
+    } else {
+        host.call_tool(&descriptor.public_name, arguments).await?
+    };
     let mut content = vec![ModelContentPart::text(ATTACHMENT_RESULT_BOUNDARY)];
     if !result.output.trim().is_empty() {
         content.push(ModelContentPart::text(result.output.clone()));
@@ -826,5 +851,101 @@ async fn attachment_image_bytes(
         StoredAttachment::ContextSource { .. } => {
             anyhow::bail!("{} is not an image", attachment.name())
         }
+    }
+}
+
+#[cfg(test)]
+mod connection_route_tests {
+    use super::*;
+    use crate::policy::BasicPolicyEngine;
+    use crate::{
+        mcp_operation_fingerprint, ConnectionOperationInvocationGate,
+        ConnectionOperationRuntimeRoute, ExecutionConnectionOperationV1, PermissionMode,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct DenyingGate(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl ConnectionOperationInvocationGate for DenyingGate {
+        async fn authorize(
+            &self,
+            _operation: &ExecutionConnectionOperationV1,
+        ) -> anyhow::Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("Connection revoked")
+        }
+    }
+
+    #[tokio::test]
+    async fn approved_attachment_inspection_still_requires_the_live_connection_gate() {
+        let server_id = Uuid::new_v4();
+        let connection_id = Uuid::new_v4();
+        let model_tool_name = "mcp_image_inspector_fixture".to_string();
+        let native_descriptor = McpToolDescriptor {
+            public_name: "vision__inspect".to_string(),
+            server_id,
+            tool_name: "inspect".to_string(),
+            description: Some("Inspect an image".to_string()),
+            input_schema: json!({ "type": "object" }),
+            annotations: json!({ "destructiveHint": true }),
+            meta: json!({
+                "com.opentopia/capabilities": {
+                    "media.image.inspect/v1": {
+                        "priority": 1,
+                        "input": {
+                            "image": { "pointer": "/image", "encoding": "base64" },
+                            "focus": "/focus"
+                        }
+                    }
+                }
+            }),
+            permission_labels: vec!["destructive".to_string()],
+        };
+        let operation = ExecutionConnectionOperationV1 {
+            connection_id,
+            capability_revision: 1,
+            operation_id: format!("connection:{connection_id}:tool:inspect"),
+            mcp_server_id: server_id,
+            provider_tool_name: "inspect".to_string(),
+            model_tool_name: model_tool_name.clone(),
+            pinned_operation_fingerprint: mcp_operation_fingerprint(&native_descriptor),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut structured_descriptor = native_descriptor;
+        structured_descriptor.public_name = model_tool_name.clone();
+        let workspace = std::env::current_dir().expect("current directory");
+        let policy = Arc::new(BasicPolicyEngine::new(
+            workspace.clone(),
+            PermissionMode::Auto,
+        ));
+        let mut context = ToolInvocationContext::local(workspace, policy);
+        context.approval_granted = true;
+        context.mcp_host = Some(crate::mcp_host::McpExtensionHost::new());
+        context.mcp_tools = vec![structured_descriptor];
+        context.connection_operations.insert(
+            model_tool_name,
+            ConnectionOperationRuntimeRoute::new(operation, Arc::new(DenyingGate(calls.clone()))),
+        );
+        let attachment = StoredAttachment::InlineImage {
+            id: Uuid::new_v4(),
+            content_type: "image/png".to_string(),
+            data: vec![1, 2, 3],
+            name: "fixture.png".to_string(),
+        };
+
+        let err = inspect_attachment_through_mcp(
+            Uuid::new_v4(),
+            &attachment,
+            "image/png",
+            &[1, 2, 3],
+            None,
+            &context,
+        )
+        .await
+        .expect_err("approved replay must not bypass Connection revocation");
+        assert!(err.to_string().contains("Connection revoked"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

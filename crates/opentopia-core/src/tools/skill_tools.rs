@@ -222,10 +222,7 @@ impl TypedTool for CreateSkillTool {
         let workspace_root =
             (scope == SkillScope::Workspace).then_some(ctx.workspace_root.as_path());
         let preview = preview_skill_draft(draft.clone(), scope, workspace_root)?;
-        enforce_policy_decision(
-            ctx.policy.inspect_write(&preview.target_path),
-            ctx.approval_granted,
-        )?;
+        enforce_policy_decision(ctx.policy.inspect_write(&preview.target_path), &ctx)?;
         let created = create_skill_from_draft(draft, scope, workspace_root)?;
         let files = created
             .files

@@ -10,12 +10,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use opentopia_core::{
-    discover_plugins, load_plugin_mcp_servers, AgentEventPayload, AppViewDescriptor,
-    AppViewMessage, AppViewSession, BasicPolicyEngine, ContributionHandlerRegistry,
-    ContributionKind, McpServerConfig, McpToolDescriptor, MediaHandlerDescriptor,
-    MediaHandlerInvocationV1, MediaHandlerOperation, MediaHandlerResultEnvelopeV1,
-    MediaHandlerRuntime, MediaHandlerSelection, ModelContentPart, PluginContribution,
-    PluginMcpServerDefinition, PluginPermissionKind, PluginRuntimeHealthRecord,
+    discover_plugins, load_plugin_mcp_servers, mcp_operation_fingerprint, AgentEventPayload,
+    AppViewDescriptor, AppViewMessage, AppViewSession, BasicPolicyEngine,
+    ContributionHandlerRegistry, ContributionKind, McpServerConfig, McpToolDescriptor,
+    MediaHandlerDescriptor, MediaHandlerInvocationV1, MediaHandlerOperation,
+    MediaHandlerResultEnvelopeV1, MediaHandlerRuntime, MediaHandlerSelection, ModelContentPart,
+    PluginContribution, PluginMcpServerDefinition, PluginPermissionKind, PluginRuntimeHealthRecord,
     PluginRuntimeHealthStatus, PolicyDecision, PolicyEngine, ToolCall, ToolPermissionDescriptor,
     ToolResult, MAX_MEDIA_HANDLER_INPUT_BYTES, MAX_MEDIA_HANDLER_OUTPUT_BYTES,
 };
@@ -275,9 +275,15 @@ async fn invoke_active_media_handler(
     );
 
     let timeout_ms = server_config.timeout_ms.min(60_000).max(1_000);
+    let operation_fingerprint = mcp_operation_fingerprint(&descriptor);
     let call_result = match tokio::time::timeout(
         Duration::from_millis(timeout_ms),
-        state.mcp_host.call_tool(&descriptor.public_name, arguments),
+        state.mcp_host.call_server_tool(
+            server_config.server_id,
+            &descriptor.tool_name,
+            &operation_fingerprint,
+            arguments,
+        ),
     )
     .await
     {

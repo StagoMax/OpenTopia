@@ -93,6 +93,74 @@ fn create_inspect_read_and_update_roundtrip() {
 }
 
 #[test]
+fn legacy_xls_reports_missing_writer_without_creating_a_file() {
+    let directory = TestDirectory::new();
+    let output = directory.path("legacy.xls");
+    let error = write_workbook_preferred(&WriteWorkbookRequest {
+        source: None,
+        output: output.clone(),
+        sheets: vec![SheetWriteRequest {
+            name: "Data".to_string(),
+            visibility: None,
+            cells: vec![update(
+                0,
+                0,
+                SpreadsheetCellInput::String("legacy".to_string()),
+            )],
+        }],
+    })
+    .expect_err("XLS writer is unavailable");
+    assert_eq!(error.code(), SpreadsheetErrorCode::UnsupportedFormat);
+    assert!(!output.exists());
+}
+
+#[test]
+fn delimited_write_uses_the_model_chosen_output_extension() {
+    let directory = TestDirectory::new();
+    let csv = directory.path("data.csv");
+    let tsv = directory.path("data.tsv");
+
+    let created = write_workbook_preferred(&WriteWorkbookRequest {
+        source: None,
+        output: csv.clone(),
+        sheets: vec![SheetWriteRequest {
+            name: "Data".to_string(),
+            visibility: None,
+            cells: vec![
+                update(0, 0, SpreadsheetCellInput::String("name".to_string())),
+                update(1, 0, SpreadsheetCellInput::String("alpha".to_string())),
+                update(1, 1, SpreadsheetCellInput::Integer(7)),
+            ],
+        }],
+    })
+    .expect("create CSV");
+    assert_eq!(created.backend, SpreadsheetWriteBackend::Delimited);
+    assert_eq!(
+        fs::read_to_string(&csv).expect("read CSV"),
+        "name,\nalpha,7\n"
+    );
+
+    write_workbook_preferred(&WriteWorkbookRequest {
+        source: Some(csv),
+        output: tsv.clone(),
+        sheets: vec![SheetWriteRequest {
+            name: "Data".to_string(),
+            visibility: None,
+            cells: vec![update(
+                0,
+                1,
+                SpreadsheetCellInput::String("count".to_string()),
+            )],
+        }],
+    })
+    .expect("convert CSV input to TSV output");
+    assert_eq!(
+        fs::read_to_string(tsv).expect("read TSV"),
+        "name\tcount\nalpha\t7\n"
+    );
+}
+
+#[test]
 fn template_patch_preserves_styles_and_non_worksheet_parts() {
     let directory = TestDirectory::new();
     let template = directory.path("styled-template.xlsx");

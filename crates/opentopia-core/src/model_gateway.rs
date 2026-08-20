@@ -26,8 +26,19 @@ pub trait ModelGateway: Send + Sync {
         prepared: PreparedProviderRequest,
         on_delta: &mut ModelStreamCallback<'_>,
         on_transport: &mut ProviderTransportCallback<'_>,
+        on_metric: &mut ModelGatewayMetricCallback<'_>,
     ) -> anyhow::Result<ModelResponse>;
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelGatewayMetricEvent {
+    /// Emitted once when the first normalized output-bearing delta arrives,
+    /// before atomic response buffers are validated and committed.
+    FirstOutputTokenReceived { request_id: Uuid },
+}
+
+pub type ModelGatewayMetricCallback<'a> =
+    dyn FnMut(ModelGatewayMetricEvent) -> anyhow::Result<()> + Send + 'a;
 
 /// Pure logical-request to provider-wire encoding boundary. New adapters
 /// implement this without acquiring sockets or streaming responses.
@@ -122,9 +133,22 @@ impl ModelGateway for ProviderModelGateway {
         prepared: PreparedProviderRequest,
         on_delta: &mut ModelStreamCallback<'_>,
         on_transport: &mut ProviderTransportCallback<'_>,
+        on_metric: &mut ModelGatewayMetricCallback<'_>,
     ) -> anyhow::Result<ModelResponse> {
+        let request_id = prepared.request_id;
         if prepared.response_commit == ProviderResponseCommitMode::Streaming {
-            return self.transport.send(prepared, on_delta, on_transport).await;
+            let mut first_token_received = false;
+            let mut observed_delta = |delta: ModelStreamDelta| {
+                if !first_token_received && delta.contains_output_token() {
+                    first_token_received = true;
+                    on_metric(ModelGatewayMetricEvent::FirstOutputTokenReceived { request_id })?;
+                }
+                on_delta(delta)
+            };
+            return self
+                .transport
+                .send(prepared, &mut observed_delta, on_transport)
+                .await;
         }
 
         // A tool-capable model turn is one semantic transaction. Transport
@@ -135,7 +159,12 @@ impl ModelGateway for ProviderModelGateway {
         // attempt, and only the successfully decoded attempt is committed.
         let pending_deltas = Arc::new(Mutex::new(Vec::<ModelStreamDelta>::new()));
         let delta_buffer = Arc::clone(&pending_deltas);
-        let mut buffered_delta = move |delta| {
+        let mut first_token_received = false;
+        let mut buffered_delta = move |delta: ModelStreamDelta| {
+            if !first_token_received && delta.contains_output_token() {
+                first_token_received = true;
+                on_metric(ModelGatewayMetricEvent::FirstOutputTokenReceived { request_id })?;
+            }
             delta_buffer
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -292,6 +321,7 @@ mod tests {
                     Ok(())
                 },
                 &mut |_| Ok(()),
+                &mut |_| Ok(()),
             )
             .await
             .expect("transport sends");
@@ -354,6 +384,7 @@ mod tests {
             .prepare(Uuid::from_u128(2), canonical_request())
             .unwrap();
         let mut committed = Vec::new();
+        let mut metrics = Vec::new();
 
         gateway
             .stream_prepared(
@@ -363,11 +394,21 @@ mod tests {
                     Ok(())
                 },
                 &mut |_| Ok(()),
+                &mut |metric| {
+                    metrics.push(metric);
+                    Ok(())
+                },
             )
             .await
             .expect_err("invalid atomic response must fail");
 
         assert!(committed.is_empty());
+        assert_eq!(
+            metrics,
+            vec![ModelGatewayMetricEvent::FirstOutputTokenReceived {
+                request_id: Uuid::from_u128(2)
+            }]
+        );
     }
 
     struct RetryingAtomicTransport;
@@ -423,6 +464,7 @@ mod tests {
                     committed.push(delta);
                     Ok(())
                 },
+                &mut |_| Ok(()),
                 &mut |_| Ok(()),
             )
             .await

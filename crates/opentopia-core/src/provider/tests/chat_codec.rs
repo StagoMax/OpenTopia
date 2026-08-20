@@ -278,7 +278,7 @@ fn chat_reasoning_replay_is_driven_by_the_adapter_profile_not_the_model_name() {
         model: model.to_string(),
         adapter: ProviderAdapterKind::OpenAiChat,
         instruction_encoding: ProviderInstructionEncoding::PortableChatEnvelope,
-        reasoning_protocol: ProviderReasoningProtocol::ReasoningEffort,
+        reasoning_protocol: ProviderReasoningProtocol::ChatReasoningEffort,
         message_protocol: ProviderMessageProtocolCapabilities {
             requires_reasoning_content_for_tool_calls: true,
         },
@@ -396,7 +396,7 @@ fn unprobed_relay_starts_with_the_portable_chat_envelope() {
 fn glm_disables_thinking_with_native_control() {
     let mut provider =
         OpenAiCompatibleProvider::new("https://api.example.test/v1", "test-key", "glm-5.2");
-    provider.reasoning_protocol = ProviderReasoningProtocol::GlmThinking;
+    provider.reasoning_protocol = ProviderReasoningProtocol::ChatThinkingReasoningEffort;
     provider.reasoning_effort = Some("none".to_string());
 
     let prepared = provider.prepare(Uuid::nil(), model_request()).unwrap();
@@ -409,7 +409,7 @@ fn glm_disables_thinking_with_native_control() {
 fn glm_enables_thinking_with_native_control() {
     let mut provider =
         OpenAiCompatibleProvider::new("https://api.example.test/v1", "test-key", "glm-5.2");
-    provider.reasoning_protocol = ProviderReasoningProtocol::GlmThinking;
+    provider.reasoning_protocol = ProviderReasoningProtocol::ChatThinkingReasoningEffort;
     provider.reasoning_effort = Some("high".to_string());
 
     let prepared = provider.prepare(Uuid::nil(), model_request()).unwrap();
@@ -419,13 +419,23 @@ fn glm_enables_thinking_with_native_control() {
 }
 
 #[test]
+fn unprobed_new_model_does_not_guess_a_vendor_reasoning_protocol() {
+    let provider = OpenAiCompatibleProvider::new("https://relay.example/v1", "test-key", "glm-5.3");
+
+    let prepared = provider.prepare(Uuid::nil(), model_request()).unwrap();
+
+    assert!(prepared.body.get("thinking").is_none());
+    assert!(prepared.body.get("reasoning_effort").is_none());
+}
+
+#[test]
 fn deepseek_v4_maps_thinking_effort_and_omits_incompatible_tool_choice() {
     let mut provider = OpenAiCompatibleProvider::new(
         "https://api.deepseek.com/v1",
         "test-key",
         "deepseek-v4-flash",
     );
-    provider.reasoning_protocol = ProviderReasoningProtocol::DeepSeekThinking;
+    provider.reasoning_protocol = ProviderReasoningProtocol::ChatThinkingHighMaxNoToolChoice;
     provider.temperature = Some(0.7);
     provider.reasoning_effort = Some("xhigh".to_string());
     let mut request = model_request();
@@ -451,7 +461,7 @@ fn deepseek_v4_maps_thinking_effort_and_omits_incompatible_tool_choice() {
 fn deepseek_v4_can_disable_thinking() {
     let mut provider =
         OpenAiCompatibleProvider::new("https://api.deepseek.com/v1", "test-key", "deepseek-v4-pro");
-    provider.reasoning_protocol = ProviderReasoningProtocol::DeepSeekThinking;
+    provider.reasoning_protocol = ProviderReasoningProtocol::ChatThinkingHighMaxNoToolChoice;
     provider.temperature = Some(0.7);
     provider.reasoning_effort = Some("none".to_string());
     let mut request = model_request();

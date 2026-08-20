@@ -60,6 +60,73 @@ async fn spreadsheet_protocol_progressively_describes_and_executes_offline_workb
     assert!(described.output.contains("write_rows"));
     assert!(described.output.contains("argumentsSchema"));
 
+    let described_value: Value = serde_json::from_str(&described.output).unwrap();
+    let operation_schema = |operation: &str| {
+        described_value["operations"]
+            .as_array()
+            .and_then(|operations| {
+                operations
+                    .iter()
+                    .find(|candidate| candidate["operation"] == operation)
+            })
+            .map(|contract| &contract["argumentsSchema"])
+            .unwrap_or_else(|| panic!("missing described contract for {operation}"))
+    };
+    let write_arguments = json!({
+        "outputPath": "protocol.xlsx",
+        "sheet": "Summary",
+        "start": { "row": 1, "column": 0 },
+        "rows": [[{ "type": "string", "value": "updated" }]]
+    });
+    let read_arguments = json!({
+        "sheet": "Summary",
+        "range": {
+            "start": { "row": 0, "column": 0 },
+            "end": { "row": 1, "column": 0 }
+        }
+    });
+    for (operation, arguments, binding) in [
+        ("write_rows", &write_arguments, "sourcePath"),
+        ("read_range", &read_arguments, "path"),
+    ] {
+        let schema = operation_schema(operation);
+        assert_eq!(
+            crate::provider::tool_input_schema_error(
+                schema,
+                arguments,
+                "spreadsheet_execute.arguments"
+            ),
+            None,
+            "described {operation} schema must accept the execute payload"
+        );
+        assert!(schema["properties"].get("action").is_none());
+        assert!(schema["properties"].get(binding).is_none());
+
+        if operation == "read_range" {
+            assert!(schema["properties"].get("attachmentId").is_none());
+        }
+
+        let forbidden_fields = if operation == "read_range" {
+            vec!["action", binding, "attachmentId"]
+        } else {
+            vec!["action", binding]
+        };
+        for forbidden in forbidden_fields {
+            let mut invalid = arguments.clone();
+            invalid[forbidden] = json!(operation);
+            assert!(crate::provider::tool_input_schema_error(
+                schema,
+                &invalid,
+                "spreadsheet_execute.arguments"
+            )
+            .is_some());
+        }
+    }
+    assert_eq!(
+        SpreadsheetExecuteTool.schema()["properties"]["arguments"]["type"],
+        "object"
+    );
+
     SpreadsheetExecuteTool
         .execute(
             ToolCall::new(
@@ -67,12 +134,7 @@ async fn spreadsheet_protocol_progressively_describes_and_executes_offline_workb
                 json!({
                     "resource": resource,
                     "operation": "write_rows",
-                    "arguments": {
-                        "outputPath": "protocol.xlsx",
-                        "sheet": "Summary",
-                        "start": { "row": 1, "column": 0 },
-                        "rows": [[{ "type": "string", "value": "updated" }]]
-                    }
+                    "arguments": write_arguments
                 }),
             ),
             ToolInvocationContext::local(workspace_root.clone(), policy.clone()),
@@ -87,7 +149,25 @@ async fn spreadsheet_protocol_progressively_describes_and_executes_offline_workb
                 json!({
                     "resource": resource,
                     "operation": "read_range",
+                    "arguments": read_arguments
+                }),
+            ),
+            ToolInvocationContext::local(workspace_root.clone(), policy.clone()),
+        )
+        .await
+        .expect("read protocol workbook");
+    assert!(read.output.contains("initial"));
+    assert!(read.output.contains("updated"));
+
+    let rejected_action = SpreadsheetExecuteTool
+        .execute(
+            ToolCall::new(
+                "spreadsheet_execute",
+                json!({
+                    "resource": resource,
+                    "operation": "read_range",
                     "arguments": {
+                        "action": "read_range",
                         "sheet": "Summary",
                         "range": {
                             "start": { "row": 0, "column": 0 },
@@ -99,29 +179,66 @@ async fn spreadsheet_protocol_progressively_describes_and_executes_offline_workb
             ToolInvocationContext::local(workspace_root.clone(), policy.clone()),
         )
         .await
-        .expect("read protocol workbook");
-    assert!(read.output.contains("initial"));
-    assert!(read.output.contains("updated"));
+        .expect_err("projected contract must reject a model-supplied action");
+    assert!(rejected_action.to_string().contains("arguments.action"));
 
-    let unavailable = SpreadsheetInspectTool
+    let inspect_schema = SpreadsheetInspectTool.schema();
+    let inspect_schema_text = serde_json::to_string(&inspect_schema).unwrap();
+    assert!(inspect_schema_text.contains("workspaceFile"));
+    assert!(inspect_schema_text.contains("attachment"));
+    assert!(!inspect_schema_text.contains("liveSession"));
+
+    assert!(SpreadsheetDescribeTool
+        .input_error(&json!({
+            "resource": resource,
+            "operations": []
+        }))
+        .is_some());
+    assert!(SpreadsheetInspectTool
+        .input_error(&json!({
+            "resource": {
+                "kind": "liveSession",
+                "sessionId": "session-1",
+                "documentId": "workbook-1"
+            }
+        }))
+        .is_some());
+
+    let attachment_resource = json!({
+        "kind": "attachment",
+        "attachmentId": Uuid::new_v4()
+    });
+    let attachment_contract = SpreadsheetDescribeTool
         .execute(
             ToolCall::new(
-                "spreadsheet_inspect",
+                "spreadsheet_describe",
                 json!({
-                    "resource": {
-                        "kind": "liveSession",
-                        "sessionId": "session-1",
-                        "documentId": "workbook-1"
-                    }
+                    "resource": attachment_resource,
+                    "operations": ["read_range"]
+                }),
+            ),
+            ToolInvocationContext::local(workspace_root.clone(), policy.clone()),
+        )
+        .await
+        .expect("describe an attachment observation");
+    assert!(attachment_contract.output.contains("offlineAttachment"));
+
+    let attachment_mutation = SpreadsheetDescribeTool
+        .execute(
+            ToolCall::new(
+                "spreadsheet_describe",
+                json!({
+                    "resource": attachment_resource,
+                    "operations": ["write_rows"]
                 }),
             ),
             ToolInvocationContext::local(workspace_root.clone(), policy),
         )
         .await
-        .expect_err("live sessions must not fall back to filesystem handling");
-    assert!(unavailable
+        .expect_err("attachments must not receive mutation contracts");
+    assert!(attachment_mutation
         .to_string()
-        .contains("liveSession resources require an Office live-session provider"));
+        .contains("attachment resources are immutable"));
 
     fs::remove_dir_all(workspace_root).unwrap();
 }

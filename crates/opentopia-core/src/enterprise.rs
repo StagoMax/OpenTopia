@@ -1,3 +1,9 @@
+use crate::enterprise_connection_grants::{
+    connection_bindings_are_subset, diff_connection_bindings, intersect_connection_bindings,
+    resolved_bindings_match, validate_connection_bindings_shape, ConnectionBindingV1,
+    ConnectionGrantChangeKind, ConnectionGrantShapeError, ExecutionConnectionOperationV1,
+    ResolvedConnectionBindingV1,
+};
 use crate::model::ExperienceMode;
 use crate::model_context::content_fingerprint;
 use chrono::{DateTime, Utc};
@@ -121,6 +127,54 @@ impl CapabilityProjection {
         }
     }
 
+    /// Produces the smallest catalog ceiling that can host either projection.
+    /// Individual workflow nodes must still execute against their own narrower
+    /// projection; this operation is not an authorization boundary.
+    pub fn union(&self, other: &Self) -> Self {
+        let (allow_all_tools, tools) = union_scope(
+            self.allow_all_tools,
+            &self.tools,
+            other.allow_all_tools,
+            &other.tools,
+        );
+        let (allow_all_skills, skills) = union_scope(
+            self.allow_all_skills,
+            &self.skills,
+            other.allow_all_skills,
+            &other.skills,
+        );
+        let (allow_all_plugins, plugins) = union_scope(
+            self.allow_all_plugins,
+            &self.plugins,
+            other.allow_all_plugins,
+            &other.plugins,
+        );
+        let (allow_all_mcp_servers, mcp_servers) = union_scope(
+            self.allow_all_mcp_servers,
+            &self.mcp_servers,
+            other.allow_all_mcp_servers,
+            &other.mcp_servers,
+        );
+        let (allow_all_workspace_roots, workspace_roots) = union_scope(
+            self.allow_all_workspace_roots,
+            &self.workspace_roots,
+            other.allow_all_workspace_roots,
+            &other.workspace_roots,
+        );
+        Self {
+            allow_all_tools,
+            tools,
+            allow_all_skills,
+            skills,
+            allow_all_plugins,
+            plugins,
+            allow_all_mcp_servers,
+            mcp_servers,
+            allow_all_workspace_roots,
+            workspace_roots,
+        }
+    }
+
     pub fn allows_tool(&self, name: &str) -> bool {
         self.allow_all_tools || self.tools.contains(name)
     }
@@ -156,6 +210,19 @@ fn intersect_scope<T: Clone + Ord>(
     }
 }
 
+fn union_scope<T: Clone + Ord>(
+    left_all: bool,
+    left: &BTreeSet<T>,
+    right_all: bool,
+    right: &BTreeSet<T>,
+) -> (bool, BTreeSet<T>) {
+    if left_all || right_all {
+        (true, BTreeSet::new())
+    } else {
+        (false, left.union(right).cloned().collect())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExperienceSurfaceProfile {
@@ -184,6 +251,29 @@ impl ExperienceSurfaceProfile {
         .into_iter()
         .map(str::to_string)
         .collect()
+    }
+
+    /// Minimal authority for a Flow session that is not bound to an Agent.
+    ///
+    /// The workspace root is retained as the execution identity required by
+    /// the policy boundary, while the tool surface remains limited to Flow
+    /// control operations. Callers may add another explicit built-in such as
+    /// `library_search`; external tools, plugins, and MCP stay denied.
+    pub fn flow_runtime_baseline(workspace_root: PathBuf) -> CapabilityProjection {
+        let mut capabilities = CapabilityProjection::deny_all();
+        capabilities.tools = Self::flow_control_tools();
+        capabilities.workspace_roots.insert(workspace_root);
+        capabilities
+    }
+
+    /// Builds the catalog ceiling used by the Flow harness itself. Individual
+    /// nodes are still attenuated to their own effective projection before
+    /// execution, so this union cannot grant a node additional authority.
+    pub fn flow_harness_capabilities(
+        workspace_root: PathBuf,
+        node_ceiling: &CapabilityProjection,
+    ) -> CapabilityProjection {
+        Self::flow_runtime_baseline(workspace_root).union(node_ceiling)
     }
 
     pub fn for_mode(mode: ExperienceMode) -> Self {
@@ -368,6 +458,10 @@ pub struct EnterpriseExecutionContextV1 {
     pub capabilities: CapabilityProjection,
     pub resource_grants: Vec<ExecutionResourceGrantV1>,
     pub model_policy: AgentModelPolicyV1,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connection_bindings: Vec<ConnectionBindingV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connection_operations: Vec<ExecutionConnectionOperationV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
@@ -475,6 +569,8 @@ pub struct AgentTemplateSpecV1 {
     pub delegate_template_ids: BTreeSet<String>,
     pub budget: AgentBudgetV1,
     pub risk_class: AgentRiskClassV1,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connection_bindings: Vec<ConnectionBindingV1>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -562,6 +658,13 @@ impl AgentTemplateVersionV1 {
             return Err(AgentTemplateError::InvalidDescription);
         }
         validate_projection_shape(&self.spec.capabilities)?;
+        validate_connection_bindings_shape(&self.spec.connection_bindings)?;
+        if !self.spec.connection_bindings.is_empty()
+            && (self.spec.capabilities.allow_all_mcp_servers
+                || !self.spec.capabilities.mcp_servers.is_empty())
+        {
+            return Err(AgentTemplateError::AmbiguousConnectionGrantPolicy);
+        }
         validate_model_policy_shape(&self.spec.model_policy)?;
         validate_schema_shape(&self.spec.state_schema, "stateSchema")?;
         validate_schema_shape(&self.spec.output_schema, "outputSchema")?;
@@ -708,6 +811,11 @@ impl AgentTemplateDiffV1 {
                     &mut changes,
                 );
                 diff_delegates(&previous.spec, &next.spec, &mut changes);
+                connection_grant_changes(
+                    &previous.spec.connection_bindings,
+                    &next.spec.connection_bindings,
+                    &mut changes,
+                );
             }
             None => {
                 projection_additions(&next.spec.capabilities, &mut changes);
@@ -734,6 +842,7 @@ impl AgentTemplateDiffV1 {
                         });
                     }
                 }
+                connection_grant_changes(&[], &next.spec.connection_bindings, &mut changes);
             }
         }
         let widens_capabilities = changes.iter().any(|change| {
@@ -803,6 +912,37 @@ impl AgentInstanceV1 {
         requested_model_policy: Option<&AgentModelPolicyV1>,
         initial_state: Value,
     ) -> Result<Self, AgentTemplateError> {
+        Self::instantiate_with_connections(
+            template,
+            thread_id,
+            mode,
+            mode_capabilities,
+            parent,
+            parent_template,
+            requested_capabilities,
+            requested_resource_grants,
+            requested_model_policy,
+            None,
+            &[],
+            initial_state,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn instantiate_with_connections(
+        template: &AgentTemplateVersionV1,
+        thread_id: Uuid,
+        mode: ExperienceMode,
+        mode_capabilities: &CapabilityProjection,
+        parent: Option<&AgentInstanceV1>,
+        parent_template: Option<&AgentTemplateVersionV1>,
+        requested_capabilities: Option<&CapabilityProjection>,
+        requested_resource_grants: Option<&[ExecutionResourceGrantV1]>,
+        requested_model_policy: Option<&AgentModelPolicyV1>,
+        requested_connection_bindings: Option<&[ConnectionBindingV1]>,
+        resolved_connection_bindings: &[ResolvedConnectionBindingV1],
+        initial_state: Value,
+    ) -> Result<Self, AgentTemplateError> {
         template.validate()?;
         if template.content_hash != template.calculate_content_hash() {
             return Err(AgentTemplateError::ContentHashMismatch);
@@ -812,9 +952,20 @@ impl AgentInstanceV1 {
         }
         validate_value_against_schema(&template.spec.state_schema, &initial_state, "$state")?;
 
-        let mut capabilities = mode_capabilities.intersect(&template.spec.capabilities);
+        if !resolved_bindings_match(
+            &template.spec.connection_bindings,
+            resolved_connection_bindings,
+        ) {
+            return Err(AgentTemplateError::InvalidResolvedConnectionBindings);
+        }
+        let template_capabilities = capabilities_with_resolved_connections(
+            &template.spec.capabilities,
+            resolved_connection_bindings,
+        );
+        let mut capabilities = mode_capabilities.intersect(&template_capabilities);
         let mut grants = template.spec.resource_grants.clone();
         let mut model_policy = template.spec.model_policy.clone();
+        let mut connection_bindings = template.spec.connection_bindings.clone();
         let (parent_instance_id, parent_agent_id, delegation_depth, delegation_chain) =
             if let Some(parent) = parent {
                 if parent.thread_id != thread_id || parent.execution_context.mode != mode {
@@ -856,6 +1007,10 @@ impl AgentInstanceV1 {
                 grants =
                     intersect_resource_grants(&grants, &parent.execution_context.resource_grants);
                 model_policy = model_policy.intersect(&parent.execution_context.model_policy);
+                connection_bindings = intersect_connection_bindings(
+                    &connection_bindings,
+                    &parent.execution_context.connection_bindings,
+                );
                 let mut chain = parent.execution_context.delegation_chain.clone();
                 chain.push(parent.id);
                 (Some(parent.id), Some(parent.id), depth, chain)
@@ -872,6 +1027,49 @@ impl AgentInstanceV1 {
         if let Some(requested) = requested_model_policy {
             model_policy = model_policy.intersect(requested);
         }
+        if let Some(requested) = requested_connection_bindings {
+            validate_connection_bindings_shape(requested)?;
+            connection_bindings = intersect_connection_bindings(&connection_bindings, requested);
+        }
+
+        let effective_connection_ids = connection_bindings
+            .iter()
+            .map(|binding| binding.connection_id)
+            .collect::<BTreeSet<_>>();
+        let effective_operation_ids = connection_bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.connection_id,
+                    binding
+                        .operation_grants
+                        .iter()
+                        .map(|grant| grant.operation_id.as_str())
+                        .collect::<BTreeSet<_>>(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut connection_operations = resolved_connection_bindings
+            .iter()
+            .filter(|binding| effective_connection_ids.contains(&binding.binding.connection_id))
+            .flat_map(|binding| binding.operations.iter())
+            .filter(|(_, operation)| {
+                effective_operation_ids
+                    .get(&operation.connection_id)
+                    .is_some_and(|operation_ids| {
+                        operation_ids.contains(operation.operation_id.as_str())
+                    })
+            })
+            .map(|(_, operation)| operation.clone())
+            .collect::<Vec<_>>();
+        connection_operations.sort_by(|left, right| {
+            (left.connection_id, left.operation_id.as_str())
+                .cmp(&(right.connection_id, right.operation_id.as_str()))
+        });
+        capabilities = capabilities.intersect(&capabilities_with_connection_operations(
+            &template.spec.capabilities,
+            &connection_operations,
+        ));
 
         let now = Utc::now();
         let id = Uuid::new_v4();
@@ -895,6 +1093,8 @@ impl AgentInstanceV1 {
                 capabilities,
                 resource_grants: grants,
                 model_policy,
+                connection_bindings,
+                connection_operations,
             },
             state: initial_state,
             state_revision: 1,
@@ -908,6 +1108,15 @@ impl AgentInstanceV1 {
         &self,
         template: &AgentTemplateVersionV1,
         mode_capabilities: &CapabilityProjection,
+    ) -> Result<(), AgentTemplateError> {
+        self.validate_execution_boundary_with_connections(template, mode_capabilities, &[])
+    }
+
+    pub fn validate_execution_boundary_with_connections(
+        &self,
+        template: &AgentTemplateVersionV1,
+        mode_capabilities: &CapabilityProjection,
+        resolved_connection_bindings: &[ResolvedConnectionBindingV1],
     ) -> Result<(), AgentTemplateError> {
         template.validate()?;
         if template.status != AgentTemplateStatusV1::Published
@@ -926,7 +1135,11 @@ impl AgentInstanceV1 {
         {
             return Err(AgentTemplateError::InvalidInstanceContext);
         }
-        let template_boundary = mode_capabilities.intersect(&template.spec.capabilities);
+        let template_boundary =
+            mode_capabilities.intersect(&capabilities_with_resolved_connections(
+                &template.spec.capabilities,
+                resolved_connection_bindings,
+            ));
         if self
             .execution_context
             .capabilities
@@ -949,6 +1162,72 @@ impl AgentInstanceV1 {
         ) {
             return Err(AgentTemplateError::InstanceCapabilityViolation);
         }
+        if validate_connection_bindings_shape(&self.execution_context.connection_bindings).is_err()
+            || !resolved_bindings_match(
+                &template.spec.connection_bindings,
+                resolved_connection_bindings,
+            )
+            || !connection_bindings_are_subset(
+                &self.execution_context.connection_bindings,
+                &template.spec.connection_bindings,
+            )
+        {
+            return Err(AgentTemplateError::InstanceCapabilityViolation);
+        }
+        let effective_connection_ids = self
+            .execution_context
+            .connection_bindings
+            .iter()
+            .map(|binding| binding.connection_id)
+            .collect::<BTreeSet<_>>();
+        let effective_operation_ids = self
+            .execution_context
+            .connection_bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.connection_id,
+                    binding
+                        .operation_grants
+                        .iter()
+                        .map(|grant| grant.operation_id.as_str())
+                        .collect::<BTreeSet<_>>(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut expected_operations = resolved_connection_bindings
+            .iter()
+            .filter(|binding| effective_connection_ids.contains(&binding.binding.connection_id))
+            .flat_map(|binding| binding.operations.iter())
+            .filter(|(_, operation)| {
+                effective_operation_ids
+                    .get(&operation.connection_id)
+                    .is_some_and(|operation_ids| {
+                        operation_ids.contains(operation.operation_id.as_str())
+                    })
+            })
+            .map(|(_, operation)| operation.clone())
+            .collect::<Vec<_>>();
+        expected_operations.sort_by(|left, right| {
+            (left.connection_id, left.operation_id.as_str())
+                .cmp(&(right.connection_id, right.operation_id.as_str()))
+        });
+        if self.execution_context.connection_operations != expected_operations {
+            return Err(AgentTemplateError::InstanceCapabilityViolation);
+        }
+        let effective_template_boundary =
+            mode_capabilities.intersect(&capabilities_with_connection_operations(
+                &template.spec.capabilities,
+                &expected_operations,
+            ));
+        if self
+            .execution_context
+            .capabilities
+            .intersect(&effective_template_boundary)
+            != self.execution_context.capabilities
+        {
+            return Err(AgentTemplateError::InstanceCapabilityViolation);
+        }
         if self.delegation_depth as usize != self.execution_context.delegation_chain.len()
             || self.delegation_depth > MAX_AGENT_DELEGATION_DEPTH
             || (self.parent_instance_id.is_none()
@@ -964,6 +1243,12 @@ impl AgentInstanceV1 {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AgentTemplateError {
+    #[error(transparent)]
+    InvalidConnectionGrantShape(#[from] ConnectionGrantShapeError),
+    #[error("resolved Connection grants do not match the Agent template")]
+    InvalidResolvedConnectionBindings,
+    #[error("connectionBindings cannot be combined with legacy mcpServers grants")]
+    AmbiguousConnectionGrantPolicy,
     #[error("unsupported Agent template schema version: {0}")]
     UnsupportedSchemaVersion(u16),
     #[error(
@@ -1089,6 +1374,46 @@ fn validate_model_policy_shape(policy: &AgentModelPolicyV1) -> Result<(), AgentT
     } else {
         Ok(())
     }
+}
+
+pub(crate) fn capabilities_with_resolved_connections(
+    base: &CapabilityProjection,
+    resolved: &[ResolvedConnectionBindingV1],
+) -> CapabilityProjection {
+    let mut capabilities = base.clone();
+    for binding in resolved {
+        if !capabilities.allow_all_mcp_servers {
+            capabilities.mcp_servers.extend(
+                binding
+                    .mcp_server_ids()
+                    .map(|server_id| server_id.to_string()),
+            );
+        }
+        if !capabilities.allow_all_tools {
+            capabilities
+                .tools
+                .extend(binding.model_tool_names().cloned());
+        }
+    }
+    capabilities
+}
+
+pub(crate) fn capabilities_with_connection_operations(
+    base: &CapabilityProjection,
+    operations: &[ExecutionConnectionOperationV1],
+) -> CapabilityProjection {
+    let mut capabilities = base.clone();
+    for operation in operations {
+        if !capabilities.allow_all_mcp_servers {
+            capabilities
+                .mcp_servers
+                .insert(operation.mcp_server_id.to_string());
+        }
+        if !capabilities.allow_all_tools {
+            capabilities.tools.insert(operation.model_tool_name.clone());
+        }
+    }
+    capabilities
 }
 
 fn intersect_resource_grants(
@@ -1320,6 +1645,31 @@ fn projection_additions(projection: &CapabilityProjection, changes: &mut Vec<Cap
     );
 }
 
+fn connection_grant_changes(
+    previous: &[ConnectionBindingV1],
+    next: &[ConnectionBindingV1],
+    changes: &mut Vec<CapabilityChangeV1>,
+) {
+    changes.extend(
+        diff_connection_bindings(previous, next)
+            .into_iter()
+            .map(|change| CapabilityChangeV1 {
+                scope: if change.operation_id.is_some() {
+                    "connection_operation".to_string()
+                } else {
+                    "connection".to_string()
+                },
+                value: change
+                    .operation_id
+                    .unwrap_or_else(|| change.connection_id.to_string()),
+                kind: match change.kind {
+                    ConnectionGrantChangeKind::Added => CapabilityChangeKindV1::Added,
+                    ConnectionGrantChangeKind::Removed => CapabilityChangeKindV1::Removed,
+                },
+            }),
+    );
+}
+
 fn diff_scope(
     scope: &str,
     previous_all: bool,
@@ -1508,6 +1858,7 @@ pub struct AuditEventV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ExecutionConnectionOperationV1, OperationGrantV1};
 
     fn template_spec(tools: &[&str], models: &[(&str, &str)]) -> AgentTemplateSpecV1 {
         AgentTemplateSpecV1 {
@@ -1532,6 +1883,7 @@ mod tests {
             delegate_template_ids: BTreeSet::new(),
             budget: AgentBudgetV1::default(),
             risk_class: AgentRiskClassV1::Medium,
+            connection_bindings: Vec::new(),
         }
     }
 
@@ -1578,6 +1930,34 @@ mod tests {
         assert!(ExperienceSurfaceProfile::flow_control_tools()
             .iter()
             .all(|tool| profile.capabilities.allows_tool(tool)));
+    }
+
+    #[test]
+    fn unbound_flow_baseline_keeps_workspace_identity_without_widening_tools() {
+        let workspace_root = PathBuf::from("C:/workspace");
+        let capabilities = ExperienceSurfaceProfile::flow_runtime_baseline(workspace_root.clone());
+
+        assert!(capabilities.allows_workspace_root(&workspace_root));
+        assert!(capabilities.allows_tool("flow_run"));
+        assert!(!capabilities.allows_tool("shell"));
+        assert!(!capabilities.allow_all_plugins);
+        assert!(!capabilities.allow_all_mcp_servers);
+    }
+
+    #[test]
+    fn flow_harness_ceiling_adds_identity_without_widening_node_projection() {
+        let workspace_root = PathBuf::from("C:/workspace");
+        let node_capabilities = CapabilityProjection::deny_all();
+        let harness = ExperienceSurfaceProfile::flow_harness_capabilities(
+            workspace_root.clone(),
+            &node_capabilities,
+        );
+
+        assert!(harness.allows_workspace_root(&workspace_root));
+        assert!(harness.allows_tool("flow_run"));
+        assert!(!harness.allows_tool("shell"));
+        assert!(!node_capabilities.allows_workspace_root(&workspace_root));
+        assert!(!node_capabilities.allows_tool("flow_run"));
     }
 
     #[test]
@@ -1645,6 +2025,188 @@ mod tests {
         assert_eq!(published.status, AgentTemplateStatusV1::Published);
         assert!(diff.widens_capabilities);
         assert_eq!(published.content_hash, first.content_hash);
+    }
+
+    #[test]
+    fn legacy_template_hash_survives_missing_connection_bindings_field() {
+        let template = published_template(
+            "legacy-worker",
+            1,
+            template_spec(&["read_file"], &[("openai", "gpt-enterprise")]),
+        );
+        let document = serde_json::to_value(&template).expect("serialize legacy template");
+        assert!(document["spec"].get("connectionBindings").is_none());
+
+        let restored: AgentTemplateVersionV1 =
+            serde_json::from_value(document).expect("deserialize legacy template");
+
+        assert_eq!(restored.content_hash, restored.calculate_content_hash());
+        restored.validate().expect("validate restored template");
+    }
+
+    #[test]
+    fn structured_and_legacy_connection_grants_cannot_be_mixed() {
+        let connection_id = Uuid::new_v4();
+        let mut spec = template_spec(&["read_file"], &[("openai", "gpt-enterprise")]);
+        spec.capabilities.allow_all_mcp_servers = false;
+        spec.capabilities
+            .mcp_servers
+            .insert(connection_id.to_string());
+        spec.connection_bindings = vec![ConnectionBindingV1 {
+            connection_id,
+            capability_revision: 1,
+            operation_grants: vec![OperationGrantV1 {
+                operation_id: "operation-1".to_string(),
+            }],
+        }];
+
+        assert_eq!(
+            AgentTemplateVersionV1::new_draft("mixed", 1, "Mixed", "owner", spec).unwrap_err(),
+            AgentTemplateError::AmbiguousConnectionGrantPolicy
+        );
+    }
+
+    #[test]
+    fn connection_revision_change_is_a_capability_expansion() {
+        let connection_id = Uuid::new_v4();
+        let mut first_spec = template_spec(&["read_file"], &[("openai", "gpt-enterprise")]);
+        first_spec.capabilities.allow_all_mcp_servers = false;
+        first_spec.connection_bindings = vec![ConnectionBindingV1 {
+            connection_id,
+            capability_revision: 1,
+            operation_grants: vec![OperationGrantV1 {
+                operation_id: "operation-1".to_string(),
+            }],
+        }];
+        let mut second_spec = first_spec.clone();
+        second_spec.connection_bindings[0].capability_revision = 2;
+        let previous = published_template("revisioned", 1, first_spec);
+        let next =
+            AgentTemplateVersionV1::new_draft("revisioned", 2, "revisioned", "owner", second_spec)
+                .unwrap();
+
+        assert!(AgentTemplateDiffV1::between(Some(&previous), &next).widens_capabilities);
+    }
+
+    #[test]
+    fn tampered_instance_connection_revision_fails_closed() {
+        let connection_id = Uuid::new_v4();
+        let operation_id = "operation-1".to_string();
+        let mut spec = template_spec(&["read_file"], &[("openai", "gpt-enterprise")]);
+        spec.capabilities.allow_all_mcp_servers = false;
+        spec.connection_bindings = vec![ConnectionBindingV1 {
+            connection_id,
+            capability_revision: 1,
+            operation_grants: vec![OperationGrantV1 {
+                operation_id: operation_id.clone(),
+            }],
+        }];
+        let template = published_template("bound-worker", 1, spec);
+        let operation = ExecutionConnectionOperationV1 {
+            connection_id,
+            capability_revision: 1,
+            operation_id: operation_id.clone(),
+            mcp_server_id: Uuid::new_v4(),
+            provider_tool_name: "read".to_string(),
+            model_tool_name: "mcp_read_1234567890abcdef".to_string(),
+            pinned_operation_fingerprint: "sha256:test".to_string(),
+        };
+        let resolved = vec![ResolvedConnectionBindingV1 {
+            binding: template.spec.connection_bindings[0].clone(),
+            operations: BTreeMap::from([(operation_id, operation)]),
+        }];
+        let mut instance = AgentInstanceV1::instantiate_with_connections(
+            &template,
+            Uuid::new_v4(),
+            ExperienceMode::Flow,
+            &CapabilityProjection::unrestricted(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &resolved,
+            serde_json::json!({"caseId": "one"}),
+        )
+        .unwrap();
+        instance.execution_context.connection_bindings[0].capability_revision = 2;
+
+        assert_eq!(
+            instance
+                .validate_execution_boundary_with_connections(
+                    &template,
+                    &CapabilityProjection::unrestricted(),
+                    &resolved,
+                )
+                .unwrap_err(),
+            AgentTemplateError::InstanceCapabilityViolation
+        );
+    }
+
+    #[test]
+    fn requested_connection_revision_mismatch_drops_routes_and_model_capabilities() {
+        let connection_id = Uuid::new_v4();
+        let mcp_server_id = Uuid::new_v4();
+        let operation_id = "operation-1".to_string();
+        let model_tool_name = "mcp_read_1234567890abcdef".to_string();
+        let mut spec = template_spec(&["read_file"], &[("openai", "gpt-enterprise")]);
+        spec.capabilities.allow_all_mcp_servers = false;
+        spec.connection_bindings = vec![ConnectionBindingV1 {
+            connection_id,
+            capability_revision: 1,
+            operation_grants: vec![OperationGrantV1 {
+                operation_id: operation_id.clone(),
+            }],
+        }];
+        let template = published_template("requested-revision", 1, spec);
+        let resolved = vec![ResolvedConnectionBindingV1 {
+            binding: template.spec.connection_bindings[0].clone(),
+            operations: BTreeMap::from([(
+                operation_id.clone(),
+                ExecutionConnectionOperationV1 {
+                    connection_id,
+                    capability_revision: 1,
+                    operation_id: operation_id.clone(),
+                    mcp_server_id,
+                    provider_tool_name: "read".to_string(),
+                    model_tool_name: model_tool_name.clone(),
+                    pinned_operation_fingerprint: "sha256:test".to_string(),
+                },
+            )]),
+        }];
+        let requested = vec![ConnectionBindingV1 {
+            connection_id,
+            capability_revision: 2,
+            operation_grants: vec![OperationGrantV1 { operation_id }],
+        }];
+
+        let instance = AgentInstanceV1::instantiate_with_connections(
+            &template,
+            Uuid::new_v4(),
+            ExperienceMode::Flow,
+            &CapabilityProjection::unrestricted(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&requested),
+            &resolved,
+            serde_json::json!({"caseId": "one"}),
+        )
+        .expect("instantiate with mismatched requested revision");
+
+        assert!(instance.execution_context.connection_bindings.is_empty());
+        assert!(instance.execution_context.connection_operations.is_empty());
+        assert!(!instance
+            .execution_context
+            .capabilities
+            .allows_tool(&model_tool_name));
+        assert!(!instance
+            .execution_context
+            .capabilities
+            .allows_mcp_server(&mcp_server_id.to_string()));
     }
 
     #[test]

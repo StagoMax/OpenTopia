@@ -1,20 +1,20 @@
 {
   "name": "spreadsheet",
   "version": "2.0.0",
-  "description": "Inspect spreadsheets, progressively obtain operation contracts, and execute XLSX/CSV/TSV work through a bounded host runtime.",
+  "description": "Inspect spreadsheets, progressively obtain operation contracts, and execute bounded spreadsheet work.",
   "author": {
     "name": "OpenTopia Contributors"
   },
   "interface": {
     "displayName": "Spreadsheet",
-    "shortDescription": "Work with XLSX, CSV, and TSV files through a progressive protocol.",
-    "longDescription": "Give the model bounded XLSX inspection, validation, creation, and update capabilities plus server-side CSV/TSV inspection, template filling, and export. The model first inspects a resource, then requests only the selected operation's contract, then executes it. Desktop workbook preview is an independent application capability.",
+    "shortDescription": "Read and write spreadsheets through a progressive protocol.",
+    "longDescription": "Give the model bounded spreadsheet inspection, validation, creation, update, template filling, and delimited-data capabilities. The model interprets the requested deliverable, selects the destination, requests only the needed operation contract, and executes it.",
     "developerName": "OpenTopia",
     "category": "Productivity",
-    "defaultPrompt": "For spreadsheet work use spreadsheet_inspect, spreadsheet_describe, then spreadsheet_execute. Describe returns the exact operation schema so do not guess optional fields. For CSV/TSV-to-XLSX template tasks, choose fill_template; the tool handles quoted commas, quoted newlines, duplicate headers, writing, and reopen validation server-side. Use validate for XLSX verification; do not use PDF or manually unpack OOXML unless the spreadsheet protocol reports an unsupported workbook feature. The legacy spreadsheet tool remains only for compatibility.",
+    "defaultPrompt": "For existing spreadsheet files or attachments, use spreadsheet_inspect, request only the needed operation contracts with spreadsheet_describe, then call spreadsheet_execute. Describe returns the exact operation schema, so do not guess optional fields or request unrelated operations. Interpret the user's requested deliverable yourself and choose the destination accordingly. Attachments are immutable inputs; mutations require a workspaceFile resource and write to a workspace-relative destination. For template tasks, choose fill_template; the tool handles delimited parsing, writing, and reopen validation server-side. Use validate for workbook verification; do not use PDF or manually unpack workbook packages unless the spreadsheet protocol reports an unsupported feature.",
     "capabilities": [
-      "XLSX inspection",
-      "XLSX structural validation",
+      "XLS, XLSX, XLSM, XLSB, Excel template, and ODS inspection",
+      "Workbook structural validation",
       "Complex CSV and TSV inspection",
       "Delimited data template filling",
       "CSV and TSV export",

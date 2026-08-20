@@ -3,7 +3,10 @@ use crate::agent_composition::AgentProviderBinding;
 use crate::agent_profiles::AgentProfile;
 use crate::collaboration::AgentPath;
 use crate::execution_authority::ExecutionAuthority;
-use crate::flow_runtime::{FlowNodeExecutionRequestV1, FlowNodeExecutionResultV1, FlowNodeHarness};
+use crate::flow_runtime::{
+    FlowNodeExecutionOutcomeV1, FlowNodeExecutionRequestV1, FlowNodeHarness,
+    FlowNodeResumeRequestV1,
+};
 use crate::model::{CollaborationMode, ExperienceMode, GoalRecord, ThreadModelSelection};
 use crate::model_context::CompiledModelContext;
 use crate::settings::AppSettings;
@@ -257,7 +260,7 @@ impl FlowNodeHarness for PreparedAgentRun {
     async fn execute_flow_node(
         &self,
         request: FlowNodeExecutionRequestV1,
-    ) -> anyhow::Result<FlowNodeExecutionResultV1> {
+    ) -> anyhow::Result<FlowNodeExecutionOutcomeV1> {
         self.authority
             .validate_workspace(&request.context.workspace_root)?;
         anyhow::ensure!(
@@ -276,6 +279,46 @@ impl FlowNodeHarness for PreparedAgentRun {
             "Flow node capabilities exceed its prepared Agent run"
         );
         self.agent.execute_prepared_flow_node(request).await
+    }
+
+    async fn resume_flow_node(
+        &self,
+        request: FlowNodeResumeRequestV1,
+    ) -> anyhow::Result<FlowNodeExecutionOutcomeV1> {
+        self.authority
+            .validate_workspace(&request.context.workspace_root)?;
+        anyhow::ensure!(
+            request.context.permission_mode == self.authority.permission_mode(),
+            "Flow resume permission mode does not match its prepared Agent run"
+        );
+        anyhow::ensure!(
+            request.effective_capabilities
+                == request
+                    .effective_capabilities
+                    .intersect(self.authority.capability_projection()),
+            "Flow resume capabilities exceed its prepared Agent run"
+        );
+        anyhow::ensure!(
+            request.command.validates(&request.interrupt),
+            "Flow ResumeCommand does not match its interrupt"
+        );
+        let continuation = request.interrupt.continuation.decode()?;
+        self.validate_continuation(&continuation)?;
+        let result = self
+            .agent
+            .resume_from_signal_streaming(
+                continuation,
+                request.command.signal.clone().into_agent_signal(),
+                request
+                    .context
+                    .state
+                    .as_ref()
+                    .map(|state| Arc::clone(state.flow_session_store())),
+                request.context.cancel.clone(),
+                None,
+            )
+            .await?;
+        AgentCore::flow_node_outcome_from_turn_result(result, Some(&request.interrupt))
     }
 }
 
@@ -317,6 +360,7 @@ impl AgentCore {
         // previous clone; product adapters must project and sync this run's
         // explicitly allowed servers before finalization.
         agent.tool_host.active_mcp_tools.clear();
+        agent.tool_host.active_connection_operations.clear();
         agent.tool_host.catalog.clear_mcp();
         if let Some(profile) = config.profile.as_ref() {
             agent.apply_agent_profile(profile);

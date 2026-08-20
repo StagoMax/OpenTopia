@@ -51,6 +51,21 @@ async fn provider_tool_loop_supports_multiple_rounds() {
         .expect("turn succeeds");
 
     assert!(assistant_text(&events).contains("Both files were inspected."));
+    let request_ids = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEventPayload::ProviderRequestSent { request_id, .. } => Some(*request_id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let first_token_request_ids = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEventPayload::ProviderFirstTokenReceived { request_id } => Some(*request_id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(first_token_request_ids, request_ids);
     let requests = provider.requests();
     assert_eq!(requests.len(), 3);
     assert_eq!(requests[2].input.tool_calls.len(), 2);
@@ -211,8 +226,8 @@ async fn more_than_twenty_four_distinct_tool_rounds_can_complete() {
 }
 
 #[tokio::test]
-async fn long_turn_compacts_completed_tool_history_automatically() {
-    let workspace = test_workspace("automatic-tool-history-compaction");
+async fn long_turn_replaces_covered_tool_history_with_a_durable_checkpoint() {
+    let workspace = test_workspace("durable-round-context-compaction");
     for index in 0..10 {
         fs::write(
             workspace.join(format!("large-{index}.txt")),
@@ -240,7 +255,33 @@ async fn long_turn_compacts_completed_tool_history_automatically() {
         },
         ModelResponse::text("Completed after automatic context maintenance."),
     ]));
-    let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
+    #[derive(Debug)]
+    struct DurableTestCompactor;
+
+    #[async_trait]
+    impl crate::round_compaction::RoundContextCompactor for DurableTestCompactor {
+        async fn compact(
+            &self,
+            request: crate::round_compaction::RoundContextCompactionRequest,
+        ) -> anyhow::Result<crate::round_compaction::RoundContextCompactionResult> {
+            let checkpoint = ContextCheckpoint::manual(
+                request.thread_id,
+                ContextCheckpointCoverage::default(),
+                "Inspect all large records; completed filesystem reads are covered by this durable checkpoint.",
+            );
+            let rendered = serde_json::to_string_pretty(&checkpoint)?;
+            let mut summary = ContextSummary::new(request.thread_id, 0, 0, rendered);
+            summary.checkpoint = Some(checkpoint);
+            Ok(crate::round_compaction::RoundContextCompactionResult {
+                summary,
+                details: None,
+                covered_tool_call_ids: (0..10).map(|index| format!("call_{index}")).collect(),
+            })
+        }
+    }
+
+    let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins())
+        .with_round_context_compactor(Arc::new(DurableTestCompactor));
 
     let result = agent
         .run_turn_detailed_streaming(
@@ -261,16 +302,22 @@ async fn long_turn_compacts_completed_tool_history_automatically() {
             None,
         )
         .await
-        .expect("history compaction is automatic");
+        .expect("round pressure creates a durable checkpoint");
 
     assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
-    assert!(requests[1].input.tool_calls.len() < 10);
-    assert!(requests[1].input.tool_calls.len() >= 4);
-    assert!(requests[1].input.conversation.iter().any(|message| message
-        .content
-        .starts_with("[Automatically compacted tool history]")));
+    assert!(requests[1].input.tool_calls.is_empty());
+    assert!(requests[1].input.tool_results.is_empty());
+    assert!(requests[1]
+        .instructions
+        .items
+        .iter()
+        .any(|item| item.kind == ContextItemKind::Checkpoint));
+    assert!(result
+        .events
+        .iter()
+        .any(|event| matches!(event, AgentEventPayload::ContextCompacted { .. })));
     assert!(!result
         .events
         .iter()

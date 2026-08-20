@@ -1,5 +1,5 @@
 use super::*;
-use crate::model_context::content_fingerprint;
+use crate::model_context::{content_fingerprint, TokenEstimateDetail};
 use crate::settings::{OpenAiProtocol, PromptCachePolicy};
 use crate::tools::{SpreadsheetTool, Tool};
 use std::time::Duration;

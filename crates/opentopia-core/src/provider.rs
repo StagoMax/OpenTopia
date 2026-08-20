@@ -1,9 +1,7 @@
 use crate::model::{ModelContentPart, ProviderRetryKind};
-use crate::model_context::{
-    estimate_tokens, CompiledModelContext, ContextCacheScope, ContextRole, TokenEstimateBreakdown,
-};
 #[cfg(test)]
-use crate::model_context::{ContextItemKind, ModelContextItem};
+use crate::model_context::{estimate_tokens, ContextItemKind, ModelContextItem};
+use crate::model_context::{CompiledModelContext, ContextCacheScope, ContextRole};
 #[cfg(test)]
 use crate::settings::ProviderKind;
 use crate::settings::{
@@ -20,15 +18,19 @@ use reqwest::header::AUTHORIZATION;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use uuid::Uuid;
 
 mod openai;
+mod token_estimate;
 mod transport;
 
 pub use openai::{OpenAiCompatibleProvider, OpenAiResponsesProvider};
+pub use token_estimate::estimate_provider_tool_surface_tokens;
+#[cfg(test)]
+use token_estimate::{estimate_provider_tool_results, estimate_serialized_slice};
 
 use openai::{
     chat_finish_reason, compatibility_probe_candidate, emit_response_deltas,
@@ -113,7 +115,9 @@ pub struct ModelUserInput {
 }
 
 /// Provider-neutral, typed request ledger. Conversation, the current user
-/// input, and the current round's tool exchange have exactly one owner.
+/// input, and the active turn's completed tool exchange as of this request
+/// have exactly one owner. On round N, calls/results from earlier rounds in the
+/// same turn are cumulative; they are not the entire thread history.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelInputLedger {
@@ -153,172 +157,6 @@ pub struct ModelRequest {
     pub prompt_cache_breakpoint_policy: PromptCacheBreakpointPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_output_json_schema: Option<Value>,
-}
-
-impl ModelRequest {
-    /// Estimates the provider-neutral logical input by harness module.
-    /// Provider adapters add their own framing, so actual response usage remains
-    /// authoritative and is used to report the estimate error.
-    pub fn token_estimate_breakdown(&self) -> TokenEstimateBreakdown {
-        let mut breakdown = TokenEstimateBreakdown::from_context_items(&self.instructions.items);
-        breakdown.conversation = self
-            .input
-            .conversation
-            .iter()
-            .map(|message| estimate_tokens(&message.content))
-            .sum();
-        breakdown.current_user = estimate_tokens(&self.input.current_user.message);
-
-        // Tool calls/results may also be represented by materialized context
-        // items. Re-estimate them from their typed source so image byte buffers
-        // are never counted as enormous JSON integer arrays.
-        breakdown.tool_calls = estimate_serialized_slice(&self.input.tool_calls);
-        breakdown.tool_results = estimate_provider_tool_results(&self.input.tool_results);
-
-        breakdown.conversation = breakdown.conversation.saturating_add(
-            self.input
-                .conversation
-                .iter()
-                .map(|message| {
-                    estimate_model_input_content(&message.content_parts)
-                        .saturating_add(estimate_serialized_slice(&message.tool_calls))
-                        .saturating_add(estimate_provider_tool_results(&message.tool_results))
-                })
-                .sum(),
-        );
-        breakdown.current_user =
-            breakdown
-                .current_user
-                .saturating_add(estimate_model_input_content(
-                    &self.input.current_user.content,
-                ));
-        let output_schema_tokens = self
-            .final_output_json_schema
-            .as_ref()
-            .map(estimate_serialized_tokens)
-            .unwrap_or_default();
-        let (direct, deferred) = estimate_tool_surface(&self.tool_candidates);
-        breakdown.direct_tool_schemas = direct.saturating_add(output_schema_tokens);
-        breakdown.deferred_tool_catalog = deferred;
-        breakdown.loaded_tool_schemas = estimate_loaded_tool_schemas(&self.previous_response_items);
-        breakdown.tool_schemas = breakdown
-            .direct_tool_schemas
-            .saturating_add(breakdown.deferred_tool_catalog)
-            .saturating_add(breakdown.loaded_tool_schemas);
-        let provider_state_items = self
-            .previous_response_items
-            .iter()
-            .filter(|item| item.get("type").and_then(Value::as_str) != Some("tool_search_output"))
-            .collect::<Vec<_>>();
-        breakdown.provider_state = if provider_state_items.is_empty() {
-            0
-        } else {
-            estimate_serialized_tokens(&provider_state_items)
-        };
-        breakdown.recalculate_total();
-        breakdown
-    }
-}
-
-fn estimate_tool_surface(candidates: &[ProviderToolCandidate]) -> (usize, usize) {
-    let direct = candidates
-        .iter()
-        .filter(|candidate| candidate.disclosure == ProviderToolDisclosure::Direct)
-        .map(|candidate| {
-            estimate_serialized_tokens(&json!({
-                "name": candidate.name,
-                "description": candidate.description,
-                "parameters": candidate.input_schema,
-            }))
-        })
-        .sum();
-    let individual = candidates
-        .iter()
-        .filter(|candidate| candidate.disclosure == ProviderToolDisclosure::DeferredIndividual)
-        .map(|candidate| {
-            estimate_serialized_tokens(&json!({
-                "name": candidate.name,
-                "description": candidate.description,
-            }))
-        })
-        .sum::<usize>();
-    let namespaces = candidates
-        .iter()
-        .filter(|candidate| candidate.disclosure == ProviderToolDisclosure::DeferredNamespace)
-        .filter_map(|candidate| candidate.namespace.as_ref())
-        .map(|namespace| (namespace.name.as_str(), namespace.description.as_str()))
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .map(|(name, description)| {
-            estimate_serialized_tokens(&json!({ "name": name, "description": description }))
-        })
-        .sum::<usize>();
-    (direct, individual.saturating_add(namespaces))
-}
-
-pub fn estimate_provider_tool_surface_tokens(candidates: &[ProviderToolCandidate]) -> usize {
-    let (direct, deferred) = estimate_tool_surface(candidates);
-    direct.saturating_add(deferred)
-}
-
-fn estimate_loaded_tool_schemas(items: &[Value]) -> usize {
-    items
-        .iter()
-        .filter(|item| item.get("type").and_then(Value::as_str) == Some("tool_search_output"))
-        .map(estimate_serialized_tokens)
-        .sum()
-}
-
-fn estimate_serialized_tokens(value: &impl Serialize) -> usize {
-    serde_json::to_string(value)
-        .map(|value| estimate_tokens(&value))
-        .unwrap_or_default()
-}
-
-fn estimate_serialized_slice(value: &[impl Serialize]) -> usize {
-    if value.is_empty() {
-        0
-    } else {
-        estimate_serialized_tokens(&value)
-    }
-}
-
-fn estimate_model_input_content(parts: &[ModelInputContent]) -> usize {
-    parts
-        .iter()
-        .map(|part| match part {
-            ModelInputContent::Text { text } => estimate_tokens(text),
-            ModelInputContent::Json { value } => estimate_tokens(&value.to_string()),
-            // The provider receives an encoded image and bills vision input, not
-            // a JSON list of every byte. Dimensions are unavailable here, so keep
-            // the established byte-size heuristic used by server-side budgeting.
-            ModelInputContent::Image { data, .. } => (data.len() / 16).max(1_024),
-            ModelInputContent::Resource {
-                uri,
-                content_type,
-                name,
-            } => estimate_tokens(&resource_fallback_text(
-                uri,
-                content_type.as_deref(),
-                name.as_deref(),
-            )),
-        })
-        .sum()
-}
-
-pub(crate) fn estimate_provider_tool_results(results: &[ProviderToolResult]) -> usize {
-    results
-        .iter()
-        .map(|result| {
-            estimate_tokens(&result.name)
-                .saturating_add(estimate_tokens(&result.output))
-                .saturating_add(estimate_model_input_content(
-                    &nonredundant_tool_result_content(result),
-                ))
-                .saturating_add(estimate_serialized_tokens(&result.metadata))
-                .saturating_add(32)
-        })
-        .sum()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -473,6 +311,25 @@ pub enum ModelStreamDelta {
     Usage {
         usage: ModelUsage,
     },
+}
+
+impl ModelStreamDelta {
+    pub fn contains_output_token(&self) -> bool {
+        match self {
+            Self::Text { text } | Self::Reasoning { text } => !text.is_empty(),
+            Self::ToolCall {
+                id,
+                name,
+                arguments_delta,
+                ..
+            } => {
+                id.as_deref().is_some_and(|value| !value.is_empty())
+                    || name.as_deref().is_some_and(|value| !value.is_empty())
+                    || !arguments_delta.is_empty()
+            }
+            Self::Usage { .. } => false,
+        }
+    }
 }
 
 /// Responses assistant-message phase values. The stream adapter uses these to
@@ -862,7 +719,7 @@ impl ProviderCapabilityNegotiator for AnthropicCapabilityNegotiator {
             model: settings.model.clone(),
             adapter: ProviderAdapterKind::AnthropicMessages,
             instruction_encoding: ProviderInstructionEncoding::FoldDeveloperIntoSystem,
-            reasoning_protocol: ProviderReasoningProtocol::ReasoningEffort,
+            reasoning_protocol: ProviderReasoningProtocol::Omit,
             message_protocol: ProviderMessageProtocolCapabilities::default(),
             output_protocol: ProviderOutputProtocolCapabilities::default(),
             tool_protocol: ProviderToolProtocolCapabilities {
@@ -902,7 +759,7 @@ impl ProviderCapabilityNegotiator for StaticCapabilityNegotiator {
                 model: settings.model.clone(),
                 adapter: self.adapter,
                 instruction_encoding: self.instruction_encoding,
-                reasoning_protocol: ProviderReasoningProtocol::ReasoningEffort,
+                reasoning_protocol: ProviderReasoningProtocol::Omit,
                 message_protocol: ProviderMessageProtocolCapabilities::default(),
                 output_protocol: ProviderOutputProtocolCapabilities::default(),
                 tool_protocol: self.tool_protocol,
@@ -1211,15 +1068,6 @@ fn ensure_visual_input_supported(
         );
     }
     Ok(())
-}
-
-fn deepseek_reasoning_effort(value: &str) -> &str {
-    match value {
-        "xhigh" | "max" => "max",
-        // DeepSeek documents low/medium as compatibility aliases for high.
-        // Treat a stale minimal value conservatively as high as well.
-        _ => "high",
-    }
 }
 
 fn request_image_part_count(request: &ModelRequest) -> usize {

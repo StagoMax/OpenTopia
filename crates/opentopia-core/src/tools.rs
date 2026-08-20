@@ -37,6 +37,7 @@ use crate::sandbox::LocalSandboxConfig;
 use crate::shell_analysis::analyze_shell_command;
 use crate::tool_state::ToolStateStore;
 use crate::work_form::WorkForm;
+use crate::ConnectionOperationRuntimeRoute;
 use anyhow::Context;
 use async_trait::async_trait;
 #[cfg(test)]
@@ -47,7 +48,7 @@ use schemars::{gen::SchemaSettings, JsonSchema};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -91,6 +92,9 @@ pub struct ToolInvocationContext {
     /// this bounded set, never to an arbitrary or merely cached server.
     pub mcp_host: Option<McpExtensionHost>,
     pub mcp_tools: Vec<McpToolDescriptor>,
+    /// Exact structured Connection routes keyed by the model-facing alias.
+    /// Legacy MCP contexts leave this empty.
+    pub connection_operations: BTreeMap<String, ConnectionOperationRuntimeRoute>,
     /// Whether the provider selected for this thread accepts native image input.
     /// `view_attachment` uses this to choose native image delivery or an explicitly
     /// declared MCP attachment-inspection capability.
@@ -169,6 +173,7 @@ impl ToolInvocationContext {
             artifact_runtime: ArtifactRuntime::shared(),
             mcp_host: None,
             mcp_tools: Vec::new(),
+            connection_operations: BTreeMap::new(),
             model_supports_vision: true,
             fork_conversation: Vec::new(),
             fork_model_context: None,
@@ -221,6 +226,7 @@ impl ToolInvocationContext {
             artifact_runtime: ArtifactRuntime::shared(),
             mcp_host: None,
             mcp_tools: Vec::new(),
+            connection_operations: BTreeMap::new(),
             model_supports_vision: true,
             fork_conversation: Vec::new(),
             fork_model_context: None,
@@ -299,11 +305,14 @@ impl ToolInvocationContext {
     }
 }
 
-fn enforce_policy_decision(decision: PolicyDecision, approval_granted: bool) -> anyhow::Result<()> {
-    match decision {
+fn enforce_policy_decision(
+    decision: PolicyDecision,
+    context: &ToolInvocationContext,
+) -> anyhow::Result<()> {
+    match context.permission_mode.resolve_policy_decision(decision) {
         PolicyDecision::Allow => Ok(()),
         PolicyDecision::Deny { reason } => anyhow::bail!("denied: {reason}"),
-        PolicyDecision::Ask { .. } if approval_granted => Ok(()),
+        PolicyDecision::Ask { .. } if context.approval_granted => Ok(()),
         PolicyDecision::Ask { reason } => Err(ApprovalRequired::new(reason).into()),
     }
 }
@@ -518,7 +527,7 @@ macro_rules! impl_typed_tool {
                         .unwrap_or(PolicyDecision::Allow);
                 enforce_policy_decision(
                     PolicyDecision::combine([intent_decision, tool_decision]),
-                    ctx.approval_granted,
+                    &ctx,
                 )?;
                 ctx.apply_execution_intent(&intent)?;
                 <Self as TypedTool>::execute_typed(self, call.id, input, ctx).await
@@ -597,7 +606,7 @@ impl ToolExecutionPolicy {
 }
 
 mod descriptor;
-pub(crate) use descriptor::{RegisteredTool, ToolGovernance};
+pub(crate) use descriptor::{RegisteredTool, ToolGovernance, ToolModelVisibility};
 pub use descriptor::{
     ToolApprovalMode, ToolCapabilityDescriptor, ToolClass, ToolRiskLevel, ToolSource,
 };
@@ -618,6 +627,7 @@ use spreadsheet_tool::SpreadsheetToolInput;
 
 mod office_resource;
 use office_resource::OfficeResourceRef;
+mod spreadsheet_protocol_contract;
 mod spreadsheet_protocol_tools;
 pub use spreadsheet_protocol_tools::{
     SpreadsheetDescribeTool, SpreadsheetExecuteTool, SpreadsheetInspectTool,
@@ -1424,7 +1434,7 @@ impl TypedTool for WriteFileTool {
         let relative = input.path.trim();
         anyhow::ensure!(!relative.is_empty(), "write_file requires a path");
         let path = normalize_workspace_path(&ctx.workspace_root, relative)?;
-        enforce_policy_decision(ctx.policy.inspect_write(&path), ctx.approval_granted)?;
+        enforce_policy_decision(ctx.policy.inspect_write(&path), &ctx)?;
 
         let original = read_optional(ctx.environment.as_ref(), &path).await?;
         verify_write_precondition(&path, original.as_deref(), input.expected_hash.as_deref())?;
@@ -1564,7 +1574,7 @@ fn tool_resource_key(kind: &str, path: &str) -> String {
 }
 
 fn enforce_read_policy(ctx: &ToolInvocationContext, path: &Path) -> anyhow::Result<()> {
-    enforce_policy_decision(ctx.policy.inspect_read(path), ctx.approval_granted)
+    enforce_policy_decision(ctx.policy.inspect_read(path), ctx)
 }
 
 fn looks_like_sandbox_denial(stderr: &str) -> bool {

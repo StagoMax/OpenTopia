@@ -8,6 +8,8 @@ use crate::tools::{
     RegisteredTool, Tool, ToolApprovalMode, ToolClass, ToolExecutionPolicy, ToolGovernance,
     ToolInvocationContext, ToolRiskLevel, ToolSideEffect,
 };
+use crate::RuntimeConnectionAuthorityV1;
+use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::Deserialize;
@@ -556,14 +558,16 @@ impl Tool for FlowTool {
                 let definition = store
                     .get_flow_definition(input.flow_id.trim(), input.version)?
                     .ok_or_else(|| anyhow::anyhow!("published Flow not found"))?;
-                let run = FlowRunV1::new(
+                let connection_authority = flow_connection_authority_from_context(&ctx);
+                let run = FlowRunV1::new_with_connection_authority(
                     thread_id,
                     &definition,
                     input.input,
                     &ctx.capability_projection,
+                    connection_authority,
                 )?;
                 let run = store.insert_flow_run(&run)?;
-                spawn_flow_run(run.id, ctx.clone())?;
+                spawn_flow_run(run.id, flow_context_for_run(ctx.clone(), &run)?)?;
                 Self::result(call.id, json!({"run": run}))
             }
             FlowToolAction::Status => {
@@ -633,7 +637,7 @@ impl Tool for FlowTool {
                 }
                 let run = store.update_flow_run(&run, expected)?;
                 if !run.status.is_terminal() {
-                    spawn_flow_run(run.id, ctx.clone())?;
+                    spawn_flow_run(run.id, flow_context_for_run(ctx.clone(), &run)?)?;
                 }
                 Self::result(call.id, json!({"run": run}))
             }
@@ -675,6 +679,78 @@ impl Tool for FlowTool {
             }
         }
     }
+}
+
+fn flow_connection_authority_from_context(
+    ctx: &ToolInvocationContext,
+) -> RuntimeConnectionAuthorityV1 {
+    if ctx.connection_operations.is_empty() {
+        return RuntimeConnectionAuthorityV1::inferred_from_projection(&ctx.capability_projection);
+    }
+    let mut operations = ctx
+        .connection_operations
+        .values()
+        .map(|route| route.operation().clone())
+        .collect::<Vec<_>>();
+    operations.sort_by(|left, right| {
+        (left.connection_id, left.operation_id.as_str())
+            .cmp(&(right.connection_id, right.operation_id.as_str()))
+    });
+    operations.dedup_by(|left, right| {
+        left.connection_id == right.connection_id && left.operation_id == right.operation_id
+    });
+    RuntimeConnectionAuthorityV1::Structured { operations }
+}
+
+fn flow_context_for_run(
+    mut ctx: ToolInvocationContext,
+    run: &FlowRunV1,
+) -> anyhow::Result<ToolInvocationContext> {
+    ctx.capability_projection = run.effective_capabilities.clone();
+    match run.effective_connection_authority() {
+        RuntimeConnectionAuthorityV1::DenyAll => {
+            ctx.connection_operations.clear();
+            ctx.mcp_tools.clear();
+        }
+        RuntimeConnectionAuthorityV1::LegacyMcp => {
+            ctx.connection_operations.clear();
+            ctx.mcp_tools.retain(|descriptor| {
+                run.effective_capabilities
+                    .allows_mcp_server(&descriptor.server_id.to_string())
+                    && run
+                        .effective_capabilities
+                        .allows_tool(&descriptor.public_name)
+            });
+        }
+        RuntimeConnectionAuthorityV1::Structured { operations } => {
+            let mut frozen_routes = std::collections::BTreeMap::new();
+            for operation in operations {
+                let route = ctx
+                    .connection_operations
+                    .get(&operation.model_tool_name)
+                    .with_context(|| {
+                        format!(
+                            "Flow Run Connection operation {} is unavailable in the current execution context",
+                            operation.operation_id
+                        )
+                    })?;
+                anyhow::ensure!(
+                    route.operation() == &operation,
+                    "Flow Run Connection operation changed after it was frozen"
+                );
+                frozen_routes.insert(operation.model_tool_name.clone(), route.clone());
+            }
+            ctx.connection_operations = frozen_routes;
+            let allowed_names = ctx
+                .connection_operations
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            ctx.mcp_tools
+                .retain(|descriptor| allowed_names.contains(&descriptor.public_name));
+        }
+    }
+    Ok(ctx)
 }
 
 fn draft_schema() -> Value {

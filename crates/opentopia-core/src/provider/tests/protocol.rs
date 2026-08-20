@@ -51,6 +51,27 @@ fn parses_openai_chat_tool_calls() {
 }
 
 #[test]
+fn parses_deepseek_prompt_cache_hit_tokens() {
+    let response = parse_model_response_body(&json!({
+        "choices": [{
+            "message": { "content": "done" },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "total_tokens": 105,
+            "prompt_cache_hit_tokens": 72,
+            "prompt_cache_miss_tokens": 28
+        }
+    }))
+    .expect("DeepSeek-compatible response parses");
+
+    let usage = response.usage.expect("usage");
+    assert_eq!(usage.cached_input_tokens, Some(72));
+}
+
+#[test]
 fn chat_adapter_rejects_a_value_less_optional_tail() {
     let body = json!({
         "choices": [{

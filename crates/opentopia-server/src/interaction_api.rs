@@ -1,6 +1,6 @@
 use super::{
-    decode_turn_checkpoint, ensure_thread, finalize_goal_after_turn, finish_turn, publish_payload,
-    run_resumed_agent_turn, ApiError, AppState,
+    decode_turn_checkpoint, ensure_thread, finalize_goal_after_turn, finalize_turn_change_capture,
+    finish_turn, publish_payload, run_resumed_agent_turn, ApiError, AppState,
 };
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
@@ -147,6 +147,7 @@ async fn decide_approval(
                 TurnStatus::Failed,
                 Some(error.clone()),
             );
+            finalize_turn_change_capture(&state, thread_id, turn.turn_id, TurnStatus::Failed).await;
             return Err(ApiError::not_found(error));
         }
         Err(error) => {
@@ -157,6 +158,7 @@ async fn decide_approval(
                 TurnStatus::Failed,
                 Some(error.to_string()),
             );
+            finalize_turn_change_capture(&state, thread_id, turn.turn_id, TurnStatus::Failed).await;
             return Err(error.into());
         }
     }
@@ -320,6 +322,13 @@ async fn respond_to_user_input(
                 reason: "User dismissed the decision request.".to_string(),
             },
         );
+        finalize_turn_change_capture(
+            &state,
+            thread_id,
+            continuation_turn_id,
+            TurnStatus::Cancelled,
+        )
+        .await;
         finalize_goal_after_turn(
             &state,
             thread_id,
@@ -358,6 +367,7 @@ async fn respond_to_user_input(
             TurnStatus::Failed,
             Some(message.clone()),
         );
+        finalize_turn_change_capture(&state, thread_id, turn.turn_id, TurnStatus::Failed).await;
         return Err(ApiError::conflict(message));
     }
     if let Err(error) = state

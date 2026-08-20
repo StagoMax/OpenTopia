@@ -23,40 +23,41 @@ use opentopia_core::AgentResumeSignal;
 use opentopia_core::PreviewTarget;
 use opentopia_core::{
     agent_model_context_with_runtime, browser_handoff_for_node, configured_provider_from_settings,
-    content_fingerprint, current_shell_runtime_status, discover_plugins, discover_skills,
-    execute_git_workflow, experience_mode_module, install_plugin, load_plugin_mcp_servers,
-    negotiate_provider_settings, permission_policy_module, redact_model_observation,
-    remove_windows_sandbox, resolve_instruction_documents, setup_windows_sandbox,
-    tool_result_is_error, uninstall_plugin, windows_sandbox_setup_status, world_state_catalog_item,
-    AgentContextBudget, AgentContinuation, AgentContinuationState, AgentCore, AgentEvent,
-    AgentEventPayload, AgentInstanceStatusV1, AgentInstanceV1, AgentRunConfig, AgentRunIdentity,
-    AgentRuntimeSettings, AgentTemplateVersionV1, AgentTurnInput, AgentTurnOutcome, AppSettings,
-    Approval, ApprovalStatus, Artifact, ArtifactMetadata, BasicPolicyEngine, BrowserAction,
-    BrowserActionReceipt, BrowserContent, BrowserDownloadRequest, BrowserNavigateRequest,
-    BrowserNodeRef, BrowserObservation, BrowserObservationId, BrowserObserveOptions, BrowserOutput,
-    BrowserRuntimeRoute, BrowserSelector, BrowserSessionId, BrowserSessionSpec, BrowserTargetRef,
-    BrowserWaitCondition, BrowserWaitRequest, CapabilityProjection, CodexAccountStatus,
-    CodexLoginStart, CollaborationMode, CompiledModelContext, ComputerSessionId, ContextCacheScope,
-    ContextCheckpoint, ContextCheckpointCoverage, ContextCheckpointMode, ContextCompactionDetails,
+    content_fingerprint, current_office_runtime_status, current_shell_runtime_status,
+    discover_plugins, discover_skills, execute_git_workflow, experience_mode_module,
+    install_plugin, load_plugin_mcp_servers, negotiate_provider_settings, permission_policy_module,
+    redact_model_observation, remove_windows_sandbox, resolve_instruction_documents,
+    setup_windows_sandbox, tool_result_is_error, uninstall_plugin, windows_sandbox_setup_status,
+    world_state_catalog_item, AgentContextBudget, AgentContinuation, AgentContinuationState,
+    AgentCore, AgentEvent, AgentEventPayload, AgentInstanceStatusV1, AgentInstanceV1,
+    AgentRunConfig, AgentRunIdentity, AgentRuntimeSettings, AgentTemplateVersionV1, AgentTurnInput,
+    AgentTurnOutcome, AppSettings, Approval, ApprovalStatus, Artifact, ArtifactMetadata,
+    BasicPolicyEngine, BrowserAction, BrowserActionReceipt, BrowserContent, BrowserDownloadRequest,
+    BrowserNavigateRequest, BrowserNodeRef, BrowserObservation, BrowserObservationId,
+    BrowserObserveOptions, BrowserOutput, BrowserRuntimeRoute, BrowserSelector, BrowserSessionId,
+    BrowserSessionSpec, BrowserTargetRef, BrowserWaitCondition, BrowserWaitRequest,
+    CapabilityProjection, CodexAccountStatus, CodexLoginStart, CollaborationMode,
+    CompiledModelContext, ComputerSessionId, ContextCacheScope, ContextCheckpoint,
+    ContextCheckpointCoverage, ContextCheckpointMode, ContextCompactionDetails,
     ContextCompactionMetrics, ContextItemKind, ContextProjection, ContextRole, ContextSensitivity,
     ContextSummary, ContributionKind, ExecutionAuthority, ExecutionContext, ExperienceMode,
     ExperienceSurfaceProfile, GitWorkflowAction, GitWorkflowRequest, GoalRecord, GoalStatus,
     LoadedSkill, LocalExecutionEnvironment, McpCallResult, McpServerConfig, McpServerStatus,
     McpToolDescriptor, MediaHandlerSelection, Message, MessagePart, MessageRole, ModelCallPurpose,
     ModelContentPart, ModelContextItem, ModelConversationMessage, ModelConversationRole,
-    ModelGateway, ModelStreamDelta, ObserveOptions, PermissionMode, PluginControlScope,
-    PluginDescriptor, PluginError, PolicyDecision, PolicyEngine, PreviewDescriptor, PreviewError,
-    PreviewKind, PreviewRange, PreviewRangeRequest, PreviewWorkbook, ProviderAdapterKind,
-    ProviderAuthKind, ProviderConversationCursor, ProviderConversationState,
-    ProviderDriverDescriptor, ProviderDriverRegistry, ProviderHealth, ProviderHealthCheck,
-    ProviderKind, ProviderModelGateway, ProviderSettings, ProviderToolCall, ProviderToolResult,
-    ProviderTransportEvent, ProviderTransportKind, ResolvedPreview, ResourceLimit, RuntimeSurface,
-    SandboxDescriptor, SandboxSettings, SessionStore, ShellRuntimeStatus, SkillDescriptor,
-    SqliteSessionStore, StoreError, ThreadContextSnapshot, ThreadMcpServer, ThreadModelSelection,
-    ToolCall, ToolPermissionDescriptor, ToolResult, TurnChangeSet, TurnChangeSetStatus,
-    TurnContextSnapshot, TurnInboxItem, TurnRecord, TurnStatus, UserInputResponse, UserInputStatus,
-    WindowsSandboxSetupStatus, WorkspaceDiff, WorldStateSkill, WorldStateSnapshot,
-    CONTEXT_CHECKPOINT_SCHEMA_VERSION, MAX_PREVIEW_CONTENT_BYTES,
+    ModelGateway, ModelStreamDelta, ObserveOptions, OfficeRuntimeStatus, PermissionMode,
+    PluginControlScope, PluginDescriptor, PluginError, PolicyDecision, PolicyEngine,
+    PreviewDescriptor, PreviewError, PreviewKind, PreviewRange, PreviewRangeRequest,
+    PreviewWorkbook, ProviderAdapterKind, ProviderAuthKind, ProviderConversationCursor,
+    ProviderConversationState, ProviderDriverDescriptor, ProviderDriverRegistry, ProviderHealth,
+    ProviderHealthCheck, ProviderKind, ProviderModelGateway, ProviderSettings, ProviderToolCall,
+    ProviderToolResult, ProviderTransportEvent, ProviderTransportKind, ResolvedPreview,
+    ResourceLimit, RuntimeSurface, SandboxDescriptor, SandboxSettings, SessionStore,
+    ShellRuntimeStatus, SkillDescriptor, SqliteSessionStore, StoreError, ThreadContextSnapshot,
+    ThreadMcpServer, ThreadModelSelection, ToolCall, ToolPermissionDescriptor, ToolResult,
+    TurnChangeSet, TurnChangeSetStatus, TurnContextSnapshot, TurnInboxItem, TurnRecord, TurnStatus,
+    UserInputResponse, UserInputStatus, WindowsSandboxSetupStatus, WorkspaceDiff, WorldStateSkill,
+    WorldStateSnapshot, CONTEXT_CHECKPOINT_SCHEMA_VERSION, MAX_PREVIEW_CONTENT_BYTES,
     MIN_PROVIDER_CONTEXT_WINDOW_TOKENS,
 };
 #[cfg(test)]
@@ -75,6 +76,7 @@ use tokio::time::timeout;
 use tracing::{error, warn};
 use uuid::Uuid;
 
+mod agent_connection_access;
 mod agent_factory;
 mod agent_runs;
 mod agent_templates_api;
@@ -83,6 +85,8 @@ mod app_state;
 mod auth;
 mod bootstrap;
 mod browser_api;
+mod connection_operation_runtime;
+mod connections_api;
 mod context_api;
 mod contributions_api;
 mod conversation_api;
@@ -100,33 +104,36 @@ mod provider_api;
 mod resource_api;
 mod resource_registry;
 mod routes;
+mod runtime_api;
 mod scm_api;
 mod terminal_api;
 mod thread_runtime;
 mod turn_changes;
 mod turns;
+mod workflow_compiler;
+mod workflow_deployments_api;
 mod workspace_api;
 
 use agent_turn_coordinator::{drive_agent_turn, resume_agent_turn};
 use app_state::AppState;
 use browser_api::BrowserRuntimeStatus;
-#[cfg(test)]
-use context_api::{
-    build_context_snapshot, message_model_content_parts, model_conversation_message,
-    model_conversation_message_token_estimate, model_user_message_with_attachment_manifest,
-    prior_messages_for_turn, recent_conversation_tail, referenced_image_message_model_content,
-    thread_context_snapshot_changed,
-};
+use connection_operation_runtime::connection_authority_for_context;
 use context_api::{
     build_turn_model_context, checkpoint_token_estimate, context_compaction_details,
     estimate_tokens, latest_active_work_form_event, latest_context_summary_event,
     prepare_turn_context, project_model_conversation, render_context_checkpoint,
     render_message_for_summary, summary_message_cursor, truncate_chars, truncate_with_flag,
-    turn_context_reservation, ContextStatusResponse,
+    turn_context_reservation, ContextStatusResponse, ServerRoundContextCompactor,
+};
+#[cfg(test)]
+use context_api::{
+    message_model_content_parts, model_conversation_message,
+    model_conversation_message_token_estimate, model_user_message_with_attachment_manifest,
+    prior_messages_for_turn, recent_conversation_tail, referenced_image_message_model_content,
+    thread_context_snapshot_changed,
 };
 use conversation_api::{
-    assemble_one_shot_model_request, ensure_experience_mode_enabled, provider_settings_for_thread,
-    GenerateThreadTitleResponse,
+    ensure_experience_mode_enabled, provider_settings_for_thread, GenerateThreadTitleResponse,
 };
 #[cfg(test)]
 use conversation_api::{
@@ -167,10 +174,10 @@ use terminal_api::{PtyManager, TerminalBus};
 #[cfg(test)]
 use thread_runtime::{attachment_preloaded_tools, computer_allowed_applications};
 use thread_runtime::{
-    bind_existing_collaboration_turn, bind_root_collaboration, ensure_bound_agent_skills_visible,
-    ensure_mode_skills_visible, ensure_plugin_skills_enabled, load_agent_profiles_for_thread,
+    bind_existing_collaboration_turn, bind_root_collaboration_with_connection_authority,
+    ensure_bound_agent_skills_visible, ensure_mode_skills_visible, ensure_plugin_skills_enabled,
+    load_agent_profiles_for_thread, sync_runtime_connection_tools,
     sync_thread_attachment_tool_preloads, sync_thread_bundled_plugin_activations,
-    sync_thread_mcp_tools,
 };
 use turn_changes::{TurnFileDiffPreview, TurnUndoPreview, TurnUndoResult};
 use turns::{TurnCancelResult, TurnHandle};
@@ -251,8 +258,9 @@ async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         ok: true,
         service: "opentopia-server",
-        api_version: 1,
+        api_version: 2,
         shell_runtime: current_shell_runtime_status(),
+        office_runtime: current_office_runtime_status(),
     })
 }
 
@@ -698,7 +706,7 @@ async fn cancel_user_turn(
                         | TurnStatus::WaitingUserAction
                 )
         }) {
-            result = cancel_waiting_agent_turn(&state, thread_id, waiting)?;
+            result = cancel_waiting_agent_turn(&state, thread_id, waiting).await?;
             cancelled_waiting = result.cancelled;
         }
     }
@@ -764,7 +772,7 @@ async fn cancel_collaboration_descendants(state: &AppState, thread_id: Uuid, _ro
     }
 }
 
-fn cancel_waiting_agent_turn(
+async fn cancel_waiting_agent_turn(
     state: &AppState,
     thread_id: Uuid,
     turn: &TurnRecord,
@@ -845,6 +853,7 @@ fn cancel_waiting_agent_turn(
             reason: "Cancelled by user while waiting.".to_string(),
         },
     );
+    finalize_turn_change_capture(state, thread_id, turn.turn_id, TurnStatus::Cancelled).await;
     finalize_goal_after_turn(
         state,
         thread_id,
@@ -1086,7 +1095,30 @@ async fn begin_turn_change_capture(
     }
 }
 
-async fn finalize_turn_change_capture(state: &AppState, thread_id: Uuid, turn_id: Uuid) {
+async fn resume_turn_change_capture(
+    state: &AppState,
+    thread_id: Uuid,
+    turn_id: Uuid,
+    workspace_root: &FsPath,
+) {
+    if let Err(error) = state
+        .turn_changes
+        .resume_capture(turn_id, thread_id, workspace_root)
+        .await
+    {
+        warn!(?error, %thread_id, %turn_id, "failed to resume turn change capture");
+    }
+}
+
+pub(crate) async fn finalize_turn_change_capture(
+    state: &AppState,
+    thread_id: Uuid,
+    turn_id: Uuid,
+    status: TurnStatus,
+) {
+    if !status.is_terminal() {
+        return;
+    }
     let changed_paths = turn_reported_changed_paths(state, thread_id, turn_id);
     match state
         .turn_changes
@@ -1171,10 +1203,18 @@ fn load_bound_agent_context(
         .store
         .get_agent_template_version(&instance.template_id, instance.template_version)?
         .ok_or_else(|| ApiError::internal("bound Agent template version is missing"))?;
+    let resolved_connection_bindings =
+        agent_connection_access::resolve_agent_template_connection_access(
+            &state.store,
+            &template.spec,
+        )?
+        .require_valid()
+        .map_err(ApiError::conflict)?;
     instance
-        .validate_execution_boundary(
+        .validate_execution_boundary_with_connections(
             &template,
             &ExperienceSurfaceProfile::for_mode(thread.experience_mode).capabilities,
+            &resolved_connection_bindings,
         )
         .map_err(|error| ApiError::conflict(error.to_string()))?;
     Ok((Some(instance), Some(template)))
@@ -1333,7 +1373,9 @@ async fn run_new_agent_turn(
         let mut flow_capabilities = bound_agent_instance
             .as_ref()
             .map(|instance| instance.execution_context.capabilities.clone())
-            .unwrap_or_else(|| surface_profile.capabilities.clone());
+            .unwrap_or_else(|| {
+                ExperienceSurfaceProfile::flow_runtime_baseline(workspace_root.clone())
+            });
         if !flow_capabilities.allow_all_tools {
             flow_capabilities
                 .tools
@@ -1386,7 +1428,7 @@ async fn run_new_agent_turn(
                     message: message.clone(),
                 },
             );
-            finalize_turn_change_capture(&state, thread_id, turn_id).await;
+            finalize_turn_change_capture(&state, thread_id, turn_id, TurnStatus::Failed).await;
             finalize_goal_after_turn(
                 &state,
                 thread_id,
@@ -1404,6 +1446,10 @@ async fn run_new_agent_turn(
             return;
         }
     };
+    agent.set_round_context_compactor(Arc::new(ServerRoundContextCompactor::new(
+        state.clone(),
+        selected_provider.clone(),
+    )));
     agent.set_mcp_host(state.mcp_host.clone());
     if agent.capability_projection().allow_all_plugins
         || !agent.capability_projection().plugins.is_empty()
@@ -1413,10 +1459,39 @@ async fn run_new_agent_turn(
         agent.disable_all_bundled_plugins();
     }
     sync_thread_attachment_tool_preloads(&state.store, thread_id, &mut agent);
-    if agent.capability_projection().allow_all_mcp_servers
-        || !agent.capability_projection().mcp_servers.is_empty()
+    let connection_authority = connection_authority_for_context(
+        thread.experience_mode,
+        bound_agent_instance.as_ref(),
+        bound_agent_template.as_ref(),
+        agent.capability_projection(),
+    );
+    if let Err(error) = sync_runtime_connection_tools(
+        &state.store,
+        &state.mcp_host,
+        thread_id,
+        &connection_authority,
+        &mut agent,
+    )
+    .await
     {
-        sync_thread_mcp_tools(&state.store, &state.mcp_host, thread_id, &mut agent).await;
+        let message = format!("failed to prepare Connection operations: {error}");
+        publish_payload(
+            &state,
+            thread_id,
+            Some(turn_id),
+            AgentEventPayload::Error {
+                message: message.clone(),
+            },
+        );
+        finalize_turn_change_capture(&state, thread_id, turn_id, TurnStatus::Failed).await;
+        finish_turn(
+            &state,
+            thread_id,
+            turn_id,
+            TurnStatus::Failed,
+            Some(message),
+        );
+        return;
     }
     if let Some(provider) = library_provider {
         agent.register_runtime_tool(Arc::new(library_api::LibrarySearchTool::new(
@@ -1424,13 +1499,14 @@ async fn run_new_agent_turn(
             provider,
         )));
     }
-    if let Err(error) = bind_root_collaboration(
+    if let Err(error) = bind_root_collaboration_with_connection_authority(
         &state,
         &thread,
         turn_id,
         turn.invocation_id,
         &content,
         &selected_provider,
+        connection_authority,
         &mut agent,
     )
     .await
@@ -1444,7 +1520,7 @@ async fn run_new_agent_turn(
                 message: message.clone(),
             },
         );
-        finalize_turn_change_capture(&state, thread_id, turn_id).await;
+        finalize_turn_change_capture(&state, thread_id, turn_id, TurnStatus::Failed).await;
         finish_turn(
             &state,
             thread_id,
@@ -1466,7 +1542,7 @@ async fn run_new_agent_turn(
                     message: message.clone(),
                 },
             );
-            finalize_turn_change_capture(&state, thread_id, turn_id).await;
+            finalize_turn_change_capture(&state, thread_id, turn_id, TurnStatus::Failed).await;
             finish_turn(
                 &state,
                 thread_id,
@@ -1508,7 +1584,7 @@ async fn run_new_agent_turn(
                     reason: "Cancelled by user.".to_string(),
                 },
             );
-            finalize_turn_change_capture(&state, thread_id, turn_id).await;
+            finalize_turn_change_capture(&state, thread_id, turn_id, TurnStatus::Cancelled).await;
             finalize_goal_after_turn(
                 &state,
                 thread_id,
@@ -1546,7 +1622,7 @@ async fn run_new_agent_turn(
                     message: message.clone(),
                 },
             );
-            finalize_turn_change_capture(&state, thread_id, turn_id).await;
+            finalize_turn_change_capture(&state, thread_id, turn_id, TurnStatus::Failed).await;
             finalize_goal_after_turn(
                 &state,
                 thread_id,
@@ -1613,7 +1689,7 @@ async fn run_new_agent_turn(
                         message: message.clone(),
                     },
                 );
-                finalize_turn_change_capture(&state, thread_id, turn_id).await;
+                finalize_turn_change_capture(&state, thread_id, turn_id, TurnStatus::Failed).await;
                 finalize_goal_after_turn(
                     &state,
                     thread_id,
@@ -1686,7 +1762,8 @@ async fn run_new_agent_turn(
                     )
                     .await;
                 }
-                finalize_turn_change_capture(&state, thread_id, turn_id).await;
+                finalize_turn_change_capture(&state, thread_id, turn_id, TurnStatus::Cancelled)
+                    .await;
                 finalize_goal_after_turn(
                     &state,
                     thread_id,
@@ -1775,7 +1852,7 @@ async fn run_new_agent_turn(
         status = TurnStatus::Failed;
         turn_error = Some(message);
     }
-    finalize_turn_change_capture(&state, thread_id, turn_id).await;
+    finalize_turn_change_capture(&state, thread_id, turn_id, status).await;
     finalize_goal_after_turn(
         &state,
         thread_id,
@@ -1802,7 +1879,7 @@ async fn run_resumed_agent_turn(
         .turn_changes
         .lock_workspace_shared(&workspace_root)
         .await;
-    begin_turn_change_capture(&state, thread_id, turn_id, &workspace_root).await;
+    resume_turn_change_capture(&state, thread_id, turn_id, &workspace_root).await;
     let prepared_draft =
         async {
             let authority = continuation.execution_authority.clone().ok_or_else(|| {
@@ -1876,10 +1953,11 @@ async fn run_resumed_agent_turn(
                 .read()
                 .expect("agent lock poisoned")
                 .begin_run(config)?;
-            Ok::<_, anyhow::Error>((draft, frozen_provider))
+            let connection_authority = snapshot.connection_authority.clone();
+            Ok::<_, anyhow::Error>((draft, frozen_provider, connection_authority))
         }
         .await;
-    let (mut agent, selected_provider) = match prepared_draft {
+    let (mut agent, selected_provider, connection_authority) = match prepared_draft {
         Ok(prepared) => prepared,
         Err(error) => {
             let message = error.to_string();
@@ -1891,7 +1969,7 @@ async fn run_resumed_agent_turn(
                     message: message.clone(),
                 },
             );
-            finalize_turn_change_capture(&state, thread_id, turn_id).await;
+            finalize_turn_change_capture(&state, thread_id, turn_id, TurnStatus::Failed).await;
             finalize_goal_after_turn(
                 &state,
                 thread_id,
@@ -1918,10 +1996,33 @@ async fn run_resumed_agent_turn(
         agent.disable_all_bundled_plugins();
     }
     sync_thread_attachment_tool_preloads(&state.store, thread_id, &mut agent);
-    if agent.capability_projection().allow_all_mcp_servers
-        || !agent.capability_projection().mcp_servers.is_empty()
+    if let Err(error) = sync_runtime_connection_tools(
+        &state.store,
+        &state.mcp_host,
+        thread_id,
+        &connection_authority,
+        &mut agent,
+    )
+    .await
     {
-        sync_thread_mcp_tools(&state.store, &state.mcp_host, thread_id, &mut agent).await;
+        let message = format!("failed to restore Connection operations: {error}");
+        publish_payload(
+            &state,
+            thread_id,
+            Some(turn_id),
+            AgentEventPayload::Error {
+                message: message.clone(),
+            },
+        );
+        finalize_turn_change_capture(&state, thread_id, turn_id, TurnStatus::Failed).await;
+        finish_turn(
+            &state,
+            thread_id,
+            turn_id,
+            TurnStatus::Failed,
+            Some(message),
+        );
+        return;
     }
     /* authority-bound setup ends here; no live setting may widen the draft */
     let library_provider = state
@@ -1953,7 +2054,7 @@ async fn run_resumed_agent_turn(
                 message: message.clone(),
             },
         );
-        finalize_turn_change_capture(&state, thread_id, turn_id).await;
+        finalize_turn_change_capture(&state, thread_id, turn_id, TurnStatus::Failed).await;
         finish_turn(
             &state,
             thread_id,
@@ -1975,7 +2076,7 @@ async fn run_resumed_agent_turn(
                     message: message.clone(),
                 },
             );
-            finalize_turn_change_capture(&state, thread_id, turn_id).await;
+            finalize_turn_change_capture(&state, thread_id, turn_id, TurnStatus::Failed).await;
             finish_turn(
                 &state,
                 thread_id,
@@ -2030,7 +2131,8 @@ async fn run_resumed_agent_turn(
                     )
                     .await;
                 }
-                finalize_turn_change_capture(&state, thread_id, turn_id).await;
+                finalize_turn_change_capture(&state, thread_id, turn_id, TurnStatus::Cancelled)
+                    .await;
                 finalize_goal_after_turn(
                     &state,
                     thread_id,
@@ -2119,7 +2221,7 @@ async fn run_resumed_agent_turn(
         status = TurnStatus::Failed;
         turn_error = Some(message);
     }
-    finalize_turn_change_capture(&state, thread_id, turn_id).await;
+    finalize_turn_change_capture(&state, thread_id, turn_id, status).await;
     finalize_goal_after_turn(
         &state,
         thread_id,
@@ -2937,6 +3039,7 @@ struct HealthResponse {
     #[serde(rename = "apiVersion")]
     api_version: u32,
     shell_runtime: ShellRuntimeStatus,
+    office_runtime: OfficeRuntimeStatus,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]

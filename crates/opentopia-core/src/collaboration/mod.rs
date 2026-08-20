@@ -17,6 +17,7 @@ mod snapshot_deriver;
 mod sqlite_activity_source;
 mod sqlite_repository;
 
+pub use crate::RuntimeConnectionAuthorityV1;
 pub use activity::{
     ActivityEvent, ActivityEventDetails, ActivityQuery, AgentActivityReader, AgentActivitySource,
     AgentActivitySourceError, AgentActivityWindow, ToolResultKind, ToolResultProjection,

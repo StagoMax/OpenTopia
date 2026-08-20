@@ -15,7 +15,12 @@ pub enum PermissionMode {
     ReadOnly,
     Auto,
     Approve,
+    /// Unrestricted host access with destructive actions still reviewed.
+    ///
+    /// This preserves the behavior of the original `full_access` preset.
     FullAccess,
+    /// Unrestricted host access with approval requests disabled.
+    Unrestricted,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -35,17 +40,26 @@ pub enum ApprovalsReviewer {
 impl PermissionMode {
     pub fn approval_policy(self) -> ApprovalPolicy {
         match self {
-            Self::Auto | Self::Approve => ApprovalPolicy::OnRequest,
-            Self::Chat | Self::ReadOnly | Self::FullAccess => ApprovalPolicy::Never,
+            Self::Auto | Self::Approve | Self::FullAccess => ApprovalPolicy::OnRequest,
+            Self::Chat | Self::ReadOnly | Self::Unrestricted => ApprovalPolicy::Never,
         }
     }
 
     pub fn approvals_reviewer(self) -> ApprovalsReviewer {
         match self {
             Self::Auto => ApprovalsReviewer::AutoReview,
-            Self::Chat | Self::ReadOnly | Self::Approve | Self::FullAccess => {
+            Self::Chat | Self::ReadOnly | Self::Approve | Self::FullAccess | Self::Unrestricted => {
                 ApprovalsReviewer::User
             }
+        }
+    }
+
+    /// Applies the preset-level approval policy after risk classification.
+    /// Explicit denials remain authoritative even when approvals are disabled.
+    pub fn resolve_policy_decision(self, decision: PolicyDecision) -> PolicyDecision {
+        match (self, decision) {
+            (Self::Unrestricted, PolicyDecision::Ask { .. }) => PolicyDecision::Allow,
+            (_, decision) => decision,
         }
     }
 }
@@ -84,6 +98,7 @@ impl FromStr for PermissionMode {
             "auto" => Ok(Self::Auto),
             "approve" => Ok(Self::Approve),
             "fullaccess" | "full_access" | "full-access" => Ok(Self::FullAccess),
+            "unrestricted" | "no_approvals" | "no-approvals" => Ok(Self::Unrestricted),
             other => anyhow::bail!("unknown permission mode: {other}"),
         }
     }
@@ -432,8 +447,11 @@ impl BasicPolicyEngine {
             workspace_root,
             writable_roots,
             approved_write_paths: sandbox_config.approved_write_paths.clone(),
-            unrestricted_file_access: mode == PermissionMode::FullAccess
-                || sandbox_config.sandbox_mode == SandboxMode::DangerFullAccess,
+            unrestricted_file_access: matches!(
+                mode,
+                PermissionMode::FullAccess | PermissionMode::Unrestricted
+            ) || sandbox_config.sandbox_mode
+                == SandboxMode::DangerFullAccess,
             mode,
             config,
         }
@@ -609,7 +627,7 @@ impl PolicyEngine for BasicPolicyEngine {
             PermissionMode::Chat | PermissionMode::ReadOnly => PolicyDecision::Deny {
                 reason: "Current permission mode does not allow writes.".to_string(),
             },
-            PermissionMode::FullAccess => PolicyDecision::Allow,
+            PermissionMode::FullAccess | PermissionMode::Unrestricted => PolicyDecision::Allow,
             PermissionMode::Auto | PermissionMode::Approve if self.unrestricted_file_access => {
                 PolicyDecision::Allow
             }
@@ -651,7 +669,10 @@ impl PolicyEngine for BasicPolicyEngine {
                         .to_string(),
                 };
             }
-            PermissionMode::Auto | PermissionMode::Approve | PermissionMode::FullAccess => {}
+            PermissionMode::Auto
+            | PermissionMode::Approve
+            | PermissionMode::FullAccess
+            | PermissionMode::Unrestricted => {}
         }
 
         for rule in &self.config.command_rules {
@@ -683,7 +704,7 @@ impl PolicyEngine for BasicPolicyEngine {
 
         if analysis.capabilities.contains(&ShellCapability::Network) {
             return match self.mode {
-                PermissionMode::FullAccess => PolicyDecision::Allow,
+                PermissionMode::FullAccess | PermissionMode::Unrestricted => PolicyDecision::Allow,
                 PermissionMode::Auto | PermissionMode::Approve => self
                     .config
                     .network
@@ -730,7 +751,7 @@ impl PolicyEngine for BasicPolicyEngine {
             PermissionMode::FullAccess if risk == McpToolRisk::Destructive => PolicyDecision::Ask {
                 reason: self.mcp_approval_reason(descriptor, risk),
             },
-            PermissionMode::FullAccess => PolicyDecision::Allow,
+            PermissionMode::FullAccess | PermissionMode::Unrestricted => PolicyDecision::Allow,
         }
     }
 
@@ -755,7 +776,7 @@ impl PolicyEngine for BasicPolicyEngine {
             PermissionMode::Chat => PolicyDecision::Deny {
                 reason: "Chat mode does not allow network access.".to_string(),
             },
-            PermissionMode::FullAccess => PolicyDecision::Allow,
+            PermissionMode::FullAccess | PermissionMode::Unrestricted => PolicyDecision::Allow,
             PermissionMode::ReadOnly | PermissionMode::Auto | PermissionMode::Approve => self
                 .config
                 .network
@@ -814,11 +835,15 @@ mod tests {
         );
         assert_eq!(
             PermissionMode::FullAccess.approval_policy(),
-            ApprovalPolicy::Never
+            ApprovalPolicy::OnRequest
         );
         assert_eq!(
             PermissionMode::FullAccess.approvals_reviewer(),
             ApprovalsReviewer::User
+        );
+        assert_eq!(
+            PermissionMode::Unrestricted.approval_policy(),
+            ApprovalPolicy::Never
         );
         assert_eq!(
             PermissionMode::ReadOnly.approval_policy(),
@@ -828,6 +853,27 @@ mod tests {
             PermissionMode::Chat.approval_policy(),
             ApprovalPolicy::Never
         );
+    }
+
+    #[test]
+    fn unrestricted_waives_approval_requests_but_not_denials() {
+        let destructive = PolicyDecision::Ask {
+            reason: "destructive".to_string(),
+        };
+        assert!(matches!(
+            PermissionMode::FullAccess.resolve_policy_decision(destructive.clone()),
+            PolicyDecision::Ask { .. }
+        ));
+        assert!(matches!(
+            PermissionMode::Unrestricted.resolve_policy_decision(destructive),
+            PolicyDecision::Allow
+        ));
+        assert!(matches!(
+            PermissionMode::Unrestricted.resolve_policy_decision(PolicyDecision::Deny {
+                reason: "invalid".to_string(),
+            }),
+            PolicyDecision::Deny { .. }
+        ));
     }
 
     #[test]
@@ -1029,23 +1075,23 @@ mod tests {
         let cases = [
             (
                 descriptor(&["read"], json!({ "readOnlyHint": true })),
-                ["deny", "allow", "allow", "allow", "allow"],
+                ["deny", "allow", "allow", "allow", "allow", "allow"],
             ),
             (
                 descriptor(&["write"], json!({})),
-                ["deny", "deny", "ask", "ask", "allow"],
+                ["deny", "deny", "ask", "ask", "allow", "allow"],
             ),
             (
                 descriptor(&["network"], json!({ "openWorldHint": true })),
-                ["deny", "deny", "ask", "ask", "allow"],
+                ["deny", "deny", "ask", "ask", "allow", "allow"],
             ),
             (
                 descriptor(&["unknown"], json!({})),
-                ["deny", "deny", "ask", "ask", "allow"],
+                ["deny", "deny", "ask", "ask", "allow", "allow"],
             ),
             (
                 descriptor(&["destructive"], json!({ "destructiveHint": true })),
-                ["deny", "deny", "ask", "ask", "ask"],
+                ["deny", "deny", "ask", "ask", "ask", "allow"],
             ),
         ];
         let modes = [
@@ -1054,6 +1100,7 @@ mod tests {
             PermissionMode::Auto,
             PermissionMode::Approve,
             PermissionMode::FullAccess,
+            PermissionMode::Unrestricted,
         ];
 
         for (descriptor, expected) in cases {

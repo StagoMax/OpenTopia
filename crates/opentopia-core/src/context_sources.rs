@@ -1,4 +1,5 @@
 use crate::model::ModelContentPart;
+use crate::spreadsheet::SpreadsheetFileFormat;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -350,6 +351,14 @@ fn read_text_limited(
 
 fn classify_source(path: &Path) -> Option<(ContextSourceKind, &'static str)> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    if let Some(format) = SpreadsheetFileFormat::from_extension(&extension) {
+        let kind = if format.is_delimited() {
+            ContextSourceKind::Text
+        } else {
+            ContextSourceKind::Document
+        };
+        return Some((kind, format.content_type()));
+    }
     let value = match extension.as_str() {
         "rs" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "c" | "h" | "cc" | "cpp" | "hpp"
         | "py" | "go" | "java" | "kt" | "swift" | "rb" | "php" | "sh" | "ps1" | "bat" | "cmd"
@@ -363,7 +372,7 @@ fn classify_source(path: &Path) -> Option<(ContextSourceKind, &'static str)> {
         "html" | "htm" => (ContextSourceKind::Text, "text/html"),
         "css" | "scss" | "less" => (ContextSourceKind::Text, "text/css"),
         "md" | "mdx" => (ContextSourceKind::Text, "text/markdown"),
-        "txt" | "log" | "csv" | "tsv" | "ini" | "conf" | "config" | "properties" => {
+        "txt" | "log" | "ini" | "conf" | "config" | "properties" => {
             (ContextSourceKind::Text, "text/plain; charset=utf-8")
         }
         "png" => (ContextSourceKind::Image, "image/png"),
@@ -375,10 +384,6 @@ fn classify_source(path: &Path) -> Option<(ContextSourceKind, &'static str)> {
         "docx" => (
             ContextSourceKind::Document,
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        ),
-        "xlsx" => (
-            ContextSourceKind::Document,
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         ),
         "pptx" => (
             ContextSourceKind::Document,
@@ -530,6 +535,23 @@ mod tests {
         ));
         assert!(sources[0].render_for_model().contains("native image"));
         assert!(sources[1].render_for_model().contains("resource file:///"));
+    }
+
+    #[test]
+    fn accepts_supported_spreadsheet_attachment_formats() {
+        let dir = TestDir::new();
+        for extension in SpreadsheetFileFormat::ATTACHMENT_EXTENSIONS {
+            let path = dir.write(&format!("sheet.{extension}"), b"fixture");
+            let source = load_context_source_metadata(&[path], &ContextSourcePolicy::default())
+                .unwrap_or_else(|error| panic!(".{extension} should be accepted: {error}"))
+                .remove(0);
+            assert_eq!(
+                source.content_type,
+                SpreadsheetFileFormat::from_extension(extension)
+                    .expect("listed extension has a format")
+                    .content_type()
+            );
+        }
     }
 
     #[test]

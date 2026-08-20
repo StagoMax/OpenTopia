@@ -591,6 +591,24 @@ fn default_office_schemas_are_eager_without_attachment_hints() {
 }
 
 #[test]
+fn eager_disclosure_cannot_expose_internal_legacy_spreadsheet_executor() {
+    let mut agent = AgentCore::default();
+    agent.set_tool_exposure_policy(ToolExposurePolicy::Eager);
+
+    let catalog = agent.provider_tool_catalog();
+    assert!(!catalog
+        .iter()
+        .any(|candidate| candidate.name == "spreadsheet"));
+    for tool in [
+        "spreadsheet_inspect",
+        "spreadsheet_describe",
+        "spreadsheet_execute",
+    ] {
+        assert!(catalog.iter().any(|candidate| candidate.name == tool));
+    }
+}
+
+#[test]
 fn attachment_projection_cannot_enable_a_disabled_bundled_plugin() {
     let mut agent = AgentCore::default();
     agent.set_bundled_plugin_activations(&HashMap::from([

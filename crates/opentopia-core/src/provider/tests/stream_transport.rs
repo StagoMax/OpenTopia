@@ -134,6 +134,78 @@ fn accumulates_streamed_text_tool_arguments_and_usage() {
 }
 
 #[test]
+fn normalizes_repeated_and_cumulative_chat_tool_call_chunks() {
+    let mut accumulator = OpenAiStreamAccumulator::default();
+    let mut deltas = Vec::new();
+    let mut collect = |delta| {
+        deltas.push(delta);
+        Ok(())
+    };
+
+    for event in [
+        json!({"choices": [{"delta": {"tool_calls": [{
+            "id": "call_shell",
+            "function": {"name": "shell", "arguments": "{\"command\":"}
+        }]}}]}),
+        json!({"choices": [{"delta": {"tool_calls": [{
+            "id": "call_shell",
+            "function": {"name": "shell", "arguments": "{\"command\":\"cargo test\"}"}
+        }]}}]}),
+    ] {
+        accumulator.apply(&event, &mut collect).unwrap();
+    }
+
+    let response = accumulator.finish().unwrap();
+    assert_eq!(response.tool_calls[0].id, "call_shell");
+    assert_eq!(response.tool_calls[0].name, "shell");
+    assert_eq!(
+        response.tool_calls[0].arguments,
+        json!({"command": "cargo test"})
+    );
+    let tool_deltas = deltas
+        .into_iter()
+        .filter_map(|delta| match delta {
+            ModelStreamDelta::ToolCall {
+                arguments_delta, ..
+            } => Some(arguments_delta),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tool_deltas, vec!["{\"command\":", "\"cargo test\"}"]);
+}
+
+#[test]
+fn keeps_parallel_chat_tool_calls_distinct_when_indices_are_missing() {
+    let mut accumulator = OpenAiStreamAccumulator::default();
+    let mut collect = |_| Ok(());
+
+    accumulator
+        .apply(
+            &json!({"choices": [{"delta": {"tool_calls": [
+                {"id": "call_a", "function": {"name": "lookup", "arguments": "{\"query\":\"a\"}"}},
+                {"id": "call_b", "function": {"name": "lookup", "arguments": "{\"query\":\"b\"}"}}
+            ]}}]}),
+            &mut collect,
+        )
+        .unwrap();
+    accumulator
+        .apply(
+            &json!({"choices": [{"delta": {"tool_calls": [
+                {"id": "call_b", "function": {"name": "lookup", "arguments": "{\"query\":\"b\"}"}}
+            ]}}]}),
+            &mut collect,
+        )
+        .unwrap();
+
+    let response = accumulator.finish().unwrap();
+    assert_eq!(response.tool_calls.len(), 2);
+    assert_eq!(response.tool_calls[0].id, "call_a");
+    assert_eq!(response.tool_calls[0].arguments, json!({"query": "a"}));
+    assert_eq!(response.tool_calls[1].id, "call_b");
+    assert_eq!(response.tool_calls[1].arguments, json!({"query": "b"}));
+}
+
+#[test]
 fn accepts_object_tool_arguments_from_compatible_chat_streams() {
     let mut accumulator = OpenAiStreamAccumulator::default();
     let mut collect = |_| Ok(());
@@ -391,8 +463,7 @@ async fn openai_provider_requests_and_collects_real_sse_stream() {
     let payload: Value = serde_json::from_str(body).unwrap();
 
     assert_eq!(payload["stream"], true);
-    let temperature = payload["temperature"].as_f64().unwrap();
-    assert!((temperature - 0.7).abs() < 0.000_001);
+    assert!(payload.get("temperature").is_none());
     assert_eq!(payload["max_tokens"], 2048);
     assert_eq!(payload["reasoning_effort"], "high");
     assert_eq!(payload["stream_options"]["include_usage"], true);
@@ -468,6 +539,121 @@ async fn openai_provider_reconnects_after_initial_network_failure() {
 }
 
 #[tokio::test]
+async fn openai_provider_honors_rate_limit_retry_after() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.unwrap();
+        let _ = read_http_request(&mut first).await;
+        let body = r#"{"error":{"code":"rpm_limited"}}"#;
+        first
+            .write_all(
+                format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        first.shutdown().await.unwrap();
+
+        let (mut second, _) = listener.accept().await.unwrap();
+        let _ = read_http_request(&mut second).await;
+        second
+            .write_all(
+                concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Type: text/event-stream\r\n",
+                    "Connection: close\r\n\r\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"after rate limit\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        second.shutdown().await.unwrap();
+    });
+
+    let provider =
+        OpenAiCompatibleProvider::new(format!("http://{address}/v1"), "test-key", "test-model");
+    let mut transport = Vec::new();
+    let response = provider
+        .stream_prepared(
+            provider.prepare(Uuid::new_v4(), model_request()).unwrap(),
+            &mut |_| Ok(()),
+            &mut |event| {
+                transport.push(event);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(response.text, "after rate limit");
+    assert!(transport.iter().any(|event| matches!(
+        event,
+        ProviderTransportEvent::Retry {
+            retry_kind: ProviderRetryKind::Network,
+            retry_index: Some(1),
+            reason,
+            ..
+        } if reason.contains("rate limited")
+    )));
+}
+
+#[tokio::test]
+async fn compatibility_probe_client_retries_429_without_bursting_the_caller() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for attempt in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            requests.push(read_http_request(&mut socket).await);
+            let (status, retry_after, body) = if attempt == 0 {
+                (
+                    "429 Too Many Requests",
+                    "Retry-After: 0\r\n",
+                    r#"{"error":{"code":"rpm_limited"}}"#,
+                )
+            } else {
+                ("200 OK", "", r#"{"ok":true}"#)
+            };
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{retry_after}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+        }
+        requests
+    });
+
+    let provider =
+        OpenAiCompatibleProvider::new(format!("http://{address}/v1"), "test-key", "test-model");
+    let probe_client = super::openai::OpenAiProbeClient::new(&provider);
+    let response = probe_client
+        .send("/chat/completions", &json!({"model": "test-model"}))
+        .await
+        .unwrap();
+    let (response, _permit) = response.into_parts();
+    let requests = server.await.unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(requests.len(), 2);
+}
+
+#[tokio::test]
 async fn chat_provider_returns_schema_mismatched_arguments_without_transport_retry() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -528,6 +714,163 @@ async fn chat_provider_returns_schema_mismatched_arguments_without_transport_ret
         .any(|event| matches!(event, ProviderTransportEvent::Retry { .. })));
     let next = provider.prepare(Uuid::new_v4(), request).unwrap();
     assert_eq!(next.body["stream"], true);
+}
+
+#[tokio::test]
+async fn chat_provider_recovers_invalid_streamed_tool_json_once_without_streaming() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.unwrap();
+        let first_request = read_http_request(&mut first).await;
+        assert!(first_request.contains(r#""stream":true"#));
+        first
+            .write_all(
+                concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Type: text/event-stream\r\n",
+                    "Connection: close\r\n\r\n",
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_shell\",\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        first.shutdown().await.unwrap();
+
+        let (mut second, _) = listener.accept().await.unwrap();
+        let second_request = read_http_request(&mut second).await;
+        assert!(second_request.contains(r#""stream":false"#));
+        assert!(!second_request.contains("stream_options"));
+        let body = r#"{"choices":[{"message":{"tool_calls":[{"id":"call_shell","type":"function","function":{"name":"shell","arguments":"{\"command\":\"cargo test\"}"}}]},"finish_reason":"tool_calls"}]}"#;
+        second
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        second.shutdown().await.unwrap();
+    });
+
+    let mut provider =
+        OpenAiCompatibleProvider::new(format!("http://{address}/v1"), "test-key", "test-model");
+    provider.tool_protocol.streaming_tools = ProviderFeatureSupport::Supported;
+    let mut request = model_request();
+    request.tool_candidates = vec![ProviderToolCandidate::direct(
+        "shell",
+        "Run a command",
+        json!({
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"]
+        }),
+    )];
+    let mut deltas = Vec::new();
+    let mut transport = Vec::new();
+    let response = provider
+        .stream_prepared(
+            provider.prepare(Uuid::new_v4(), request).unwrap(),
+            &mut |delta| {
+                deltas.push(delta);
+                Ok(())
+            },
+            &mut |event| {
+                transport.push(event);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(response.tool_calls[0].name, "shell");
+    assert_eq!(
+        response.tool_calls[0].arguments,
+        json!({"command": "cargo test"})
+    );
+    assert_eq!(
+        deltas
+            .iter()
+            .filter(|delta| matches!(delta, ModelStreamDelta::ToolCall { .. }))
+            .count(),
+        1
+    );
+    assert!(transport.iter().any(|event| matches!(
+        event,
+        ProviderTransportEvent::Retry {
+            attempt: 2,
+            retry_kind: ProviderRetryKind::StateRecovery,
+            retry_index: Some(1),
+            retry_limit: Some(1),
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn chat_provider_reports_protocol_corruption_when_nonstreaming_recovery_is_also_invalid() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for streamed in [true, false] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await;
+            assert!(request.contains(&format!(r#""stream":{streamed}"#)));
+            if streamed {
+                socket
+                    .write_all(
+                        concat!(
+                            "HTTP/1.1 200 OK\r\n",
+                            "Content-Type: text/event-stream\r\n",
+                            "Connection: close\r\n\r\n",
+                            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_lookup\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"query\\\":\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                            "data: [DONE]\n\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                let body = r#"{"choices":[{"message":{"tool_calls":[{"id":"call_lookup","type":"function","function":{"name":"lookup","arguments":"{\"query\":"}}]},"finish_reason":"tool_calls"}]}"#;
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            socket.shutdown().await.unwrap();
+        }
+    });
+
+    let mut provider =
+        OpenAiCompatibleProvider::new(format!("http://{address}/v1"), "test-key", "test-model");
+    provider.tool_protocol.streaming_tools = ProviderFeatureSupport::Supported;
+    let error = provider
+        .stream_prepared(
+            provider.prepare(Uuid::new_v4(), tool_request()).unwrap(),
+            &mut |_| Ok(()),
+            &mut |_| Ok(()),
+        )
+        .await
+        .expect_err("both malformed responses must fail");
+    server.await.unwrap();
+
+    let message = error.to_string();
+    assert!(message.contains("provider tool-call protocol error"));
+    assert!(message.contains("both streamed decoding and one non-streaming recovery failed"));
+    assert!(!message.contains("capability profile is stale"));
 }
 
 #[tokio::test]

@@ -36,6 +36,19 @@ fn every_static_builtin_uses_an_inline_derived_input_schema() {
     }
 }
 
+#[test]
+fn foreground_yield_schema_allows_two_minutes() {
+    let shell = ShellTool.schema();
+    assert_eq!(
+        shell["properties"]["yieldTimeMs"]["maximum"].as_f64(),
+        Some(120_000.0)
+    );
+
+    let browser = BrowserTool.schema();
+    let download = &action_schema_branch(&browser, "download")["properties"];
+    assert_eq!(download["yieldTimeMs"]["maximum"].as_f64(), Some(120_000.0));
+}
+
 fn schema_contains_object_matching(
     value: &Value,
     predicate: &impl Fn(&serde_json::Map<String, Value>) -> bool,

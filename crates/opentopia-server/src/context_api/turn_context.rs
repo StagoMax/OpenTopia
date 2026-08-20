@@ -1,32 +1,29 @@
 use super::{
-    build_context_projection, context_compact_threshold_percent, context_compaction_details,
-    durable_context, estimate_tokens, generate_context_summary, latest_context_summary_event,
-    message_token_estimate, model_content_part_token_estimate, prior_messages_for_turn,
-    recent_conversation_tail, summary_message_cursor, truncate_with_flag,
+    build_context_projection, durable_context, estimate_tokens, latest_context_summary_event,
+    model_content_part_token_estimate, model_conversation_message_token_estimate,
+    prior_messages_for_turn, project_model_conversation, summary_message_cursor,
+    truncate_with_flag,
 };
 #[cfg(test)]
 use crate::ensure_experience_mode_enabled;
 use crate::{
     agent_model_context_with_runtime, content_fingerprint, discover_plugins, discover_skills,
-    experience_mode_module, permission_policy_module, plugins_api, publish_payload,
-    resolve_instruction_documents, run_git, world_state_catalog_item, AgentContextBudget,
-    AgentCore, AgentEvent, AgentEventPayload, AgentInstanceV1, AgentTemplateVersionV1, ApiError,
-    AppSettings, AppState, CompiledModelContext, ContextCacheScope, ContextItemKind,
-    ContextProjection, ContextRole, ContextSensitivity, ContributionKind, ExperienceMode,
-    ExperienceSurfaceProfile, FsPath, LoadedSkill, ModelContentPart, ModelContextItem,
-    ModelConversationMessage, PermissionMode, ProviderSettings, ProviderTransportKind,
-    RuntimeSurface, SessionStore, ThreadContextSnapshot, TurnContextSnapshot, WorldStateSkill,
-    WorldStateSnapshot,
+    experience_mode_module, permission_policy_module, plugins_api, resolve_instruction_documents,
+    run_git, world_state_catalog_item, AgentContextBudget, AgentCore, AgentEvent,
+    AgentEventPayload, AgentInstanceV1, AgentTemplateVersionV1, ApiError, AppSettings, AppState,
+    CompiledModelContext, ContextCacheScope, ContextItemKind, ContextProjection, ContextRole,
+    ContextSensitivity, ContributionKind, ExperienceMode, ExperienceSurfaceProfile, FsPath,
+    LoadedSkill, ModelContentPart, ModelContextItem, ModelConversationMessage, PermissionMode,
+    ProviderSettings, RuntimeSurface, SessionStore, ThreadContextSnapshot, TurnContextSnapshot,
+    WorldStateSkill, WorldStateSnapshot,
 };
 #[cfg(test)]
 use axum::http::StatusCode;
 use chrono::{Local, Utc};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
-use tracing::{error, warn};
+use tracing::warn;
 use uuid::Uuid;
-
-const MAX_CONTEXT_COMPACTION_PASSES: usize = 12;
 
 pub(crate) struct PreparedTurnContext {
     pub(crate) summary: Option<String>,
@@ -38,7 +35,6 @@ pub(crate) struct PreparedTurnContext {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TurnContextReservation {
     fixed_input_tokens: usize,
-    current_input_tokens: usize,
     generation_reserve_tokens: usize,
 }
 
@@ -46,7 +42,7 @@ pub(crate) fn turn_context_reservation(
     provider: &ProviderSettings,
     model_context: &CompiledModelContext,
     tool_schema_tokens: usize,
-    current_text: &str,
+    _current_text: &str,
     current_content: &[ModelContentPart],
 ) -> TurnContextReservation {
     let context_window = provider.resolved_context_window_tokens();
@@ -77,7 +73,6 @@ pub(crate) fn turn_context_reservation(
         fixed_input_tokens: model_context_tokens
             .saturating_add(tool_schema_tokens)
             .saturating_add(attachment_tokens),
-        current_input_tokens: estimate_tokens(current_text).saturating_add(12),
         generation_reserve_tokens: output_reserve
             .saturating_add(reasoning_reserve)
             .saturating_add(512)
@@ -673,20 +668,21 @@ fn permission_mode_name(mode: PermissionMode) -> &'static str {
         PermissionMode::Auto => "auto",
         PermissionMode::Approve => "approve",
         PermissionMode::FullAccess => "full_access",
+        PermissionMode::Unrestricted => "unrestricted",
     }
 }
 
 pub(crate) async fn prepare_turn_context(
     state: &AppState,
     thread_id: Uuid,
-    turn_id: Uuid,
+    _turn_id: Uuid,
     current_message_id: Uuid,
     reservation: TurnContextReservation,
     provider: &ProviderSettings,
 ) -> Result<PreparedTurnContext, ApiError> {
     let messages = state.store.list_messages(thread_id)?;
     let events = state.store.list_events(thread_id, None)?;
-    let mut summary = latest_context_summary_event(&events);
+    let summary = latest_context_summary_event(&events);
     let prior_messages = prior_messages_for_turn(&messages, current_message_id)?;
     let provider_state = state
         .store
@@ -698,179 +694,36 @@ pub(crate) async fn prepare_turn_context(
         .as_ref()
         .map(|state| state.response_items.as_slice())
         .unwrap_or_default();
-    let mut covered = summary
-        .as_ref()
-        .map(summary_message_cursor)
-        .unwrap_or_default()
-        .min(prior_messages.len());
-    let mut covered_seq = summary
-        .as_ref()
-        .map(|summary| summary.covered_through_seq)
-        .unwrap_or_default();
-    let target_seq = events.last().map(|event| event.seq).unwrap_or_default();
-    let unsummarized_tokens = prior_messages
-        .iter()
-        .skip(covered)
-        .map(message_token_estimate)
-        .sum::<usize>();
-    let projected_recent_tail_tokens = summary
-        .as_ref()
-        .map(|_| {
-            recent_conversation_tail(
-                &prior_messages,
-                (provider.resolved_context_window_tokens() / 10).clamp(2_048, 16_384),
-                provider_response_items,
-            )
-            .1
-        })
-        .unwrap_or_default();
-    let summary_tokens = summary
-        .as_ref()
-        .map(|summary| estimate_tokens(&summary.summary))
-        .unwrap_or_default();
-    let context_window = provider.resolved_context_window_tokens();
-    let usage_percent = reservation
-        .fixed_input_tokens
-        .saturating_add(reservation.current_input_tokens)
-        .saturating_add(reservation.generation_reserve_tokens)
-        .saturating_add(summary_tokens)
-        .saturating_add(projected_recent_tail_tokens)
-        .saturating_add(unsummarized_tokens)
-        .saturating_mul(100)
-        / context_window.max(1);
-    let provider_is_compactable = provider.effective_transport() != ProviderTransportKind::Mock;
-    let mut compaction_passes = 0usize;
-    loop {
-        let remaining_messages = prior_messages.len().saturating_sub(covered);
-        let remaining_events = events
-            .iter()
-            .filter(|event| event.seq > covered_seq)
-            .count();
-        let soft_trigger = (remaining_messages >= 6 || remaining_events >= 12)
-            && usage_percent >= context_compact_threshold_percent();
-        let catch_up_trigger =
-            compaction_passes > 0 && (remaining_messages > 0 || remaining_events > 0);
-        if !provider_is_compactable
-            || (!soft_trigger && !catch_up_trigger)
-            || compaction_passes >= MAX_CONTEXT_COMPACTION_PASSES
-        {
-            break;
-        }
-        let previous_summary = summary.clone();
-        match generate_context_summary(
-            state,
-            thread_id,
-            &prior_messages,
-            &events,
-            "automatic_threshold",
-            previous_summary.as_ref(),
-        )
-        .await
-        {
-            Ok(compacted) => {
-                let next_covered = summary_message_cursor(&compacted);
-                let next_covered_seq = compacted.covered_through_seq;
-                if next_covered <= covered && next_covered_seq <= covered_seq {
-                    publish_payload(
-                        state,
-                        thread_id,
-                        Some(turn_id),
-                        AgentEventPayload::ContextWarning {
-                            stage: "automatic_compaction_stalled".to_string(),
-                            message: "checkpoint coverage did not advance; retaining the previous projection".to_string(),
-                        },
-                    );
-                    break;
-                }
-                publish_payload(
-                    state,
-                    thread_id,
-                    None,
-                    AgentEventPayload::ContextCompacted {
-                        summary: compacted.clone(),
-                        details: Some(context_compaction_details(state, thread_id, &compacted)),
-                    },
-                );
-                summary = Some(compacted);
-                compaction_passes += 1;
-                let new_covered = summary
-                    .as_ref()
-                    .map(summary_message_cursor)
-                    .unwrap_or_default()
-                    .min(prior_messages.len());
-                covered = new_covered;
-                covered_seq = next_covered_seq;
-                if new_covered >= prior_messages.len() && covered_seq >= target_seq {
-                    break;
-                }
-            }
-            Err(err) => {
-                error!(message = %err.message, "automatic context compaction failed");
-                publish_payload(
-                    state,
-                    thread_id,
-                    Some(turn_id),
-                    AgentEventPayload::ContextWarning {
-                        stage: "automatic_compaction".to_string(),
-                        message: err.message,
-                    },
-                );
-                break;
-            }
-        }
-    }
-    if compaction_passes >= MAX_CONTEXT_COMPACTION_PASSES
-        && (covered < prior_messages.len() || covered_seq < target_seq)
-    {
-        publish_payload(
-            state,
-            thread_id,
-            Some(turn_id),
-            AgentEventPayload::ContextWarning {
-                stage: "automatic_compaction_pass_limit".to_string(),
-                message: format!(
-                    "automatic compaction stopped after {MAX_CONTEXT_COMPACTION_PASSES} passes with {} messages and {} events still outside checkpoint coverage",
-                    prior_messages.len().saturating_sub(covered),
-                    events.iter().filter(|event| event.seq > covered_seq).count()
-                ),
-            },
-        );
-    }
     let covered_messages = summary
         .as_ref()
         .map(summary_message_cursor)
         .unwrap_or_default()
         .min(prior_messages.len());
-    let history_limit = context_window
-        .saturating_sub(reservation.fixed_input_tokens)
-        .saturating_sub(reservation.current_input_tokens)
-        .saturating_sub(reservation.generation_reserve_tokens);
+    let context_window = provider.resolved_context_window_tokens();
     let mut history_used = summary
         .as_ref()
         .map(|summary| estimate_tokens(&summary.summary))
         .unwrap_or_default();
-    let available_tail_tokens = history_limit.saturating_sub(history_used);
-    let recent_tail_limit = if summary.is_some() {
-        available_tail_tokens.min((context_window / 10).clamp(2_048, 16_384))
-    } else {
-        available_tail_tokens
-    };
-    let tail_messages = if summary.is_some() {
-        &prior_messages[..]
-    } else {
-        &prior_messages[covered_messages..]
-    };
-    let (conversation, recent_tail_tokens) =
-        recent_conversation_tail(tail_messages, recent_tail_limit, provider_response_items);
-    history_used = history_used.saturating_add(recent_tail_tokens);
+    // The admission boundary must inspect the same complete history that the
+    // provider would receive. Materialize every message after the durable
+    // checkpoint; do not pre-truncate a recent tail and compensate with a
+    // hidden backlog estimate.
+    let conversation =
+        project_model_conversation(&prior_messages[covered_messages..], provider_response_items);
+    let uncheckpointed_history_tokens = conversation
+        .iter()
+        .map(|message| model_conversation_message_token_estimate(message, provider_response_items))
+        .sum::<usize>();
+    history_used = history_used.saturating_add(uncheckpointed_history_tokens);
 
     let mut budget = AgentContextBudget::new(context_window);
     budget.record_tokens(reservation.fixed_input_tokens.saturating_add(history_used));
+    budget.set_round_pressure(reservation.generation_reserve_tokens);
     let projection = build_context_projection(
         summary.as_ref(),
         prior_messages.len(),
         &events,
-        recent_tail_tokens,
+        uncheckpointed_history_tokens,
         provider,
         provider_state.as_ref(),
     );

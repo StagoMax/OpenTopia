@@ -189,6 +189,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_structured_connection_authority_is_inherited_without_legacy_fallback() {
+        let parent = parent(json!({
+            "allowedAgentTypes": ["worker"],
+            "workspaceRoot": "C:/workspace/project",
+            "workspaceMode": "shared_coordinated",
+            "connectionAuthority": {
+                "mode": "structured",
+                "operations": []
+            },
+            "spawnPolicy": {
+                "allowChildSpawns": true,
+                "maxDepth": 2,
+                "maxDirectChildren": 1
+            }
+        }));
+
+        let child = AttenuatingRuntimeSnapshotDeriver
+            .derive_child(
+                &parent,
+                ChildRuntimeSnapshotRequest {
+                    agent_type: "worker".to_string(),
+                    fork_turns: ForkTurns::All,
+                    workspace_mode: AgentWorkspaceMode::Auto,
+                    allow_child_spawns: false,
+                },
+            )
+            .await
+            .expect("derive child");
+        assert_eq!(
+            child.runtime_snapshot.snapshot["connectionAuthority"],
+            json!({ "mode": "structured", "operations": [] })
+        );
+    }
+
+    #[tokio::test]
     async fn workspace_modes_inherit_or_narrow_but_never_expand_write_authority() {
         let coordinated = parent(json!({
             "allowedAgentTypes": ["worker"],

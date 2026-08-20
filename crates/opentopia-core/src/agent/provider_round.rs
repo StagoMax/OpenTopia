@@ -1,13 +1,13 @@
 use super::{
-    compact_completed_tool_history, finalization_outcome, finalize_inbox_cancelled_turn,
-    finalize_provider_turn, finalize_rollout_hard_limit_turn, incomplete_model_response,
-    latest_work_form, provider_context_window_exceeded, record_rollout_usage,
-    repeated_invalid_tool_call_error, rollout_checkpoint_due, synchronize_context_budget,
-    truncate_for_summary, AgentCompletionGuardDelivery, AgentCore, AgentEventPayload,
-    AgentTurnResult, Arc, CancellationToken, CompiledModelContext, ContextBudget, ModelContentPart,
-    ModelConversationMessage, ModelDecision, ProviderToolCall, ProviderToolCandidate,
-    ProviderToolResult, RolloutBudget, RolloutCheckpointObservation, SessionStore, TurnEvents,
-    TurnRuntimeState, Uuid, BACKGROUND_COMMAND_REMINDER_STAGE, MAX_ROLLOUT_MODEL_ROUNDS,
+    finalization_outcome, finalize_inbox_cancelled_turn, finalize_provider_turn,
+    finalize_rollout_hard_limit_turn, incomplete_model_response, latest_work_form,
+    provider_context_window_exceeded, record_rollout_usage, repeated_invalid_tool_call_error,
+    rollout_checkpoint_due, truncate_for_summary, AgentCompletionGuardDelivery, AgentCore,
+    AgentEventPayload, AgentTurnResult, Arc, CancellationToken, CompiledModelContext,
+    ContextBudget, ModelContentPart, ModelConversationMessage, ModelDecision, ProviderToolCall,
+    ProviderToolCandidate, ProviderToolResult, RolloutBudget, RolloutCheckpointObservation,
+    SessionStore, TurnEvents, TurnRuntimeState, Uuid, BACKGROUND_COMMAND_REMINDER_STAGE,
+    MAX_ROLLOUT_MODEL_ROUNDS,
 };
 
 pub(super) enum ProviderRoundOutcome {
@@ -24,7 +24,7 @@ impl AgentCore {
         &self,
         thread_id: Uuid,
         user_message_id: Uuid,
-        context_summary: Option<&str>,
+        context_summary: &mut Option<String>,
         conversation: &mut Vec<ModelConversationMessage>,
         budget: &mut Option<ContextBudget>,
         rollout_budget: &mut Option<RolloutBudget>,
@@ -43,7 +43,7 @@ impl AgentCore {
         compacted_tool_history: &mut String,
         provider_response_items: &mut Vec<serde_json::Value>,
         branch_developer_instructions: Option<&str>,
-        compatibility_hash: &str,
+        compatibility_hash: &mut String,
         completion_guard_delivery: &mut Option<AgentCompletionGuardDelivery>,
         events: &mut TurnEvents,
     ) -> anyhow::Result<ProviderRoundOutcome> {
@@ -131,41 +131,31 @@ impl AgentCore {
                 events,
             );
         }
-        let pressure_request = self.assemble_model_request(
-            &round_model_context,
-            context_summary,
-            conversation.clone(),
-            model_user_message.to_string(),
-            model_user_content.to_vec(),
-            tool_candidates.to_vec(),
-            provider_tool_calls.clone(),
-            provider_tool_results.clone(),
-            provider_response_items.clone(),
-            None,
-            branch_developer_instructions.map(str::to_string),
-        )?;
-        synchronize_context_budget(budget, pressure_request.logical());
-        compact_completed_tool_history(
-            conversation,
-            provider_tool_calls,
-            provider_tool_results,
-            provider_response_items,
-            compacted_tool_history,
-            budget,
-        );
-        let request = self.assemble_model_request(
-            &round_model_context,
-            context_summary,
-            conversation.clone(),
-            model_user_message.to_string(),
-            model_user_content.to_vec(),
-            tool_candidates.to_vec(),
-            provider_tool_calls.clone(),
-            provider_tool_results.clone(),
-            provider_response_items.clone(),
-            None,
-            branch_developer_instructions.map(str::to_string),
-        )?;
+        let request = self
+            .admitted_round_request(
+                thread_id,
+                user_message_id,
+                model_rounds,
+                model_context,
+                &round_model_context,
+                context_summary,
+                conversation,
+                budget,
+                runtime_state,
+                model_user_message,
+                model_user_content,
+                tool_candidates,
+                provider_tool_calls,
+                provider_tool_results,
+                compacted_tool_history,
+                provider_response_items,
+                None,
+                branch_developer_instructions,
+                compatibility_hash,
+                events,
+            )
+            .await?;
+        let rejected_request = request.logical().clone();
         let response = match self
             .complete_model(
                 request,
@@ -185,40 +175,33 @@ impl AgentCore {
                 ));
             }
             Err(error) if provider_context_window_exceeded(&error) => {
-                let previous_result_count = provider_tool_results.len();
-                if let Some(context_budget) = budget.as_mut() {
-                    context_budget.used_tokens = context_budget.max_tokens;
-                }
-                compact_completed_tool_history(
-                    conversation,
-                    provider_tool_calls,
-                    provider_tool_results,
-                    provider_response_items,
-                    compacted_tool_history,
-                    budget,
-                );
-                if provider_tool_results.len() == previous_result_count {
+                let Some(retry_request) = self
+                    .request_after_context_overflow(
+                        thread_id,
+                        user_message_id,
+                        model_rounds,
+                        model_context,
+                        &round_model_context,
+                        context_summary,
+                        conversation,
+                        budget,
+                        runtime_state,
+                        model_user_message,
+                        model_user_content,
+                        tool_candidates,
+                        provider_tool_calls,
+                        provider_tool_results,
+                        compacted_tool_history,
+                        provider_response_items,
+                        &rejected_request,
+                        branch_developer_instructions,
+                        compatibility_hash,
+                        events,
+                    )
+                    .await?
+                else {
                     return Err(error);
-                }
-                events.push(AgentEventPayload::ContextWarning {
-                    stage: "provider_context_overflow_recovery".to_string(),
-                    message: "The provider rejected the input as larger than its context window. Older completed tool results were compacted and the model request is being retried once."
-                        .to_string(),
-                });
-                let retry_request = self.assemble_model_request(
-                    &round_model_context,
-                    context_summary,
-                    conversation.clone(),
-                    model_user_message.to_string(),
-                    model_user_content.to_vec(),
-                    tool_candidates.to_vec(),
-                    provider_tool_calls.clone(),
-                    provider_tool_results.clone(),
-                    provider_response_items.clone(),
-                    None,
-                    branch_developer_instructions.map(str::to_string),
-                )?;
-                synchronize_context_budget(budget, retry_request.logical());
+                };
                 let retry = self
                     .complete_model(
                         retry_request,

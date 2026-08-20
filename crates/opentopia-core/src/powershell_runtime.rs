@@ -1,18 +1,19 @@
 use crate::execution_spec::ShellDialect;
+use crate::managed_runtime_download::{
+    managed_runtime_root, verify_file_sha256, ManagedRuntimeArtifact, ManagedRuntimeDownloadPolicy,
+    ManagedRuntimeDownloader, VerifiedRuntimeDownload,
+};
 use anyhow::{Context, Result};
-use futures_util::StreamExt;
 use schemars::JsonSchema;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 use uuid::Uuid;
 use wait_timeout::ChildExt;
@@ -116,15 +117,9 @@ pub fn current_shell_runtime_status() -> ShellRuntimeStatus {
 }
 
 pub fn start_managed_powershell_install() -> Option<tokio::task::JoinHandle<()>> {
-    let status = current_shell_runtime_status();
-    if !cfg!(windows)
-        || status.runtime.dialect == ShellDialect::PowerShell7
-        || status.managed_status == ManagedPowerShellStatus::Downloading
-        || !managed_install_enabled()
-    {
+    if !begin_managed_powershell_install() {
         return None;
     }
-    set_managed_status(ManagedPowerShellStatus::Downloading, None);
     Some(tokio::spawn(async {
         match ensure_managed_powershell().await {
             Ok(runtime) => {
@@ -146,6 +141,30 @@ pub fn start_managed_powershell_install() -> Option<tokio::task::JoinHandle<()>>
             }
         }
     }))
+}
+
+/// Starts a new managed install attempt when the previous one failed or is pending.
+/// The state claim is atomic, so repeated UI requests cannot launch duplicate downloads.
+pub fn retry_managed_powershell_install() -> ShellRuntimeStatus {
+    drop(start_managed_powershell_install());
+    current_shell_runtime_status()
+}
+
+fn begin_managed_powershell_install() -> bool {
+    if !cfg!(windows) || !managed_install_enabled() {
+        return false;
+    }
+    let mut state = shell_runtime_state()
+        .write()
+        .expect("shell runtime lock poisoned");
+    if state.runtime.dialect == ShellDialect::PowerShell7
+        || state.managed_status == ManagedPowerShellStatus::Downloading
+    {
+        return false;
+    }
+    state.managed_status = ManagedPowerShellStatus::Downloading;
+    state.managed_error = None;
+    true
 }
 
 fn shell_runtime_state() -> &'static RwLock<ShellRuntimeState> {
@@ -318,25 +337,6 @@ fn probe_powershell_version(program: &Path) -> Option<String> {
     (!version.is_empty()).then_some(version)
 }
 
-fn managed_runtime_root() -> PathBuf {
-    if let Some(root) = env::var_os("OPENTOPIA_RUNTIME_HOME") {
-        return PathBuf::from(root);
-    }
-    if cfg!(windows) {
-        return env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(env::temp_dir)
-            .join("OpenTopia")
-            .join("runtimes");
-    }
-    env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .unwrap_or_else(env::temp_dir)
-        .join("opentopia")
-        .join("runtimes")
-}
-
 fn managed_powershell_directory() -> PathBuf {
     managed_runtime_root()
         .join("powershell")
@@ -387,18 +387,23 @@ async fn ensure_managed_powershell() -> Result<ShellRuntime> {
     tokio::fs::create_dir_all(&root)
         .await
         .with_context(|| format!("failed to create runtime directory {}", root.display()))?;
-    let (archive, downloaded_archive) =
-        if let Some(offline_archive) = env::var_os("OPENTOPIA_POWERSHELL_ARCHIVE") {
-            (PathBuf::from(offline_archive), false)
-        } else {
-            (download_managed_archive(&root, asset).await?, true)
-        };
-    if let Err(error) = verify_archive_hash(&archive, asset.sha256).await {
-        if downloaded_archive {
-            let _ = tokio::fs::remove_file(&archive).await;
-        }
-        return Err(error);
-    }
+    let offline_archive = env::var_os("OPENTOPIA_POWERSHELL_ARCHIVE").map(PathBuf::from);
+    let downloaded_archive = if let Some(archive) = offline_archive.as_deref() {
+        verify_file_sha256(archive, asset.sha256)
+            .await
+            .context("offline PowerShell archive failed integrity verification")?;
+        None
+    } else {
+        Some(download_managed_archive(&root, asset).await?)
+    };
+    let archive = offline_archive
+        .as_deref()
+        .or_else(|| {
+            downloaded_archive
+                .as_ref()
+                .map(VerifiedRuntimeDownload::path)
+        })
+        .context("managed PowerShell archive was not resolved")?;
 
     let staging = root.join(format!(
         ".powershell-{}-{}",
@@ -406,7 +411,7 @@ async fn ensure_managed_powershell() -> Result<ShellRuntime> {
         Uuid::new_v4()
     ));
     let final_directory = managed_powershell_directory();
-    let archive_for_extract = archive.clone();
+    let archive_for_extract = archive.to_path_buf();
     let staging_for_extract = staging.clone();
     let extraction = tokio::task::spawn_blocking(move || {
         extract_archive(&archive_for_extract, &staging_for_extract)
@@ -415,9 +420,6 @@ async fn ensure_managed_powershell() -> Result<ShellRuntime> {
     .context("managed PowerShell extraction task failed")?;
     if let Err(error) = extraction {
         let _ = tokio::fs::remove_dir_all(&staging).await;
-        if downloaded_archive {
-            let _ = tokio::fs::remove_file(&archive).await;
-        }
         return Err(error);
     }
 
@@ -462,9 +464,6 @@ async fn ensure_managed_powershell() -> Result<ShellRuntime> {
     if activation.is_err() {
         let _ = tokio::fs::remove_dir_all(&staging).await;
     }
-    if downloaded_archive {
-        let _ = tokio::fs::remove_file(&archive).await;
-    }
     activation
 }
 
@@ -477,72 +476,30 @@ fn managed_runtime(program: PathBuf, version: String) -> ShellRuntime {
     }
 }
 
-async fn download_managed_archive(root: &Path, asset: ManagedAsset) -> Result<PathBuf> {
+async fn download_managed_archive(
+    root: &Path,
+    asset: ManagedAsset,
+) -> Result<VerifiedRuntimeDownload> {
     let url = format!(
         "https://github.com/PowerShell/PowerShell/releases/download/v{MANAGED_POWERSHELL_VERSION}/{}",
         asset.file_name
-    );
-    let response = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(20))
-        .timeout(Duration::from_secs(15 * 60))
-        .user_agent("OpenTopia managed runtime installer")
-        .build()?
-        .get(&url)
-        .send()
+    )
+    .parse()
+    .context("managed PowerShell URL is invalid")?;
+    let downloader = ManagedRuntimeDownloader::new(
+        "OpenTopia managed runtime installer",
+        ManagedRuntimeDownloadPolicy::default(),
+    )?;
+    downloader
+        .download_verified(&ManagedRuntimeArtifact {
+            url,
+            file_name: asset.file_name.to_string(),
+            expected_sha256: asset.sha256.to_string(),
+            download_directory: root.to_path_buf(),
+            max_bytes: MAX_ARCHIVE_BYTES,
+        })
         .await
-        .with_context(|| format!("failed to download {url}"))?
-        .error_for_status()
-        .with_context(|| format!("PowerShell download returned an error for {url}"))?;
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_ARCHIVE_BYTES)
-    {
-        anyhow::bail!("PowerShell archive exceeds the configured download limit");
-    }
-
-    let path = root.join(format!(".{}-{}.download", asset.file_name, Uuid::new_v4()));
-    let mut output = tokio::fs::File::create(&path).await?;
-    let mut downloaded = 0_u64;
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("failed while downloading PowerShell archive")?;
-        downloaded = downloaded.saturating_add(chunk.len() as u64);
-        if downloaded > MAX_ARCHIVE_BYTES {
-            let _ = tokio::fs::remove_file(&path).await;
-            anyhow::bail!("PowerShell archive exceeds the configured download limit");
-        }
-        output.write_all(&chunk).await?;
-    }
-    output.flush().await?;
-    Ok(path)
-}
-
-async fn verify_archive_hash(path: &Path, expected: &str) -> Result<()> {
-    let path = path.to_path_buf();
-    let actual = tokio::task::spawn_blocking(move || -> Result<String> {
-        let mut file = fs::File::open(&path)?;
-        let mut hasher = Sha256::new();
-        let mut buffer = [0_u8; 128 * 1024];
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
-        Ok(hasher
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02X}"))
-            .collect())
-    })
-    .await
-    .context("PowerShell archive hash task failed")??;
-    anyhow::ensure!(
-        actual.eq_ignore_ascii_case(expected),
-        "PowerShell archive SHA-256 mismatch: expected {expected}, got {actual}"
-    );
-    Ok(())
+        .context("failed to download managed PowerShell archive")
 }
 
 fn extract_archive(archive_path: &Path, output_root: &Path) -> Result<()> {

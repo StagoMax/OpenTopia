@@ -254,7 +254,17 @@ fn attachment_tool_projection_accumulates_supported_office_formats() {
 
     assert_eq!(
         attachment_preloaded_tools(&messages),
-        BTreeSet::from(["document", "pdf", "spreadsheet"])
+        BTreeSet::from(["document", "pdf", "spreadsheet_inspect"])
+    );
+
+    let mime_only = vec![source_message(
+        thread_id,
+        "opaque-upload",
+        "application/vnd.ms-excel",
+    )];
+    assert_eq!(
+        attachment_preloaded_tools(&mime_only),
+        BTreeSet::from(["spreadsheet_inspect"])
     );
 }
 

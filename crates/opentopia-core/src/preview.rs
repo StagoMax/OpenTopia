@@ -2,7 +2,9 @@ use crate::model::{Artifact, ArtifactStorage, ContextSourceRef};
 use crate::spreadsheet::{
     inspect_workbook, read_range, CellAddress, CellRange, InspectWorkbookRequest, ReadRangeRequest,
     SheetKind, SheetVisibility, SpreadsheetCell, SpreadsheetCellValue, SpreadsheetError,
-    EXCEL_MAX_COLUMNS, EXCEL_MAX_ROWS, MAX_READ_CELLS, MAX_READ_COLUMNS, MAX_READ_ROWS,
+    SpreadsheetFileFormat, EXCEL_MAX_COLUMNS, EXCEL_MAX_ROWS,
+    MAX_INPUT_FILE_BYTES as MAX_SPREADSHEET_INPUT_BYTES, MAX_READ_CELLS, MAX_READ_COLUMNS,
+    MAX_READ_ROWS,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -520,7 +522,7 @@ pub fn preview_workbook(preview: &ResolvedPreview) -> Result<PreviewWorkbook, Pr
     }
     let path = spreadsheet_path(preview)?;
     let result = inspect_workbook(&InspectWorkbookRequest {
-        path: path.to_path_buf(),
+        path: path.as_path().to_path_buf(),
     })?;
     let sheets = result
         .sheets
@@ -601,7 +603,7 @@ pub fn preview_spreadsheet_range(
         },
     };
     let result = read_range(&ReadRangeRequest {
-        path: path.to_path_buf(),
+        path: path.as_path().to_path_buf(),
         sheet: request.sheet.clone(),
         range,
     })?;
@@ -779,7 +781,7 @@ fn delimited_preview_delimiter(preview: &ResolvedPreview) -> Option<u8> {
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if media_type == "text/tab-separated-values" || extension == "tsv" {
+    if media_type == "text/tab-separated-values" || matches!(extension.as_str(), "tsv" | "tab") {
         Some(b'\t')
     } else if media_type == "text/csv" || extension == "csv" {
         Some(b',')
@@ -788,12 +790,71 @@ fn delimited_preview_delimiter(preview: &ResolvedPreview) -> Option<u8> {
     }
 }
 
-fn spreadsheet_path(preview: &ResolvedPreview) -> Result<&Path, PreviewError> {
+enum SpreadsheetPreviewPath<'a> {
+    Borrowed(&'a Path),
+    Staged(PathBuf),
+}
+
+impl SpreadsheetPreviewPath<'_> {
+    fn as_path(&self) -> &Path {
+        match self {
+            Self::Borrowed(path) => path,
+            Self::Staged(path) => path,
+        }
+    }
+}
+
+impl Drop for SpreadsheetPreviewPath<'_> {
+    fn drop(&mut self) {
+        if let Self::Staged(path) = self {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn spreadsheet_path(preview: &ResolvedPreview) -> Result<SpreadsheetPreviewPath<'_>, PreviewError> {
     if preview.descriptor.kind != PreviewKind::Spreadsheet {
         return Err(PreviewError::NotSpreadsheet(preview.descriptor.id.clone()));
     }
     match &preview.content {
-        PreviewContentSource::Path(path) => Ok(path),
+        PreviewContentSource::Path(path) => {
+            if SpreadsheetFileFormat::from_path(path)
+                .is_some_and(SpreadsheetFileFormat::is_workbook)
+            {
+                return Ok(SpreadsheetPreviewPath::Borrowed(path));
+            }
+            if preview.descriptor.bytes > MAX_SPREADSHEET_INPUT_BYTES {
+                return Err(PreviewError::Spreadsheet(SpreadsheetError::FileTooLarge {
+                    path: path.clone(),
+                    actual_bytes: preview.descriptor.bytes,
+                    limit_bytes: MAX_SPREADSHEET_INPUT_BYTES,
+                }));
+            }
+            let format = SpreadsheetFileFormat::from_path(Path::new(&preview.descriptor.name))
+                .or_else(|| {
+                    SpreadsheetFileFormat::from_content_type(&preview.descriptor.content_type)
+                })
+                .filter(|format| format.is_workbook())
+                .ok_or_else(|| {
+                    PreviewError::Spreadsheet(SpreadsheetError::UnsupportedFormat {
+                        path: path.clone(),
+                        extension: path
+                            .extension()
+                            .and_then(|extension| extension.to_str())
+                            .map(str::to_string),
+                    })
+                })?;
+            let staged = SpreadsheetPreviewPath::Staged(std::env::temp_dir().join(format!(
+                "opentopia-preview-{}.{}",
+                Uuid::new_v4(),
+                format.extension()
+            )));
+            std::fs::copy(path, staged.as_path()).map_err(|source| PreviewError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            Ok(staged)
+        }
         PreviewContentSource::Inline(_) => Err(PreviewError::InlineSpreadsheetUnsupported),
     }
 }
@@ -946,8 +1007,11 @@ fn infer_content_type(path: &Path, declared: Option<&str>) -> String {
         "css" => "text/css; charset=utf-8",
         "js" | "mjs" | "cjs" => "text/javascript; charset=utf-8",
         "xml" => "application/xml; charset=utf-8",
-        "csv" => "text/csv; charset=utf-8",
-        "tsv" => "text/tab-separated-values; charset=utf-8",
+        _ if SpreadsheetFileFormat::from_extension(&extension).is_some() => {
+            SpreadsheetFileFormat::from_extension(&extension)
+                .expect("spreadsheet extension was checked")
+                .content_type()
+        }
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
@@ -957,7 +1021,6 @@ fn infer_content_type(path: &Path, declared: Option<&str>) -> String {
         "svg" => "image/svg+xml",
         "pdf" => "application/pdf",
         "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         _ if is_source_extension(&extension) => "text/plain; charset=utf-8",
         _ => return declared.unwrap_or("application/octet-stream").to_string(),
     };
@@ -978,17 +1041,12 @@ fn classify_preview(content_type: &str, path: &Path) -> PreviewKind {
             .is_some_and(|value| value.eq_ignore_ascii_case("docx"))
     {
         PreviewKind::Document
-    } else if media_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        || matches!(
-            media_type.as_str(),
-            "text/csv" | "text/tab-separated-values"
-        )
+    } else if SpreadsheetFileFormat::from_content_type(&media_type).is_some()
         || path
             .extension()
             .and_then(|value| value.to_str())
-            .is_some_and(|value| {
-                matches!(value.to_ascii_lowercase().as_str(), "csv" | "tsv" | "xlsx")
-            })
+            .and_then(SpreadsheetFileFormat::from_extension)
+            .is_some()
     {
         PreviewKind::Spreadsheet
     } else if media_type == "application/pdf" {
@@ -1293,6 +1351,33 @@ mod tests {
         assert_eq!(
             range.rows[0][0].value,
             crate::spreadsheet::SpreadsheetCellValue::String("OpenTopia".to_string())
+        );
+    }
+
+    #[test]
+    fn legacy_xls_attachment_keeps_its_logical_extension_for_the_reader() {
+        let directory = TestDirectory::new();
+        let opaque_path = directory.path().join("upload.bin");
+        std::fs::write(&opaque_path, b"not a real workbook").expect("write opaque attachment");
+        let attachment = ContextSourceRef {
+            id: Uuid::new_v4(),
+            path: opaque_path,
+            name: "legacy.xls".to_string(),
+            kind: ContextSourceKind::Document,
+            content_type: "application/vnd.ms-excel".to_string(),
+            bytes: 0,
+            truncated: false,
+        };
+        let preview =
+            resolve_attachment_preview(&attachment).expect("resolve opaque XLS attachment");
+        assert_eq!(preview.descriptor.kind, PreviewKind::Spreadsheet);
+        let staged = spreadsheet_path(&preview).expect("stage opaque XLS attachment");
+        assert_eq!(
+            staged
+                .as_path()
+                .extension()
+                .and_then(|value| value.to_str()),
+            Some("xls")
         );
     }
 

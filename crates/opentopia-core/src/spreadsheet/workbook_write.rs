@@ -1,11 +1,15 @@
 use super::{
     cell_value_from_data, contains_invalid_xml_character, ensure_sheet_count,
-    ensure_workbook_cell_count, invalid_cell_value, invalid_workbook_coordinate, open_xlsx,
-    sheet_info, validate_address, worksheet_formulas, worksheet_values, BTreeMap, CellAddress,
-    Data, Formula, Path, Range, Reader, SheetKind, SheetVisibility, SheetWriteRequest,
-    SpreadsheetCellInput, SpreadsheetCellValue, SpreadsheetError, Workbook, Worksheet,
-    MAX_FORMULA_BYTES, MAX_WORKBOOK_CELLS,
+    ensure_workbook_cell_count, invalid_cell_value, invalid_workbook_coordinate,
+    open_workbook_reader, sheet_info, validate_address, validate_write_request, worksheet_formulas,
+    worksheet_values, BTreeMap, CellAddress, Data, Formula, Path, Range, Reader, SheetKind,
+    SheetVisibility, SheetWriteRequest, SpreadsheetCellInput, SpreadsheetCellValue,
+    SpreadsheetError, SpreadsheetFileFormat, SpreadsheetWriteBackend, Workbook, Worksheet,
+    WriteWorkbookRequest, WriteWorkbookResult, MAX_FORMULA_BYTES, MAX_INPUT_FILE_BYTES,
+    MAX_OUTPUT_FILE_BYTES, MAX_WORKBOOK_CELLS,
 };
+use crate::delimited;
+use std::fs::{self, File};
 
 #[derive(Debug, Default)]
 pub(super) struct LoadedWorkbook {
@@ -27,7 +31,7 @@ pub(super) struct StoredCell {
 }
 
 pub(super) fn load_workbook(path: &Path) -> Result<LoadedWorkbook, SpreadsheetError> {
-    let (mut workbook, _) = open_xlsx(path)?;
+    let (mut workbook, _) = open_workbook_reader(path)?;
     let metadata = workbook.sheets_metadata().to_vec();
     ensure_sheet_count(metadata.len())?;
     let mut loaded = LoadedWorkbook {
@@ -64,6 +68,93 @@ pub(super) fn load_workbook(path: &Path) -> Result<LoadedWorkbook, SpreadsheetEr
         });
     }
     Ok(loaded)
+}
+
+pub(super) fn load_spreadsheet(path: &Path) -> Result<LoadedWorkbook, SpreadsheetError> {
+    let format = SpreadsheetFileFormat::from_path(path).ok_or_else(|| {
+        SpreadsheetError::UnsupportedFormat {
+            path: path.to_path_buf(),
+            extension: path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(str::to_string),
+        }
+    })?;
+    if format.is_delimited() {
+        load_delimited(path, format)
+    } else {
+        load_workbook(path)
+    }
+}
+
+fn load_delimited(
+    path: &Path,
+    format: SpreadsheetFileFormat,
+) -> Result<LoadedWorkbook, SpreadsheetError> {
+    let metadata = fs::metadata(path).map_err(|source| SpreadsheetError::Io {
+        operation: "inspect",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if metadata.len() > MAX_INPUT_FILE_BYTES {
+        return Err(SpreadsheetError::FileTooLarge {
+            path: path.to_path_buf(),
+            actual_bytes: metadata.len(),
+            limit_bytes: MAX_INPUT_FILE_BYTES,
+        });
+    }
+    let file = File::open(path).map_err(|source| SpreadsheetError::Io {
+        operation: "open",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let delimiter = if format == SpreadsheetFileFormat::Tsv {
+        b'\t'
+    } else {
+        b','
+    };
+    let mut reader = delimited::byte_reader(file, delimiter);
+    let mut cells = BTreeMap::new();
+    for (row, record) in reader.byte_records().enumerate() {
+        let row = u32::try_from(row).map_err(|_| SpreadsheetError::TooManyCells {
+            context: "delimited rows",
+            actual: usize::MAX,
+            limit: super::EXCEL_MAX_ROWS as usize,
+        })?;
+        let record = record.map_err(|error| SpreadsheetError::InvalidDelimited {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })?;
+        for (column, field) in record.iter().enumerate() {
+            let column = u32::try_from(column).map_err(|_| SpreadsheetError::TooManyCells {
+                context: "delimited columns",
+                actual: usize::MAX,
+                limit: super::EXCEL_MAX_COLUMNS as usize,
+            })?;
+            let address = CellAddress { row, column };
+            validate_address(address)?;
+            let value = delimited::decode_field(field, row == 0 && column == 0, false);
+            if value.is_empty() {
+                continue;
+            }
+            cells.insert(
+                address,
+                StoredCell {
+                    value: SpreadsheetCellValue::String(value),
+                    formula: None,
+                    formula_result: None,
+                },
+            );
+            ensure_workbook_cell_count(cells.len())?;
+        }
+    }
+    Ok(LoadedWorkbook {
+        sheets: vec![LoadedSheet {
+            name: "Data".to_string(),
+            visibility: SheetVisibility::Visible,
+            cells,
+        }],
+    })
 }
 
 fn load_values(
@@ -344,6 +435,112 @@ fn formula_result_from_value(value: &SpreadsheetCellValue) -> Option<String> {
         }
         SpreadsheetCellValue::DateTime(value) => Some(value.serial.to_string()),
     }
+}
+
+pub(super) fn write_delimited_workbook(
+    request: &WriteWorkbookRequest,
+    format: SpreadsheetFileFormat,
+) -> Result<WriteWorkbookResult, SpreadsheetError> {
+    let applied_updates = validate_write_request(request)?;
+    let mut workbook = match request.source.as_deref() {
+        Some(source) => load_spreadsheet(source)?,
+        None => LoadedWorkbook::default(),
+    };
+    apply_sheet_updates(&mut workbook, &request.sheets)?;
+    if workbook.sheets.is_empty() {
+        return Err(SpreadsheetError::NoSheets);
+    }
+    if workbook.sheets.len() != 1 {
+        return Err(SpreadsheetError::ValidationFailed {
+            message: "CSV/TSV output requires exactly one worksheet; use export_delimited to choose a sheet from a multi-sheet workbook".to_string(),
+        });
+    }
+    let sheet = &workbook.sheets[0];
+    if sheet.visibility != SheetVisibility::Visible {
+        return Err(SpreadsheetError::NoVisibleSheet);
+    }
+    let delimiter = if format == SpreadsheetFileFormat::Tsv {
+        b'\t'
+    } else {
+        b','
+    };
+    let range = used_cell_bounds(&sheet.cells).unwrap_or((
+        CellAddress { row: 0, column: 0 },
+        CellAddress { row: 0, column: 0 },
+    ));
+    let mut writer = delimited::writer(Vec::new(), delimiter);
+    for row in range.0.row..=range.1.row {
+        let record = (range.0.column..=range.1.column)
+            .map(|column| {
+                sheet
+                    .cells
+                    .get(&CellAddress { row, column })
+                    .map(delimited_cell_text)
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        writer
+            .write_record(&record)
+            .map_err(|error| write_failed(&request.output, error))?;
+    }
+    writer
+        .flush()
+        .map_err(|error| write_failed(&request.output, error))?;
+    let bytes = writer
+        .into_inner()
+        .map_err(|error| write_failed(&request.output, error.error()))?;
+    let bytes_written = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if bytes_written > MAX_OUTPUT_FILE_BYTES {
+        return Err(SpreadsheetError::OutputTooLarge {
+            actual_bytes: bytes_written,
+            limit_bytes: MAX_OUTPUT_FILE_BYTES,
+        });
+    }
+    fs::write(&request.output, bytes).map_err(|source| SpreadsheetError::Io {
+        operation: "write",
+        path: request.output.clone(),
+        source,
+    })?;
+    let output_cells = sheet.cells.len();
+    let result = WriteWorkbookResult {
+        output: request.output.clone(),
+        bytes_written,
+        sheet_count: 1,
+        output_cells,
+        applied_updates,
+        rebuilt_from_source: request.source.is_some(),
+        preserved_template_parts: false,
+        backend: SpreadsheetWriteBackend::Delimited,
+    };
+    super::ensure_return_size(&result)?;
+    Ok(result)
+}
+
+fn used_cell_bounds(
+    cells: &BTreeMap<CellAddress, StoredCell>,
+) -> Option<(CellAddress, CellAddress)> {
+    let mut addresses = cells.keys();
+    let first = *addresses.next()?;
+    let mut start = first;
+    let mut end = first;
+    for address in addresses {
+        start.row = start.row.min(address.row);
+        start.column = start.column.min(address.column);
+        end.row = end.row.max(address.row);
+        end.column = end.column.max(address.column);
+    }
+    Some((start, end))
+}
+
+fn delimited_cell_text(cell: &StoredCell) -> String {
+    if let Some(formula) = &cell.formula {
+        return if formula.starts_with('=') {
+            formula.clone()
+        } else {
+            format!("={formula}")
+        };
+    }
+    formula_result_from_value(&cell.value).unwrap_or_default()
 }
 
 pub(super) fn write_failed(output: &Path, error: impl std::fmt::Display) -> SpreadsheetError {

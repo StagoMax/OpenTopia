@@ -375,7 +375,7 @@ impl TypedTool for ComputerTool {
                     thread_id: Some(thread_id),
                 },
             ),
-            ctx.approval_granted,
+            &ctx,
         )?;
         let receipt = runtime.perform(session, action).await?;
         let observation = runtime

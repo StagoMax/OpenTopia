@@ -1,5 +1,7 @@
 use super::*;
-use crate::model::{MessagePart, TurnRecord};
+use crate::model::{
+    ContextCheckpoint, ContextCheckpointCoverage, ContextSummary, MessagePart, TurnRecord,
+};
 use crate::policy::ApprovalRequired;
 use crate::settings::ProviderHealthCheck;
 use crate::store::SqliteSessionStore;

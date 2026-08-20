@@ -15,6 +15,9 @@ pub mod chrome_extension_browser;
 pub mod collaboration;
 pub mod completion_runtime;
 pub mod computer;
+pub mod connection;
+pub mod connection_capability_fingerprint;
+pub mod connection_operation_runtime;
 pub mod context_runtime;
 pub mod context_sources;
 pub mod contribution_hosts;
@@ -24,6 +27,7 @@ pub mod desktop_browser;
 pub mod document;
 pub mod effect_journal;
 pub mod enterprise;
+pub mod enterprise_connection_grants;
 pub mod execution;
 pub mod execution_authority;
 pub mod execution_authorization;
@@ -38,6 +42,7 @@ pub mod guardian;
 pub mod human_task;
 pub mod instructions;
 pub mod local_git;
+mod managed_runtime_download;
 pub mod mcp;
 pub mod mcp_host;
 pub mod model;
@@ -54,6 +59,7 @@ pub mod process_quota;
 mod process_supervisor;
 pub mod prompt_runtime;
 pub mod provider;
+pub mod round_compaction;
 pub mod sandbox;
 pub mod scm_connector;
 pub mod settings;
@@ -63,6 +69,7 @@ pub mod skills;
 pub mod spreadsheet;
 pub mod store;
 mod store_migrations;
+mod token_breakdown;
 mod tool_adapter;
 mod tool_error;
 mod tool_result_ingress;
@@ -72,6 +79,9 @@ mod tool_surface;
 pub mod tools;
 pub mod turn_inbox;
 pub mod work_form;
+pub mod workflow;
+pub mod workflow_interrupt;
+pub mod workflow_state;
 pub mod workspace;
 
 pub use agent::{
@@ -138,6 +148,22 @@ pub use computer::{
     ObserveOptions, ScreenRect, WindowTarget, MAX_COMPUTER_IMAGE_EDGE,
     MAX_COMPUTER_SCREENSHOT_BYTES, MAX_COMPUTER_WINDOWS,
 };
+pub use connection::{
+    connection_auth_is_runtime_ready, mcp_operation_fingerprint_from_capability,
+    CapabilityDiscoveryKindV1, CapabilityDiscoverySupportV1, ConnectionAccountV1,
+    ConnectionAuthContextV1, ConnectionAuthVerificationV1, ConnectionCapabilityDiscoveryCoverageV1,
+    ConnectionCapabilityKindV1, ConnectionCapabilityProviderMetadataV1,
+    ConnectionCapabilityRevisionV1, ConnectionCapabilitySourceV1, ConnectionCapabilityV1,
+    ConnectionOwnerTypeV1, ConnectionRuntimeBindingV1, ConnectionStatusV1, ConnectionV1,
+    IntegrationAuthSchemeV1, IntegrationDefinitionV1, IntegrationKindV1,
+    CONNECTION_CAPABILITY_REVISION_SCHEMA_VERSION, CONNECTION_SCHEMA_VERSION,
+    INTEGRATION_DEFINITION_SCHEMA_VERSION,
+};
+pub use connection_capability_fingerprint::mcp_operation_fingerprint;
+pub use connection_operation_runtime::{
+    ConnectionOperationInvocationGate, ConnectionOperationRuntimeRoute,
+    RuntimeConnectionAuthorityV1,
+};
 pub use context_runtime::{
     prompt_cache_lineage_key, CanonicalModelRequest, ContextAssembler, ContextAssemblyInput,
     ContextAssemblyManifest, ContextManifestItem, ContextPreparationInput, DefaultContextAssembler,
@@ -174,6 +200,13 @@ pub use enterprise::{
     ExecutionIdentityRouter, ExecutionResourceGrantV1, ExperienceSurfaceProfile, ResourceKind,
     ENTERPRISE_SCHEMA_VERSION_V1, MAX_AGENT_DELEGATION_DEPTH,
 };
+pub use enterprise_connection_grants::{
+    connection_bindings_are_subset, connection_model_tool_name, diff_connection_bindings,
+    intersect_connection_bindings, validate_connection_bindings_shape, ConnectionBindingV1,
+    ConnectionGrantChange, ConnectionGrantChangeKind, ConnectionGrantShapeError,
+    ExecutionConnectionOperationV1, OperationGrantV1, ResolvedConnectionBindingV1,
+    MAX_TEMPLATE_CONNECTION_BINDINGS, MAX_TEMPLATE_OPERATION_GRANTS,
+};
 pub use execution::{
     ExecRequest, ExecResult, ExecutionContext, ExecutionEnvironment, FileReadRequest,
     FileReadResult, FileWriteRequest, LocalExecutionEnvironment, PatchResult, ResourceLimit,
@@ -198,10 +231,13 @@ pub use flow::{
     MAX_FLOW_LOOP_ITERATIONS, MAX_FLOW_NODES,
 };
 pub use flow_runtime::{
-    evaluate_condition as evaluate_flow_condition, prepare_flow_resume, resolve_flow_approval,
-    spawn_flow_run, FlowNodeExecutionRequestV1, FlowNodeExecutionResultV1, FlowNodeHarness,
-    FlowNodeRunStatusV1, FlowNodeRunV1, FlowRunStatusV1, FlowRunV1, FlowTranscriptEntryKindV1,
-    FlowTranscriptEntryV1,
+    evaluate_condition as evaluate_flow_condition, prepare_flow_interrupt_resume,
+    prepare_flow_resume, resolve_flow_approval, spawn_flow_run, FlowNodeExecutionOutcomeV1,
+    FlowNodeExecutionRequestV1, FlowNodeExecutionResultV1, FlowNodeHarness,
+    FlowNodeResumeRequestV1, FlowNodeRunStatusV1, FlowNodeRunV1, FlowRunStatusV1, FlowRunV1,
+    FlowTranscriptEntryKindV1, FlowTranscriptEntryV1, WorkflowCheckpointStatusV1,
+    WorkflowCheckpointSummaryV1, WorkflowCheckpointV1, WorkflowPendingWriteV1,
+    WorkflowSuperstepNodeV1,
 };
 pub use git_workflow::{
     execute_git_workflow, isolated_agent_compare_request, isolated_agent_worktree_request,
@@ -240,26 +276,31 @@ pub use model::{
     ArtifactStorage, ArtifactStorageMetadata, CollaborationMode, ContextCheckpoint,
     ContextCheckpointArtifact, ContextCheckpointCommand, ContextCheckpointCoverage,
     ContextCheckpointFact, ContextCheckpointFile, ContextCheckpointInteraction,
-    ContextCheckpointMode, ContextCheckpointStep, ContextCheckpointWorkspace,
-    ContextCompactionDetails, ContextCompactionMetrics, ContextFactStatus, ContextProjection,
-    ContextSourceRef, ContextSummary, ExperienceMode, GoalRecord, GoalSnapshot, GoalStatus,
-    Message, MessagePart, MessageRole, ModelCallPurpose, ModelContentPart, Project, SkillRef,
-    TerminalCommandHistory, TerminalCommandStatus, Thread, ThreadModelSelection, ToolCall,
-    ToolResult, TurnChangeSet, TurnChangeSetStatus, TurnFileChange, TurnFileChangeKind, TurnRecord,
-    TurnStatus, UserInputAnswer, UserInputOption, UserInputQuestion, UserInputRecord,
-    UserInputRequest, UserInputResponse, UserInputStatus, CONTEXT_CHECKPOINT_SCHEMA_VERSION,
+    ContextCheckpointMetric, ContextCheckpointMode, ContextCheckpointPhase, ContextCheckpointStep,
+    ContextCheckpointWorkspace, ContextCompactionDetails, ContextCompactionMetrics,
+    ContextFactStatus, ContextProjection, ContextSourceRef, ContextSummary, ExperienceMode,
+    GoalRecord, GoalSnapshot, GoalStatus, Message, MessagePart, MessageRole, ModelCallPurpose,
+    ModelContentPart, Project, SkillRef, TerminalCommandHistory, TerminalCommandStatus, Thread,
+    ThreadModelSelection, ToolCall, ToolResult, TurnChangeSet, TurnChangeSetStatus, TurnFileChange,
+    TurnFileChangeKind, TurnRecord, TurnStatus, UserInputAnswer, UserInputOption,
+    UserInputQuestion, UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus,
+    CONTEXT_CHECKPOINT_SCHEMA_VERSION,
 };
 pub use model_context::{
     content_fingerprint, estimate_tokens as estimate_model_context_tokens,
     world_state_catalog_item, world_state_item, CompiledModelContext, ContextAuthority,
     ContextCacheScope, ContextItemKind, ContextLifecycle, ContextRole, ContextSensitivity,
     InstructionSnapshotRef, ModelContextItem, ThreadContextSnapshot, TokenEstimateBreakdown,
-    TurnContextSnapshot, WorldStateSkill, WorldStateSnapshot,
+    TokenEstimateDetail, TurnContextSnapshot, WorldStateSkill, WorldStateSnapshot,
 };
-pub use model_gateway::{ModelGateway, ProviderCodec, ProviderModelGateway, ProviderTransport};
+pub use model_gateway::{
+    ModelGateway, ModelGatewayMetricEvent, ProviderCodec, ProviderModelGateway, ProviderTransport,
+};
 pub use office_runtime::{
-    OfficePythonRuntime, OfficeRuntime, OfficeRuntimeError, OfficeRuntimeSource,
-    OfficeRuntimeStatus, OFFICE_RUNTIME_ID, OFFICE_RUNTIME_MANIFEST,
+    current_office_runtime_status, initialize_office_runtime, retry_managed_office_runtime_install,
+    start_managed_office_runtime_install, ManagedOfficeRuntimeStatus, OfficePythonRuntime,
+    OfficeRuntime, OfficeRuntimeError, OfficeRuntimeSource, OfficeRuntimeStatus, OFFICE_RUNTIME_ID,
+    OFFICE_RUNTIME_MANIFEST,
 };
 pub use pdf::{
     extract_pdf_text, inspect_pdf, validate_pdf, PdfError, PdfExtraction, PdfInspection,
@@ -284,8 +325,8 @@ pub use policy::{
 };
 pub use powershell_runtime::{
     current_shell_runtime, current_shell_runtime_status, initialize_shell_runtime,
-    start_managed_powershell_install, ManagedPowerShellStatus, ShellRuntime, ShellRuntimeSource,
-    ShellRuntimeStatus, MANAGED_POWERSHELL_VERSION,
+    retry_managed_powershell_install, start_managed_powershell_install, ManagedPowerShellStatus,
+    ShellRuntime, ShellRuntimeSource, ShellRuntimeStatus, MANAGED_POWERSHELL_VERSION,
 };
 pub use preview::{
     decode_preview_id, encode_preview_id, preview_spreadsheet_range, preview_workbook,
@@ -312,6 +353,10 @@ pub use provider::{
     ProviderDriverRegistry, ProviderDriverTrust, ProviderNegotiationResult, ProviderToolCall,
     ProviderToolCandidate, ProviderToolDisclosure, ProviderToolNamespace, ProviderToolResult,
     ProviderTransportEvent,
+};
+pub use round_compaction::{
+    context_compact_threshold_percent, RoundContextCompactionRequest, RoundContextCompactionResult,
+    RoundContextCompactor,
 };
 pub use sandbox::{
     build_local_sandbox_command, build_local_sandbox_command_for_platform,
@@ -352,16 +397,16 @@ pub use spreadsheet::{
     ListSheetsRequest, ReadRangeRequest, ReadRangesRequest, ReadRangesResult, SheetRangeRequest,
     SheetVisibility, SheetWriteRequest, SpreadsheetAction, SpreadsheetActionKind, SpreadsheetCell,
     SpreadsheetCellInput, SpreadsheetCellMatch, SpreadsheetCellValue, SpreadsheetError,
-    SpreadsheetErrorCode, SpreadsheetErrorInfo, SpreadsheetFilterCondition,
+    SpreadsheetErrorCode, SpreadsheetErrorInfo, SpreadsheetFileFormat, SpreadsheetFilterCondition,
     SpreadsheetFilterMatchMode, SpreadsheetFilterOperator, SpreadsheetFilterValue,
     SpreadsheetRequest, SpreadsheetResult, SpreadsheetTextMatchMode, SpreadsheetWriteBackend,
     WriteWorkbookRequest, MAX_INPUT_FILE_BYTES as MAX_SPREADSHEET_INPUT_BYTES,
     MAX_OUTPUT_FILE_BYTES as MAX_SPREADSHEET_OUTPUT_BYTES,
 };
 pub use store::{
-    normalize_workspace_key, AgentTemplateStoreError, ContextBudget, FlowStoreError,
-    HumanTaskStoreError, ProviderContextStateKind, ProviderConversationState, SessionStore,
-    SqliteSessionStore, StoreError,
+    normalize_workspace_key, AgentTemplateStoreError, ConnectionStoreError, ContextBudget,
+    FlowStoreError, HumanTaskStoreError, ProviderContextStateKind, ProviderConversationState,
+    SessionStore, SqliteSessionStore, StoreError, WorkflowDeploymentStoreError,
 };
 pub use tool_result_ingress::tool_result_is_error;
 pub use tool_runtime::{
@@ -381,6 +426,18 @@ pub use tools::{
 };
 pub use turn_inbox::{BufferedTurnInbox, TurnInbox, TurnInboxItem};
 pub use work_form::{WorkForm, WorkFormStatus, WorkItem, WorkItemStatus, WorkScope};
+pub use workflow::{
+    CompiledWorkflowV1, DeploymentSnapshotV1, WorkflowAgentSpecV1, WorkflowCompileError,
+    WorkflowDeploymentStatusV1, WorkflowDeploymentV1, WorkflowOutputSpecV1, WorkflowTriggerSpecV1,
+};
+pub use workflow_interrupt::{
+    AgentContinuationEnvelopeV1, FlowNodeInterruptV1, FlowResumeCommandV1, FlowResumeSignalV1,
+    WorkflowInterruptKindV1, WorkflowInterruptRequestV1, WORKFLOW_INTERRUPT_SCHEMA_VERSION_V1,
+};
+pub use workflow_state::{
+    apply_state_writes, parse_state_writes, validate_graph_state_writes, WorkflowStateReducerV1,
+    WorkflowStateWriteV1, MAX_WORKFLOW_STATE_CHANNEL_LENGTH, MAX_WORKFLOW_STATE_WRITES_PER_NODE,
+};
 pub use workspace::{
     ChangedFile, WorkspaceDiff, WorkspaceDiffHunk, WorkspaceDiffScope, WorkspaceEntry,
     WorkspaceEntryKind, WorkspaceFilePreview, WorkspaceTree,

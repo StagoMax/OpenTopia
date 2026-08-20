@@ -22,6 +22,17 @@ pub enum ToolClass {
     Flow,
 }
 
+/// Whether a registered implementation belongs in the model-facing catalog.
+///
+/// Internal tools remain executable so persisted calls and compatibility
+/// adapters can reuse their implementation, but no disclosure policy may add
+/// their schema to a provider request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolModelVisibility {
+    Visible,
+    InternalOnly,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolRiskLevel {
@@ -98,6 +109,7 @@ pub(crate) struct RegisteredTool {
     pub(crate) tool: Arc<dyn Tool>,
     pub(crate) source: ToolSource,
     pub(crate) class: ToolClass,
+    pub(crate) model_visibility: ToolModelVisibility,
     pub(crate) governance: ToolGovernance,
 }
 
@@ -112,12 +124,18 @@ impl RegisteredTool {
             tool,
             source,
             class,
+            model_visibility: ToolModelVisibility::Visible,
             governance,
         }
     }
 
     pub(crate) fn core(tool: Arc<dyn Tool>, class: ToolClass, governance: ToolGovernance) -> Self {
         Self::new(tool, ToolSource::Core, class, governance)
+    }
+
+    pub(crate) fn internal_only(mut self) -> Self {
+        self.model_visibility = ToolModelVisibility::InternalOnly;
+        self
     }
 
     pub(crate) fn name(&self) -> &str {

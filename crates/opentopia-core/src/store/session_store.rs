@@ -1,4 +1,7 @@
 use super::{ContextBudget, ProviderConversationState};
+use crate::connection::{
+    ConnectionCapabilityRevisionV1, ConnectionStatusV1, ConnectionV1, IntegrationDefinitionV1,
+};
 use crate::effect_journal::{EffectIntent, EffectJournalRecord, EffectStatus};
 use crate::enterprise::AgentTemplateVersionV1;
 use crate::flow::{FlowDefinitionV1, FlowDraftV1, FlowTrialV1};
@@ -11,6 +14,7 @@ use crate::model::{
     UserInputRequest, UserInputResponse, UserInputStatus,
 };
 use crate::work_form::{WorkForm, WorkScope};
+use crate::workflow::{WorkflowDeploymentStatusV1, WorkflowDeploymentV1};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -281,6 +285,48 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         template_id: &str,
         version: u32,
     ) -> anyhow::Result<Option<AgentTemplateVersionV1>>;
+    fn insert_integration_definition(
+        &self,
+        definition: &IntegrationDefinitionV1,
+    ) -> anyhow::Result<IntegrationDefinitionV1>;
+    fn get_integration_definition(
+        &self,
+        definition_id: Uuid,
+    ) -> anyhow::Result<Option<IntegrationDefinitionV1>>;
+    fn list_integration_definitions(&self) -> anyhow::Result<Vec<IntegrationDefinitionV1>>;
+    fn update_integration_definition(
+        &self,
+        definition: &IntegrationDefinitionV1,
+        expected_revision: u32,
+    ) -> anyhow::Result<IntegrationDefinitionV1>;
+    fn delete_integration_definition(&self, definition_id: Uuid) -> anyhow::Result<bool>;
+    fn insert_connection(&self, connection: &ConnectionV1) -> anyhow::Result<ConnectionV1>;
+    fn get_connection(&self, connection_id: Uuid) -> anyhow::Result<Option<ConnectionV1>>;
+    fn list_connections(
+        &self,
+        integration_definition_id: Option<Uuid>,
+        status: Option<ConnectionStatusV1>,
+    ) -> anyhow::Result<Vec<ConnectionV1>>;
+    fn update_connection(
+        &self,
+        connection: &ConnectionV1,
+        expected_revision: u32,
+    ) -> anyhow::Result<ConnectionV1>;
+    fn list_connection_capability_revisions(
+        &self,
+        connection_id: Uuid,
+    ) -> anyhow::Result<Vec<ConnectionCapabilityRevisionV1>>;
+    fn get_connection_capability_revision(
+        &self,
+        connection_id: Uuid,
+        revision: u32,
+    ) -> anyhow::Result<Option<ConnectionCapabilityRevisionV1>>;
+    fn publish_connection_capability_revision(
+        &self,
+        connection: &ConnectionV1,
+        expected_connection_revision: u32,
+        capability_revision: &ConnectionCapabilityRevisionV1,
+    ) -> anyhow::Result<(ConnectionV1, ConnectionCapabilityRevisionV1)>;
     fn create_flow_draft(&self, draft: &FlowDraftV1) -> anyhow::Result<FlowDraftV1>;
     fn get_flow_draft(&self, draft_id: Uuid) -> anyhow::Result<Option<FlowDraftV1>>;
     fn list_flow_drafts(&self, thread_id: Option<Uuid>) -> anyhow::Result<Vec<FlowDraftV1>>;
@@ -304,6 +350,24 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         flow_id: &str,
         version: Option<u32>,
     ) -> anyhow::Result<Option<FlowDefinitionV1>>;
+    fn insert_workflow_deployment(
+        &self,
+        deployment: &WorkflowDeploymentV1,
+    ) -> anyhow::Result<WorkflowDeploymentV1>;
+    fn get_workflow_deployment(
+        &self,
+        deployment_id: Uuid,
+    ) -> anyhow::Result<Option<WorkflowDeploymentV1>>;
+    fn list_workflow_deployments(
+        &self,
+        flow_id: Option<&str>,
+        status: Option<WorkflowDeploymentStatusV1>,
+    ) -> anyhow::Result<Vec<WorkflowDeploymentV1>>;
+    fn update_workflow_deployment(
+        &self,
+        deployment: &WorkflowDeploymentV1,
+        expected_revision: u32,
+    ) -> anyhow::Result<WorkflowDeploymentV1>;
     fn insert_flow_run(&self, run: &FlowRunV1) -> anyhow::Result<FlowRunV1>;
     fn get_flow_run(&self, run_id: Uuid) -> anyhow::Result<Option<FlowRunV1>>;
     fn list_flow_runs(&self, thread_id: Uuid) -> anyhow::Result<Vec<FlowRunV1>>;

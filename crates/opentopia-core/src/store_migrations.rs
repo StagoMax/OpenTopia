@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 pub(crate) const LEGACY_DATABASE_SCHEMA_VERSION: i64 = 19;
-pub(crate) const CURRENT_DATABASE_SCHEMA_VERSION: i64 = 25;
+pub(crate) const CURRENT_DATABASE_SCHEMA_VERSION: i64 = 28;
 
 const LEGACY_BASELINE_NAME: &str = "legacy_baseline_v19";
 const MIGRATION_LEDGER_SQL: &str = include_str!("migrations/0019_legacy_baseline.sql");
@@ -103,6 +103,24 @@ const MIGRATIONS: &[Migration] = &[
         name: "flow_human_tasks",
         sql: include_str!("migrations/0025_human_tasks.sql"),
         verify: verify_v25,
+    },
+    Migration {
+        version: 26,
+        name: "connections_control_plane",
+        sql: include_str!("migrations/0026_connections_control_plane.sql"),
+        verify: verify_v26,
+    },
+    Migration {
+        version: 27,
+        name: "workflow_deployments",
+        sql: include_str!("migrations/0027_workflow_deployments.sql"),
+        verify: verify_v27,
+    },
+    Migration {
+        version: 28,
+        name: "workflow_activity_receipts",
+        sql: include_str!("migrations/0028_workflow_activity_receipts.sql"),
+        verify: verify_v28,
     },
 ];
 
@@ -569,6 +587,53 @@ fn verify_v25(conn: &Connection) -> anyhow::Result<()> {
         "idx_human_tasks_thread_status_updated",
         "idx_human_tasks_flow_run_status",
     ] {
+        anyhow::ensure!(index_exists(conn, index)?, "{index} index is missing");
+    }
+    Ok(())
+}
+
+fn verify_v26(conn: &Connection) -> anyhow::Result<()> {
+    for table in [
+        "integration_definitions",
+        "connections",
+        "connection_capability_revisions",
+    ] {
+        anyhow::ensure!(table_exists(conn, table)?, "{table} table is missing");
+    }
+    for index in [
+        "idx_connections_mcp_server",
+        "idx_connections_integration_updated",
+        "idx_connections_status_updated",
+        "idx_connection_capability_revisions_discovered",
+    ] {
+        anyhow::ensure!(index_exists(conn, index)?, "{index} index is missing");
+    }
+    Ok(())
+}
+
+fn verify_v27(conn: &Connection) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        table_exists(conn, "workflow_deployments")?,
+        "workflow_deployments table is missing"
+    );
+    for index in [
+        "idx_workflow_deployments_flow_updated",
+        "idx_workflow_deployments_status_environment",
+    ] {
+        anyhow::ensure!(index_exists(conn, index)?, "{index} index is missing");
+    }
+    Ok(())
+}
+
+fn verify_v28(conn: &Connection) -> anyhow::Result<()> {
+    let sql = table_sql(conn, "effect_journal")?
+        .context("effect_journal table is missing")?
+        .to_ascii_lowercase();
+    anyhow::ensure!(
+        !sql.contains("foreign key(turn_id) references turns"),
+        "effect_journal.turn_id must accept Workflow execution scopes"
+    );
+    for index in ["idx_effect_journal_turn", "idx_effect_journal_recovery"] {
         anyhow::ensure!(index_exists(conn, index)?, "{index} index is missing");
     }
     Ok(())

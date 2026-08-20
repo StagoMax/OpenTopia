@@ -456,6 +456,7 @@ pub fn prompt_cache_lineage_key(
     let namespace = model_context
         .prompt_cache_key
         .as_deref()
+        .filter(|key| !key.starts_with("opentopia-"))
         .unwrap_or("opentopia");
     let mut bytes = Vec::new();
     bytes.extend_from_slice(PROMPT_CACHE_LINEAGE_VERSION.as_bytes());
@@ -879,6 +880,40 @@ mod tests {
                 .filter(|item| item.source == "opentopia:tool_search_protocol")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn generated_prompt_cache_lineage_can_be_refreshed_without_hash_chaining() {
+        let base = CompiledModelContext {
+            items: vec![ModelContextItem::text(
+                ContextItemKind::BaseInstructions,
+                ContextRole::System,
+                "opentopia:base",
+                "Stable instructions",
+                ContextCacheScope::Stable,
+                ContextSensitivity::Public,
+            )],
+            prompt_cache_key: None,
+        };
+        let prepared = DefaultContextAssembler
+            .prepare_context(ContextPreparationInput {
+                model_context: &base,
+                context_summary: Some("checkpoint-a"),
+                tool_candidates: &[],
+                lineage_instructions: None,
+            })
+            .expect("prepare context");
+
+        let same_checkpoint = prompt_cache_lineage_key(&prepared, Some("checkpoint-a"), &[]);
+        let different_checkpoint = prompt_cache_lineage_key(&prepared, Some("checkpoint-b"), &[]);
+        assert_eq!(
+            prepared.prompt_cache_key.as_deref(),
+            Some(same_checkpoint.as_str())
+        );
+        assert_ne!(
+            prepared.prompt_cache_key.as_deref(),
+            Some(different_checkpoint.as_str())
         );
     }
 }

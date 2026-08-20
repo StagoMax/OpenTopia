@@ -46,12 +46,13 @@ use crate::tools::{
 };
 use crate::turn_inbox::{TurnInbox, TurnInboxItem};
 use crate::work_form::{WorkForm, WorkItemStatus};
+use crate::ConnectionOperationRuntimeRoute;
 use async_trait::async_trait;
 use chrono::Utc;
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -72,6 +73,7 @@ pub struct ToolRuntimeHost {
     pub(crate) catalog: ToolRegistry,
     pub(crate) mcp_host: Option<McpExtensionHost>,
     pub(crate) active_mcp_tools: Vec<McpToolDescriptor>,
+    pub(crate) active_connection_operations: BTreeMap<String, ConnectionOperationRuntimeRoute>,
     pub(crate) model_supports_vision: bool,
     pub(crate) sandbox_config: LocalSandboxConfig,
     pub(crate) browser: Arc<dyn BrowserRuntime>,
@@ -90,6 +92,7 @@ impl ToolRuntimeHost {
             catalog,
             mcp_host: None,
             active_mcp_tools: Vec::new(),
+            active_connection_operations: BTreeMap::new(),
             model_supports_vision,
             sandbox_config,
             browser: Arc::new(LocalBrowserRuntime::new(BrowserRuntimeConfig::default())),
@@ -767,10 +770,10 @@ impl ToolRuntime for LocalToolRuntime {
             if !execution_policy.parallel_safe {
                 break;
             }
-            if !matches!(
-                tool.authorization_preflight(&call, &authorization_context),
-                Some(PolicyDecision::Allow)
-            ) {
+            let decision = tool
+                .authorization_preflight(&call, &authorization_context)
+                .map(|decision| permission_mode.resolve_policy_decision(decision));
+            if !matches!(decision, Some(PolicyDecision::Allow)) {
                 continue;
             }
             if scheduling_conflicts(&mut resource_keys, &execution_policy) {
@@ -843,7 +846,10 @@ impl ToolRuntime for LocalToolRuntime {
             if action.reviewability_error().is_some() {
                 break;
             }
-            match tool.authorization_preflight(&call, &context) {
+            let decision = tool
+                .authorization_preflight(&call, &context)
+                .map(|decision| permission_mode.resolve_policy_decision(decision));
+            match decision {
                 Some(PolicyDecision::Ask { reason }) => candidates.push(ToolApprovalCandidate {
                     call: provider_call.clone(),
                     reason,
@@ -1144,6 +1150,29 @@ impl ToolRuntime for LocalToolRuntime {
             },
             _ => None,
         };
+        // Conversation effects use the persisted Turn id. Flow Agent nodes do
+        // not create synthetic conversation Turns; their prepared context
+        // carries the durable FlowRun id instead. The journal accepts either
+        // logical execution scope after migration v28.
+        let durable_effect_scope = if let Some(turn) = active_turn.as_ref() {
+            Some(turn.turn_id)
+        } else if let (Some(store), Some(flow_run_id)) =
+            (context.state.as_ref(), context.agent_turn_id)
+        {
+            match store.flow_session_store().get_flow_run(flow_run_id) {
+                Ok(Some(_)) => Some(flow_run_id),
+                Ok(None) => None,
+                Err(error) => {
+                    return ProviderToolExecutionReport {
+                        provider_call,
+                        outcome: ToolExecutionOutcome::Failed(error),
+                        events: Vec::new(),
+                    };
+                }
+            }
+        } else {
+            None
+        };
         let completion_sink = match (
             context.state.as_ref(),
             context.thread_id,
@@ -1170,11 +1199,11 @@ impl ToolRuntime for LocalToolRuntime {
             .get(&provider_call.name)
             .map(|tool| tool.execution_policy(&call));
         let mut journal = None;
-        if let (Some(store), Some(thread_id), Some(policy), Some(active_turn)) = (
+        if let (Some(store), Some(thread_id), Some(policy), Some(effect_scope_id)) = (
             context.state.as_ref(),
             context.thread_id,
             execution_policy.as_ref(),
-            active_turn.as_ref(),
+            durable_effect_scope,
         ) {
             let input_hash = content_fingerprint(
                 serde_json::to_vec(&provider_call.arguments)
@@ -1183,11 +1212,11 @@ impl ToolRuntime for LocalToolRuntime {
             );
             let intent = EffectIntent {
                 thread_id,
-                turn_id: active_turn.turn_id,
+                turn_id: effect_scope_id,
                 agent_path: agent_path.clone(),
                 idempotency_key: format!(
                     "{}/{}/{}/{}",
-                    active_turn.turn_id, agent_path, provider_call.name, provider_call.id
+                    effect_scope_id, agent_path, provider_call.name, provider_call.id
                 ),
                 kind: EffectKind::ToolCall,
                 operation: provider_call.name.clone(),

@@ -1,12 +1,13 @@
 use super::{
     agent_model_context_with_runtime, finalization_outcome, finalize_inbox_cancelled_turn,
     finalize_provider_turn, incomplete_model_response, json, provider_compatibility_hash,
-    record_provider_tool_result_event, record_rollout_usage, repeated_invalid_tool_call_error,
-    truncate_for_summary, user_denied_tool_result, AgentContinuation, AgentContinuationState,
-    AgentCore, AgentEventPayload, AgentEventSender, AgentTurnInput, AgentTurnResult, Arc,
-    CancellationToken, CompiledModelContext, Context, ContextBudget, ContextPreparationInput,
-    ModelContentPart, ModelDecision, ProviderToolResult, RolloutBudget, RuntimeSurface,
-    SessionStore, ToolCall, TurnEvents, TurnRuntimeState, Value, BACKGROUND_COMMAND_REMINDER_STAGE,
+    provider_context_window_exceeded, record_provider_tool_result_event, record_rollout_usage,
+    repeated_invalid_tool_call_error, truncate_for_summary, user_denied_tool_result,
+    AgentContinuation, AgentContinuationState, AgentCore, AgentEventPayload, AgentEventSender,
+    AgentTurnInput, AgentTurnResult, Arc, CancellationToken, CompiledModelContext, Context,
+    ContextBudget, ContextPreparationInput, ModelContentPart, ModelDecision, ProviderToolResult,
+    RolloutBudget, RuntimeSurface, SessionStore, ToolCall, TurnEvents, TurnRuntimeState, Value,
+    BACKGROUND_COMMAND_REMINDER_STAGE,
 };
 
 impl AgentCore {
@@ -30,7 +31,7 @@ impl AgentCore {
 
     pub(crate) async fn run_turn_detailed_streaming_with_context(
         &self,
-        input: AgentTurnInput,
+        mut input: AgentTurnInput,
         model_context: Option<CompiledModelContext>,
         sender: Option<AgentEventSender>,
     ) -> anyhow::Result<AgentTurnResult> {
@@ -84,7 +85,7 @@ impl AgentCore {
         // Kept in continuations for backward-compatible serialization. New
         // turns materialize branch/profile/flow policy in the lineage header.
         let branch_developer_instructions = None;
-        let provider_compatibility_hash = provider_compatibility_hash(
+        let mut provider_compatibility_hash = provider_compatibility_hash(
             &model_context,
             input.context_summary.as_deref(),
             &tool_candidates,
@@ -151,34 +152,87 @@ impl AgentCore {
                 &mut events,
             );
         }
-        let response = self
-            .complete_model(
-                self.assemble_model_request(
-                    &model_context,
-                    input.context_summary.as_deref(),
-                    input.conversation.clone(),
-                    model_user_message.clone(),
-                    input.user_content.clone(),
-                    tool_candidates.clone(),
-                    opening_provider_tool_calls.clone(),
-                    opening_provider_tool_results.clone(),
-                    opening_provider_response_items.clone(),
-                    previous_response_id,
-                    branch_developer_instructions.clone(),
-                )?,
-                1,
+        let mut compacted_tool_history = String::new();
+        let opening_request = self
+            .admitted_round_request(
+                input.thread_id,
+                input.user_message_id,
+                0,
+                &model_context,
+                &model_context,
+                &mut input.context_summary,
+                &mut input.conversation,
+                &mut budget,
+                &mut runtime_state,
+                &model_user_message,
+                &input.user_content,
+                &tool_candidates,
+                &mut opening_provider_tool_calls,
+                &mut opening_provider_tool_results,
+                &mut compacted_tool_history,
+                &mut opening_provider_response_items,
+                previous_response_id,
+                branch_developer_instructions.as_deref(),
+                &mut provider_compatibility_hash,
                 &mut events,
-                input.cancellation.as_ref(),
             )
-            .await;
-        if input
-            .cancellation
-            .as_ref()
-            .is_some_and(CancellationToken::is_cancelled)
+            .await?;
+        let rejected_opening_request = opening_request.logical().clone();
+        let response = match self
+            .complete_model(opening_request, 1, &mut events, input.cancellation.as_ref())
+            .await
         {
-            return Ok(finalize_inbox_cancelled_turn(input.thread_id, events));
-        }
-        let response = response?;
+            Ok(response) => response,
+            Err(_)
+                if input
+                    .cancellation
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled) =>
+            {
+                return Ok(finalize_inbox_cancelled_turn(input.thread_id, events));
+            }
+            Err(error) if provider_context_window_exceeded(&error) => {
+                let Some(retry_request) = self
+                    .request_after_context_overflow(
+                        input.thread_id,
+                        input.user_message_id,
+                        0,
+                        &model_context,
+                        &model_context,
+                        &mut input.context_summary,
+                        &mut input.conversation,
+                        &mut budget,
+                        &mut runtime_state,
+                        &model_user_message,
+                        &input.user_content,
+                        &tool_candidates,
+                        &mut opening_provider_tool_calls,
+                        &mut opening_provider_tool_results,
+                        &mut compacted_tool_history,
+                        &mut opening_provider_response_items,
+                        &rejected_opening_request,
+                        branch_developer_instructions.as_deref(),
+                        &mut provider_compatibility_hash,
+                        &mut events,
+                    )
+                    .await?
+                else {
+                    return Err(error);
+                };
+                let retry = self
+                    .complete_model(retry_request, 1, &mut events, input.cancellation.as_ref())
+                    .await;
+                if input
+                    .cancellation
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled)
+                {
+                    return Ok(finalize_inbox_cancelled_turn(input.thread_id, events));
+                }
+                retry?
+            }
+            Err(error) => return Err(error),
+        };
         self.commit_step_reminders(opening_reminders, &mut rollout_budget, &mut runtime_state)
             .await?;
         let model_rounds = 1;
@@ -221,7 +275,7 @@ impl AgentCore {
                     opening_provider_tool_calls,
                     opening_provider_tool_results,
                     Vec::new(),
-                    String::new(),
+                    compacted_tool_history,
                     opening_provider_response_items,
                     branch_developer_instructions,
                     provider_compatibility_hash,

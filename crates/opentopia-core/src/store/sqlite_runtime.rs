@@ -99,12 +99,27 @@ pub(super) fn recover_interrupted_runtime_state(conn: &Connection) -> anyhow::Re
                 .node_runs
                 .iter()
                 .rev()
-                .find(|node| node.status == crate::flow_runtime::FlowNodeRunStatusV1::Running)
+                .find(|node| {
+                    matches!(
+                        node.status,
+                        crate::flow_runtime::FlowNodeRunStatusV1::Running
+                            | crate::flow_runtime::FlowNodeRunStatusV1::Resuming
+                    )
+                })
                 .map(|node| (node.id, node.node_id.clone()))
             else {
                 continue;
             };
             let expected_run_revision = run.revision;
+            let checkpoint_payload = run.active_checkpoint.as_ref().map(|checkpoint| {
+                serde_json::json!({
+                    "checkpointId": checkpoint.id,
+                    "superstep": checkpoint.superstep,
+                    "nodeIds": checkpoint.nodes.iter().map(|node| node.node_id.clone()).collect::<Vec<_>>(),
+                    "completedPendingWrites": checkpoint.pending_writes.iter().filter(|write| write.result.is_some()).count(),
+                    "pendingWriteCount": checkpoint.pending_writes.len(),
+                })
+            });
             let task = HumanTaskV1::flow_recovery(
                 run.thread_id,
                 run.id,
@@ -117,6 +132,9 @@ pub(super) fn recover_interrupted_runtime_state(conn: &Connection) -> anyhow::Re
                     "flowVersion": run.flow_version,
                     "nodeId": node_id,
                     "sideEffectState": "unknown",
+                    "resumeCommandId": run.pending_resume_command_id(),
+                    "resumableContinuation": run.pending_resume_command_id().is_some(),
+                    "checkpoint": checkpoint_payload,
                 }),
             );
             run.active_human_task_id = Some(task.id);

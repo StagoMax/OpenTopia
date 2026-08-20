@@ -1,7 +1,9 @@
 use super::{
-    current_settings, ensure_experience_mode_enabled, ensure_thread,
-    sync_thread_bundled_plugin_activations, sync_thread_mcp_tools, ApiError, AppState,
+    current_settings, ensure_experience_mode_enabled, ensure_thread, load_bound_agent_context,
+    sync_thread_bundled_plugin_activations, ApiError, AppState,
 };
+use crate::connection_operation_runtime::connection_authority_for_context;
+use crate::thread_runtime::sync_runtime_connection_tools;
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -12,8 +14,8 @@ use opentopia_core::{
     AgentRunIdentity, CapabilityProjection, ExecutionAuthority, ExperienceMode,
     ExperienceSurfaceProfile, FlowDefinitionV1, FlowDraftStatusV1, FlowDraftV1, FlowRunStatusV1,
     FlowRunV1, FlowSourceV1, FlowSpecV1, FlowStoreError, FlowTrialV1, HumanTaskActionV1,
-    HumanTaskStoreError, RuntimeSurface, SessionStore, ToolInvocationContext, ToolStateStore,
-    TurnStatus,
+    HumanTaskStoreError, RuntimeConnectionAuthorityV1, RuntimeSurface, SessionStore,
+    ToolInvocationContext, ToolStateStore, TurnStatus,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -294,11 +296,24 @@ async fn start_flow_run(
         .get_flow_definition(request.flow_id.trim(), request.version)
         .map_err(flow_error)?
         .ok_or_else(|| ApiError::not_found("published Flow not found"))?;
-    let capabilities = flow_capabilities(&state, thread_id)?;
-    let run = FlowRunV1::new(thread_id, &definition, request.input, &capabilities)
-        .map_err(ApiError::from)?;
+    let (capabilities, connection_authority) = flow_execution_authority(&state, &thread)?;
+    let run = FlowRunV1::new_with_connection_authority(
+        thread_id,
+        &definition,
+        request.input,
+        &capabilities,
+        connection_authority,
+    )
+    .map_err(ApiError::from)?;
     let run = state.store.insert_flow_run(&run).map_err(flow_error)?;
-    let context = flow_runtime_context(&state, &thread, run.id, capabilities).await?;
+    let context = flow_runtime_context(
+        &state,
+        &thread,
+        run.id,
+        run.harness_capabilities(),
+        run.harness_connection_authority(),
+    )
+    .await?;
     spawn_flow_run(run.id, context).map_err(ApiError::from)?;
     Ok(Json(run))
 }
@@ -310,7 +325,7 @@ async fn pause_flow_run(
     let mut run = flow_run_for_request(&state, run_id)?;
     if !matches!(
         run.status,
-        FlowRunStatusV1::Queued | FlowRunStatusV1::Running
+        FlowRunStatusV1::Queued | FlowRunStatusV1::Running | FlowRunStatusV1::Resuming
     ) {
         return Err(ApiError::conflict(
             "only a queued or running Flow can be paused",
@@ -394,8 +409,14 @@ async fn resume_flow_run(
             .map_err(flow_error)?
     };
     if !run.status.is_terminal() {
-        let capabilities = flow_capabilities(&state, run.thread_id)?;
-        let context = flow_runtime_context(&state, &thread, run.id, capabilities).await?;
+        let context = flow_runtime_context(
+            &state,
+            &thread,
+            run.id,
+            run.harness_capabilities(),
+            run.harness_connection_authority(),
+        )
+        .await?;
         spawn_flow_run(run.id, context).map_err(ApiError::from)?;
     }
     Ok(Json(run))
@@ -412,7 +433,7 @@ async fn cancel_flow_run(
     let expected = run.revision;
     if matches!(
         run.status,
-        FlowRunStatusV1::Paused | FlowRunStatusV1::WaitingApproval
+        FlowRunStatusV1::Paused | FlowRunStatusV1::WaitingApproval | FlowRunStatusV1::WaitingHuman
     ) {
         run.status = FlowRunStatusV1::Cancelled;
         run.completed_at = Some(Utc::now());
@@ -458,13 +479,18 @@ pub(crate) async fn flow_runtime_context(
     thread: &opentopia_core::Thread,
     parent_run_id: Uuid,
     capabilities: CapabilityProjection,
+    connection_authority: RuntimeConnectionAuthorityV1,
 ) -> Result<ToolInvocationContext, ApiError> {
     let settings = current_settings(state);
+    let harness_capabilities = ExperienceSurfaceProfile::flow_harness_capabilities(
+        thread.workspace_root.clone(),
+        &capabilities,
+    );
     let authority = ExecutionAuthority::new(
         thread.workspace_root.clone(),
         settings.permission_mode,
         settings.sandbox.to_local_sandbox_config(),
-        capabilities.clone(),
+        harness_capabilities,
     )
     .map_err(ApiError::from)?;
     let config = AgentRunConfig::from_settings(
@@ -486,9 +512,15 @@ pub(crate) async fn flow_runtime_context(
     } else {
         agent.disable_all_bundled_plugins();
     }
-    if capabilities.allow_all_mcp_servers || !capabilities.mcp_servers.is_empty() {
-        sync_thread_mcp_tools(&state.store, &state.mcp_host, thread.id, &mut agent).await;
-    }
+    sync_runtime_connection_tools(
+        &state.store,
+        &state.mcp_host,
+        thread.id,
+        &connection_authority.attenuate(&capabilities),
+        &mut agent,
+    )
+    .await
+    .map_err(ApiError::from)?;
     let agent = agent.finalize().map_err(ApiError::from)?;
     let sandbox = authority.sandbox_config().clone();
     let mut context = authority.local_tool_context();
@@ -498,6 +530,7 @@ pub(crate) async fn flow_runtime_context(
     context.background = Some(state.background.clone());
     context.browser = Some(state.browser.clone());
     context.computer = Some(state.computer.clone());
+    agent.project_external_tools_to_context(&mut context);
     let mut model_context = agent_model_context_with_runtime(
         &thread.workspace_root,
         &sandbox,
@@ -534,21 +567,34 @@ pub(crate) fn ensure_flow_thread(
 }
 
 fn flow_capabilities(state: &AppState, thread_id: Uuid) -> Result<CapabilityProjection, ApiError> {
-    let surface = ExperienceSurfaceProfile::for_mode(ExperienceMode::Flow).capabilities;
-    if let Some(instance) = state
-        .store
-        .get_bound_thread_agent_instance(thread_id)
-        .map_err(flow_error)?
-    {
-        let mut capabilities = instance.execution_context.capabilities;
-        if !capabilities.allow_all_tools {
-            capabilities
-                .tools
-                .extend(ExperienceSurfaceProfile::flow_control_tools());
-        }
-        return Ok(capabilities);
+    let thread = ensure_flow_thread(state, thread_id)?;
+    flow_execution_authority(state, &thread).map(|(capabilities, _)| capabilities)
+}
+
+fn flow_execution_authority(
+    state: &AppState,
+    thread: &opentopia_core::Thread,
+) -> Result<(CapabilityProjection, RuntimeConnectionAuthorityV1), ApiError> {
+    let (instance, template) = load_bound_agent_context(state, thread)?;
+    let mut capabilities = instance
+        .as_ref()
+        .map(|instance| instance.execution_context.capabilities.clone())
+        .unwrap_or_else(|| {
+            ExperienceSurfaceProfile::flow_runtime_baseline(thread.workspace_root.clone())
+        });
+    if !capabilities.allow_all_tools {
+        capabilities
+            .tools
+            .extend(ExperienceSurfaceProfile::flow_control_tools());
     }
-    Ok(surface)
+    let connection_authority = connection_authority_for_context(
+        ExperienceMode::Flow,
+        instance.as_ref(),
+        template.as_ref(),
+        &capabilities,
+    )
+    .attenuate(&capabilities);
+    Ok((capabilities, connection_authority))
 }
 
 pub(crate) fn flow_error(error: anyhow::Error) -> ApiError {

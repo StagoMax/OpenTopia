@@ -18,6 +18,7 @@ fn applying_probe_report_persists_profile_used_by_first_request() {
         chat_parallel_tool_calls: ProviderFeatureSupport::Unsupported,
         chat_json_schema_output: ProviderFeatureSupport::Unsupported,
         chat_message_protocol: ProviderMessageProtocolCapabilities::default(),
+        chat_reasoning_protocol: Some(ProviderReasoningProtocol::ChatReasoningEffort),
         responses: ProviderFeatureSupport::Unsupported,
         responses_native_tools: ProviderFeatureSupport::Unsupported,
         responses_function_tools: ProviderFeatureSupport::Unsupported,
@@ -27,11 +28,56 @@ fn applying_probe_report_persists_profile_used_by_first_request() {
         responses_json_schema_output: ProviderFeatureSupport::Unsupported,
         responses_custom_tools: ProviderFeatureSupport::Unsupported,
         responses_apply_patch: ProviderFeatureSupport::Unsupported,
+        responses_reasoning_protocol: Some(ProviderReasoningProtocol::ResponsesReasoning),
         developer_messages: ProviderFeatureSupport::Unsupported,
         message_compatibility: true,
         checked_at: chrono::Utc::now(),
         notes: Vec::new(),
     });
+    assert_eq!(
+        settings.model_settings[model].preferred_adapter,
+        Some(ProviderAdapterKind::OpenAiChat)
+    );
+    let mut responses_report = settings.openai_compatibility.clone().unwrap();
+    responses_report.selected_protocol = OpenAiProtocol::Responses;
+    responses_report.responses = ProviderFeatureSupport::Supported;
+    responses_report.responses_function_tools = ProviderFeatureSupport::Supported;
+    responses_report.responses_streaming_tools = ProviderFeatureSupport::Supported;
+    settings.apply_openai_compatibility_report(responses_report);
+    assert_eq!(
+        settings.model_settings[model].preferred_adapter,
+        Some(ProviderAdapterKind::OpenAiResponses),
+        "a probe-managed recommendation should follow a newly proven route"
+    );
+    settings
+        .model_settings
+        .entry(model.to_string())
+        .or_default()
+        .preferred_adapter = None;
+    assert_eq!(
+        settings.resolved_adapter_for_model(model),
+        ProviderAdapterKind::OpenAiResponses,
+        "routing without an explicit preference should select the richer proven profile"
+    );
+    let mut chat_report = settings.openai_compatibility.clone().unwrap();
+    chat_report.selected_protocol = OpenAiProtocol::ChatCompletions;
+    chat_report.responses = ProviderFeatureSupport::Unsupported;
+    chat_report.responses_function_tools = ProviderFeatureSupport::Unsupported;
+    settings.apply_openai_compatibility_report(chat_report);
+    assert_eq!(
+        settings.model_settings[model].preferred_adapter,
+        Some(ProviderAdapterKind::OpenAiChat)
+    );
+    settings
+        .model_settings
+        .entry(model.to_string())
+        .or_default()
+        .preferred_adapter = Some(ProviderAdapterKind::OpenAiResponses);
+    assert_eq!(
+        settings.resolved_adapter_for_model(model),
+        ProviderAdapterKind::OpenAiChat,
+        "a preference whose adapter failed negotiation must not override the proven route"
+    );
 
     let provider = OpenAiCompatibleProvider::new(base_url, "test-key", model)
         .with_generation_settings(&settings);
@@ -60,7 +106,7 @@ fn applying_probe_report_persists_profile_used_by_first_request() {
 }
 
 #[tokio::test]
-async fn compatibility_probe_produces_a_persistable_chat_adapter_profile() {
+async fn compatibility_probe_negotiates_thinking_for_an_unknown_model() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -74,12 +120,19 @@ async fn compatibility_probe_produces_a_persistable_chat_adapter_profile() {
             };
             let request = read_http_request(&mut socket).await;
             let is_responses = request.starts_with("POST /v1/responses ");
+            let has_thinking = request.contains(r#""thinking":{"type":"enabled"}"#)
+                && request.contains(r#""reasoning_effort":"high""#);
             let has_developer = request.contains(r#""role":"developer""#);
             let forces_tool = request.contains(r#""name":"compatibility_probe""#)
                 && request.contains("opentopia-tool-probe-v1");
             let streams = request.contains(r#""stream":true"#);
             let (status, body) = if is_responses {
                 ("404 Not Found", r#"{"error":"not found"}"#)
+            } else if !has_thinking {
+                (
+                    "400 Bad Request",
+                    r#"{"error":"thinking envelope required"}"#,
+                )
             } else if has_developer {
                 (
                     "400 Bad Request",
@@ -113,7 +166,7 @@ async fn compatibility_probe_produces_a_persistable_chat_adapter_profile() {
     });
 
     let base_url = format!("http://{address}/v1");
-    let provider = OpenAiCompatibleProvider::new(&base_url, "test-key", "probe-test-model");
+    let provider = OpenAiCompatibleProvider::new(&base_url, "test-key", "future-reasoner-1");
     let health = provider
         .probe_compatibility(ProviderAdapterKind::OpenAiChat)
         .await
@@ -124,6 +177,10 @@ async fn compatibility_probe_produces_a_persistable_chat_adapter_profile() {
     assert!(health.model_available);
     let report = health.openai_compatibility.unwrap();
     assert_eq!(report.selected_protocol, OpenAiProtocol::ChatCompletions);
+    assert_eq!(
+        report.chat_reasoning_protocol,
+        Some(ProviderReasoningProtocol::ChatThinkingReasoningEffort)
+    );
     assert_eq!(report.chat_completions, ProviderFeatureSupport::Supported);
     assert_eq!(
         report.chat_function_tools,
@@ -136,7 +193,7 @@ async fn compatibility_probe_produces_a_persistable_chat_adapter_profile() {
     assert_eq!(report.responses, ProviderFeatureSupport::Unsupported);
     assert_eq!(
         report.responses_native_tools,
-        ProviderFeatureSupport::Unsupported
+        ProviderFeatureSupport::Unknown
     );
     assert_eq!(
         report.developer_messages,
@@ -151,7 +208,7 @@ async fn compatibility_probe_produces_a_persistable_chat_adapter_profile() {
 
     let mut settings = ProviderSettings {
         base_url: base_url.clone(),
-        model: "probe-test-model".to_string(),
+        model: "future-reasoner-1".to_string(),
         ..ProviderSettings::default()
     };
     settings.apply_openai_compatibility_report(report);
@@ -165,7 +222,7 @@ async fn compatibility_probe_produces_a_persistable_chat_adapter_profile() {
             .message_protocol
             .requires_reasoning_content_for_tool_calls
     );
-    let prepared = OpenAiCompatibleProvider::new(&base_url, "test-key", "probe-test-model")
+    let prepared = OpenAiCompatibleProvider::new(&base_url, "test-key", "future-reasoner-1")
         .with_generation_settings(&settings)
         .prepare(Uuid::nil(), layered_model_request())
         .unwrap();
@@ -177,7 +234,64 @@ async fn compatibility_probe_produces_a_persistable_chat_adapter_profile() {
 }
 
 #[tokio::test]
-async fn compatibility_probe_prefers_responses_over_lossy_chat_fallback() {
+async fn compatibility_probe_reports_the_function_tool_failure_reason() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok(Ok((mut socket, _))) =
+                tokio::time::timeout(Duration::from_secs(2), listener.accept()).await
+            else {
+                break;
+            };
+            let request = read_http_request(&mut socket).await;
+            let is_tool_probe = request.contains(r#""name":"compatibility_probe""#)
+                && request.contains("opentopia-tool-probe-v1");
+            let (status, body) = if is_tool_probe {
+                (
+                    "400 Bad Request",
+                    r#"{"error":"function tools are disabled for this API key"}"#,
+                )
+            } else {
+                ("200 OK", "{}")
+            };
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+        }
+    });
+
+    let provider =
+        OpenAiCompatibleProvider::new(format!("http://{address}/v1"), "test-key", "relay-model");
+    let health = provider
+        .probe_compatibility(ProviderAdapterKind::OpenAiChat)
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    assert!(health.reachable);
+    assert!(!health.model_available);
+    let error = health.error.expect("failed probes include a diagnostic");
+    assert!(error.contains("model 'relay-model'"));
+    assert!(error.contains("Chat function tools:"));
+    assert!(error.contains("Responses function tools:"));
+    assert!(error.contains("HTTP 400"));
+    assert!(
+        error.contains("function tools are disabled for this API key"),
+        "the relay's response should reach the settings error"
+    );
+}
+
+#[tokio::test]
+async fn compatibility_probe_prefers_portable_chat_for_third_party_relays() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -247,11 +361,11 @@ async fn compatibility_probe_prefers_responses_over_lossy_chat_fallback() {
     server.await.unwrap();
     let report = health.openai_compatibility.unwrap();
 
-    assert_eq!(report.selected_protocol, OpenAiProtocol::Responses);
+    assert_eq!(report.selected_protocol, OpenAiProtocol::ChatCompletions);
     assert_eq!(report.responses, ProviderFeatureSupport::Supported);
     assert_eq!(
         report.responses_native_tools,
-        ProviderFeatureSupport::Supported
+        ProviderFeatureSupport::Unknown
     );
     assert_eq!(
         report.chat_streaming_tools,
@@ -265,11 +379,11 @@ async fn compatibility_probe_prefers_responses_over_lossy_chat_fallback() {
         report.developer_messages,
         ProviderFeatureSupport::Unsupported
     );
-    assert!(!report.message_compatibility);
+    assert!(report.message_compatibility);
 }
 
 #[tokio::test]
-async fn compatibility_probe_uses_chat_when_responses_rejects_native_tools() {
+async fn compatibility_probe_keeps_hosted_tools_unknown_for_third_party_relays() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -345,7 +459,7 @@ async fn compatibility_probe_uses_chat_when_responses_rejects_native_tools() {
     assert_eq!(report.selected_protocol, OpenAiProtocol::ChatCompletions);
     assert_eq!(
         report.responses_native_tools,
-        ProviderFeatureSupport::Unsupported
+        ProviderFeatureSupport::Unknown
     );
     assert_eq!(
         report.chat_streaming_tools,
@@ -434,6 +548,7 @@ async fn responses_provider_prepares_redacted_body_and_collects_typed_stream() {
     });
     let mut provider =
         OpenAiResponsesProvider::new(format!("http://{address}/v1"), "test-key", "test-model");
+    provider.native_web_search = true;
     provider.tool_protocol.streaming_tools = ProviderFeatureSupport::Supported;
     let mut request = model_request();
     request.input.current_user.content = vec![ModelInputContent::image("image/png", vec![1, 2, 3])];
@@ -450,10 +565,7 @@ async fn responses_provider_prepares_redacted_body_and_collects_typed_stream() {
     }];
     let prepared = provider.prepare(Uuid::nil(), request).unwrap();
     assert_eq!(prepared.adapter, "openai_responses");
-    assert_eq!(
-        prepared.observation_body["prompt_cache_key"],
-        "workspace-cache"
-    );
+    assert!(prepared.observation_body.get("prompt_cache_key").is_none());
     assert!(prepared
         .observation_body
         .to_string()

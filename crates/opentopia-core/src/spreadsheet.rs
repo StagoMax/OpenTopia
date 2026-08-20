@@ -1,7 +1,7 @@
 use crate::office_runtime::OfficeRuntime;
 use calamine::{
-    CellType, Data, Range, Reader, SheetType as CalamineSheetType,
-    SheetVisible as CalamineSheetVisible, Xlsx,
+    open_workbook_auto, CellType, Data, Range, Reader, SheetType as CalamineSheetType,
+    SheetVisible as CalamineSheetVisible, Sheets,
 };
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event as XmlEvent};
 use quick_xml::{Reader as XmlReader, Writer as XmlWriter};
@@ -20,18 +20,20 @@ use wait_timeout::ChildExt;
 use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
 
+mod format;
 mod read;
 mod template_patch;
 mod transfer;
 mod workbook_write;
 
+pub use format::SpreadsheetFileFormat;
 pub use read::{filter_rows, find_cells, inspect_workbook, list_sheets, read_range, read_ranges};
 pub use transfer::*;
 
 use template_patch::patch_workbook_template;
 use workbook_write::{
-    apply_sheet_updates, load_workbook, render_workbook, write_failed, LoadedSheet, LoadedWorkbook,
-    StoredCell,
+    apply_sheet_updates, load_spreadsheet, load_workbook, render_workbook,
+    write_delimited_workbook, write_failed, LoadedSheet, LoadedWorkbook, StoredCell,
 };
 
 pub const EXCEL_MAX_ROWS: u32 = 1_048_576;
@@ -518,6 +520,7 @@ pub struct WriteWorkbookResult {
 pub enum SpreadsheetWriteBackend {
     Native,
     Openpyxl,
+    Delimited,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -563,7 +566,7 @@ pub struct SpreadsheetErrorInfo {
 
 #[derive(Debug, Error)]
 pub enum SpreadsheetError {
-    #[error("unsupported spreadsheet format for {path}: expected .xlsx, found {extension:?}")]
+    #[error("unsupported spreadsheet format for {path}: {extension:?}")]
     UnsupportedFormat {
         path: PathBuf,
         extension: Option<String>,
@@ -764,6 +767,11 @@ pub fn execute_spreadsheet(
 pub fn write_workbook_preferred(
     request: &WriteWorkbookRequest,
 ) -> Result<WriteWorkbookResult, SpreadsheetError> {
+    if let Some(output_format) =
+        SpreadsheetFileFormat::from_path(&request.output).filter(|format| format.is_delimited())
+    {
+        return write_delimited_workbook(request, output_format);
+    }
     let preference = std::env::var("OPENTOPIA_SPREADSHEET_BACKEND")
         .unwrap_or_else(|_| "auto".to_string())
         .trim()
@@ -793,6 +801,12 @@ fn native_template_patch_applies(request: &WriteWorkbookRequest) -> Result<bool,
     let Some(source) = request.source.as_ref() else {
         return Ok(false);
     };
+    let source_format = SpreadsheetFileFormat::from_path(source);
+    let output_format = SpreadsheetFileFormat::from_path(&request.output);
+    if source_format != output_format || !source_format.is_some_and(SpreadsheetFileFormat::is_ooxml)
+    {
+        return Ok(false);
+    }
     if request
         .sheets
         .iter()
@@ -926,20 +940,52 @@ pub fn write_workbook_openpyxl(
 pub fn write_workbook(
     request: &WriteWorkbookRequest,
 ) -> Result<WriteWorkbookResult, SpreadsheetError> {
-    validate_xlsx_path(&request.output)?;
+    let output_format = SpreadsheetFileFormat::from_path(&request.output).ok_or_else(|| {
+        SpreadsheetError::UnsupportedFormat {
+            path: request.output.clone(),
+            extension: request
+                .output
+                .extension()
+                .and_then(OsStr::to_str)
+                .map(str::to_string),
+        }
+    })?;
+    if !output_format.is_ooxml() {
+        return Err(SpreadsheetError::UnsupportedFormat {
+            path: request.output.clone(),
+            extension: request
+                .output
+                .extension()
+                .and_then(OsStr::to_str)
+                .map(str::to_string),
+        });
+    }
     let applied_updates = validate_write_request(request)?;
     let mut loaded = match &request.source {
-        Some(source) => load_workbook(source)?,
+        Some(source) => load_spreadsheet(source)?,
         None => LoadedWorkbook::default(),
     };
-    let preserve_template_parts = request.source.is_some()
-        && request.sheets.iter().all(|sheet| {
-            sheet.visibility.is_none()
-                && loaded
-                    .sheets
-                    .iter()
-                    .any(|existing| existing.name.eq_ignore_ascii_case(&sheet.name))
+    let preserve_template_parts = request.source.as_ref().is_some_and(|source| {
+        SpreadsheetFileFormat::from_path(source) == Some(output_format) && output_format.is_ooxml()
+    }) && request.sheets.iter().all(|sheet| {
+        sheet.visibility.is_none()
+            && loaded
+                .sheets
+                .iter()
+                .any(|existing| existing.name.eq_ignore_ascii_case(&sheet.name))
+    });
+    if matches!(
+        output_format,
+        SpreadsheetFileFormat::Xlsm | SpreadsheetFileFormat::Xltx | SpreadsheetFileFormat::Xltm
+    ) && !preserve_template_parts
+    {
+        return Err(SpreadsheetError::ValidationFailed {
+            message: format!(
+                ".{} output requires package-preserving updates to an existing same-format source",
+                output_format.extension()
+            ),
         });
+    }
 
     apply_sheet_updates(&mut loaded, &request.sheets)?;
     if loaded.sheets.is_empty() {
@@ -993,8 +1039,8 @@ pub fn write_workbook(
     Ok(result)
 }
 
-fn open_xlsx(path: &Path) -> Result<(Xlsx<BufReader<File>>, u64), SpreadsheetError> {
-    validate_xlsx_path(path)?;
+fn open_workbook_reader(path: &Path) -> Result<(Sheets<BufReader<File>>, u64), SpreadsheetError> {
+    validate_workbook_path(path)?;
     let metadata = fs::metadata(path).map_err(|source| SpreadsheetError::Io {
         operation: "inspect",
         path: path.to_path_buf(),
@@ -1008,17 +1054,27 @@ fn open_xlsx(path: &Path) -> Result<(Xlsx<BufReader<File>>, u64), SpreadsheetErr
             limit_bytes: MAX_INPUT_FILE_BYTES,
         });
     }
-    let file = File::open(path).map_err(|source| SpreadsheetError::Io {
-        operation: "open",
+    let workbook = open_workbook_auto(path).map_err(|error| SpreadsheetError::InvalidWorkbook {
         path: path.to_path_buf(),
-        source,
+        message: error.to_string(),
     })?;
-    let workbook =
-        Xlsx::new(BufReader::new(file)).map_err(|error| SpreadsheetError::InvalidWorkbook {
-            path: path.to_path_buf(),
-            message: error.to_string(),
-        })?;
     Ok((workbook, file_size_bytes))
+}
+
+fn validate_workbook_path(path: &Path) -> Result<SpreadsheetFileFormat, SpreadsheetError> {
+    let format = SpreadsheetFileFormat::from_path(path).ok_or_else(|| {
+        SpreadsheetError::UnsupportedFormat {
+            path: path.to_path_buf(),
+            extension: path.extension().and_then(OsStr::to_str).map(str::to_string),
+        }
+    })?;
+    if !format.is_workbook() {
+        return Err(SpreadsheetError::UnsupportedFormat {
+            path: path.to_path_buf(),
+            extension: path.extension().and_then(OsStr::to_str).map(str::to_string),
+        });
+    }
+    Ok(format)
 }
 
 fn validate_xlsx_path(path: &Path) -> Result<(), SpreadsheetError> {
@@ -1098,7 +1154,15 @@ fn validate_read_range(range: CellRange) -> Result<(), SpreadsheetError> {
 
 fn validate_write_request(request: &WriteWorkbookRequest) -> Result<usize, SpreadsheetError> {
     if let Some(source) = &request.source {
-        validate_xlsx_path(source)?;
+        if SpreadsheetFileFormat::from_path(source).is_none() {
+            return Err(SpreadsheetError::UnsupportedFormat {
+                path: source.clone(),
+                extension: source
+                    .extension()
+                    .and_then(OsStr::to_str)
+                    .map(str::to_string),
+            });
+        }
     }
     let update_count = request
         .sheets
@@ -1304,7 +1368,7 @@ fn contains_invalid_xml_character(value: &str) -> bool {
 }
 
 fn worksheet_values(
-    workbook: &mut Xlsx<BufReader<File>>,
+    workbook: &mut Sheets<BufReader<File>>,
     path: &Path,
     sheet: &str,
 ) -> Result<Range<Data>, SpreadsheetError> {
@@ -1317,7 +1381,7 @@ fn worksheet_values(
 }
 
 fn worksheet_formulas(
-    workbook: &mut Xlsx<BufReader<File>>,
+    workbook: &mut Sheets<BufReader<File>>,
     path: &Path,
     sheet: &str,
 ) -> Result<Range<String>, SpreadsheetError> {

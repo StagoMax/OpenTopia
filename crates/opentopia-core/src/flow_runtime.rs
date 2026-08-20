@@ -3,11 +3,21 @@ use crate::flow::{
     compile_flow, FlowBudgetV1, FlowDefinitionV1, GraphDefinitionV1, GraphEdgeV1,
     GraphLoopPolicyV1, GraphNodeKindV1, GraphNodeV1, LoopExhaustionActionV1,
 };
-use crate::human_task::HumanTaskV1;
+use crate::human_task::{HumanTaskActionV1, HumanTaskV1};
+use crate::model::UserInputResponse;
 use crate::tools::ToolInvocationContext;
+use crate::workflow_interrupt::{
+    FlowNodeInterruptV1, FlowResumeCommandV1, WorkflowInterruptKindV1, WorkflowInterruptRequestV1,
+};
+use crate::workflow_state::{apply_state_writes, parse_state_writes};
+use crate::{
+    DeploymentSnapshotV1, RuntimeConnectionAuthorityV1, WorkflowAgentSpecV1,
+    WorkflowDeploymentStatusV1, WorkflowDeploymentV1,
+};
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use futures_util::stream::{self, StreamExt};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -23,6 +33,8 @@ pub enum FlowRunStatusV1 {
     PauseRequested,
     Paused,
     WaitingApproval,
+    WaitingHuman,
+    Resuming,
     Succeeded,
     Failed,
     CancelRequested,
@@ -37,6 +49,10 @@ impl FlowRunStatusV1 {
             Self::PauseRequested => "pause_requested",
             Self::Paused => "paused",
             Self::WaitingApproval => "waiting_approval",
+            // The indexed v19 compatibility column groups all human waits and
+            // active execution states. The precise state remains in document_json.
+            Self::WaitingHuman => "waiting_approval",
+            Self::Resuming => "running",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::CancelRequested => "cancel_requested",
@@ -54,6 +70,8 @@ impl FlowRunStatusV1 {
 pub enum FlowNodeRunStatusV1 {
     Running,
     WaitingApproval,
+    WaitingHuman,
+    Resuming,
     Succeeded,
     Failed,
     Cancelled,
@@ -141,6 +159,68 @@ pub struct FlowNodeRunV1 {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowCheckpointStatusV1 {
+    Running,
+    Committed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowSuperstepNodeV1 {
+    pub node_id: String,
+    pub node_run_id: Uuid,
+    pub attempt: u32,
+    pub input: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowPendingWriteV1 {
+    pub node_id: String,
+    pub node_run_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<FlowNodeExecutionResultV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupt: Option<WorkflowInterruptRequestV1>,
+    /// The command is retained after execution as an immutable audit record.
+    /// It only applies when its interrupt id/revision matches `interrupt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_command: Option<FlowResumeCommandV1>,
+    pub completed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowCheckpointV1 {
+    pub id: Uuid,
+    pub superstep: u32,
+    pub status: WorkflowCheckpointStatusV1,
+    pub nodes: Vec<WorkflowSuperstepNodeV1>,
+    #[serde(default)]
+    pub pending_writes: Vec<WorkflowPendingWriteV1>,
+    pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowCheckpointSummaryV1 {
+    pub id: Uuid,
+    pub superstep: u32,
+    pub status: WorkflowCheckpointStatusV1,
+    pub node_ids: Vec<String>,
+    pub pending_write_count: u32,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct FlowRunV1 {
@@ -151,6 +231,10 @@ pub struct FlowRunV1 {
     pub flow_version: u32,
     pub definition_id: Uuid,
     pub definition_content_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_snapshot: Option<DeploymentSnapshotV1>,
     pub revision: u32,
     pub status: FlowRunStatusV1,
     pub input: Value,
@@ -158,6 +242,11 @@ pub struct FlowRunV1 {
     pub output: Option<Value>,
     pub graph: GraphDefinitionV1,
     pub effective_capabilities: CapabilityProjection,
+    /// Immutable operation-level authority captured when the Run starts.
+    /// `None` is reserved for persisted runs created before this field existed;
+    /// those are restored through explicit legacy-projection inference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_authority: Option<RuntimeConnectionAuthorityV1>,
     pub budget: FlowBudgetV1,
     #[serde(default)]
     pub ready_nodes: Vec<String>,
@@ -165,10 +254,26 @@ pub struct FlowRunV1 {
     pub node_runs: Vec<FlowNodeRunV1>,
     #[serde(default)]
     pub node_outputs: BTreeMap<String, Value>,
+    /// Reducer-owned shared state. Node outputs remain the immutable routing
+    /// source; state channels are applied only at a committed superstep.
+    #[serde(default)]
+    pub state: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub superstep: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_checkpoint: Option<WorkflowCheckpointV1>,
+    #[serde(default)]
+    pub checkpoint_history: Vec<WorkflowCheckpointSummaryV1>,
     #[serde(default)]
     pub loop_counts: BTreeMap<String, u32>,
     pub node_executions: u32,
     pub tool_calls: u32,
+    /// Production deployments pause after terminal output until a HumanTask
+    /// records the review decision. Trial/manual compatibility runs may opt out.
+    #[serde(default)]
+    pub output_review_required: bool,
+    #[serde(default)]
+    pub output_reviewed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_node_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -190,12 +295,30 @@ impl FlowRunV1 {
         input: Value,
         available_capabilities: &CapabilityProjection,
     ) -> anyhow::Result<Self> {
+        let connection_authority =
+            RuntimeConnectionAuthorityV1::inferred_from_projection(available_capabilities);
+        Self::new_with_connection_authority(
+            thread_id,
+            definition,
+            input,
+            available_capabilities,
+            connection_authority,
+        )
+    }
+
+    pub fn new_with_connection_authority(
+        thread_id: Uuid,
+        definition: &FlowDefinitionV1,
+        input: Value,
+        available_capabilities: &CapabilityProjection,
+        connection_authority: RuntimeConnectionAuthorityV1,
+    ) -> anyhow::Result<Self> {
         let effective_capabilities = definition.capabilities.intersect(available_capabilities);
         anyhow::ensure!(
             effective_capabilities == definition.capabilities,
             "the current ExecutionContext is narrower than the published Flow capability snapshot"
         );
-        let spec = definition.as_spec();
+        let spec = definition.to_spec();
         compile_flow(&spec, &effective_capabilities).map_err(|report| {
             anyhow::anyhow!(
                 "published Flow no longer compiles in this ExecutionContext: {} validation error(s)",
@@ -211,19 +334,28 @@ impl FlowRunV1 {
             flow_version: definition.version,
             definition_id: definition.id,
             definition_content_hash: definition.content_hash.clone(),
+            deployment_id: None,
+            deployment_snapshot: None,
             revision: 1,
             status: FlowRunStatusV1::Queued,
             input,
             output: None,
             graph: definition.graph.clone(),
+            connection_authority: Some(connection_authority.attenuate(&effective_capabilities)),
             effective_capabilities,
             budget: definition.budget.clone(),
             ready_nodes: vec![definition.graph.entry_node_id.clone()],
             node_runs: Vec::new(),
             node_outputs: BTreeMap::new(),
+            state: BTreeMap::new(),
+            superstep: 0,
+            active_checkpoint: None,
+            checkpoint_history: Vec::new(),
             loop_counts: BTreeMap::new(),
             node_executions: 0,
             tool_calls: 0,
+            output_review_required: false,
+            output_reviewed: false,
             waiting_node_id: None,
             active_human_task_id: None,
             error: None,
@@ -234,11 +366,127 @@ impl FlowRunV1 {
         })
     }
 
+    pub fn new_from_deployment(
+        thread_id: Uuid,
+        deployment: &WorkflowDeploymentV1,
+        input: Value,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            deployment.status == WorkflowDeploymentStatusV1::Active,
+            "Workflow deployment is not active"
+        );
+        let workflow = &deployment.snapshot.compiled_workflow;
+        anyhow::ensure!(
+            workflow.schema_version == ENTERPRISE_SCHEMA_VERSION_V1
+                && deployment.snapshot.schema_version == ENTERPRISE_SCHEMA_VERSION_V1,
+            "Workflow deployment snapshot uses an unsupported schema version"
+        );
+        let now = Utc::now();
+        Ok(Self {
+            schema_version: ENTERPRISE_SCHEMA_VERSION_V1,
+            id: Uuid::new_v4(),
+            thread_id,
+            flow_id: workflow.flow_id.clone(),
+            flow_version: workflow.flow_version,
+            definition_id: workflow.definition_id,
+            definition_content_hash: workflow.definition_content_hash.clone(),
+            deployment_id: Some(deployment.id),
+            deployment_snapshot: Some(deployment.snapshot.clone()),
+            revision: 1,
+            status: FlowRunStatusV1::Queued,
+            input,
+            output: None,
+            graph: workflow.graph.clone(),
+            // Production Agent-node authority is owned by the compiled
+            // workflow. The root graph itself has no implicit account access.
+            connection_authority: Some(RuntimeConnectionAuthorityV1::DenyAll),
+            effective_capabilities: workflow.root_capabilities.clone(),
+            budget: workflow.budget.clone(),
+            ready_nodes: vec![workflow.graph.entry_node_id.clone()],
+            node_runs: Vec::new(),
+            node_outputs: BTreeMap::new(),
+            state: BTreeMap::new(),
+            superstep: 0,
+            active_checkpoint: None,
+            checkpoint_history: Vec::new(),
+            loop_counts: BTreeMap::new(),
+            node_executions: 0,
+            tool_calls: 0,
+            output_review_required: true,
+            output_reviewed: false,
+            waiting_node_id: None,
+            active_human_task_id: None,
+            error: None,
+            created_at: now,
+            started_at: None,
+            completed_at: None,
+            updated_at: now,
+        })
+    }
+
+    pub fn effective_connection_authority(&self) -> RuntimeConnectionAuthorityV1 {
+        self.connection_authority.clone().unwrap_or_else(|| {
+            RuntimeConnectionAuthorityV1::inferred_from_projection(&self.effective_capabilities)
+        })
+    }
+
+    pub fn harness_capabilities(&self) -> CapabilityProjection {
+        self.deployment_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.compiled_workflow.harness_capabilities.clone())
+            .unwrap_or_else(|| self.effective_capabilities.clone())
+    }
+
+    pub fn harness_connection_authority(&self) -> RuntimeConnectionAuthorityV1 {
+        self.deployment_snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .compiled_workflow
+                    .harness_connection_authority
+                    .clone()
+            })
+            .unwrap_or_else(|| self.effective_connection_authority())
+    }
+
+    pub fn workflow_agent_spec(&self, node_id: &str) -> Option<&WorkflowAgentSpecV1> {
+        self.deployment_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.compiled_workflow.agent_spec(node_id))
+    }
+
+    pub fn effective_capabilities_for_node(&self, node_id: &str) -> CapabilityProjection {
+        self.workflow_agent_spec(node_id)
+            .map(|spec| spec.capabilities.clone())
+            .unwrap_or_else(|| self.effective_capabilities.clone())
+    }
+
+    pub fn effective_connection_authority_for_node(
+        &self,
+        node_id: &str,
+    ) -> RuntimeConnectionAuthorityV1 {
+        self.workflow_agent_spec(node_id)
+            .map(|spec| spec.connection_authority.clone())
+            .unwrap_or_else(|| self.effective_connection_authority())
+    }
+
     pub fn active_node_run_mut(&mut self, node_id: &str) -> Option<&mut FlowNodeRunV1> {
         self.node_runs
             .iter_mut()
             .rev()
             .find(|node| node.node_id == node_id && node.completed_at.is_none())
+    }
+
+    pub fn pending_resume_command_id(&self) -> Option<Uuid> {
+        self.active_checkpoint
+            .as_ref()?
+            .pending_writes
+            .iter()
+            .find_map(|write| {
+                let interrupt = write.interrupt.as_ref()?;
+                let command = write.resume_command.as_ref()?;
+                command.validates(interrupt).then_some(command.id)
+            })
     }
 
     pub fn next_attempt(&self, node_id: &str) -> u32 {
@@ -262,30 +510,6 @@ impl FlowRunV1 {
     }
 }
 
-trait FlowDefinitionSpec {
-    fn as_spec(&self) -> crate::flow::FlowSpecV1;
-}
-
-impl FlowDefinitionSpec for FlowDefinitionV1 {
-    fn as_spec(&self) -> crate::flow::FlowSpecV1 {
-        crate::flow::FlowSpecV1 {
-            flow_id: self.flow_id.clone(),
-            name: self.name.clone(),
-            description: self.description.clone(),
-            owner: self.owner.clone(),
-            categories: self.categories.clone(),
-            source: self.source.clone(),
-            input_schema: self.input_schema.clone(),
-            output_schema: self.output_schema.clone(),
-            graph: self.graph.clone(),
-            requested_capabilities: self.capabilities.clone(),
-            budget: self.budget.clone(),
-            risk_class: self.risk_class,
-            pending_decisions: Vec::new(),
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct FlowNodeExecutionRequestV1 {
     pub flow_run_id: Uuid,
@@ -293,6 +517,7 @@ pub struct FlowNodeExecutionRequestV1 {
     pub node: GraphNodeV1,
     pub input: Value,
     pub effective_capabilities: CapabilityProjection,
+    pub workflow_agent_spec: Option<WorkflowAgentSpecV1>,
     pub remaining_tool_calls: u32,
     pub context: ToolInvocationContext,
 }
@@ -306,12 +531,76 @@ pub struct FlowNodeExecutionResultV1 {
     pub transcript: Vec<FlowTranscriptEntryV1>,
 }
 
+#[derive(Debug, Clone)]
+pub enum FlowNodeExecutionOutcomeV1 {
+    Completed(FlowNodeExecutionResultV1),
+    Interrupted(FlowNodeInterruptV1),
+}
+
+#[derive(Clone)]
+pub struct FlowNodeResumeRequestV1 {
+    pub flow_run_id: Uuid,
+    pub node_run_id: Uuid,
+    pub node: GraphNodeV1,
+    pub input: Value,
+    pub effective_capabilities: CapabilityProjection,
+    pub workflow_agent_spec: Option<WorkflowAgentSpecV1>,
+    pub remaining_tool_calls: u32,
+    pub interrupt: WorkflowInterruptRequestV1,
+    pub command: FlowResumeCommandV1,
+    pub context: ToolInvocationContext,
+}
+
 #[async_trait]
 pub trait FlowNodeHarness: Send + Sync {
     async fn execute_flow_node(
         &self,
         request: FlowNodeExecutionRequestV1,
-    ) -> anyhow::Result<FlowNodeExecutionResultV1>;
+    ) -> anyhow::Result<FlowNodeExecutionOutcomeV1>;
+
+    async fn resume_flow_node(
+        &self,
+        _request: FlowNodeResumeRequestV1,
+    ) -> anyhow::Result<FlowNodeExecutionOutcomeV1> {
+        anyhow::bail!("this Flow Agent Harness does not support resumable node continuations")
+    }
+}
+
+fn restrict_flow_node_connection_context(
+    context: &mut ToolInvocationContext,
+    authority: &RuntimeConnectionAuthorityV1,
+) -> anyhow::Result<()> {
+    match authority {
+        RuntimeConnectionAuthorityV1::DenyAll => {
+            context.mcp_tools.clear();
+            context.connection_operations.clear();
+        }
+        RuntimeConnectionAuthorityV1::LegacyMcp => {}
+        RuntimeConnectionAuthorityV1::Structured { operations } => {
+            let expected = operations
+                .iter()
+                .map(|operation| (operation.model_tool_name.as_str(), operation))
+                .collect::<BTreeMap<_, _>>();
+            for (name, operation) in &expected {
+                let route = context.connection_operations.get(*name).with_context(|| {
+                    format!("Workflow Agent node Connection route {name} is unavailable")
+                })?;
+                anyhow::ensure!(
+                    route.operation() == *operation,
+                    "Workflow Agent node Connection route {name} differs from its DeploymentSnapshot"
+                );
+            }
+            context
+                .mcp_tools
+                .retain(|descriptor| expected.contains_key(descriptor.public_name.as_str()));
+            context.connection_operations.retain(|name, route| {
+                expected
+                    .get(name.as_str())
+                    .is_some_and(|operation| route.operation() == *operation)
+            });
+        }
+    }
+    Ok(())
 }
 
 pub fn spawn_flow_run(run_id: Uuid, context: ToolInvocationContext) -> anyhow::Result<()> {
@@ -394,10 +683,203 @@ pub fn resolve_flow_approval(
     Ok(())
 }
 
+pub fn prepare_flow_interrupt_resume(
+    run: &mut FlowRunV1,
+    task: &HumanTaskV1,
+    action: HumanTaskActionV1,
+    response: Option<Value>,
+    note: Option<&str>,
+    actor: &str,
+    idempotency_key: &str,
+) -> anyhow::Result<FlowResumeCommandV1> {
+    anyhow::ensure!(
+        run.status == FlowRunStatusV1::WaitingHuman,
+        "Flow run is not waiting on an Agent continuation"
+    );
+    anyhow::ensure!(
+        run.active_human_task_id == Some(task.id),
+        "Flow run is no longer waiting on this Human task"
+    );
+    let continuation_id = task
+        .continuation_id
+        .context("Human task is missing its Agent continuation identity")?;
+    let write = run
+        .active_checkpoint
+        .as_mut()
+        .context("waiting Flow run is missing its checkpoint")?
+        .pending_writes
+        .iter_mut()
+        .find(|write| {
+            write
+                .interrupt
+                .as_ref()
+                .is_some_and(|interrupt| interrupt.continuation.id == continuation_id)
+        })
+        .context("Human task continuation is no longer present in the checkpoint")?;
+    let interrupt = write
+        .interrupt
+        .as_ref()
+        .context("checkpoint write is missing its interrupt")?;
+    let signal = match interrupt.kind {
+        WorkflowInterruptKindV1::Approval => {
+            anyhow::ensure!(
+                matches!(
+                    action,
+                    HumanTaskActionV1::Approve | HumanTaskActionV1::Reject
+                ),
+                "approval interrupt only accepts approve or reject"
+            );
+            crate::workflow_interrupt::FlowResumeSignalV1::Approval {
+                approval_id: interrupt
+                    .payload
+                    .get("approvalId")
+                    .and_then(Value::as_str)
+                    .and_then(|value| Uuid::parse_str(value).ok()),
+                approved: action == HumanTaskActionV1::Approve,
+            }
+        }
+        WorkflowInterruptKindV1::InputRequest => {
+            anyhow::ensure!(
+                action == HumanTaskActionV1::Submit,
+                "input interrupt only accepts submit"
+            );
+            let response = response.context("input interrupt requires a structured response")?;
+            let response = serde_json::from_value::<UserInputResponse>(response)?;
+            let request_id = interrupt
+                .payload
+                .get("request")
+                .and_then(|request| request.get("requestId"))
+                .and_then(Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .context("input interrupt is missing requestId")?;
+            crate::workflow_interrupt::FlowResumeSignalV1::UserInput {
+                request_id,
+                response,
+            }
+        }
+        WorkflowInterruptKindV1::ExternalAction | WorkflowInterruptKindV1::EffectReconciliation => {
+            anyhow::ensure!(
+                matches!(
+                    action,
+                    HumanTaskActionV1::Resume
+                        | HumanTaskActionV1::Reconnect
+                        | HumanTaskActionV1::Acknowledge
+                ),
+                "external interrupt requires resume, reconnect, or acknowledge"
+            );
+            let observation = response
+                .as_ref()
+                .and_then(|value| value.get("observation"))
+                .and_then(Value::as_str)
+                .or(note)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .context("external action requires an observation")?
+                .to_string();
+            crate::workflow_interrupt::FlowResumeSignalV1::ExternalAction { observation }
+        }
+        WorkflowInterruptKindV1::ResumeRetry => {
+            anyhow::ensure!(
+                action == HumanTaskActionV1::Retry,
+                "resume retry interrupt only accepts retry"
+            );
+            write
+                .resume_command
+                .as_ref()
+                .context("resume retry interrupt is missing its previous command")?
+                .signal
+                .clone()
+        }
+    };
+    let command =
+        FlowResumeCommandV1::new(task.id, idempotency_key, interrupt, signal, note, actor)?;
+    write.resume_command = Some(command.clone());
+    if let Some(node_run) = run
+        .node_runs
+        .iter_mut()
+        .find(|node| node.id == interrupt.node_run_id)
+    {
+        node_run.status = FlowNodeRunStatusV1::Resuming;
+    }
+    run.status = FlowRunStatusV1::Resuming;
+    run.waiting_node_id = None;
+    run.active_human_task_id = None;
+    run.error = None;
+    run.touch();
+    Ok(command)
+}
+
 pub fn prepare_flow_resume(
     run: &mut FlowRunV1,
     retry_interrupted_node: bool,
 ) -> anyhow::Result<()> {
+    if let Some(mut checkpoint) = run.active_checkpoint.take() {
+        anyhow::ensure!(
+            retry_interrupted_node,
+            "superstep {} was interrupted; inspect external state, then explicitly set retryInterruptedNode or cancel the Run",
+            checkpoint.superstep
+        );
+        let completed = checkpoint
+            .pending_writes
+            .iter()
+            .filter(|write| write.result.is_some())
+            .map(|write| write.node_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let retry_count = checkpoint
+            .nodes
+            .iter()
+            .filter(|item| !completed.contains(&item.node_id))
+            .count() as u32;
+        anyhow::ensure!(
+            run.node_executions.saturating_add(retry_count) <= run.budget.max_node_executions,
+            "Flow node execution budget exhausted ({})",
+            run.budget.max_node_executions
+        );
+        checkpoint
+            .pending_writes
+            .retain(|write| completed.contains(&write.node_id));
+        for item in &mut checkpoint.nodes {
+            if completed.contains(&item.node_id) {
+                continue;
+            }
+            if let Some(node_run) = run
+                .node_runs
+                .iter_mut()
+                .find(|candidate| candidate.id == item.node_run_id)
+            {
+                node_run.status = FlowNodeRunStatusV1::Cancelled;
+                node_run.error = Some(
+                    "process stopped during superstep execution; operator explicitly requested a fresh attempt"
+                        .to_string(),
+                );
+                node_run.completed_at = Some(Utc::now());
+            }
+            let node_run_id = Uuid::new_v4();
+            item.node_run_id = node_run_id;
+            item.attempt = item.attempt.saturating_add(1);
+            run.node_runs.push(FlowNodeRunV1 {
+                id: node_run_id,
+                node_id: item.node_id.clone(),
+                attempt: item.attempt,
+                status: FlowNodeRunStatusV1::Running,
+                input: item.input.clone(),
+                output: None,
+                error: None,
+                tool_calls: 0,
+                transcript: vec![FlowTranscriptEntryV1::new(
+                    FlowTranscriptEntryKindV1::Input,
+                    "Node input",
+                    item.input.clone(),
+                )],
+                started_at: Utc::now(),
+                completed_at: None,
+            });
+            run.node_executions = run.node_executions.saturating_add(1);
+        }
+        run.active_checkpoint = Some(checkpoint);
+        run.active_human_task_id = None;
+        return Ok(());
+    }
     let Some(index) = run
         .node_runs
         .iter()
@@ -432,24 +914,31 @@ async fn drive_flow_run(run_id: Uuid, context: ToolInvocationContext) -> anyhow:
     let harness = context
         .flow_harness
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Flow Runtime requires the Agent Harness"))?;
+        .ok_or_else(|| anyhow::anyhow!("Flow Runtime requires the Agent Harness"))?
+        .clone();
 
     loop {
         let mut run = store
             .get_flow_run(run_id)?
             .ok_or_else(|| anyhow::anyhow!("Flow run not found: {run_id}"))?;
-        if run.status.is_terminal() || run.status == FlowRunStatusV1::WaitingApproval {
+        if run.status.is_terminal()
+            || matches!(
+                run.status,
+                FlowRunStatusV1::WaitingApproval | FlowRunStatusV1::WaitingHuman
+            )
+        {
             return Ok(());
         }
         if run.status == FlowRunStatusV1::CancelRequested {
             let expected = run.revision;
+            cancel_active_checkpoint(&mut run);
             run.status = FlowRunStatusV1::Cancelled;
             run.completed_at = Some(Utc::now());
             run.touch();
             store.update_flow_run(&run, expected)?;
             return Ok(());
         }
-        if run.status == FlowRunStatusV1::PauseRequested {
+        if run.status == FlowRunStatusV1::PauseRequested && run.active_checkpoint.is_none() {
             let expected = run.revision;
             run.status = FlowRunStatusV1::Paused;
             run.touch();
@@ -461,7 +950,78 @@ async fn drive_flow_run(run_id: Uuid, context: ToolInvocationContext) -> anyhow:
         }
 
         enforce_run_budget(&run)?;
-        let Some(node_id) = next_ready_node(&run) else {
+        if let Some(checkpoint) = run.active_checkpoint.clone() {
+            if run.status == FlowRunStatusV1::Resuming {
+                let resumable = checkpoint.pending_writes.iter().find_map(|write| {
+                    let interrupt = write.interrupt.as_ref()?;
+                    let command = write.resume_command.as_ref()?;
+                    command
+                        .validates(interrupt)
+                        .then(|| (write.clone(), interrupt.clone(), command.clone()))
+                });
+                let (write, interrupt, command) = resumable
+                    .context("Flow run is resuming without a matching persisted ResumeCommand")?;
+                let replacement = execute_resume_checkpoint_node(
+                    run.clone(),
+                    write,
+                    interrupt,
+                    command,
+                    context.clone(),
+                    harness.clone(),
+                )
+                .await;
+                replace_pending_write(store.as_ref(), run_id, checkpoint.id, replacement)?;
+                continue;
+            }
+            let completed = checkpoint
+                .pending_writes
+                .iter()
+                .map(|write| write.node_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            let pending = checkpoint
+                .nodes
+                .iter()
+                .filter(|item| !completed.contains(item.node_id.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+
+            let mut parallel = Vec::new();
+            let mut serial = Vec::new();
+            for item in pending {
+                let node = run
+                    .graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == item.node_id)
+                    .context("Flow checkpoint references a missing node")?;
+                if node_is_parallel_safe(node) {
+                    parallel.push(item);
+                } else {
+                    serial.push(item);
+                }
+            }
+
+            let results = stream::iter(parallel.into_iter().map(|item| {
+                execute_checkpoint_node(run.clone(), item, context.clone(), harness.clone())
+            }))
+            .buffer_unordered(MAX_SUPERSTEP_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+            for write in results {
+                persist_pending_write(store.as_ref(), run_id, checkpoint.id, write)?;
+            }
+            for item in serial {
+                let write =
+                    execute_checkpoint_node(run.clone(), item, context.clone(), harness.clone())
+                        .await;
+                persist_pending_write(store.as_ref(), run_id, checkpoint.id, write)?;
+            }
+            commit_active_checkpoint(store.as_ref(), run_id, checkpoint.id)?;
+            continue;
+        }
+
+        let ready_nodes = ready_superstep_nodes(&run);
+        if ready_nodes.is_empty() {
             let expected = run.revision;
             if run.ready_nodes.is_empty() {
                 run.status = FlowRunStatusV1::Succeeded;
@@ -478,75 +1038,72 @@ async fn drive_flow_run(run_id: Uuid, context: ToolInvocationContext) -> anyhow:
             run.touch();
             store.update_flow_run(&run, expected)?;
             return Ok(());
-        };
-        let node = run
-            .graph
-            .nodes
-            .iter()
-            .find(|node| node.id == node_id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Flow node disappeared from run snapshot: {node_id}"))?;
-        let input = node_input(&run, &node_id);
-        let expected = run.revision;
-        remove_first(&mut run.ready_nodes, &node_id);
-        if node.kind == GraphNodeKindV1::Approval {
-            let transcript_input = input.clone();
-            let task_input = input.clone();
-            let node_run_id = Uuid::new_v4();
-            let node_run = FlowNodeRunV1 {
-                id: node_run_id,
-                node_id: node_id.clone(),
-                attempt: run.next_attempt(&node_id),
-                status: FlowNodeRunStatusV1::WaitingApproval,
-                input,
-                output: None,
-                error: None,
-                tool_calls: 0,
-                transcript: vec![
-                    FlowTranscriptEntryV1::new(
-                        FlowTranscriptEntryKindV1::Input,
-                        "Node input",
-                        transcript_input,
-                    ),
-                    FlowTranscriptEntryV1::new(
-                        FlowTranscriptEntryKindV1::Approval,
-                        "Waiting for human approval",
-                        json!({"status": "pending"}),
-                    ),
-                ],
-                started_at: Utc::now(),
-                completed_at: None,
-            };
-            run.node_runs.push(node_run);
-            run.node_executions = run.node_executions.saturating_add(1);
-            run.started_at.get_or_insert_with(Utc::now);
-            run.waiting_node_id = Some(node_id.clone());
-            run.status = FlowRunStatusV1::WaitingApproval;
-            let task = HumanTaskV1::flow_approval(
-                run.thread_id,
-                run.id,
-                node_run_id,
-                node_id.clone(),
-                &node.label,
-                json!({
-                    "flowId": run.flow_id,
-                    "flowVersion": run.flow_version,
-                    "nodeId": node_id,
-                    "nodeLabel": node.label,
-                    "input": task_input,
-                }),
-            );
-            run.active_human_task_id = Some(task.id);
-            run.touch();
-            store.update_flow_run_and_human_task(&run, expected, &task, None)?;
+        }
+        let approval_node = ready_nodes.iter().find_map(|ready_node_id| {
+            run.graph
+                .nodes
+                .iter()
+                .find(|node| node.id == *ready_node_id && node.kind == GraphNodeKindV1::Approval)
+                .cloned()
+        });
+        if let Some(node) = approval_node {
+            pause_for_approval(store.as_ref(), &mut run, &node)?;
             return Ok(());
         }
+        begin_superstep(store.as_ref(), &mut run, &ready_nodes)?;
+    }
+}
 
+const MAX_SUPERSTEP_CONCURRENCY: usize = 8;
+const MAX_CHECKPOINT_HISTORY: usize = 100;
+
+fn ready_superstep_nodes(run: &FlowRunV1) -> Vec<String> {
+    run.ready_nodes
+        .iter()
+        .filter(|node_id| {
+            let node_id = node_id.as_str();
+            run.graph
+                .nodes
+                .iter()
+                .find(|node| node.id == node_id)
+                .is_some_and(|node| node.kind != GraphNodeKindV1::Join || join_ready(run, node_id))
+        })
+        .cloned()
+        .collect()
+}
+
+fn node_is_parallel_safe(node: &GraphNodeV1) -> bool {
+    matches!(
+        node.kind,
+        GraphNodeKindV1::Condition
+            | GraphNodeKindV1::Validator
+            | GraphNodeKindV1::Join
+            | GraphNodeKindV1::Loop
+            | GraphNodeKindV1::Output
+    ) || node.config.get("parallelSafe").and_then(Value::as_bool) == Some(true)
+}
+
+fn begin_superstep(
+    store: &dyn crate::SessionStore,
+    run: &mut FlowRunV1,
+    node_ids: &[String],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(!node_ids.is_empty(), "cannot begin an empty superstep");
+    anyhow::ensure!(
+        run.node_executions.saturating_add(node_ids.len() as u32) <= run.budget.max_node_executions,
+        "Flow node execution budget exhausted ({})",
+        run.budget.max_node_executions
+    );
+    let expected = run.revision;
+    let mut nodes = Vec::with_capacity(node_ids.len());
+    for node_id in node_ids {
+        let input = node_input(run, node_id);
         let node_run_id = Uuid::new_v4();
+        let attempt = run.next_attempt(node_id);
         run.node_runs.push(FlowNodeRunV1 {
             id: node_run_id,
             node_id: node_id.clone(),
-            attempt: run.next_attempt(&node_id),
+            attempt,
             status: FlowNodeRunStatusV1::Running,
             input: input.clone(),
             output: None,
@@ -560,97 +1117,668 @@ async fn drive_flow_run(run_id: Uuid, context: ToolInvocationContext) -> anyhow:
             started_at: Utc::now(),
             completed_at: None,
         });
-        run.node_executions = run.node_executions.saturating_add(1);
-        run.status = FlowRunStatusV1::Running;
-        run.started_at.get_or_insert_with(Utc::now);
-        run.touch();
-        store.update_flow_run(&run, expected)?;
+        nodes.push(WorkflowSuperstepNodeV1 {
+            node_id: node_id.clone(),
+            node_run_id,
+            attempt,
+            input,
+        });
+        remove_first(&mut run.ready_nodes, node_id);
+    }
+    run.node_executions = run
+        .node_executions
+        .saturating_add(u32::try_from(nodes.len()).unwrap_or(u32::MAX));
+    run.status = FlowRunStatusV1::Running;
+    run.started_at.get_or_insert_with(Utc::now);
+    run.active_checkpoint = Some(WorkflowCheckpointV1 {
+        id: Uuid::new_v4(),
+        superstep: run.superstep.saturating_add(1),
+        status: WorkflowCheckpointStatusV1::Running,
+        nodes,
+        pending_writes: Vec::new(),
+        created_at: Utc::now(),
+        completed_at: None,
+    });
+    run.touch();
+    store.update_flow_run(run, expected)?;
+    Ok(())
+}
 
-        let result = match node.kind {
+async fn execute_checkpoint_node(
+    run: FlowRunV1,
+    item: WorkflowSuperstepNodeV1,
+    context: ToolInvocationContext,
+    harness: std::sync::Arc<dyn FlowNodeHarness>,
+) -> WorkflowPendingWriteV1 {
+    let result = async {
+        let node = run
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.id == item.node_id)
+            .cloned()
+            .with_context(|| format!("Flow node disappeared from checkpoint: {}", item.node_id))?;
+        match node.kind {
             GraphNodeKindV1::Condition
             | GraphNodeKindV1::Validator
             | GraphNodeKindV1::Join
             | GraphNodeKindV1::Loop
-            | GraphNodeKindV1::Output => execute_runtime_node(&node, input),
+            | GraphNodeKindV1::Output => execute_runtime_node(&node, item.input.clone())
+                .map(FlowNodeExecutionOutcomeV1::Completed),
             GraphNodeKindV1::Agent | GraphNodeKindV1::Skill | GraphNodeKindV1::Tool => {
+                let node_capabilities = run.effective_capabilities_for_node(&item.node_id);
+                let authority = run.effective_connection_authority_for_node(&item.node_id);
+                let mut node_context = context;
+                restrict_flow_node_connection_context(&mut node_context, &authority)?;
+                node_context.capability_projection = node_capabilities.clone();
                 harness
                     .execute_flow_node(FlowNodeExecutionRequestV1 {
-                        flow_run_id: run_id,
-                        node_run_id,
-                        node: node.clone(),
-                        input,
-                        effective_capabilities: run.effective_capabilities.clone(),
+                        flow_run_id: run.id,
+                        node_run_id: item.node_run_id,
+                        node,
+                        input: item.input.clone(),
+                        effective_capabilities: node_capabilities,
+                        workflow_agent_spec: run.workflow_agent_spec(&item.node_id).cloned(),
                         remaining_tool_calls: run
                             .budget
                             .max_tool_calls
                             .saturating_sub(run.tool_calls),
-                        context: context.clone(),
+                        context: node_context,
                     })
                     .await
             }
-            GraphNodeKindV1::Approval => unreachable!("approval nodes pause before execution"),
-        };
-
-        let mut run = store
-            .get_flow_run(run_id)?
-            .ok_or_else(|| anyhow::anyhow!("Flow run not found after node execution"))?;
-        let expected = run.revision;
-        match result {
-            Ok(result) => {
-                let now = Utc::now();
-                let node_run = run
-                    .node_runs
-                    .iter_mut()
-                    .find(|candidate| candidate.id == node_run_id)
-                    .ok_or_else(|| anyhow::anyhow!("active Flow node run disappeared"))?;
-                node_run.status = FlowNodeRunStatusV1::Succeeded;
-                node_run.output = Some(result.output.clone());
-                node_run.tool_calls = result.tool_calls;
-                node_run.transcript.extend(result.transcript);
-                node_run.transcript.push(FlowTranscriptEntryV1::new(
-                    FlowTranscriptEntryKindV1::Output,
-                    "Node output",
-                    result.output.clone(),
-                ));
-                node_run.completed_at = Some(now);
-                run.tool_calls = run.tool_calls.saturating_add(result.tool_calls);
-                run.node_outputs
-                    .insert(node_id.clone(), result.output.clone());
-                if node.kind == GraphNodeKindV1::Output {
-                    run.output = Some(result.output);
-                    run.status = FlowRunStatusV1::Succeeded;
-                    run.completed_at = Some(now);
-                } else {
-                    route_after_node(&mut run, &node_id, &result.output)?;
-                }
-            }
-            Err(error) => {
-                if let Some(node_run) = run
-                    .node_runs
-                    .iter_mut()
-                    .find(|candidate| candidate.id == node_run_id)
-                {
-                    node_run.status = FlowNodeRunStatusV1::Failed;
-                    node_run.error = Some(error.to_string());
-                    node_run.transcript.push(FlowTranscriptEntryV1::new(
-                        FlowTranscriptEntryKindV1::Error,
-                        "Node failed",
-                        json!({"message": error.to_string()}),
-                    ));
-                    node_run.completed_at = Some(Utc::now());
-                }
-                if let Some(target) = error_route(&run.graph, &node_id) {
-                    enqueue_unique(&mut run.ready_nodes, target);
-                } else {
-                    run.status = FlowRunStatusV1::Failed;
-                    run.error = Some(format!("node {node_id} failed: {error}"));
-                    run.completed_at = Some(Utc::now());
-                }
+            GraphNodeKindV1::Approval => {
+                anyhow::bail!("approval nodes cannot execute inside a superstep")
             }
         }
+    }
+    .await;
+    match result {
+        Ok(FlowNodeExecutionOutcomeV1::Completed(result)) => WorkflowPendingWriteV1 {
+            node_id: item.node_id,
+            node_run_id: item.node_run_id,
+            result: Some(result),
+            error: None,
+            interrupt: None,
+            resume_command: None,
+            completed_at: Utc::now(),
+        },
+        Ok(FlowNodeExecutionOutcomeV1::Interrupted(interrupt)) => {
+            let checkpoint = run
+                .active_checkpoint
+                .as_ref()
+                .expect("checkpoint node execution requires an active checkpoint");
+            WorkflowPendingWriteV1 {
+                node_id: item.node_id.clone(),
+                node_run_id: item.node_run_id,
+                result: None,
+                error: None,
+                interrupt: Some(WorkflowInterruptRequestV1::at_checkpoint(
+                    checkpoint.id,
+                    checkpoint.superstep,
+                    item.node_id,
+                    item.node_run_id,
+                    interrupt,
+                )),
+                resume_command: None,
+                completed_at: Utc::now(),
+            }
+        }
+        Err(error) => WorkflowPendingWriteV1 {
+            node_id: item.node_id,
+            node_run_id: item.node_run_id,
+            result: None,
+            error: Some(error.to_string()),
+            interrupt: None,
+            resume_command: None,
+            completed_at: Utc::now(),
+        },
+    }
+}
+
+async fn execute_resume_checkpoint_node(
+    run: FlowRunV1,
+    previous_write: WorkflowPendingWriteV1,
+    interrupt: WorkflowInterruptRequestV1,
+    command: FlowResumeCommandV1,
+    context: ToolInvocationContext,
+    harness: std::sync::Arc<dyn FlowNodeHarness>,
+) -> WorkflowPendingWriteV1 {
+    let result = async {
+        anyhow::ensure!(
+            command.validates(&interrupt),
+            "ResumeCommand does not match the active interrupt revision"
+        );
+        let node = run
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.id == previous_write.node_id)
+            .cloned()
+            .context("resuming Flow node disappeared from the graph")?;
+        anyhow::ensure!(
+            matches!(node.kind, GraphNodeKindV1::Agent | GraphNodeKindV1::Skill),
+            "only Agent and Skill nodes have resumable continuations"
+        );
+        let node_capabilities = run.effective_capabilities_for_node(&previous_write.node_id);
+        let authority = run.effective_connection_authority_for_node(&previous_write.node_id);
+        let mut node_context = context;
+        restrict_flow_node_connection_context(&mut node_context, &authority)?;
+        node_context.capability_projection = node_capabilities.clone();
+        harness
+            .resume_flow_node(FlowNodeResumeRequestV1 {
+                flow_run_id: run.id,
+                node_run_id: previous_write.node_run_id,
+                node,
+                input: run
+                    .active_checkpoint
+                    .as_ref()
+                    .and_then(|checkpoint| {
+                        checkpoint
+                            .nodes
+                            .iter()
+                            .find(|item| item.node_run_id == previous_write.node_run_id)
+                    })
+                    .map(|item| item.input.clone())
+                    .unwrap_or(Value::Null),
+                effective_capabilities: node_capabilities,
+                workflow_agent_spec: run.workflow_agent_spec(&previous_write.node_id).cloned(),
+                remaining_tool_calls: run.budget.max_tool_calls.saturating_sub(run.tool_calls),
+                interrupt: interrupt.clone(),
+                command: command.clone(),
+                context: node_context,
+            })
+            .await
+    }
+    .await;
+
+    match result {
+        Ok(FlowNodeExecutionOutcomeV1::Completed(result)) => WorkflowPendingWriteV1 {
+            result: Some(result),
+            error: None,
+            interrupt: None,
+            resume_command: Some(command),
+            completed_at: Utc::now(),
+            ..previous_write
+        },
+        Ok(FlowNodeExecutionOutcomeV1::Interrupted(next_interrupt)) => {
+            let request = WorkflowInterruptRequestV1::at_checkpoint(
+                interrupt.checkpoint_id,
+                interrupt.superstep,
+                previous_write.node_id.clone(),
+                previous_write.node_run_id,
+                next_interrupt,
+            );
+            WorkflowPendingWriteV1 {
+                result: None,
+                error: None,
+                interrupt: Some(request),
+                resume_command: Some(command),
+                completed_at: Utc::now(),
+                ..previous_write
+            }
+        }
+        Err(error) => WorkflowPendingWriteV1 {
+            result: None,
+            error: None,
+            interrupt: Some(WorkflowInterruptRequestV1::resume_retry(
+                &interrupt,
+                &command,
+                error.to_string(),
+            )),
+            resume_command: Some(command),
+            completed_at: Utc::now(),
+            ..previous_write
+        },
+    }
+}
+
+fn persist_pending_write(
+    store: &dyn crate::SessionStore,
+    run_id: Uuid,
+    checkpoint_id: Uuid,
+    write: WorkflowPendingWriteV1,
+) -> anyhow::Result<()> {
+    for _ in 0..8 {
+        let mut run = store
+            .get_flow_run(run_id)?
+            .context("Flow run disappeared while recording a pending write")?;
+        let expected = run.revision;
+        let checkpoint = run
+            .active_checkpoint
+            .as_mut()
+            .filter(|checkpoint| checkpoint.id == checkpoint_id)
+            .context("Flow checkpoint changed while a node was executing")?;
+        if checkpoint
+            .pending_writes
+            .iter()
+            .any(|existing| existing.node_id == write.node_id)
+        {
+            return Ok(());
+        }
+        checkpoint.pending_writes.push(write.clone());
+        checkpoint
+            .pending_writes
+            .sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        run.touch();
+        match store.update_flow_run(&run, expected) {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<crate::FlowStoreError>(),
+                    Some(crate::FlowStoreError::RunRevisionConflict(_))
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    anyhow::bail!("Flow checkpoint could not persist a pending write after concurrent updates")
+}
+
+fn replace_pending_write(
+    store: &dyn crate::SessionStore,
+    run_id: Uuid,
+    checkpoint_id: Uuid,
+    replacement: WorkflowPendingWriteV1,
+) -> anyhow::Result<()> {
+    for _ in 0..8 {
+        let mut run = store
+            .get_flow_run(run_id)?
+            .context("Flow run disappeared while recording a resumed write")?;
+        let expected = run.revision;
+        let checkpoint = run
+            .active_checkpoint
+            .as_mut()
+            .filter(|checkpoint| checkpoint.id == checkpoint_id)
+            .context("Flow checkpoint changed while a node continuation was resuming")?;
+        let current = checkpoint
+            .pending_writes
+            .iter_mut()
+            .find(|write| write.node_run_id == replacement.node_run_id)
+            .context("resumed Flow node pending write disappeared")?;
+        let expected_command_id = current.resume_command.as_ref().map(|command| command.id);
+        anyhow::ensure!(
+            expected_command_id
+                == replacement
+                    .resume_command
+                    .as_ref()
+                    .map(|command| command.id),
+            "resumed Flow node command changed while it was executing"
+        );
+        *current = replacement.clone();
+        run.status = FlowRunStatusV1::Running;
+        run.active_human_task_id = None;
+        run.touch();
+        match store.update_flow_run(&run, expected) {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<crate::FlowStoreError>(),
+                    Some(crate::FlowStoreError::RunRevisionConflict(_))
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    anyhow::bail!("Flow continuation result could not be persisted after concurrent updates")
+}
+
+fn commit_active_checkpoint(
+    store: &dyn crate::SessionStore,
+    run_id: Uuid,
+    checkpoint_id: Uuid,
+) -> anyhow::Result<()> {
+    let mut run = store
+        .get_flow_run(run_id)?
+        .context("Flow run disappeared before checkpoint commit")?;
+    let expected = run.revision;
+    let mut checkpoint = run
+        .active_checkpoint
+        .take()
+        .filter(|checkpoint| checkpoint.id == checkpoint_id)
+        .context("Flow checkpoint changed before commit")?;
+    if run.status == FlowRunStatusV1::CancelRequested {
+        run.active_checkpoint = Some(checkpoint);
+        cancel_active_checkpoint(&mut run);
+        run.status = FlowRunStatusV1::Cancelled;
+        run.completed_at = Some(Utc::now());
         run.touch();
         store.update_flow_run(&run, expected)?;
+        return Ok(());
     }
+    anyhow::ensure!(
+        checkpoint.pending_writes.len() == checkpoint.nodes.len(),
+        "Flow checkpoint has incomplete pending writes"
+    );
+    checkpoint
+        .pending_writes
+        .sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    if let Some(interrupt) = checkpoint
+        .pending_writes
+        .iter()
+        .find_map(|write| write.interrupt.clone())
+    {
+        return pause_for_interrupt(store, &mut run, expected, checkpoint, interrupt);
+    }
+    let mut succeeded = Vec::new();
+    let mut routed_errors = Vec::new();
+    let mut unhandled_error = None;
+    let mut output_values = Vec::new();
+    for write in &checkpoint.pending_writes {
+        let node = run
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.id == write.node_id)
+            .cloned()
+            .context("Flow checkpoint references a missing graph node")?;
+        let node_run = run
+            .node_runs
+            .iter_mut()
+            .find(|candidate| candidate.id == write.node_run_id)
+            .context("Flow checkpoint node run disappeared")?;
+        node_run.completed_at = Some(write.completed_at);
+        if let Some(result) = &write.result {
+            node_run.status = FlowNodeRunStatusV1::Succeeded;
+            node_run.output = Some(result.output.clone());
+            node_run.tool_calls = result.tool_calls;
+            extend_transcript_unique(&mut node_run.transcript, &result.transcript);
+            node_run.transcript.push(FlowTranscriptEntryV1::new(
+                FlowTranscriptEntryKindV1::Output,
+                "Node output",
+                result.output.clone(),
+            ));
+            run.tool_calls = run.tool_calls.saturating_add(result.tool_calls);
+            succeeded.push((node, result.output.clone()));
+        } else {
+            let error = write.error.as_deref().unwrap_or("node execution failed");
+            node_run.status = FlowNodeRunStatusV1::Failed;
+            node_run.error = Some(error.to_string());
+            node_run.transcript.push(FlowTranscriptEntryV1::new(
+                FlowTranscriptEntryKindV1::Error,
+                "Node failed",
+                json!({"message": error}),
+            ));
+            if let Some(target) = error_route(&run.graph, &write.node_id) {
+                routed_errors.push(target);
+            } else if unhandled_error.is_none() {
+                unhandled_error = Some(format!("node {} failed: {error}", write.node_id));
+            }
+        }
+    }
+
+    if run.tool_calls > run.budget.max_tool_calls && unhandled_error.is_none() {
+        unhandled_error = Some(format!(
+            "Flow tool-call budget exhausted ({})",
+            run.budget.max_tool_calls
+        ));
+    }
+    if unhandled_error.is_none() {
+        for (node, output) in &succeeded {
+            run.node_outputs.insert(node.id.clone(), output.clone());
+            let writes = parse_state_writes(&node.config).map_err(anyhow::Error::msg)?;
+            apply_state_writes(&mut run.state, &writes, output).map_err(anyhow::Error::msg)?;
+        }
+        for (node, output) in &succeeded {
+            if node.kind == GraphNodeKindV1::Output {
+                output_values.push((node.id.clone(), output.clone()));
+            } else {
+                route_after_node(&mut run, &node.id, output)?;
+            }
+        }
+        for target in routed_errors {
+            enqueue_unique(&mut run.ready_nodes, target);
+        }
+    }
+
+    let completed_at = Utc::now();
+    checkpoint.completed_at = Some(completed_at);
+    checkpoint.status = if unhandled_error.is_some() {
+        WorkflowCheckpointStatusV1::Failed
+    } else {
+        WorkflowCheckpointStatusV1::Committed
+    };
+    run.superstep = checkpoint.superstep;
+    run.checkpoint_history.push(WorkflowCheckpointSummaryV1 {
+        id: checkpoint.id,
+        superstep: checkpoint.superstep,
+        status: checkpoint.status,
+        node_ids: checkpoint
+            .nodes
+            .iter()
+            .map(|node| node.node_id.clone())
+            .collect(),
+        pending_write_count: u32::try_from(checkpoint.pending_writes.len()).unwrap_or(u32::MAX),
+        created_at: checkpoint.created_at,
+        completed_at,
+    });
+    if run.checkpoint_history.len() > MAX_CHECKPOINT_HISTORY {
+        let overflow = run.checkpoint_history.len() - MAX_CHECKPOINT_HISTORY;
+        run.checkpoint_history.drain(0..overflow);
+    }
+    if let Some(error) = unhandled_error {
+        run.status = FlowRunStatusV1::Failed;
+        run.error = Some(error);
+        run.completed_at = Some(completed_at);
+    } else if !output_values.is_empty() {
+        let review_node_id = output_values.first().map(|(node_id, _)| node_id.clone());
+        run.output = if output_values.len() == 1 {
+            output_values.pop().map(|(_, output)| output)
+        } else {
+            Some(Value::Object(output_values.into_iter().collect()))
+        };
+        if run.output_review_required && !run.output_reviewed {
+            let node_run = review_node_id.as_ref().and_then(|node_id| {
+                run.node_runs
+                    .iter()
+                    .rev()
+                    .find(|node_run| node_run.node_id == *node_id)
+            });
+            let task = HumanTaskV1::flow_output_review(
+                run.thread_id,
+                run.id,
+                node_run.map(|node_run| node_run.id),
+                review_node_id,
+                checkpoint.id,
+                json!({
+                    "flowId": run.flow_id,
+                    "flowVersion": run.flow_version,
+                    "checkpointId": checkpoint.id,
+                    "output": run.output,
+                }),
+            );
+            run.status = FlowRunStatusV1::WaitingHuman;
+            run.active_human_task_id = Some(task.id);
+            run.touch();
+            store.update_flow_run_and_human_task(&run, expected, &task, None)?;
+            return Ok(());
+        }
+        run.status = FlowRunStatusV1::Succeeded;
+        run.completed_at = Some(completed_at);
+    } else if run.status == FlowRunStatusV1::PauseRequested {
+        run.status = FlowRunStatusV1::Paused;
+    } else {
+        run.status = FlowRunStatusV1::Running;
+    }
+    run.touch();
+    store.update_flow_run(&run, expected)?;
+    Ok(())
+}
+
+fn pause_for_interrupt(
+    store: &dyn crate::SessionStore,
+    run: &mut FlowRunV1,
+    expected_revision: u32,
+    checkpoint: WorkflowCheckpointV1,
+    interrupt: WorkflowInterruptRequestV1,
+) -> anyhow::Result<()> {
+    let node_run = run
+        .node_runs
+        .iter_mut()
+        .find(|candidate| candidate.id == interrupt.node_run_id)
+        .context("interrupted Flow node run disappeared")?;
+    node_run.status = FlowNodeRunStatusV1::WaitingHuman;
+    extend_transcript_unique(&mut node_run.transcript, &interrupt.transcript);
+    node_run.transcript.push(FlowTranscriptEntryV1::new(
+        match interrupt.kind {
+            WorkflowInterruptKindV1::Approval => FlowTranscriptEntryKindV1::Approval,
+            WorkflowInterruptKindV1::InputRequest
+            | WorkflowInterruptKindV1::ExternalAction
+            | WorkflowInterruptKindV1::EffectReconciliation
+            | WorkflowInterruptKindV1::ResumeRetry => FlowTranscriptEntryKindV1::Input,
+        },
+        "Waiting for human input",
+        json!({
+            "interruptId": interrupt.id,
+            "kind": interrupt.kind,
+            "checkpointId": interrupt.checkpoint_id,
+            "continuationId": interrupt.continuation.id,
+        }),
+    ));
+
+    let mut payload = match interrupt.payload.clone() {
+        Value::Object(payload) => payload,
+        value => {
+            let mut payload = Map::new();
+            payload.insert("value".to_string(), value);
+            payload
+        }
+    };
+    payload.insert("flowId".to_string(), json!(run.flow_id));
+    payload.insert("flowVersion".to_string(), json!(run.flow_version));
+    payload.insert("interruptId".to_string(), json!(interrupt.id));
+    payload.insert("interruptRevision".to_string(), json!(interrupt.revision));
+    payload.insert("checkpointId".to_string(), json!(interrupt.checkpoint_id));
+    payload.insert("superstep".to_string(), json!(interrupt.superstep));
+    payload.insert("nodeId".to_string(), json!(interrupt.node_id));
+    payload.insert(
+        "continuationId".to_string(),
+        json!(interrupt.continuation.id),
+    );
+    if let Some(effect_id) = payload
+        .get("effectId")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+    {
+        if let Some(receipt) = store.get_effect(effect_id)? {
+            payload.insert(
+                "activityReceipt".to_string(),
+                serde_json::to_value(receipt)?,
+            );
+        }
+    }
+    let task =
+        HumanTaskV1::flow_interrupt(run.thread_id, run.id, &interrupt, Value::Object(payload));
+    run.status = FlowRunStatusV1::WaitingHuman;
+    run.waiting_node_id = Some(interrupt.node_id.clone());
+    run.active_human_task_id = Some(task.id);
+    run.active_checkpoint = Some(checkpoint);
+    run.touch();
+    store.update_flow_run_and_human_task(run, expected_revision, &task, None)?;
+    Ok(())
+}
+
+fn extend_transcript_unique(
+    target: &mut Vec<FlowTranscriptEntryV1>,
+    additions: &[FlowTranscriptEntryV1],
+) {
+    let existing = target
+        .iter()
+        .map(|entry| entry.id)
+        .collect::<std::collections::HashSet<_>>();
+    target.extend(
+        additions
+            .iter()
+            .filter(|entry| !existing.contains(&entry.id))
+            .cloned(),
+    );
+}
+
+fn cancel_active_checkpoint(run: &mut FlowRunV1) {
+    let Some(mut checkpoint) = run.active_checkpoint.take() else {
+        return;
+    };
+    let completed_at = Utc::now();
+    for item in &checkpoint.nodes {
+        if let Some(node_run) = run
+            .node_runs
+            .iter_mut()
+            .find(|candidate| candidate.id == item.node_run_id && candidate.completed_at.is_none())
+        {
+            node_run.status = FlowNodeRunStatusV1::Cancelled;
+            node_run.error = Some("Flow run cancelled before superstep commit".to_string());
+            node_run.completed_at = Some(completed_at);
+        }
+    }
+    checkpoint.status = WorkflowCheckpointStatusV1::Cancelled;
+    checkpoint.completed_at = Some(completed_at);
+    run.checkpoint_history.push(WorkflowCheckpointSummaryV1 {
+        id: checkpoint.id,
+        superstep: checkpoint.superstep,
+        status: checkpoint.status,
+        node_ids: checkpoint
+            .nodes
+            .iter()
+            .map(|node| node.node_id.clone())
+            .collect(),
+        pending_write_count: u32::try_from(checkpoint.pending_writes.len()).unwrap_or(u32::MAX),
+        created_at: checkpoint.created_at,
+        completed_at,
+    });
+}
+
+fn pause_for_approval(
+    store: &dyn crate::SessionStore,
+    run: &mut FlowRunV1,
+    node: &GraphNodeV1,
+) -> anyhow::Result<()> {
+    let node_id = node.id.clone();
+    let input = node_input(run, &node_id);
+    let expected = run.revision;
+    remove_first(&mut run.ready_nodes, &node_id);
+    let node_run_id = Uuid::new_v4();
+    let attempt = run.next_attempt(&node_id);
+    let task_input = input.clone();
+    run.node_runs.push(FlowNodeRunV1 {
+        id: node_run_id,
+        node_id: node_id.clone(),
+        attempt,
+        status: FlowNodeRunStatusV1::WaitingApproval,
+        input: input.clone(),
+        output: None,
+        error: None,
+        tool_calls: 0,
+        transcript: vec![
+            FlowTranscriptEntryV1::new(FlowTranscriptEntryKindV1::Input, "Node input", input),
+            FlowTranscriptEntryV1::new(
+                FlowTranscriptEntryKindV1::Approval,
+                "Waiting for human approval",
+                json!({"status": "pending"}),
+            ),
+        ],
+        started_at: Utc::now(),
+        completed_at: None,
+    });
+    run.node_executions = run.node_executions.saturating_add(1);
+    run.started_at.get_or_insert_with(Utc::now);
+    run.waiting_node_id = Some(node_id.clone());
+    run.status = FlowRunStatusV1::WaitingApproval;
+    let task = HumanTaskV1::flow_approval(
+        run.thread_id,
+        run.id,
+        node_run_id,
+        node_id.clone(),
+        &node.label,
+        json!({
+            "flowId": run.flow_id,
+            "flowVersion": run.flow_version,
+            "nodeId": node_id,
+            "nodeLabel": node.label,
+            "input": task_input,
+        }),
+    );
+    run.active_human_task_id = Some(task.id);
+    run.touch();
+    store.update_flow_run_and_human_task(run, expected, &task, None)?;
+    Ok(())
 }
 
 fn execute_runtime_node(
@@ -722,17 +1850,6 @@ fn enforce_run_budget(run: &FlowRunV1) -> anyhow::Result<()> {
         run.budget.max_duration_seconds
     );
     Ok(())
-}
-
-fn next_ready_node(run: &FlowRunV1) -> Option<String> {
-    run.ready_nodes.iter().find_map(|node_id| {
-        let node = run.graph.nodes.iter().find(|node| node.id == *node_id)?;
-        if node.kind != GraphNodeKindV1::Join || join_ready(run, node_id) {
-            Some(node_id.clone())
-        } else {
-            None
-        }
-    })
 }
 
 fn join_ready(run: &FlowRunV1, node_id: &str) -> bool {
@@ -942,17 +2059,137 @@ mod tests {
     use async_trait::async_trait;
     use std::collections::BTreeSet;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     struct NeverCalledHarness;
+
+    struct ParallelHarness {
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+    }
+
+    struct InterruptHarness {
+        starts: AtomicUsize,
+        resumes: AtomicUsize,
+    }
+
+    impl InterruptHarness {
+        fn new() -> Self {
+            Self {
+                starts: AtomicUsize::new(0),
+                resumes: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl ParallelHarness {
+        fn new() -> Self {
+            Self {
+                active: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
+            }
+        }
+
+        fn max_active(&self) -> usize {
+            self.max_active.load(Ordering::SeqCst)
+        }
+    }
 
     #[async_trait]
     impl FlowNodeHarness for NeverCalledHarness {
         async fn execute_flow_node(
             &self,
             _request: FlowNodeExecutionRequestV1,
-        ) -> anyhow::Result<FlowNodeExecutionResultV1> {
+        ) -> anyhow::Result<FlowNodeExecutionOutcomeV1> {
             anyhow::bail!("deterministic runtime test unexpectedly called the Agent Harness")
+        }
+    }
+
+    #[async_trait]
+    impl FlowNodeHarness for ParallelHarness {
+        async fn execute_flow_node(
+            &self,
+            request: FlowNodeExecutionRequestV1,
+        ) -> anyhow::Result<FlowNodeExecutionOutcomeV1> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(FlowNodeExecutionOutcomeV1::Completed(
+                FlowNodeExecutionResultV1 {
+                    output: json!({"node": request.node.id}),
+                    tool_calls: 0,
+                    transcript: Vec::new(),
+                },
+            ))
+        }
+    }
+
+    #[async_trait]
+    impl FlowNodeHarness for InterruptHarness {
+        async fn execute_flow_node(
+            &self,
+            request: FlowNodeExecutionRequestV1,
+        ) -> anyhow::Result<FlowNodeExecutionOutcomeV1> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            let continuation = crate::AgentContinuation {
+                thread_id: request.context.thread_id.expect("thread"),
+                turn_id: request.flow_run_id,
+                invocation_id: 1,
+                user_message_id: request.node_run_id,
+                workspace_root: request.context.workspace_root.clone(),
+                context_summary: None,
+                conversation: Vec::new(),
+                permission_mode: request.context.permission_mode,
+                execution_authority: None,
+                context_budget: None,
+                rollout_budget: None,
+                model_context: Default::default(),
+                collaboration_mode: Default::default(),
+                goal: None,
+                state: crate::AgentContinuationState::Provider {
+                    model_user_message: "continue".to_string(),
+                    model_user_content: Vec::new(),
+                    tool_candidates: Vec::new(),
+                    provider_tool_calls: Vec::new(),
+                    provider_tool_results: Vec::new(),
+                    pending_tool_calls: Vec::new(),
+                    compacted_tool_history: String::new(),
+                    provider_response_items: Vec::new(),
+                    model_rounds: 1,
+                    rollout_reviews: 0,
+                    runtime_state: Default::default(),
+                    branch_developer_instructions: None,
+                    provider_compatibility_hash: String::new(),
+                },
+            };
+            Ok(FlowNodeExecutionOutcomeV1::Interrupted(
+                FlowNodeInterruptV1::new(
+                    WorkflowInterruptKindV1::Approval,
+                    "Approve dynamic action",
+                    "Resume the same node",
+                    json!({ "approvalId": Uuid::new_v4() }),
+                    &continuation,
+                    0,
+                    Vec::new(),
+                )?,
+            ))
+        }
+
+        async fn resume_flow_node(
+            &self,
+            request: FlowNodeResumeRequestV1,
+        ) -> anyhow::Result<FlowNodeExecutionOutcomeV1> {
+            self.resumes.fetch_add(1, Ordering::SeqCst);
+            anyhow::ensure!(request.command.validates(&request.interrupt));
+            Ok(FlowNodeExecutionOutcomeV1::Completed(
+                FlowNodeExecutionResultV1 {
+                    output: json!({ "resumed": true }),
+                    tool_calls: 0,
+                    transcript: request.interrupt.transcript,
+                },
+            ))
         }
     }
 
@@ -964,6 +2201,18 @@ mod tests {
             config,
             input_schema: json!({"type": "object"}),
             output_schema: json!({"type": "object"}),
+        }
+    }
+
+    fn edge(from: &str, to: &str) -> GraphEdgeV1 {
+        GraphEdgeV1 {
+            from: from.to_string(),
+            to: to.to_string(),
+            condition: None,
+            allowed_fields: BTreeSet::new(),
+            data_classification: DataClassification::Internal,
+            on_error: None,
+            loop_policy: None,
         }
     }
 
@@ -1074,6 +2323,131 @@ mod tests {
         );
     }
 
+    #[test]
+    fn old_flow_runs_only_infer_legacy_authority_from_their_frozen_projection() {
+        let definition = definition(
+            vec![runtime_node("output", GraphNodeKindV1::Output, json!({}))],
+            Vec::new(),
+        );
+        let run = FlowRunV1::new(
+            Uuid::new_v4(),
+            &definition,
+            json!({}),
+            &CapabilityProjection::unrestricted(),
+        )
+        .expect("create run");
+        let mut persisted = serde_json::to_value(run).expect("serialize run");
+        persisted
+            .as_object_mut()
+            .expect("run object")
+            .remove("connectionAuthority");
+        let restored: FlowRunV1 = serde_json::from_value(persisted).expect("restore old run");
+
+        assert_eq!(
+            restored.effective_connection_authority(),
+            RuntimeConnectionAuthorityV1::LegacyMcp
+        );
+    }
+
+    #[test]
+    fn flow_run_freezes_only_structured_operations_inside_its_definition_ceiling() {
+        fn operation(name: &str) -> crate::ExecutionConnectionOperationV1 {
+            crate::ExecutionConnectionOperationV1 {
+                connection_id: Uuid::new_v4(),
+                capability_revision: 1,
+                operation_id: format!("connection:test:tool:{name}"),
+                mcp_server_id: Uuid::new_v4(),
+                provider_tool_name: name.to_string(),
+                model_tool_name: format!("{name}__account"),
+                pinned_operation_fingerprint: format!("sha256:{name}"),
+            }
+        }
+
+        let allowed = operation("allowed");
+        let excluded = operation("excluded");
+        let mut definition = definition(
+            vec![runtime_node("output", GraphNodeKindV1::Output, json!({}))],
+            Vec::new(),
+        );
+        definition.capabilities = CapabilityProjection::deny_all();
+        definition
+            .capabilities
+            .tools
+            .insert(allowed.model_tool_name.clone());
+        definition
+            .capabilities
+            .mcp_servers
+            .insert(allowed.mcp_server_id.to_string());
+        let mut available = definition.capabilities.clone();
+        available.tools.insert(excluded.model_tool_name.clone());
+        available
+            .mcp_servers
+            .insert(excluded.mcp_server_id.to_string());
+
+        let run = FlowRunV1::new_with_connection_authority(
+            Uuid::new_v4(),
+            &definition,
+            json!({}),
+            &available,
+            RuntimeConnectionAuthorityV1::Structured {
+                operations: vec![allowed.clone(), excluded],
+            },
+        )
+        .expect("create structured run");
+
+        assert_eq!(
+            run.effective_connection_authority(),
+            RuntimeConnectionAuthorityV1::Structured {
+                operations: vec![allowed]
+            }
+        );
+    }
+
+    #[test]
+    fn deployed_flow_run_owns_the_immutable_deployment_snapshot() {
+        let mut definition = definition(
+            vec![runtime_node("output", GraphNodeKindV1::Output, json!({}))],
+            Vec::new(),
+        );
+        definition.capabilities = CapabilityProjection::deny_all();
+        let compiled =
+            crate::CompiledWorkflowV1::compile(&definition, Vec::new()).expect("compile workflow");
+        let deployment = crate::WorkflowDeploymentV1::new(
+            "Runtime production",
+            "production",
+            compiled,
+            "release-manager",
+        )
+        .expect("deployment");
+
+        let run = FlowRunV1::new_from_deployment(
+            Uuid::new_v4(),
+            &deployment,
+            json!({"requestId": "lead-1"}),
+        )
+        .expect("deployed run");
+        let restored: FlowRunV1 =
+            serde_json::from_str(&serde_json::to_string(&run).expect("serialize deployed run"))
+                .expect("restore deployed run");
+
+        assert_eq!(restored.deployment_id, Some(deployment.id));
+        assert_eq!(
+            restored
+                .deployment_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.content_hash.as_str()),
+            Some(deployment.snapshot.content_hash.as_str())
+        );
+        assert_eq!(
+            restored.harness_connection_authority(),
+            RuntimeConnectionAuthorityV1::Structured {
+                operations: Vec::new()
+            }
+        );
+        assert!(restored.output_review_required);
+        assert!(!restored.output_reviewed);
+    }
+
     #[tokio::test]
     async fn deterministic_flow_runs_to_persisted_output() {
         let store = Arc::new(SqliteSessionStore::open(":memory:").expect("open store"));
@@ -1125,6 +2499,172 @@ mod tests {
         assert_eq!(
             completed.output,
             Some(json!({"matched": true, "value": {"ready": true}}))
+        );
+        assert_eq!(completed.superstep, 2);
+        assert_eq!(completed.checkpoint_history.len(), 2);
+        assert!(completed.active_checkpoint.is_none());
+    }
+
+    #[tokio::test]
+    async fn parallel_superstep_commits_pending_writes_in_stable_node_order() {
+        let store = Arc::new(SqliteSessionStore::open(":memory:").expect("open store"));
+        let thread = store
+            .create_thread_with_mode(
+                Some("Parallel Flow".to_string()),
+                PathBuf::from("."),
+                ExperienceMode::Flow,
+            )
+            .expect("create Flow thread");
+        let state_write = json!([{"channel":"results","reducer":"append"}]);
+        let definition = definition(
+            vec![
+                runtime_node("entry", GraphNodeKindV1::Condition, json!({})),
+                runtime_node(
+                    "left",
+                    GraphNodeKindV1::Tool,
+                    json!({"reference":"left_tool","parallelSafe":true,"stateWrites":state_write}),
+                ),
+                runtime_node(
+                    "right",
+                    GraphNodeKindV1::Tool,
+                    json!({"reference":"right_tool","parallelSafe":true,"stateWrites":[{"channel":"results","reducer":"append"}]}),
+                ),
+                runtime_node("join", GraphNodeKindV1::Join, json!({})),
+                runtime_node("output", GraphNodeKindV1::Output, json!({})),
+            ],
+            vec![
+                edge("entry", "left"),
+                edge("entry", "right"),
+                edge("left", "join"),
+                edge("right", "join"),
+                edge("join", "output"),
+            ],
+        );
+        let run = FlowRunV1::new(
+            thread.id,
+            &definition,
+            json!({"request":"parallel"}),
+            &CapabilityProjection::unrestricted(),
+        )
+        .expect("create run");
+        store.insert_flow_run(&run).expect("persist run");
+        let harness = Arc::new(ParallelHarness::new());
+        let mut context = runtime_context(store.clone(), thread.id);
+        context.flow_harness = Some(harness.clone());
+        spawn_flow_run(run.id, context).expect("spawn run");
+
+        let completed = wait_for_status(&store, run.id, FlowRunStatusV1::Succeeded).await;
+        assert_eq!(harness.max_active(), 2);
+        assert_eq!(
+            completed.state["results"],
+            json!([{"node":"left"},{"node":"right"}])
+        );
+        let parallel_checkpoint = completed
+            .checkpoint_history
+            .iter()
+            .find(|checkpoint| checkpoint.node_ids == vec!["left", "right"])
+            .expect("parallel checkpoint");
+        assert_eq!(parallel_checkpoint.pending_write_count, 2);
+        assert_eq!(
+            parallel_checkpoint.status,
+            WorkflowCheckpointStatusV1::Committed
+        );
+    }
+
+    #[test]
+    fn recovery_retries_only_nodes_without_a_successful_pending_write() {
+        let store = SqliteSessionStore::open(":memory:").expect("open store");
+        let thread = store
+            .create_thread_with_mode(
+                Some("Pending write recovery".to_string()),
+                PathBuf::from("."),
+                ExperienceMode::Flow,
+            )
+            .expect("create Flow thread");
+        let definition = definition(
+            vec![
+                runtime_node("left", GraphNodeKindV1::Validator, json!({})),
+                runtime_node("right", GraphNodeKindV1::Validator, json!({})),
+                runtime_node("output", GraphNodeKindV1::Output, json!({})),
+            ],
+            vec![
+                edge("left", "right"),
+                edge("left", "output"),
+                edge("right", "output"),
+            ],
+        );
+        let mut run = FlowRunV1::new(
+            thread.id,
+            &definition,
+            json!({"request":"recover"}),
+            &CapabilityProjection::unrestricted(),
+        )
+        .expect("create run");
+        run.ready_nodes = vec!["left".to_string(), "right".to_string()];
+        store.insert_flow_run(&run).expect("persist run");
+        begin_superstep(&store, &mut run, &["left".to_string(), "right".to_string()])
+            .expect("begin superstep");
+        let checkpoint = run.active_checkpoint.clone().expect("checkpoint");
+        let left = checkpoint
+            .nodes
+            .iter()
+            .find(|node| node.node_id == "left")
+            .expect("left item");
+        let right = checkpoint
+            .nodes
+            .iter()
+            .find(|node| node.node_id == "right")
+            .expect("right item");
+        let right_original_run_id = right.node_run_id;
+        persist_pending_write(
+            &store,
+            run.id,
+            checkpoint.id,
+            WorkflowPendingWriteV1 {
+                node_id: "left".to_string(),
+                node_run_id: left.node_run_id,
+                result: Some(FlowNodeExecutionResultV1 {
+                    output: json!({"completed":"left"}),
+                    tool_calls: 0,
+                    transcript: Vec::new(),
+                }),
+                error: None,
+                interrupt: None,
+                resume_command: None,
+                completed_at: Utc::now(),
+            },
+        )
+        .expect("persist left pending write");
+
+        let mut recovered = store.get_flow_run(run.id).expect("read run").expect("run");
+        prepare_flow_resume(&mut recovered, true).expect("prepare retry");
+        let resumed = recovered.active_checkpoint.as_ref().expect("checkpoint");
+        assert_eq!(resumed.pending_writes.len(), 1);
+        assert_eq!(resumed.pending_writes[0].node_id, "left");
+        assert_eq!(
+            resumed
+                .nodes
+                .iter()
+                .find(|node| node.node_id == "left")
+                .expect("left")
+                .attempt,
+            1
+        );
+        let right_retry = resumed
+            .nodes
+            .iter()
+            .find(|node| node.node_id == "right")
+            .expect("right retry");
+        assert_eq!(right_retry.attempt, 2);
+        assert_ne!(right_retry.node_run_id, right_original_run_id);
+        assert_eq!(
+            recovered
+                .node_runs
+                .iter()
+                .find(|node| node.id == right_original_run_id)
+                .expect("old right attempt")
+                .status,
+            FlowNodeRunStatusV1::Cancelled
         );
     }
 
@@ -1188,6 +2728,83 @@ mod tests {
             completed.output,
             Some(json!({"approved": true, "note": "reviewed"}))
         );
+    }
+
+    #[tokio::test]
+    async fn dynamic_agent_interrupt_resumes_the_same_checkpoint_and_node_attempt() {
+        let store = Arc::new(SqliteSessionStore::open(":memory:").expect("open store"));
+        let thread = store
+            .create_thread_with_mode(
+                Some("Dynamic interrupt".to_string()),
+                PathBuf::from("."),
+                ExperienceMode::Flow,
+            )
+            .expect("create Flow thread");
+        let definition = definition(
+            vec![
+                runtime_node(
+                    "agent",
+                    GraphNodeKindV1::Skill,
+                    json!({ "reference": "test-skill" }),
+                ),
+                runtime_node("output", GraphNodeKindV1::Output, json!({})),
+            ],
+            vec![edge("agent", "output")],
+        );
+        let run = FlowRunV1::new(
+            thread.id,
+            &definition,
+            json!({ "request": "perform action" }),
+            &CapabilityProjection::unrestricted(),
+        )
+        .expect("create run");
+        store.insert_flow_run(&run).expect("persist run");
+        let harness = Arc::new(InterruptHarness::new());
+        let mut context = runtime_context(store.clone(), thread.id);
+        context.flow_harness = Some(harness.clone());
+        spawn_flow_run(run.id, context.clone()).expect("spawn run");
+
+        let mut waiting = wait_for_status(&store, run.id, FlowRunStatusV1::WaitingHuman).await;
+        let checkpoint_id = waiting.active_checkpoint.as_ref().expect("checkpoint").id;
+        let node_run_id = waiting.node_runs[0].id;
+        let mut task = store
+            .get_pending_human_task_for_flow_run(run.id)
+            .expect("load task")
+            .expect("interrupt task");
+        assert_eq!(task.continuation_id.is_some(), true);
+        let run_revision = waiting.revision;
+        let task_revision = task.revision;
+        let command = prepare_flow_interrupt_resume(
+            &mut waiting,
+            &task,
+            HumanTaskActionV1::Approve,
+            None,
+            Some("reviewed"),
+            "operator",
+            "stable-command-key",
+        )
+        .expect("prepare resume");
+        task.resolve_with_command(
+            HumanTaskActionV1::Approve,
+            Some("reviewed"),
+            "operator",
+            Some(command.id),
+            Some("stable-command-key"),
+            None,
+        )
+        .expect("resolve task");
+        store
+            .update_flow_run_and_human_task(&waiting, run_revision, &task, Some(task_revision))
+            .expect("persist resume command");
+        spawn_flow_run(run.id, context).expect("resume run");
+
+        let completed = wait_for_status(&store, run.id, FlowRunStatusV1::Succeeded).await;
+        assert_eq!(harness.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(harness.resumes.load(Ordering::SeqCst), 1);
+        assert_eq!(completed.node_runs[0].id, node_run_id);
+        assert_eq!(completed.node_runs[0].attempt, 1);
+        assert_eq!(completed.checkpoint_history[0].id, checkpoint_id);
+        assert_eq!(completed.node_outputs["agent"], json!({ "resumed": true }));
     }
 
     #[test]

@@ -1,3 +1,6 @@
+use super::agent_connection_access::{
+    resolve_agent_template_connection_access, AgentTemplateConnectionAccessView,
+};
 use super::{current_settings, ensure_experience_mode_enabled, ensure_thread, ApiError, AppState};
 use axum::extract::{Path, Query, State};
 use axum::routing::{delete, get, post, put};
@@ -5,8 +8,8 @@ use axum::{Json, Router};
 use opentopia_core::{
     AgentInstanceStatusV1, AgentInstanceV1, AgentModelPolicyV1, AgentTemplateDiffV1,
     AgentTemplateError, AgentTemplateSpecV1, AgentTemplateStatusV1, AgentTemplateStoreError,
-    AgentTemplateVersionV1, CapabilityProjection, ExecutionResourceGrantV1, ExperienceMode,
-    ExperienceSurfaceProfile,
+    AgentTemplateVersionV1, CapabilityProjection, ConnectionBindingV1, ExecutionResourceGrantV1,
+    ExperienceMode, ExperienceSurfaceProfile,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -30,6 +33,10 @@ pub(crate) fn router() -> Router<AppState> {
         .route(
             "/api/agent-templates/:template_id/versions/:version/publish",
             post(publish_agent_template_version),
+        )
+        .route(
+            "/api/agent-templates/:template_id/versions/:version/connection-access",
+            get(get_agent_template_connection_access),
         )
         .route("/api/agent-instances", post(create_agent_instance))
         .route(
@@ -117,6 +124,12 @@ async fn publish_agent_template_version(
     Json(request): Json<PublishAgentTemplateVersionRequest>,
 ) -> Result<Json<AgentTemplateVersionView>, ApiError> {
     ensure_enterprise(&state)?;
+    let draft = state
+        .store
+        .get_agent_template_version(&template_id, version)
+        .map_err(control_error)?
+        .ok_or_else(|| ApiError::not_found("Agent template version not found"))?;
+    require_valid_connection_access(&state, &draft.spec)?;
     let (template, diff) = state
         .store
         .publish_agent_template_version(
@@ -127,6 +140,29 @@ async fn publish_agent_template_version(
         )
         .map_err(control_error)?;
     Ok(Json(AgentTemplateVersionView { template, diff }))
+}
+
+async fn get_agent_template_connection_access(
+    State(state): State<AppState>,
+    Path((template_id, version)): Path<(String, u32)>,
+) -> Result<Json<AgentTemplateConnectionAccessView>, ApiError> {
+    ensure_enterprise(&state)?;
+    if state
+        .store
+        .agent_template_is_archived(&template_id)
+        .map_err(control_error)?
+        != Some(false)
+    {
+        return Err(ApiError::not_found("Agent template not found"));
+    }
+    let template = state
+        .store
+        .get_agent_template_version(&template_id, version)
+        .map_err(control_error)?
+        .ok_or_else(|| ApiError::not_found("Agent template version not found"))?;
+    let access = resolve_agent_template_connection_access(&state.store, &template.spec)
+        .map_err(ApiError::from)?;
+    Ok(Json(access.view))
 }
 
 async fn delete_agent_template_version(
@@ -211,7 +247,8 @@ async fn create_agent_instance(
         })
         .transpose()?;
     let profile = ExperienceSurfaceProfile::for_mode(thread.experience_mode);
-    let instance = AgentInstanceV1::instantiate(
+    let resolved_connection_bindings = require_valid_connection_access(&state, &template.spec)?;
+    let instance = AgentInstanceV1::instantiate_with_connections(
         &template,
         thread.id,
         thread.experience_mode,
@@ -221,6 +258,8 @@ async fn create_agent_instance(
         request.requested_capabilities.as_ref(),
         request.requested_resource_grants.as_deref(),
         request.requested_model_policy.as_ref(),
+        request.requested_connection_bindings.as_deref(),
+        &resolved_connection_bindings,
         request.initial_state,
     )
     .map_err(|error| control_error(error.into()))?;
@@ -236,6 +275,17 @@ async fn create_agent_instance(
             .map_err(control_error)?;
     }
     Ok(Json(CreateAgentInstanceResponse { instance, bound }))
+}
+
+fn require_valid_connection_access(
+    state: &AppState,
+    spec: &AgentTemplateSpecV1,
+) -> Result<Vec<opentopia_core::ResolvedConnectionBindingV1>, ApiError> {
+    let resolved =
+        resolve_agent_template_connection_access(&state.store, spec).map_err(ApiError::from)?;
+    resolved
+        .require_valid()
+        .map_err(|message| ApiError::conflict(message))
 }
 
 async fn get_agent_instance(
@@ -486,6 +536,7 @@ struct CreateAgentInstanceRequest {
     requested_capabilities: Option<CapabilityProjection>,
     requested_resource_grants: Option<Vec<ExecutionResourceGrantV1>>,
     requested_model_policy: Option<AgentModelPolicyV1>,
+    requested_connection_bindings: Option<Vec<ConnectionBindingV1>>,
     #[serde(default = "empty_object")]
     initial_state: Value,
     #[serde(default = "default_true")]

@@ -1,8 +1,9 @@
 use super::{
     checkpoint_token_budget, checkpoint_token_estimate, context_compaction_details, context_status,
-    context_window_tokens, estimate_tokens, generate_context_summary, latest_context_summary_event,
-    merge_context_checkpoint, render_context_checkpoint, sanitize_checkpoint_draft,
-    trim_checkpoint_to_budget, validate_checkpoint_draft, ContextCheckpointDraft,
+    context_window_tokens, estimate_tokens, generate_context_summary,
+    historical_context_model_request, latest_context_summary_event, merge_context_checkpoint,
+    render_context_checkpoint, sanitize_checkpoint_draft, trim_checkpoint_to_budget,
+    validate_checkpoint_draft, ContextCheckpointDraft,
 };
 use crate::{
     current_settings, ensure_thread, get_workspace_diff_inner, publish_payload,
@@ -48,6 +49,7 @@ async fn compact_context(
     Json(request): Json<ContextCompactRequest>,
 ) -> Result<Json<ContextSummary>, ApiError> {
     ensure_thread(&state, thread_id)?;
+    let compaction_id = Uuid::new_v4();
     let queued = state
         .store
         .list_queued_turn_messages(thread_id)?
@@ -79,7 +81,7 @@ async fn compact_context(
             .map_err(|error| ApiError::bad_request(format!("invalid checkpoint: {error}")))?;
         let mut draft: ContextCheckpointDraft = serde_json::from_value(redacted)
             .map_err(|error| ApiError::bad_request(format!("invalid checkpoint: {error}")))?;
-        sanitize_checkpoint_draft(&mut draft, covered_through_seq)
+        sanitize_checkpoint_draft(&mut draft, covered_through_seq, &events)
             .map_err(|error| ApiError::bad_request(error.message))?;
         validate_checkpoint_draft(&draft, &events)
             .map_err(|error| ApiError::bad_request(error.message))?;
@@ -169,26 +171,79 @@ async fn compact_context(
         });
         summary
     } else {
-        generate_context_summary(
+        let active_provider = current_settings(&state).active_provider().clone();
+        let provider_response_items = state
+            .store
+            .get_provider_conversation_state(thread_id, "/root")?
+            .filter(|provider_state| {
+                provider_state.provider_id == active_provider.id
+                    && provider_state.model == active_provider.model
+            })
+            .map(|provider_state| provider_state.response_items)
+            .unwrap_or_default();
+        let current_model_request = historical_context_model_request(
+            &messages,
+            previous_summary.as_ref(),
+            &provider_response_items,
+        );
+        match generate_context_summary(
             &state,
             thread_id,
+            Some(compaction_id),
+            "/root",
             &messages,
             &events,
             "context_compact_api",
-            None,
+            previous_summary.as_ref(),
+            Some(&active_provider),
+            &current_model_request,
         )
-        .await?
+        .await
+        {
+            Ok(summary) => summary,
+            Err(error) => {
+                publish_payload(
+                    &state,
+                    thread_id,
+                    Some(compaction_id),
+                    AgentEventPayload::ContextWarning {
+                        stage: "manual_compaction".to_string(),
+                        message: error.message.clone(),
+                    },
+                );
+                return Err(error);
+            }
+        }
     };
 
     publish_payload(
         &state,
         thread_id,
-        Some(Uuid::new_v4()),
+        Some(compaction_id),
         AgentEventPayload::ContextCompacted {
             summary: summary.clone(),
             details: Some(context_compaction_details(&state, thread_id, &summary)),
         },
     );
+    if let Some(provider_state) = state
+        .store
+        .get_provider_conversation_state(thread_id, "/root")?
+    {
+        state
+            .store
+            .clear_provider_conversation_state(thread_id, "/root")?;
+        publish_payload(
+            &state,
+            thread_id,
+            Some(compaction_id),
+            AgentEventPayload::ProviderContextStateInvalidated {
+                provider_id: Some(provider_state.provider_id),
+                model: Some(provider_state.model),
+                reason: "durable local checkpoint started a fresh provider request epoch"
+                    .to_string(),
+            },
+        );
+    }
     Ok(Json(summary))
 }
 

@@ -1,3 +1,6 @@
+use crate::connection::{
+    ConnectionCapabilityRevisionV1, ConnectionStatusV1, ConnectionV1, IntegrationDefinitionV1,
+};
 use crate::effect_journal::{
     valid_effect_transition, validate_effect_intent, EffectIntent, EffectJournalError,
     EffectJournalRecord, EffectStatus,
@@ -15,6 +18,7 @@ use crate::model::{
     UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus,
 };
 use crate::work_form::{WorkForm, WorkScope};
+use crate::workflow::{WorkflowDeploymentStatusV1, WorkflowDeploymentV1};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use rusqlite::types::Type;
@@ -33,6 +37,7 @@ mod sqlite_rows;
 use sqlite_rows::*;
 mod agent_flow_repository;
 mod agent_repository;
+mod connection_repository;
 mod flow_runtime_repository;
 mod goal_event_repository;
 mod legacy_schema;
@@ -121,11 +126,37 @@ pub enum FlowStoreError {
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum WorkflowDeploymentStoreError {
+    #[error("Workflow deployment not found: {0}")]
+    NotFound(Uuid),
+    #[error("Workflow deployment revision conflict; current revision is {0}")]
+    RevisionConflict(u32),
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum HumanTaskStoreError {
     #[error("Human task not found: {0}")]
     NotFound(Uuid),
     #[error("Human task revision conflict; current revision is {0}")]
     RevisionConflict(u32),
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ConnectionStoreError {
+    #[error("Integration definition not found: {0}")]
+    IntegrationDefinitionNotFound(Uuid),
+    #[error("Integration definition revision conflict; current revision is {0}")]
+    IntegrationDefinitionRevisionConflict(u32),
+    #[error("Integration definition key already exists: {0}")]
+    DuplicateIntegrationKey(String),
+    #[error("Connection not found: {0}")]
+    ConnectionNotFound(Uuid),
+    #[error("Connection revision conflict; current revision is {0}")]
+    ConnectionRevisionConflict(u32),
+    #[error("MCP server runtime is already bound to a different Connection: {0}")]
+    McpRuntimeAlreadyBound(Uuid),
+    #[error("Connection capability revision not found: {connection_id}@{revision}")]
+    CapabilityRevisionNotFound { connection_id: Uuid, revision: u32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -164,6 +195,89 @@ impl SessionStore for SqliteSessionStore {
     ) -> anyhow::Result<Option<AgentTemplateVersionV1>> {
         let template = SqliteSessionStore::get_agent_template_version(self, template_id, version)?;
         Ok(template.filter(|template| template.status == AgentTemplateStatusV1::Published))
+    }
+
+    fn insert_integration_definition(
+        &self,
+        definition: &IntegrationDefinitionV1,
+    ) -> anyhow::Result<IntegrationDefinitionV1> {
+        SqliteSessionStore::insert_integration_definition(self, definition)
+    }
+
+    fn get_integration_definition(
+        &self,
+        definition_id: Uuid,
+    ) -> anyhow::Result<Option<IntegrationDefinitionV1>> {
+        SqliteSessionStore::get_integration_definition(self, definition_id)
+    }
+
+    fn list_integration_definitions(&self) -> anyhow::Result<Vec<IntegrationDefinitionV1>> {
+        SqliteSessionStore::list_integration_definitions(self)
+    }
+
+    fn update_integration_definition(
+        &self,
+        definition: &IntegrationDefinitionV1,
+        expected_revision: u32,
+    ) -> anyhow::Result<IntegrationDefinitionV1> {
+        SqliteSessionStore::update_integration_definition(self, definition, expected_revision)
+    }
+
+    fn delete_integration_definition(&self, definition_id: Uuid) -> anyhow::Result<bool> {
+        SqliteSessionStore::delete_integration_definition(self, definition_id)
+    }
+
+    fn insert_connection(&self, connection: &ConnectionV1) -> anyhow::Result<ConnectionV1> {
+        SqliteSessionStore::insert_connection(self, connection)
+    }
+
+    fn get_connection(&self, connection_id: Uuid) -> anyhow::Result<Option<ConnectionV1>> {
+        SqliteSessionStore::get_connection(self, connection_id)
+    }
+
+    fn list_connections(
+        &self,
+        integration_definition_id: Option<Uuid>,
+        status: Option<ConnectionStatusV1>,
+    ) -> anyhow::Result<Vec<ConnectionV1>> {
+        SqliteSessionStore::list_connections(self, integration_definition_id, status)
+    }
+
+    fn update_connection(
+        &self,
+        connection: &ConnectionV1,
+        expected_revision: u32,
+    ) -> anyhow::Result<ConnectionV1> {
+        SqliteSessionStore::update_connection(self, connection, expected_revision)
+    }
+
+    fn list_connection_capability_revisions(
+        &self,
+        connection_id: Uuid,
+    ) -> anyhow::Result<Vec<ConnectionCapabilityRevisionV1>> {
+        SqliteSessionStore::list_connection_capability_revisions(self, connection_id)
+    }
+
+    fn get_connection_capability_revision(
+        &self,
+        connection_id: Uuid,
+        revision: u32,
+    ) -> anyhow::Result<Option<ConnectionCapabilityRevisionV1>> {
+        SqliteSessionStore::get_connection_capability_revision(self, connection_id, revision)
+    }
+
+    fn publish_connection_capability_revision(
+        &self,
+        connection: &ConnectionV1,
+        expected_connection_revision: u32,
+        capability_revision: &ConnectionCapabilityRevisionV1,
+    ) -> anyhow::Result<(ConnectionV1, ConnectionCapabilityRevisionV1)> {
+        SqliteSessionStore::publish_connection_capability_revision(
+            self,
+            connection,
+            expected_connection_revision,
+            capability_revision,
+        )
     }
 
     fn create_flow_draft(&self, draft: &FlowDraftV1) -> anyhow::Result<FlowDraftV1> {
@@ -471,6 +585,137 @@ impl SessionStore for SqliteSessionStore {
         document
             .map(|document| serde_json::from_str(&document).map_err(Into::into))
             .transpose()
+    }
+
+    fn insert_workflow_deployment(
+        &self,
+        deployment: &WorkflowDeploymentV1,
+    ) -> anyhow::Result<WorkflowDeploymentV1> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let workflow = &deployment.snapshot.compiled_workflow;
+        conn.execute(
+            r#"
+            INSERT INTO workflow_deployments (
+                id, revision, name, environment, status, flow_id, flow_version,
+                definition_id, snapshot_hash, document_json, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "#,
+            params![
+                deployment.id.to_string(),
+                i64::from(deployment.revision),
+                &deployment.name,
+                &deployment.environment,
+                deployment.status.as_str(),
+                &workflow.flow_id,
+                i64::from(workflow.flow_version),
+                workflow.definition_id.to_string(),
+                &deployment.snapshot.content_hash,
+                serde_json::to_string(deployment)?,
+                deployment.created_at.to_rfc3339(),
+                deployment.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(deployment.clone())
+    }
+
+    fn get_workflow_deployment(
+        &self,
+        deployment_id: Uuid,
+    ) -> anyhow::Result<Option<WorkflowDeploymentV1>> {
+        let conn = self.read_connection();
+        let document = conn
+            .query_row(
+                "SELECT document_json FROM workflow_deployments WHERE id = ?1",
+                params![deployment_id.to_string()],
+                deserialize_json_column::<WorkflowDeploymentV1>,
+            )
+            .optional()?;
+        Ok(document)
+    }
+
+    fn list_workflow_deployments(
+        &self,
+        flow_id: Option<&str>,
+        status: Option<WorkflowDeploymentStatusV1>,
+    ) -> anyhow::Result<Vec<WorkflowDeploymentV1>> {
+        let conn = self.read_connection();
+        match (flow_id, status) {
+            (Some(flow_id), Some(status)) => {
+                let mut statement = conn.prepare(
+                    "SELECT document_json FROM workflow_deployments WHERE flow_id = ?1 AND status = ?2 ORDER BY updated_at DESC",
+                )?;
+                let rows = statement.query_map(
+                    params![flow_id, status.as_str()],
+                    deserialize_json_column::<WorkflowDeploymentV1>,
+                )?;
+                collect_rows(rows)
+            }
+            (Some(flow_id), None) => {
+                let mut statement = conn.prepare(
+                    "SELECT document_json FROM workflow_deployments WHERE flow_id = ?1 ORDER BY updated_at DESC",
+                )?;
+                let rows = statement.query_map(
+                    params![flow_id],
+                    deserialize_json_column::<WorkflowDeploymentV1>,
+                )?;
+                collect_rows(rows)
+            }
+            (None, Some(status)) => {
+                let mut statement = conn.prepare(
+                    "SELECT document_json FROM workflow_deployments WHERE status = ?1 ORDER BY updated_at DESC",
+                )?;
+                let rows = statement.query_map(
+                    params![status.as_str()],
+                    deserialize_json_column::<WorkflowDeploymentV1>,
+                )?;
+                collect_rows(rows)
+            }
+            (None, None) => {
+                let mut statement = conn.prepare(
+                    "SELECT document_json FROM workflow_deployments ORDER BY updated_at DESC",
+                )?;
+                let rows =
+                    statement.query_map([], deserialize_json_column::<WorkflowDeploymentV1>)?;
+                collect_rows(rows)
+            }
+        }
+    }
+
+    fn update_workflow_deployment(
+        &self,
+        deployment: &WorkflowDeploymentV1,
+        expected_revision: u32,
+    ) -> anyhow::Result<WorkflowDeploymentV1> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let changed = conn.execute(
+            r#"
+            UPDATE workflow_deployments
+            SET revision = ?2, status = ?3, document_json = ?4, updated_at = ?5
+            WHERE id = ?1 AND revision = ?6
+            "#,
+            params![
+                deployment.id.to_string(),
+                i64::from(deployment.revision),
+                deployment.status.as_str(),
+                serde_json::to_string(deployment)?,
+                deployment.updated_at.to_rfc3339(),
+                i64::from(expected_revision),
+            ],
+        )?;
+        if changed == 0 {
+            let current = conn
+                .query_row(
+                    "SELECT revision FROM workflow_deployments WHERE id = ?1",
+                    params![deployment.id.to_string()],
+                    |row| row.get::<_, u32>(0),
+                )
+                .optional()?;
+            return Err(match current {
+                Some(revision) => WorkflowDeploymentStoreError::RevisionConflict(revision).into(),
+                None => WorkflowDeploymentStoreError::NotFound(deployment.id).into(),
+            });
+        }
+        Ok(deployment.clone())
     }
 
     fn insert_flow_run(&self, run: &FlowRunV1) -> anyhow::Result<FlowRunV1> {

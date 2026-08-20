@@ -151,7 +151,7 @@ pub(super) enum BrowserInput {
         #[schemars(range(min = 1, max = 21600000))]
         timeout_ms: Option<u64>,
         #[serde(default)]
-        #[schemars(range(min = 1, max = 60000))]
+        #[schemars(range(min = 1, max = 120000))]
         yield_time_ms: Option<u64>,
         #[serde(default)]
         expected_filename: Option<String>,
@@ -659,7 +659,7 @@ fn inspect_browser_destination(
     raw_url: &str,
 ) -> anyhow::Result<String> {
     let host = browser_destination_host(raw_url)?;
-    enforce_policy_decision(ctx.policy.inspect_network(&host), ctx.approval_granted)?;
+    enforce_policy_decision(ctx.policy.inspect_network(&host), ctx)?;
     Ok(host)
 }
 
@@ -674,7 +674,7 @@ fn inspect_browser_node_destinations(
     {
         let host = browser_destination_host(destination)?;
         if inspected.insert(host.clone()) {
-            enforce_policy_decision(ctx.policy.inspect_network(&host), ctx.approval_granted)?;
+            enforce_policy_decision(ctx.policy.inspect_network(&host), ctx)?;
         }
     }
     Ok(inspected.into_iter().collect())

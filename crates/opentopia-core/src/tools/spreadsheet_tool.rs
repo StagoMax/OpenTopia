@@ -15,9 +15,9 @@ use crate::spreadsheet::{
     FilterRowsRequest, FindCellsRequest, FormulaInput, InspectDelimitedRequest,
     InspectWorkbookRequest, ListSheetsRequest, ReadRangeRequest, ReadRangesRequest,
     SheetRangeRequest, SheetWriteRequest, SpreadsheetAction, SpreadsheetCell, SpreadsheetCellInput,
-    SpreadsheetCellValue, SpreadsheetFilterCondition, SpreadsheetFilterMatchMode,
-    SpreadsheetRequest, SpreadsheetResult, SpreadsheetSheetValidation, SpreadsheetTextMatchMode,
-    ValidateWorkbookRequest, WriteWorkbookRequest,
+    SpreadsheetCellValue, SpreadsheetFileFormat, SpreadsheetFilterCondition,
+    SpreadsheetFilterMatchMode, SpreadsheetRequest, SpreadsheetResult, SpreadsheetSheetValidation,
+    SpreadsheetTextMatchMode, ValidateWorkbookRequest, WriteWorkbookRequest,
     MAX_INPUT_FILE_BYTES as MAX_SPREADSHEET_INPUT_BYTES,
 };
 use anyhow::Context;
@@ -136,7 +136,7 @@ pub(super) enum SpreadsheetToolInput {
     },
     #[schemars(rename_all = "camelCase")]
     Inspect {
-        /// Workspace-relative XLSX path. Provide exactly one of path or attachmentId.
+        /// Workspace-relative workbook path (.xls/.xlsx/.xlsm/.xlsb/.xltx/.xltm/.ods). Provide exactly one of path or attachmentId.
         #[serde(default)]
         path: Option<String>,
         #[serde(default)]
@@ -235,7 +235,7 @@ pub(super) enum SpreadsheetToolInput {
     },
     #[schemars(rename_all = "camelCase")]
     Validate {
-        /// XLSX path. Provide exactly one of path or attachmentId.
+        /// Workbook path (.xls/.xlsx/.xlsm/.xlsb/.xltx/.xltm/.ods). Provide exactly one of path or attachmentId.
         #[serde(default)]
         path: Option<String>,
         #[serde(default)]
@@ -272,7 +272,7 @@ pub(super) enum SpreadsheetToolInput {
     },
     #[schemars(rename_all = "camelCase")]
     ExportDelimited {
-        /// Source XLSX path.
+        /// Source workbook path.
         path: String,
         /// Destination .csv or .tsv path.
         output_path: String,
@@ -286,7 +286,7 @@ pub(super) enum SpreadsheetToolInput {
     },
     #[schemars(rename_all = "camelCase")]
     Write {
-        /// Destination path. Existing files are updated in place when possible.
+        /// Workspace-relative destination selected by the model from the user's request.
         #[serde(default)]
         path: Option<String>,
         #[serde(default)]
@@ -1097,7 +1097,7 @@ impl TypedTool for SpreadsheetTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect and validate XLSX, inspect complex CSV/TSV, fill XLSX templates directly from delimited data, export XLSX to CSV/TSV, and perform bounded workbook reads or atomic mutations. CSV quoting, embedded newlines, duplicate headers, and optional trailing-tab cleanup are handled server-side; use spreadsheet validate, never PDF, to verify XLSX output."
+        "Inspect common workbook and delimited-data files, then execute bounded reads or atomic writes to the destination selected by the model. CSV quoting, embedded newlines, duplicate headers, and optional trailing-tab cleanup are handled server-side."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
@@ -1236,7 +1236,8 @@ async fn execute_spreadsheet_read(
     input: SpreadsheetExecutionInput,
     ctx: ToolInvocationContext,
 ) -> anyhow::Result<ToolResult> {
-    let reads_delimited = input.action == SpreadsheetToolAction::InspectDelimited;
+    let mut action = input.action;
+    let mut reads_delimited = action == SpreadsheetToolAction::InspectDelimited;
     let path = input
         .path
         .as_deref()
@@ -1256,10 +1257,17 @@ async fn execute_spreadsheet_read(
             let logical_path = normalize_workspace_path(&ctx.workspace_root, relative)?;
             enforce_read_policy(&ctx, &logical_path)?;
             let resolved_path = ctx.environment.resolve_read_path(&logical_path)?;
+            if action == SpreadsheetToolAction::Inspect
+                && SpreadsheetFileFormat::from_path(&resolved_path)
+                    .is_some_and(SpreadsheetFileFormat::is_delimited)
+            {
+                action = SpreadsheetToolAction::InspectDelimited;
+                reads_delimited = true;
+            }
             let resolved_format = if reads_delimited {
                 Some(resolve_delimited_format(&resolved_path, input.format)?)
             } else {
-                ensure_xlsx_path(&resolved_path)?;
+                ensure_workbook_path(&resolved_path)?;
                 None
             };
             let read = ctx
@@ -1276,16 +1284,23 @@ async fn execute_spreadsheet_read(
             let attachment =
                 read_stored_attachment_file(&ctx, attachment_id, MAX_SPREADSHEET_INPUT_BYTES)
                     .await?;
-            let extension = if reads_delimited {
+            let fallback_extension = if reads_delimited {
                 input.format.unwrap_or_default().extension()
             } else {
                 "xlsx"
             };
-            let logical_path = attachment.logical_path(extension);
+            let logical_path = attachment.original_logical_path(fallback_extension);
+            if action == SpreadsheetToolAction::Inspect
+                && SpreadsheetFileFormat::from_path(&logical_path)
+                    .is_some_and(SpreadsheetFileFormat::is_delimited)
+            {
+                action = SpreadsheetToolAction::InspectDelimited;
+                reads_delimited = true;
+            }
             let resolved_format = if reads_delimited {
                 Some(resolve_delimited_format(&logical_path, input.format)?)
             } else {
-                ensure_xlsx_path(&logical_path)?;
+                ensure_workbook_path(&logical_path)?;
                 None
             };
             let metadata = attachment.metadata();
@@ -1297,7 +1312,6 @@ async fn execute_spreadsheet_read(
             )
         };
     let source_path = resolved_path.clone();
-    let action = input.action;
     let format = resolved_delimited_format.or(input.format);
     let header_row = input.header_row;
     let sample_rows = input.sample_rows;
@@ -1321,14 +1335,15 @@ async fn execute_spreadsheet_read(
     let sheet_validations = input.sheet_validations;
     let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let staging = SpreadsheetStaging::new()?;
-        let staged_input = staging.path(if action == SpreadsheetToolAction::InspectDelimited {
+        let staged_input_name = if action == SpreadsheetToolAction::InspectDelimited {
             match format.unwrap_or_default() {
-                DelimitedFormat::Csv => "input.csv",
-                DelimitedFormat::Tsv => "input.tsv",
+                DelimitedFormat::Csv => "input.csv".to_string(),
+                DelimitedFormat::Tsv => "input.tsv".to_string(),
             }
         } else {
-            "input.xlsx"
-        });
+            staging_file_name("input", &source_path, "xlsx")
+        };
+        let staged_input = staging.path(&staged_input_name);
         fs::write(&staged_input, source_bytes)
             .with_context(|| format!("failed to stage {}", source_path.display()))?;
         let action = match action {
@@ -1468,7 +1483,7 @@ async fn execute_spreadsheet_fill_template(
     let source_format = resolve_delimited_format(&data_logical, input.format)?;
     ensure_xlsx_path(&template_logical)?;
     ensure_xlsx_path(&output_path)?;
-    enforce_policy_decision(ctx.policy.inspect_write(&output_path), ctx.approval_granted)?;
+    enforce_policy_decision(ctx.policy.inspect_write(&output_path), &ctx)?;
 
     let data_path = ctx.environment.resolve_read_path(&data_logical)?;
     let template_path = ctx.environment.resolve_read_path(&template_logical)?;
@@ -1550,9 +1565,9 @@ async fn execute_spreadsheet_export_delimited(
     let source_logical = normalize_workspace_path(&ctx.workspace_root, &source_relative)?;
     let output_path = normalize_workspace_path(&ctx.workspace_root, &output_relative)?;
     enforce_read_policy(&ctx, &source_logical)?;
-    ensure_xlsx_path(&source_logical)?;
+    ensure_workbook_path(&source_logical)?;
     let format = resolve_delimited_format(&output_path, input.format)?;
-    enforce_policy_decision(ctx.policy.inspect_write(&output_path), ctx.approval_granted)?;
+    enforce_policy_decision(ctx.policy.inspect_write(&output_path), &ctx)?;
 
     let resolved_source = ctx.environment.resolve_read_path(&source_logical)?;
     let source = ctx
@@ -1567,7 +1582,8 @@ async fn execute_spreadsheet_export_delimited(
     let formula_mode = input.formula_mode;
     let staged = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let staging = SpreadsheetStaging::new()?;
-        let staged_source = staging.path("source.xlsx");
+        let staged_source_name = staging_file_name("source", &source.path, "xlsx");
+        let staged_source = staging.path(&staged_source_name);
         let staged_output = staging.path(match format.unwrap_or_default() {
             DelimitedFormat::Csv => "output.csv",
             DelimitedFormat::Tsv => "output.tsv",
@@ -1651,8 +1667,7 @@ async fn execute_spreadsheet_write(
         .filter(|path| !path.is_empty())
         .context("spreadsheet write requires path")?;
     let output_path = normalize_workspace_path(&ctx.workspace_root, output_relative)?;
-    ensure_xlsx_path(&output_path)?;
-    enforce_policy_decision(ctx.policy.inspect_write(&output_path), ctx.approval_granted)?;
+    enforce_policy_decision(ctx.policy.inspect_write(&output_path), &ctx)?;
 
     let source = if let Some(relative) = input
         .source_path
@@ -1663,7 +1678,7 @@ async fn execute_spreadsheet_write(
         let logical_path = normalize_workspace_path(&ctx.workspace_root, relative)?;
         enforce_read_policy(&ctx, &logical_path)?;
         let path = ctx.environment.resolve_read_path(&logical_path)?;
-        ensure_xlsx_path(&path)?;
+        ensure_spreadsheet_source_path(&path)?;
         Some(
             ctx.environment
                 .read_file(FileReadRequest::new(&path).with_max_bytes(MAX_SPREADSHEET_INPUT_BYTES))
@@ -1680,17 +1695,20 @@ async fn execute_spreadsheet_write(
     };
 
     let sheets = input.sheets;
+    let staged_output_format_path = output_path.clone();
     let staged = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let staging = SpreadsheetStaging::new()?;
         let staged_source = if let Some(source) = source {
-            let path = staging.path("source.xlsx");
+            let source_name = staging_file_name("source", &source.path, "xlsx");
+            let path = staging.path(&source_name);
             fs::write(&path, source.bytes)
                 .with_context(|| format!("failed to stage {}", source.path.display()))?;
             Some(path)
         } else {
             None
         };
-        let staged_output = staging.path("output.xlsx");
+        let output_name = staging_file_name("output", &staged_output_format_path, "xlsx");
+        let staged_output = staging.path(&output_name);
         let outcome = execute_spreadsheet(SpreadsheetRequest {
             action: SpreadsheetAction::WriteWorkbook(WriteWorkbookRequest {
                 source: staged_source,
@@ -1736,8 +1754,7 @@ async fn execute_spreadsheet_mutations(
         .filter(|path| !path.is_empty())
         .context("spreadsheet mutation requires path")?;
     let output_path = normalize_workspace_path(&ctx.workspace_root, output_relative)?;
-    ensure_xlsx_path(&output_path)?;
-    enforce_policy_decision(ctx.policy.inspect_write(&output_path), ctx.approval_granted)?;
+    enforce_policy_decision(ctx.policy.inspect_write(&output_path), &ctx)?;
 
     let compact_operation = input.compact_direct_operation()?;
     let operations =
@@ -1751,7 +1768,7 @@ async fn execute_spreadsheet_mutations(
         let logical_path = normalize_workspace_path(&ctx.workspace_root, relative)?;
         enforce_read_policy(&ctx, &logical_path)?;
         let path = ctx.environment.resolve_read_path(&logical_path)?;
-        ensure_xlsx_path(&path)?;
+        ensure_spreadsheet_source_path(&path)?;
         Some(
             ctx.environment
                 .read_file(FileReadRequest::new(&path).with_max_bytes(MAX_SPREADSHEET_INPUT_BYTES))
@@ -1783,7 +1800,7 @@ async fn execute_spreadsheet_mutations(
         let logical_path = normalize_workspace_path(&ctx.workspace_root, &key)?;
         enforce_read_policy(&ctx, &logical_path)?;
         let path = ctx.environment.resolve_read_path(&logical_path)?;
-        ensure_xlsx_path(&path)?;
+        ensure_workbook_path(&path)?;
         let read = ctx
             .environment
             .read_file(FileReadRequest::new(&path).with_max_bytes(MAX_SPREADSHEET_INPUT_BYTES))
@@ -1791,10 +1808,12 @@ async fn execute_spreadsheet_mutations(
         copy_sources.insert(key, (read.path, read.bytes));
     }
 
+    let staged_output_format_path = output_path.clone();
     let staged = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let staging = SpreadsheetStaging::new()?;
         let staged_base = if let Some(source) = base_source {
-            let path = staging.path("base.xlsx");
+            let source_name = staging_file_name("base", &source.path, "xlsx");
+            let path = staging.path(&source_name);
             fs::write(&path, source.bytes)
                 .with_context(|| format!("failed to stage {}", source.path.display()))?;
             Some(path)
@@ -1803,13 +1822,15 @@ async fn execute_spreadsheet_mutations(
         };
         let mut staged_copy_sources = BTreeMap::new();
         for (index, (logical, (original, bytes))) in copy_sources.into_iter().enumerate() {
-            let path = staging.path(&format!("copy-source-{index}.xlsx"));
+            let source_name = staging_file_name(&format!("copy-source-{index}"), &original, "xlsx");
+            let path = staging.path(&source_name);
             fs::write(&path, bytes)
                 .with_context(|| format!("failed to stage {}", original.display()))?;
             staged_copy_sources.insert(logical, path);
         }
         let sheets = materialize_spreadsheet_operations(&operations, &staged_copy_sources)?;
-        let staged_output = staging.path("output.xlsx");
+        let output_name = staging_file_name("output", &staged_output_format_path, "xlsx");
+        let staged_output = staging.path(&output_name);
         let outcome = execute_spreadsheet(SpreadsheetRequest {
             action: SpreadsheetAction::WriteWorkbook(WriteWorkbookRequest {
                 source: staged_base,
@@ -2210,6 +2231,41 @@ fn ensure_xlsx_path(path: &Path) -> anyhow::Result<()> {
     } else {
         anyhow::bail!("spreadsheet tool supports only .xlsx files")
     }
+}
+
+fn ensure_workbook_path(path: &Path) -> anyhow::Result<SpreadsheetFileFormat> {
+    let format = SpreadsheetFileFormat::from_path(path).with_context(|| {
+        format!(
+            "unsupported spreadsheet source {}; expected one of {}",
+            path.display(),
+            SpreadsheetFileFormat::ATTACHMENT_EXTENSIONS.join(", ")
+        )
+    })?;
+    anyhow::ensure!(
+        format.is_workbook(),
+        "spreadsheet workbook actions require a workbook file; use delimited actions for {}",
+        path.display()
+    );
+    Ok(format)
+}
+
+fn ensure_spreadsheet_source_path(path: &Path) -> anyhow::Result<SpreadsheetFileFormat> {
+    SpreadsheetFileFormat::from_path(path).with_context(|| {
+        format!(
+            "unsupported spreadsheet source {}; expected one of {}",
+            path.display(),
+            SpreadsheetFileFormat::ATTACHMENT_EXTENSIONS.join(", ")
+        )
+    })
+}
+
+fn staging_file_name(prefix: &str, path: &Path, fallback_extension: &str) -> String {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| !extension.is_empty())
+        .unwrap_or(fallback_extension);
+    format!("{prefix}.{extension}")
 }
 
 fn resolve_delimited_format(

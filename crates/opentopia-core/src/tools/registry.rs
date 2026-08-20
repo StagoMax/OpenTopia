@@ -5,7 +5,8 @@ use super::{
     RequestUserInputTool, SendAgentMessageTool, SetPlanTool, ShellTool, SpawnAgentTool,
     SpreadsheetDescribeTool, SpreadsheetExecuteTool, SpreadsheetInspectTool, SpreadsheetTool, Tool,
     ToolApprovalMode, ToolCapabilityDescriptor, ToolClass, ToolExecutionPolicy, ToolGovernance,
-    ToolRiskLevel, ToolSideEffect, ToolSource, UpdatePlanTool, ViewAttachmentTool, WaitAgentTool,
+    ToolModelVisibility, ToolRiskLevel, ToolSideEffect, ToolSource, UpdatePlanTool,
+    ViewAttachmentTool, WaitAgentTool,
 };
 use crate::bundled_plugins::bundled_plugin_catalog;
 use crate::enterprise::DataClassification;
@@ -271,14 +272,23 @@ impl ToolRegistry {
                     ),
                     _ => continue,
                 };
-                self.register_entry(RegisteredTool::new(
+                let registration = RegisteredTool::new(
                     tool,
                     ToolSource::BundledPlugin {
                         plugin_name: plugin.name.to_string(),
                     },
                     ToolClass::Standard,
                     governance,
-                ));
+                );
+                // The v1 action-union implementation is retained as the shared
+                // executor for persisted calls and the v2 protocol adapter. It
+                // must never contribute its large schema to a model request.
+                let registration = if *capability == "spreadsheet" {
+                    registration.internal_only()
+                } else {
+                    registration
+                };
+                self.register_entry(registration);
             }
         }
     }
@@ -297,16 +307,28 @@ impl ToolRegistry {
     }
 
     /// Registers a server-composed local tool without repeating its ID. When a
-    /// tool replaces an existing record, its static class and governance stay
-    /// attached to that registry slot.
+    /// tool replaces an existing record, its static class, model visibility,
+    /// and governance stay attached to that registry slot.
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
         let name = tool.name();
-        let (class, governance) = self
+        let (class, model_visibility, governance) = self
             .entries
             .get(name)
-            .map(|entry| (entry.class, entry.governance.clone()))
-            .unwrap_or((ToolClass::Standard, ToolGovernance::unknown()));
-        self.register_core(tool, class, governance);
+            .map(|entry| {
+                (
+                    entry.class,
+                    entry.model_visibility,
+                    entry.governance.clone(),
+                )
+            })
+            .unwrap_or((
+                ToolClass::Standard,
+                ToolModelVisibility::Visible,
+                ToolGovernance::unknown(),
+            ));
+        let mut registration = RegisteredTool::core(tool, class, governance);
+        registration.model_visibility = model_visibility;
+        self.register_entry(registration);
     }
 
     /// Compatibility entry point for callers that still pass a duplicate ID.
@@ -352,6 +374,12 @@ impl ToolRegistry {
             .retain(|_, entry| !matches!(entry.source, ToolSource::Mcp));
     }
 
+    pub(crate) fn retain_mcp_where(&mut self, mut retain: impl FnMut(&str) -> bool) {
+        Arc::make_mut(&mut self.entries).retain(|name, entry| {
+            !matches!(entry.source, ToolSource::Mcp) || retain(name.as_str())
+        });
+    }
+
     pub fn list(&self) -> Vec<String> {
         self.entries.keys().cloned().collect()
     }
@@ -362,6 +390,12 @@ impl ToolRegistry {
 
     pub fn class(&self, name: &str) -> Option<ToolClass> {
         self.entries.get(name).map(|entry| entry.class)
+    }
+
+    pub(crate) fn is_model_visible(&self, name: &str) -> bool {
+        self.entries
+            .get(name)
+            .is_some_and(|entry| entry.model_visibility == ToolModelVisibility::Visible)
     }
 
     pub fn execution_policy(&self, name: &str, call: &ToolCall) -> Option<ToolExecutionPolicy> {
@@ -399,6 +433,23 @@ mod tests {
             assert_eq!(name, tool.name());
             assert!(registry.source(&name).is_some());
             assert!(registry.class(&name).is_some());
+        }
+    }
+
+    #[test]
+    fn legacy_spreadsheet_executor_is_internal_only() {
+        let mut registry = ToolRegistry::with_builtins();
+
+        assert!(registry.get("spreadsheet").is_some());
+        assert!(!registry.is_model_visible("spreadsheet"));
+        registry.register(Arc::new(SpreadsheetTool));
+        assert!(!registry.is_model_visible("spreadsheet"));
+        for name in [
+            "spreadsheet_inspect",
+            "spreadsheet_describe",
+            "spreadsheet_execute",
+        ] {
+            assert!(registry.is_model_visible(name), "{name} should be visible");
         }
     }
 

@@ -2,23 +2,23 @@ use super::transport::{
     next_stream_chunk, send_provider_request_with_network_retries, stream_idle_timeout, SseDecoder,
 };
 use super::{
-    apply_provider_auth, deepseek_reasoning_effort, ensure_visual_input_supported,
-    provider_api_key, provider_rejected_image_input, redact_transport_value,
-    rejected_chat_profile_capability, rejected_responses_profile_capability,
-    request_image_part_count, require_function_tools, truncate_observation_text, ModelFinishReason,
-    ModelProvider, ModelRequest, ModelResponse, ModelStreamCallback, ModelStreamDelta,
-    PreparedProviderRequest, ProviderAdapterError, ProviderEnv, ProviderResponseCommitMode,
-    ProviderToolCandidate, ProviderTransportCallback, ProviderTransportEvent,
+    apply_provider_auth, ensure_visual_input_supported, provider_api_key,
+    provider_rejected_image_input, redact_transport_value, rejected_chat_profile_capability,
+    rejected_responses_profile_capability, request_image_part_count, require_function_tools,
+    truncate_observation_text, ModelFinishReason, ModelProvider, ModelRequest, ModelResponse,
+    ModelStreamCallback, ModelStreamDelta, PreparedProviderRequest, ProviderAdapterError,
+    ProviderEnv, ProviderResponseCommitMode, ProviderToolCandidate, ProviderTransportCallback,
+    ProviderTransportEvent,
 };
 use crate::model::ProviderRetryKind;
 use crate::settings::{
-    chat_reasoning_protocol_for_model, is_official_openai_endpoint,
-    official_openai_explicit_prompt_cache_support, official_openai_tool_search_support,
-    trusted_chat_message_protocol_contract, OpenAiCompatibilityReport, OpenAiProtocol,
-    PromptCachePolicy, ProviderAdapterKind, ProviderAuthKind, ProviderFeatureSupport,
-    ProviderHealthCheck, ProviderInstructionEncoding, ProviderMessageProtocolCapabilities,
-    ProviderOutputProtocolCapabilities, ProviderReasoningProtocol, ProviderSettings,
-    ProviderToolProtocolCapabilities, ProviderTransportKind,
+    is_official_openai_endpoint, official_openai_explicit_prompt_cache_support,
+    official_openai_tool_search_support, trusted_chat_message_protocol_contract,
+    OpenAiCompatibilityReport, OpenAiProtocol, PromptCachePolicy, ProviderAdapterKind,
+    ProviderAuthKind, ProviderFeatureSupport, ProviderHealthCheck, ProviderInstructionEncoding,
+    ProviderMessageProtocolCapabilities, ProviderOutputProtocolCapabilities,
+    ProviderReasoningProtocol, ProviderSettings, ProviderToolProtocolCapabilities,
+    ProviderTransportKind,
 };
 use anyhow::Context;
 use async_trait::async_trait;
@@ -30,6 +30,9 @@ use uuid::Uuid;
 
 mod codec;
 mod decode;
+mod probe;
+mod reasoning;
+mod recovery;
 mod stream;
 
 use codec::{
@@ -56,6 +59,14 @@ pub(crate) use decode::{invalid_tool_arguments_json_details, tool_input_schema_e
 pub(in crate::provider) use decode::{
     model_response_observation, parse_model_usage, parse_required_tool_arguments,
     tool_call_protocol_error_observation,
+};
+pub(in crate::provider) use probe::OpenAiProbeClient;
+use reasoning::{
+    apply_reasoning_protocol, default_reasoning_protocol, reasoning_probe_candidates,
+    reasoning_protocol_label, AppliedReasoning,
+};
+use recovery::{
+    recover_streamed_tool_call_non_streaming, OpenAiRecoveryProtocol, RecoveredToolResponse,
 };
 pub(in crate::provider) use stream::{
     chat_finish_reason, OpenAiStreamAccumulator, ResponsesStreamAccumulator, StreamingToolCall,
@@ -119,6 +130,12 @@ pub(super) struct OpenAiProbeOutcome {
 pub(super) struct OpenAiMessageProtocolProbeOutcome {
     capabilities: ProviderMessageProtocolCapabilities,
     detail: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct OpenAiReasoningProbeOutcome {
+    protocol: Option<ProviderReasoningProtocol>,
+    tool_support: OpenAiProbeOutcome,
 }
 
 pub(super) fn compatibility_probe_candidate(expected_token: &str) -> ProviderToolCandidate {
@@ -199,7 +216,7 @@ impl OpenAiCompatibleProvider {
                 message_protocol: trusted_chat_message_protocol_contract(&base_url, &model)
                     .unwrap_or_default(),
             },
-            reasoning_protocol: ProviderReasoningProtocol::ReasoningEffort,
+            reasoning_protocol: default_reasoning_protocol(ProviderAdapterKind::OpenAiChat, &model),
             output_protocol: ProviderOutputProtocolCapabilities::default(),
             tool_protocol: ProviderToolProtocolCapabilities {
                 function_tools: ProviderFeatureSupport::Supported,
@@ -276,6 +293,40 @@ impl OpenAiCompatibleProvider {
         self
     }
 
+    fn apply_chat_reasoning_options(&self, payload: &mut Value) -> AppliedReasoning {
+        apply_reasoning_protocol(
+            self.reasoning_protocol,
+            self.reasoning_effort.as_deref(),
+            None,
+            payload,
+        )
+    }
+
+    fn apply_probe_reasoning_options(
+        &self,
+        protocol: ProviderReasoningProtocol,
+        payload: &mut Value,
+    ) {
+        let effort = self
+            .reasoning_effort
+            .as_deref()
+            .filter(|value| !matches!(*value, "none" | "minimal"))
+            .unwrap_or("high");
+        let applied = apply_reasoning_protocol(protocol, Some(effort), None, payload);
+        if applied.omit_tool_choice {
+            payload
+                .as_object_mut()
+                .expect("OpenAI compatibility probe payload")
+                .remove("tool_choice");
+        }
+        if applied.omit_temperature {
+            payload
+                .as_object_mut()
+                .expect("OpenAI compatibility probe payload")
+                .remove("temperature");
+        }
+    }
+
     pub async fn probe_settings(
         settings: &ProviderSettings,
     ) -> anyhow::Result<ProviderHealthCheck> {
@@ -302,7 +353,9 @@ impl OpenAiCompatibleProvider {
     ) -> anyhow::Result<ProviderHealthCheck> {
         const TOOL_PROBE_TOKEN: &str = "opentopia-tool-probe-v1";
         let start = std::time::Instant::now();
-        let chat_payload = json!({
+        let probe_client = OpenAiProbeClient::new(self);
+        let probe_enhanced_features = is_official_openai_endpoint(&self.base_url);
+        let mut chat_payload = json!({
             "model": self.model,
             "messages": [
                 {"role": "system", "content": "System compatibility probe."},
@@ -311,14 +364,14 @@ impl OpenAiCompatibleProvider {
             "max_tokens": 16,
             "stream": false
         });
-        let responses_payload = json!({
+        let mut responses_payload = json!({
             "model": self.model,
             "input": "Reply with OK.",
             "max_output_tokens": 16,
             "stream": false,
             "store": false
         });
-        let chat_json_schema_output_payload = json!({
+        let mut chat_json_schema_output_payload = json!({
             "model": self.model,
             "messages": [{
                 "role": "user",
@@ -340,7 +393,7 @@ impl OpenAiCompatibleProvider {
             "max_tokens": 64,
             "stream": false
         });
-        let responses_json_schema_output_payload = json!({
+        let mut responses_json_schema_output_payload = json!({
             "model": self.model,
             "input": "Return a JSON object whose ok property is true.",
             "text": {
@@ -386,7 +439,7 @@ impl OpenAiCompatibleProvider {
             "max_tokens": 1024,
             "stream": false
         });
-        let responses_native_tools_payload = json!({
+        let mut responses_native_tools_payload = json!({
             "model": self.model,
             "input": "Reply with OK.",
             "tools": [{"type": "web_search"}],
@@ -395,7 +448,7 @@ impl OpenAiCompatibleProvider {
             "stream": false,
             "store": false
         });
-        let responses_strict_function_tools_payload = json!({
+        let mut responses_strict_function_tools_payload = json!({
             "model": self.model,
             "input": format!("Call compatibility_probe exactly once with token {TOOL_PROBE_TOKEN}."),
             "tools": [{
@@ -415,7 +468,7 @@ impl OpenAiCompatibleProvider {
             "stream": false,
             "store": false
         });
-        let responses_custom_tools_payload = json!({
+        let mut responses_custom_tools_payload = json!({
             "model": self.model,
             "input": "Reply with OK.",
             "tools": [{
@@ -428,7 +481,7 @@ impl OpenAiCompatibleProvider {
             "stream": false,
             "store": false
         });
-        let responses_apply_patch_payload = json!({
+        let mut responses_apply_patch_payload = json!({
             "model": self.model,
             "input": "Reply with OK.",
             "tools": [{"type": "apply_patch"}],
@@ -444,120 +497,301 @@ impl OpenAiCompatibleProvider {
             .remove("strict");
         let known_chat_message_protocol =
             trusted_chat_message_protocol_contract(&self.base_url, &self.model).unwrap_or_default();
-        let chat_reasoning_protocol = chat_reasoning_protocol_for_model(&self.model);
-        if chat_reasoning_protocol == ProviderReasoningProtocol::DeepSeekThinking {
-            for payload in [
-                &mut chat_strict_tools_payload,
-                &mut chat_portable_tools_payload,
-            ] {
-                payload
-                    .as_object_mut()
-                    .expect("DeepSeek Chat tool probe")
-                    .remove("tool_choice");
-                payload["thinking"] = json!({ "type": "enabled" });
-                payload["reasoning_effort"] = json!("high");
-            }
-        }
         let mut responses_portable_function_tools_payload =
             responses_strict_function_tools_payload.clone();
         responses_portable_function_tools_payload["tools"][0]
             .as_object_mut()
             .expect("responses function probe")
             .remove("strict");
-        let mut chat_parallel_tools_payload = chat_portable_tools_payload.clone();
-        chat_parallel_tools_payload["parallel_tool_calls"] = json!(true);
-        let mut responses_parallel_tools_payload =
-            responses_portable_function_tools_payload.clone();
-        responses_parallel_tools_payload["parallel_tool_calls"] = json!(true);
-        let mut chat_streaming_tools_payload = chat_portable_tools_payload.clone();
+        // Reasoning negotiation is serialized per adapter because the first
+        // successful function-tool round trip becomes the persisted runtime
+        // contract. Model names only order candidates; they never decide the
+        // result. Chat and Responses remain independent and can negotiate in
+        // parallel behind the shared rate-limit-aware probe client.
+        let (chat_reasoning, responses_reasoning) = tokio::join!(
+            self.probe_reasoning_protocol(
+                &probe_client,
+                ProviderAdapterKind::OpenAiChat,
+                "/chat/completions",
+                chat_portable_tools_payload.clone(),
+                TOOL_PROBE_TOKEN,
+            ),
+            self.probe_reasoning_protocol(
+                &probe_client,
+                ProviderAdapterKind::OpenAiResponses,
+                "/responses",
+                responses_portable_function_tools_payload.clone(),
+                TOOL_PROBE_TOKEN,
+            ),
+        );
+        let chat_reasoning_protocol = chat_reasoning.protocol.unwrap_or(self.reasoning_protocol);
+        let responses_reasoning_protocol = responses_reasoning
+            .protocol
+            .unwrap_or(ProviderReasoningProtocol::ResponsesReasoning);
+        for payload in [
+            &mut chat_payload,
+            &mut chat_json_schema_output_payload,
+            &mut chat_strict_tools_payload,
+            &mut chat_portable_tools_payload,
+        ] {
+            self.apply_probe_reasoning_options(chat_reasoning_protocol, payload);
+        }
+        for payload in [
+            &mut responses_payload,
+            &mut responses_json_schema_output_payload,
+            &mut responses_native_tools_payload,
+            &mut responses_strict_function_tools_payload,
+            &mut responses_custom_tools_payload,
+            &mut responses_apply_patch_payload,
+            &mut responses_portable_function_tools_payload,
+        ] {
+            self.apply_probe_reasoning_options(responses_reasoning_protocol, payload);
+        }
+
+        let chat_function_tools = chat_reasoning.tool_support;
+        let responses_function_tools = responses_reasoning.tool_support;
+        let (chat_strict_function_tools, responses_strict_function_tools) = tokio::join!(
+            async {
+                if chat_function_tools.support == ProviderFeatureSupport::Supported {
+                    self.probe_openai_function_tool_roundtrip(
+                        &probe_client,
+                        "/chat/completions",
+                        chat_strict_tools_payload.clone(),
+                        TOOL_PROBE_TOKEN,
+                    )
+                    .await
+                } else {
+                    OpenAiProbeOutcome {
+                        support: ProviderFeatureSupport::Unknown,
+                        detail: Some(
+                            "strict tools were not probed because the portable Chat function contract failed"
+                                .to_string(),
+                        ),
+                    }
+                }
+            },
+            async {
+                if responses_function_tools.support == ProviderFeatureSupport::Supported {
+                    self.probe_openai_function_tool_roundtrip(
+                        &probe_client,
+                        "/responses",
+                        responses_strict_function_tools_payload.clone(),
+                        TOOL_PROBE_TOKEN,
+                    )
+                    .await
+                } else {
+                    OpenAiProbeOutcome {
+                        support: ProviderFeatureSupport::Unknown,
+                        detail: Some(
+                            "strict tools were not probed because the portable Responses function contract failed"
+                                .to_string(),
+                        ),
+                    }
+                }
+            },
+        );
+
+        // Streaming uses the strongest non-streaming tool shape already
+        // proven. A failed strict probe therefore degrades only strictness, not
+        // the portable streaming contract.
+        let mut chat_streaming_tools_payload =
+            if chat_strict_function_tools.support == ProviderFeatureSupport::Supported {
+                chat_strict_tools_payload.clone()
+            } else {
+                chat_portable_tools_payload.clone()
+            };
         chat_streaming_tools_payload["stream"] = json!(true);
         chat_streaming_tools_payload["stream_options"] = json!({ "include_usage": true });
-        let mut chat_message_protocol_payload = chat_portable_tools_payload.clone();
-        if chat_reasoning_protocol == ProviderReasoningProtocol::DeepSeekThinking {
-            chat_message_protocol_payload["thinking"] = json!({ "type": "enabled" });
-            chat_message_protocol_payload["reasoning_effort"] = json!("high");
-        }
+        chat_streaming_tools_payload["parallel_tool_calls"] = json!(true);
+        let chat_message_protocol_payload = chat_portable_tools_payload.clone();
         let mut responses_streaming_tools_payload =
-            responses_portable_function_tools_payload.clone();
+            if responses_strict_function_tools.support == ProviderFeatureSupport::Supported {
+                responses_strict_function_tools_payload.clone()
+            } else {
+                responses_portable_function_tools_payload.clone()
+            };
         responses_streaming_tools_payload["stream"] = json!(true);
+        responses_streaming_tools_payload["parallel_tool_calls"] = json!(true);
 
         let (
-            chat,
-            responses,
-            chat_function_tool_capabilities,
+            mut chat,
+            mut responses,
             chat_streaming_tools,
-            chat_parallel_tool_calls,
             chat_json_schema_output,
             chat_message_protocol,
             responses_native_tools,
-            responses_function_tool_capabilities,
             responses_streaming_tools,
-            responses_parallel_tool_calls,
             responses_json_schema_output,
             responses_custom_tools,
             responses_apply_patch,
         ) = tokio::join!(
-            self.probe_openai_endpoint("/chat/completions", chat_payload, false),
-            self.probe_openai_endpoint("/responses", responses_payload, false),
-            self.probe_openai_function_tool_capabilities(
-                "/chat/completions",
-                chat_strict_tools_payload,
-                chat_portable_tools_payload,
-                TOOL_PROBE_TOKEN,
-            ),
-            self.probe_openai_function_tool_roundtrip(
-                "/chat/completions",
-                chat_streaming_tools_payload,
-                TOOL_PROBE_TOKEN,
-            ),
-            self.probe_openai_function_tool_roundtrip(
-                "/chat/completions",
-                chat_parallel_tools_payload,
-                TOOL_PROBE_TOKEN,
-            ),
-            self.probe_openai_endpoint("/chat/completions", chat_json_schema_output_payload, true,),
-            self.probe_openai_chat_message_protocol(chat_message_protocol_payload),
-            self.probe_openai_endpoint("/responses", responses_native_tools_payload, true),
-            self.probe_openai_function_tool_capabilities(
-                "/responses",
-                responses_strict_function_tools_payload,
-                responses_portable_function_tools_payload,
-                TOOL_PROBE_TOKEN,
-            ),
-            self.probe_openai_function_tool_roundtrip(
-                "/responses",
-                responses_streaming_tools_payload,
-                TOOL_PROBE_TOKEN,
-            ),
-            self.probe_openai_function_tool_roundtrip(
-                "/responses",
-                responses_parallel_tools_payload,
-                TOOL_PROBE_TOKEN,
-            ),
-            self.probe_openai_endpoint("/responses", responses_json_schema_output_payload, true,),
-            self.probe_openai_endpoint("/responses", responses_custom_tools_payload, true),
-            self.probe_openai_endpoint("/responses", responses_apply_patch_payload, true),
+            self.probe_openai_endpoint(&probe_client, "/chat/completions", chat_payload, false),
+            self.probe_openai_endpoint(&probe_client, "/responses", responses_payload, false),
+            async {
+                if chat_function_tools.support == ProviderFeatureSupport::Supported {
+                    self.probe_openai_function_tool_roundtrip(
+                        &probe_client,
+                        "/chat/completions",
+                        chat_streaming_tools_payload,
+                        TOOL_PROBE_TOKEN,
+                    )
+                    .await
+                } else {
+                    OpenAiProbeOutcome {
+                        support: ProviderFeatureSupport::Unknown,
+                        detail: Some(
+                            "streaming tools were not probed because the portable Chat function contract failed"
+                                .to_string(),
+                        ),
+                    }
+                }
+            },
+            async {
+                if probe_enhanced_features {
+                    self.probe_openai_endpoint(
+                        &probe_client,
+                        "/chat/completions",
+                        chat_json_schema_output_payload,
+                        true,
+                    )
+                    .await
+                } else {
+                    OpenAiProbeOutcome {
+                        support: ProviderFeatureSupport::Unknown,
+                        detail: None,
+                    }
+                }
+            },
+            async {
+                if chat_function_tools.support == ProviderFeatureSupport::Supported {
+                    self.probe_openai_chat_message_protocol(
+                        &probe_client,
+                        chat_message_protocol_payload,
+                    )
+                    .await
+                } else {
+                    OpenAiMessageProtocolProbeOutcome {
+                        capabilities: known_chat_message_protocol,
+                        detail: Some(
+                            "assistant-message reasoning replay was not probed because the portable Chat function contract failed"
+                                .to_string(),
+                        ),
+                    }
+                }
+            },
+            async {
+                if probe_enhanced_features {
+                    self.probe_openai_endpoint(
+                        &probe_client,
+                        "/responses",
+                        responses_native_tools_payload,
+                        true,
+                    )
+                    .await
+                } else {
+                    OpenAiProbeOutcome {
+                        support: ProviderFeatureSupport::Unknown,
+                        detail: Some(
+                            "hosted Responses tools are not assumed for third-party relays"
+                                .to_string(),
+                        ),
+                    }
+                }
+            },
+            async {
+                if responses_function_tools.support == ProviderFeatureSupport::Supported {
+                    self.probe_openai_function_tool_roundtrip(
+                        &probe_client,
+                        "/responses",
+                        responses_streaming_tools_payload,
+                        TOOL_PROBE_TOKEN,
+                    )
+                    .await
+                } else {
+                    OpenAiProbeOutcome {
+                        support: ProviderFeatureSupport::Unknown,
+                        detail: Some(
+                            "streaming tools were not probed because the portable Responses function contract failed"
+                                .to_string(),
+                        ),
+                    }
+                }
+            },
+            async {
+                if probe_enhanced_features {
+                    self.probe_openai_endpoint(
+                        &probe_client,
+                        "/responses",
+                        responses_json_schema_output_payload,
+                        true,
+                    )
+                    .await
+                } else {
+                    OpenAiProbeOutcome {
+                        support: ProviderFeatureSupport::Unknown,
+                        detail: None,
+                    }
+                }
+            },
+            async {
+                if probe_enhanced_features {
+                    self.probe_openai_endpoint(
+                        &probe_client,
+                        "/responses",
+                        responses_custom_tools_payload,
+                        true,
+                    )
+                    .await
+                } else {
+                    OpenAiProbeOutcome {
+                        support: ProviderFeatureSupport::Unknown,
+                        detail: None,
+                    }
+                }
+            },
+            async {
+                if probe_enhanced_features {
+                    self.probe_openai_endpoint(
+                        &probe_client,
+                        "/responses",
+                        responses_apply_patch_payload,
+                        true,
+                    )
+                    .await
+                } else {
+                    OpenAiProbeOutcome {
+                        support: ProviderFeatureSupport::Unknown,
+                        detail: None,
+                    }
+                }
+            },
         );
-        let (chat_function_tools, chat_strict_function_tools) = chat_function_tool_capabilities;
-        let (responses_function_tools, responses_strict_function_tools) =
-            responses_function_tool_capabilities;
+        if chat_function_tools.support == ProviderFeatureSupport::Supported {
+            chat.support = ProviderFeatureSupport::Supported;
+        }
+        if responses_function_tools.support == ProviderFeatureSupport::Supported {
+            responses.support = ProviderFeatureSupport::Supported;
+        }
+        // The streaming probe already carries the production parallel hint.
+        // Reusing its outcome avoids two extra RPM-consuming requests and is
+        // conservative if the combined envelope fails.
+        let chat_parallel_tool_calls = chat_streaming_tools.clone();
+        let responses_parallel_tool_calls = responses_streaming_tools.clone();
 
         let developer = if chat.support == ProviderFeatureSupport::Supported {
-            self.probe_openai_endpoint(
-                "/chat/completions",
-                json!({
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system", "content": "System compatibility probe."},
-                        {"role": "developer", "content": "Developer compatibility probe."},
-                        {"role": "user", "content": "Reply with OK."}
-                    ],
-                    "max_tokens": 16,
-                    "stream": false
-                }),
-                true,
-            )
-            .await
+            let mut developer_payload = json!({
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": "System compatibility probe."},
+                    {"role": "developer", "content": "Developer compatibility probe."},
+                    {"role": "user", "content": "Reply with OK."}
+                ],
+                "max_tokens": 16,
+                "stream": false
+            });
+            self.apply_probe_reasoning_options(chat_reasoning_protocol, &mut developer_payload);
+            self.probe_openai_endpoint(&probe_client, "/chat/completions", developer_payload, true)
+                .await
         } else {
             OpenAiProbeOutcome {
                 support: ProviderFeatureSupport::Unknown,
@@ -570,38 +804,27 @@ impl OpenAiCompatibleProvider {
 
         // Selecting `/responses` from a bare text request is unsafe for relay
         // endpoints: some gateways accept the request and later translate it to
-        // Chat Completions, but reject native Responses tools such as
-        // `web_search` during a real agent turn. Prefer Chat whenever it has
-        // native developer messages; otherwise only switch to Responses after
-        // its native-tool probe has explicitly succeeded.
+        // Chat Completions, but lose fields during a real agent turn. Route on
+        // completed function-tool contracts and keep hosted web search as an
+        // independent optional capability.
         let chat_agent_compatible = chat.support == ProviderFeatureSupport::Supported
             && chat_function_tools.support == ProviderFeatureSupport::Supported;
         let responses_agent_compatible = responses.support == ProviderFeatureSupport::Supported
-            && responses_function_tools.support == ProviderFeatureSupport::Supported
-            && responses_native_tools.support == ProviderFeatureSupport::Supported;
-        let selected_protocol =
-            if chat_agent_compatible && developer.support == ProviderFeatureSupport::Supported {
-                OpenAiProtocol::ChatCompletions
-            } else if responses.support == ProviderFeatureSupport::Supported
-                && responses_function_tools.support == ProviderFeatureSupport::Supported
-                && responses_native_tools.support == ProviderFeatureSupport::Supported
-            {
-                OpenAiProtocol::Responses
-            } else if chat_agent_compatible {
-                OpenAiProtocol::ChatCompletions
-            } else if responses_agent_compatible {
-                OpenAiProtocol::Responses
-            } else if chat.support == ProviderFeatureSupport::Supported {
-                OpenAiProtocol::ChatCompletions
-            } else if responses.support == ProviderFeatureSupport::Supported {
-                OpenAiProtocol::Responses
-            } else if preferred_adapter == ProviderAdapterKind::OpenAiResponses {
-                OpenAiProtocol::Responses
-            } else {
-                OpenAiProtocol::ChatCompletions
-            };
-        let message_compatibility = selected_protocol == OpenAiProtocol::ChatCompletions
-            && developer.support != ProviderFeatureSupport::Supported;
+            && responses_function_tools.support == ProviderFeatureSupport::Supported;
+        let fallback_protocol = if chat_agent_compatible {
+            OpenAiProtocol::ChatCompletions
+        } else if responses_agent_compatible {
+            OpenAiProtocol::Responses
+        } else if chat.support == ProviderFeatureSupport::Supported {
+            OpenAiProtocol::ChatCompletions
+        } else if responses.support == ProviderFeatureSupport::Supported {
+            OpenAiProtocol::Responses
+        } else if preferred_adapter == ProviderAdapterKind::OpenAiResponses {
+            OpenAiProtocol::Responses
+        } else {
+            OpenAiProtocol::ChatCompletions
+        };
+        let message_compatibility = developer.support != ProviderFeatureSupport::Supported;
         let mut notes = Vec::new();
         if let Some(detail) = chat.detail {
             notes.push(format!("Chat Completions: {detail}"));
@@ -661,16 +884,11 @@ impl OpenAiCompatibleProvider {
             );
         }
 
-        let reachable = chat.support == ProviderFeatureSupport::Supported
-            || responses.support == ProviderFeatureSupport::Supported;
-        let model_available = match selected_protocol {
-            OpenAiProtocol::ChatCompletions => chat_agent_compatible,
-            OpenAiProtocol::Responses => responses_agent_compatible,
-        };
-        let report = OpenAiCompatibilityReport {
+        let tool_probe_failure_detail = Self::summarize_function_tool_probe_failures(&notes);
+        let mut report = OpenAiCompatibilityReport {
             base_url: self.base_url.clone(),
             model: self.model.clone(),
-            selected_protocol,
+            selected_protocol: fallback_protocol,
             chat_completions: chat.support,
             chat_function_tools: chat_function_tools.support,
             chat_strict_function_tools: chat_strict_function_tools.support,
@@ -679,6 +897,7 @@ impl OpenAiCompatibleProvider {
             chat_json_schema_output: chat_json_schema_output.support,
             chat_message_protocol: known_chat_message_protocol
                 .union(chat_message_protocol.capabilities),
+            chat_reasoning_protocol: chat_reasoning.protocol,
             responses: responses.support,
             responses_native_tools: responses_native_tools.support,
             responses_function_tools: responses_function_tools.support,
@@ -688,10 +907,19 @@ impl OpenAiCompatibleProvider {
             responses_json_schema_output: responses_json_schema_output.support,
             responses_custom_tools: responses_custom_tools.support,
             responses_apply_patch: responses_apply_patch.support,
+            responses_reasoning_protocol: responses_reasoning.protocol,
             developer_messages: developer.support,
             message_compatibility,
             checked_at: Utc::now(),
             notes,
+        };
+        let selected_protocol = report.recommended_protocol().unwrap_or(fallback_protocol);
+        report.selected_protocol = selected_protocol;
+        let reachable = chat.support == ProviderFeatureSupport::Supported
+            || responses.support == ProviderFeatureSupport::Supported;
+        let model_available = match selected_protocol {
+            OpenAiProtocol::ChatCompletions => chat_agent_compatible,
+            OpenAiProtocol::Responses => responses_agent_compatible,
         };
         Ok(ProviderHealthCheck {
             reachable,
@@ -699,50 +927,79 @@ impl OpenAiCompatibleProvider {
             model_available,
             error: (!model_available).then(|| {
                 if reachable {
-                    "the endpoint is reachable, but no adapter completed the required function-tool capability round trip"
-                        .to_string()
+                    let summary = format!(
+                        "model '{}' reached the endpoint, but no adapter completed the required function-tool capability round trip",
+                        self.model.trim()
+                    );
+                    tool_probe_failure_detail
+                        .as_deref()
+                        .map(|detail| format!("{summary}: {detail}"))
+                        .unwrap_or(summary)
                 } else {
-                    report
+                    let detail = report
                         .notes
                         .first()
                         .cloned()
-                        .unwrap_or_else(|| "no supported OpenAI endpoint was detected".to_string())
+                        .unwrap_or_else(|| "no supported OpenAI endpoint was detected".to_string());
+                    format!("model '{}': {detail}", self.model.trim())
                 }
             }),
             openai_compatibility: Some(report),
         })
     }
 
+    /// Returns the bounded, user-actionable portion of a failed adapter
+    /// negotiation. A connection test used to retain these notes in the
+    /// compatibility report but discard them from the error shown during
+    /// model discovery, leaving a generic failure with no way to diagnose a
+    /// relay's tool-call incompatibility.
+    fn summarize_function_tool_probe_failures(notes: &[String]) -> Option<String> {
+        const TOOL_PROBE_PREFIXES: [&str; 2] =
+            ["Chat function tools:", "Responses function tools:"];
+        const MAX_DETAILS: usize = 2;
+        const MAX_CHARS: usize = 1_500;
+
+        let details = notes
+            .iter()
+            .filter(|note| {
+                TOOL_PROBE_PREFIXES
+                    .iter()
+                    .any(|prefix| note.starts_with(prefix))
+            })
+            .take(MAX_DETAILS)
+            .map(|note| note.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>();
+        if details.is_empty() {
+            return None;
+        }
+
+        let summary = details.join("; ");
+        if summary.chars().count() <= MAX_CHARS {
+            return Some(summary);
+        }
+        Some(format!(
+            "{}…",
+            summary.chars().take(MAX_CHARS - 1).collect::<String>()
+        ))
+    }
+
     async fn probe_openai_chat_message_protocol(
         &self,
+        probe_client: &OpenAiProbeClient,
         payload: Value,
     ) -> OpenAiMessageProtocolProbeOutcome {
         let fallback =
             trusted_chat_message_protocol_contract(&self.base_url, &self.model).unwrap_or_default();
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let response = tokio::time::timeout(
-            Duration::from_secs(20),
-            apply_provider_auth(self.client.post(url), self.auth, &self.api_key)
-                .header(CONTENT_TYPE, "application/json")
-                .json(&payload)
-                .send(),
-        )
-        .await;
-        let response = match response {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => {
+        let response = match probe_client.send("/chat/completions", &payload).await {
+            Ok(response) => response,
+            Err(error) => {
                 return OpenAiMessageProtocolProbeOutcome {
                     capabilities: fallback,
-                    detail: Some(error.to_string()),
-                }
-            }
-            Err(_) => {
-                return OpenAiMessageProtocolProbeOutcome {
-                    capabilities: fallback,
-                    detail: Some("request timed out after 20 seconds".to_string()),
+                    detail: Some(error),
                 }
             }
         };
+        let (response, _probe_permit) = response.into_parts();
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -788,34 +1045,21 @@ impl OpenAiCompatibleProvider {
 
     async fn probe_openai_endpoint(
         &self,
+        probe_client: &OpenAiProbeClient,
         path: &str,
         payload: Value,
         role_probe: bool,
     ) -> OpenAiProbeOutcome {
-        let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
-        let response = tokio::time::timeout(
-            Duration::from_secs(20),
-            apply_provider_auth(self.client.post(url), self.auth, &self.api_key)
-                .header(CONTENT_TYPE, "application/json")
-                .json(&payload)
-                .send(),
-        )
-        .await;
-        let response = match response {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => {
+        let response = match probe_client.send(path, &payload).await {
+            Ok(response) => response,
+            Err(error) => {
                 return OpenAiProbeOutcome {
                     support: ProviderFeatureSupport::Unknown,
-                    detail: Some(error.to_string()),
-                }
-            }
-            Err(_) => {
-                return OpenAiProbeOutcome {
-                    support: ProviderFeatureSupport::Unknown,
-                    detail: Some("request timed out after 20 seconds".to_string()),
+                    detail: Some(error),
                 }
             }
         };
+        let (response, _probe_permit) = response.into_parts();
         let status = response.status();
         if status.is_success() {
             return OpenAiProbeOutcome {
@@ -843,34 +1087,21 @@ impl OpenAiCompatibleProvider {
 
     async fn probe_openai_function_tool_roundtrip(
         &self,
+        probe_client: &OpenAiProbeClient,
         path: &str,
         payload: Value,
         expected_token: &str,
     ) -> OpenAiProbeOutcome {
-        let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
-        let response = tokio::time::timeout(
-            Duration::from_secs(20),
-            apply_provider_auth(self.client.post(url), self.auth, &self.api_key)
-                .header(CONTENT_TYPE, "application/json")
-                .json(&payload)
-                .send(),
-        )
-        .await;
-        let response = match response {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => {
+        let response = match probe_client.send(path, &payload).await {
+            Ok(response) => response,
+            Err(error) => {
                 return OpenAiProbeOutcome {
                     support: ProviderFeatureSupport::Unknown,
-                    detail: Some(error.to_string()),
-                }
-            }
-            Err(_) => {
-                return OpenAiProbeOutcome {
-                    support: ProviderFeatureSupport::Unknown,
-                    detail: Some("request timed out after 20 seconds".to_string()),
+                    detail: Some(error),
                 }
             }
         };
+        let (response, _probe_permit) = response.into_parts();
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -933,33 +1164,50 @@ impl OpenAiCompatibleProvider {
         }
     }
 
-    async fn probe_openai_function_tool_capabilities(
+    async fn probe_reasoning_protocol(
         &self,
+        probe_client: &OpenAiProbeClient,
+        adapter: ProviderAdapterKind,
         path: &str,
-        strict_payload: Value,
-        portable_payload: Value,
+        portable_tool_payload: Value,
         expected_token: &str,
-    ) -> (OpenAiProbeOutcome, OpenAiProbeOutcome) {
-        let strict = self
-            .probe_openai_function_tool_roundtrip(path, strict_payload, expected_token)
-            .await;
-        if strict.support == ProviderFeatureSupport::Supported {
-            return (
-                OpenAiProbeOutcome {
-                    support: ProviderFeatureSupport::Supported,
-                    detail: None,
-                },
-                strict,
-            );
+    ) -> OpenAiReasoningProbeOutcome {
+        let mut attempts = Vec::new();
+        let mut final_outcome = OpenAiProbeOutcome {
+            support: ProviderFeatureSupport::Unknown,
+            detail: Some("no reasoning protocol candidates were available".to_string()),
+        };
+        for protocol in reasoning_probe_candidates(adapter, &self.model) {
+            let mut payload = portable_tool_payload.clone();
+            self.apply_probe_reasoning_options(protocol, &mut payload);
+            let outcome = self
+                .probe_openai_function_tool_roundtrip(probe_client, path, payload, expected_token)
+                .await;
+            if outcome.support == ProviderFeatureSupport::Supported {
+                return OpenAiReasoningProbeOutcome {
+                    protocol: Some(protocol),
+                    tool_support: outcome,
+                };
+            }
+            if let Some(detail) = outcome.detail.as_deref() {
+                attempts.push(format!("{}: {detail}", reasoning_protocol_label(protocol)));
+            }
+            let should_stop = outcome.support == ProviderFeatureSupport::Unknown;
+            final_outcome = outcome;
+            // Unknown normally means transport/rate-limit/server failure. More
+            // candidate requests cannot establish a protocol and would amplify
+            // load on an already unhealthy endpoint.
+            if should_stop {
+                break;
+            }
         }
-
-        // A relay may support ordinary function tools while rejecting the
-        // provider-specific `strict` field. Probe the portable shape separately
-        // so strict support never becomes a prerequisite for tool use.
-        let portable = self
-            .probe_openai_function_tool_roundtrip(path, portable_payload, expected_token)
-            .await;
-        (portable, strict)
+        if !attempts.is_empty() {
+            final_outcome.detail = Some(attempts.join("; "));
+        }
+        OpenAiReasoningProbeOutcome {
+            protocol: None,
+            tool_support: final_outcome,
+        }
     }
 
     pub(crate) fn for_guardian(mut self) -> Self {
@@ -986,7 +1234,15 @@ impl OpenAiCompatibleProvider {
             .reasoning_effort
             .as_deref()
             .is_none_or(|effort| effort != "none");
-        let messages = self.chat_codec.encode_messages(&request, thinking_enabled);
+        let mut messages = self.chat_codec.encode_messages(&request, thinking_enabled);
+        if self.output_protocol.json_schema != ProviderFeatureSupport::Supported {
+            if let Some(schema) = request.final_output_json_schema.as_ref() {
+                messages.push(json!({
+                    "role": "system",
+                    "content": textual_json_schema_output_instruction(schema),
+                }));
+            }
+        }
         let tool_capable = !request.tool_candidates.is_empty();
         let compiled_tools = compile_openai_tools(&request.tool_candidates, self.tool_protocol);
         let stream = !tool_capable
@@ -1001,13 +1257,8 @@ impl OpenAiCompatibleProvider {
         }
         // Reasoning models reject any explicit temperature with a 400, so the
         // field is omitted rather than clamped.
-        let deepseek_thinking_enabled = self.reasoning_protocol
-            == ProviderReasoningProtocol::DeepSeekThinking
-            && self
-                .reasoning_effort
-                .as_deref()
-                .is_none_or(|effort| effort != "none");
-        if !deepseek_thinking_enabled {
+        let applied_reasoning = self.apply_chat_reasoning_options(&mut payload);
+        if !applied_reasoning.omit_temperature {
             if let Some(temperature) = self.temperature {
                 payload["temperature"] = json!(temperature);
             }
@@ -1015,53 +1266,25 @@ impl OpenAiCompatibleProvider {
         if let Some(max_output_tokens) = self.max_output_tokens {
             payload["max_tokens"] = json!(max_output_tokens);
         }
-        if let Some(reasoning_effort) = self
-            .reasoning_effort
-            .as_deref()
-            .filter(|value| !value.is_empty())
-        {
-            match self.reasoning_protocol {
-                ProviderReasoningProtocol::DeepSeekThinking => {
-                    if reasoning_effort == "none" {
-                        payload["thinking"] = json!({ "type": "disabled" });
-                    } else {
-                        payload["thinking"] = json!({ "type": "enabled" });
-                        payload["reasoning_effort"] =
-                            json!(deepseek_reasoning_effort(reasoning_effort));
-                    }
-                }
-                ProviderReasoningProtocol::GlmThinking => {
-                    if matches!(reasoning_effort, "none" | "minimal") {
-                        payload["thinking"] = json!({ "type": "disabled" });
-                    } else {
-                        payload["thinking"] = json!({ "type": "enabled" });
-                        payload["reasoning_effort"] = json!(reasoning_effort);
-                    }
-                }
-                ProviderReasoningProtocol::ReasoningEffort => {
-                    payload["reasoning_effort"] = json!(reasoning_effort);
-                }
-            }
-        }
         if !request.tool_candidates.is_empty() {
             payload["tools"] = json!(compiled_tools.tools);
-            // DeepSeek V4 thinking mode rejects tool_choice and treats an
-            // omitted value as auto. Non-thinking mode accepts the field.
-            if !deepseek_thinking_enabled {
+            if !applied_reasoning.omit_tool_choice {
                 payload["tool_choice"] = json!("auto");
             }
             if self.tool_protocol.parallel_tool_calls == ProviderFeatureSupport::Supported {
                 payload["parallel_tool_calls"] = json!(self.parallel_tool_calls);
             }
         }
-        if let Some(prompt_cache_key) = request
-            .instructions
-            .prompt_cache_key
-            .as_deref()
-            .or(self.prompt_cache_key.as_deref())
-            .filter(|value| !value.is_empty())
-        {
-            payload["prompt_cache_key"] = json!(prompt_cache_key);
+        if is_official_openai_endpoint(&self.base_url) {
+            if let Some(prompt_cache_key) = request
+                .instructions
+                .prompt_cache_key
+                .as_deref()
+                .or(self.prompt_cache_key.as_deref())
+                .filter(|value| !value.is_empty())
+            {
+                payload["prompt_cache_key"] = json!(prompt_cache_key);
+            }
         }
         if self.output_protocol.json_schema == ProviderFeatureSupport::Supported {
             if let Some(schema) = request.final_output_json_schema.as_ref() {
@@ -1147,35 +1370,53 @@ impl OpenAiCompatibleProvider {
             .get("stream")
             .and_then(Value::as_bool)
             .unwrap_or(true);
-        let decoded = decode_openai_chat_response(
-            response,
-            streamed,
-            &prepared.logical_request.tool_candidates,
-            on_delta,
-            true,
-        )
-        .await;
-        let mut response = match decoded {
-            Ok(response) => response,
-            Err(error)
-                if streamed
-                    && !prepared.logical_request.tool_candidates.is_empty()
-                    && is_tool_call_protocol_error(&error) =>
-            {
-                on_transport(ProviderTransportEvent::Response {
+        let atomic_stream =
+            streamed && prepared.response_commit == ProviderResponseCommitMode::Atomic;
+        let mut provisional_deltas = Vec::new();
+        let decoded = if atomic_stream {
+            let mut buffer_delta = |delta| {
+                provisional_deltas.push(delta);
+                Ok(())
+            };
+            decode_openai_chat_response(
+                response,
+                streamed,
+                &prepared.logical_request.tool_candidates,
+                &mut buffer_delta,
+                true,
+            )
+            .await
+        } else {
+            decode_openai_chat_response(
+                response,
+                streamed,
+                &prepared.logical_request.tool_candidates,
+                on_delta,
+                true,
+            )
+            .await
+        };
+        let (mut response, response_attempt, response_status, commit_deltas) = match decoded {
+            Ok(response) => (response, attempt, status.as_u16(), provisional_deltas),
+            Err(error) if atomic_stream => {
+                let RecoveredToolResponse {
+                    response,
                     attempt,
-                    status: Some(status.as_u16()),
-                    response_id: None,
-                    body: tool_call_protocol_error_observation(
-                        &error,
-                        Some("capability_profile_stale"),
-                    ),
-                })?;
-                return Err(ProviderAdapterError::CapabilityProfileStale {
-                    capability: "streaming_tools",
-                    detail: error.to_string(),
-                }
-                .into());
+                    status,
+                } = recover_streamed_tool_call_non_streaming(
+                    OpenAiRecoveryProtocol::ChatCompletions,
+                    &self.client,
+                    self.auth,
+                    &self.api_key,
+                    &prepared,
+                    attempt,
+                    status.as_u16(),
+                    &error,
+                    on_delta,
+                    on_transport,
+                )
+                .await?;
+                (response, attempt, status, Vec::new())
             }
             Err(error) => {
                 on_transport(ProviderTransportEvent::Response {
@@ -1188,9 +1429,12 @@ impl OpenAiCompatibleProvider {
             }
         };
         normalize_provider_tool_calls(&mut response.tool_calls, &prepared.tool_contracts);
+        for delta in commit_deltas {
+            on_delta(delta)?;
+        }
         on_transport(ProviderTransportEvent::Response {
-            attempt,
-            status: Some(200),
+            attempt: response_attempt,
+            status: Some(response_status),
             response_id: response.response_id.clone(),
             body: model_response_observation(&response),
         })?;
@@ -1319,6 +1563,7 @@ pub struct OpenAiResponsesProvider {
     pub(in crate::provider) temperature: Option<f64>,
     pub(in crate::provider) max_output_tokens: Option<u32>,
     pub(in crate::provider) reasoning_effort: Option<String>,
+    pub(in crate::provider) reasoning_protocol: ProviderReasoningProtocol,
     pub(in crate::provider) store_responses: bool,
     pub(in crate::provider) parallel_tool_calls: bool,
     pub(in crate::provider) prompt_cache_key: Option<String>,
@@ -1421,6 +1666,9 @@ impl OpenAiResponsesProvider {
         let base_url = base_url.into();
         let model = model.into();
         let native_tool_search = official_openai_tool_search_support(&base_url, &model);
+        let native_web_search = is_official_openai_endpoint(&base_url);
+        let reasoning_protocol =
+            default_reasoning_protocol(ProviderAdapterKind::OpenAiResponses, &model);
         Self {
             client: reqwest::Client::new(),
             base_url,
@@ -1430,12 +1678,13 @@ impl OpenAiResponsesProvider {
             temperature: None,
             max_output_tokens: None,
             reasoning_effort: None,
+            reasoning_protocol,
             store_responses: false,
             parallel_tool_calls: true,
             prompt_cache_key: None,
             prompt_cache_policy: None,
             compaction_threshold_tokens: None,
-            native_web_search: true,
+            native_web_search,
             supports_vision: true,
             output_protocol: ProviderOutputProtocolCapabilities::default(),
             tool_protocol: ProviderToolProtocolCapabilities {
@@ -1466,10 +1715,13 @@ impl OpenAiResponsesProvider {
         provider.tool_protocol = settings
             .capabilities_for_adapter(ProviderAdapterKind::OpenAiResponses)
             .tool_protocol;
+        provider.native_web_search = is_official_openai_endpoint(&provider.base_url)
+            || provider.tool_protocol.hosted_web_search == ProviderFeatureSupport::Supported;
         if let Some(profile) = settings.adapter_profile_for_model_and_adapter(
             &settings.model,
             ProviderAdapterKind::OpenAiResponses,
         ) {
+            provider.reasoning_protocol = profile.reasoning_protocol;
             provider.output_protocol = profile.output_protocol;
         }
         Some(provider)
@@ -1516,10 +1768,26 @@ impl OpenAiResponsesProvider {
         // Reasoning models reject any explicit temperature with a 400, so the
         // field is omitted rather than clamped. `None` also omits it — letting
         // the model use its vendor default.
-        if let Some(temperature) = self.temperature {
-            payload["temperature"] = json!(temperature);
+        let applied_reasoning = apply_reasoning_protocol(
+            self.reasoning_protocol,
+            self.reasoning_effort.as_deref(),
+            None,
+            &mut payload,
+        );
+        if !applied_reasoning.omit_temperature {
+            if let Some(temperature) = self.temperature {
+                payload["temperature"] = json!(temperature);
+            }
         }
         let mut system_instructions = responses_system_instructions(&request);
+        if self.output_protocol.json_schema != ProviderFeatureSupport::Supported {
+            if let Some(schema) = request.final_output_json_schema.as_ref() {
+                if !system_instructions.trim().is_empty() {
+                    system_instructions.push_str("\n\n");
+                }
+                system_instructions.push_str(&textual_json_schema_output_instruction(schema));
+            }
+        }
         if self.native_web_search {
             if !system_instructions.trim().is_empty() {
                 system_instructions.push_str("\n\n");
@@ -1539,15 +1807,11 @@ impl OpenAiResponsesProvider {
         if let Some(max_output_tokens) = self.max_output_tokens {
             payload["max_output_tokens"] = json!(max_output_tokens);
         }
-        if let Some(reasoning_effort) = self
-            .reasoning_effort
-            .as_deref()
-            .filter(|value| !value.is_empty())
+        if applied_reasoning.enabled
+            && !self.store_responses
+            && is_official_openai_endpoint(&self.base_url)
         {
-            payload["reasoning"] = json!({ "effort": reasoning_effort });
-            if !self.store_responses {
-                payload["include"] = json!(["reasoning.encrypted_content"]);
-            }
+            payload["include"] = json!(["reasoning.encrypted_content"]);
         }
         let mut tools = Vec::new();
         if self.native_web_search {
@@ -1558,14 +1822,16 @@ impl OpenAiResponsesProvider {
             payload["tools"] = json!(tools);
             payload["tool_choice"] = json!("auto");
         }
-        if let Some(prompt_cache_key) = request
-            .instructions
-            .prompt_cache_key
-            .as_deref()
-            .or(self.prompt_cache_key.as_deref())
-            .filter(|value| !value.is_empty())
-        {
-            payload["prompt_cache_key"] = json!(prompt_cache_key);
+        if is_official_openai_endpoint(&self.base_url) {
+            if let Some(prompt_cache_key) = request
+                .instructions
+                .prompt_cache_key
+                .as_deref()
+                .or(self.prompt_cache_key.as_deref())
+                .filter(|value| !value.is_empty())
+            {
+                payload["prompt_cache_key"] = json!(prompt_cache_key);
+            }
         }
         match self.prompt_cache_policy {
             Some(PromptCachePolicy::Explicit30m)
@@ -1667,35 +1933,53 @@ impl OpenAiResponsesProvider {
             .get("stream")
             .and_then(Value::as_bool)
             .unwrap_or(true);
-        let decoded = decode_openai_responses_response(
-            response,
-            streamed,
-            &prepared.logical_request.tool_candidates,
-            on_delta,
-            true,
-        )
-        .await;
-        let mut response = match decoded {
-            Ok(response) => response,
-            Err(error)
-                if streamed
-                    && prepared.response_commit == ProviderResponseCommitMode::Atomic
-                    && is_tool_call_protocol_error(&error) =>
-            {
-                on_transport(ProviderTransportEvent::Response {
+        let atomic_stream =
+            streamed && prepared.response_commit == ProviderResponseCommitMode::Atomic;
+        let mut provisional_deltas = Vec::new();
+        let decoded = if atomic_stream {
+            let mut buffer_delta = |delta| {
+                provisional_deltas.push(delta);
+                Ok(())
+            };
+            decode_openai_responses_response(
+                response,
+                streamed,
+                &prepared.logical_request.tool_candidates,
+                &mut buffer_delta,
+                true,
+            )
+            .await
+        } else {
+            decode_openai_responses_response(
+                response,
+                streamed,
+                &prepared.logical_request.tool_candidates,
+                on_delta,
+                true,
+            )
+            .await
+        };
+        let (mut response, response_attempt, response_status, commit_deltas) = match decoded {
+            Ok(response) => (response, attempt, status.as_u16(), provisional_deltas),
+            Err(error) if atomic_stream => {
+                let RecoveredToolResponse {
+                    response,
                     attempt,
-                    status: Some(status.as_u16()),
-                    response_id: None,
-                    body: tool_call_protocol_error_observation(
-                        &error,
-                        Some("capability_profile_stale"),
-                    ),
-                })?;
-                return Err(ProviderAdapterError::CapabilityProfileStale {
-                    capability: "streaming_tools",
-                    detail: error.to_string(),
-                }
-                .into());
+                    status,
+                } = recover_streamed_tool_call_non_streaming(
+                    OpenAiRecoveryProtocol::Responses,
+                    &self.client,
+                    self.auth,
+                    &self.api_key,
+                    &prepared,
+                    attempt,
+                    status.as_u16(),
+                    &error,
+                    on_delta,
+                    on_transport,
+                )
+                .await?;
+                (response, attempt, status, Vec::new())
             }
             Err(error) => {
                 on_transport(ProviderTransportEvent::Response {
@@ -1708,14 +1992,24 @@ impl OpenAiResponsesProvider {
             }
         };
         normalize_provider_tool_calls(&mut response.tool_calls, &prepared.tool_contracts);
+        for delta in commit_deltas {
+            on_delta(delta)?;
+        }
         on_transport(ProviderTransportEvent::Response {
-            attempt,
-            status: Some(status.as_u16()),
+            attempt: response_attempt,
+            status: Some(response_status),
             response_id: response.response_id.clone(),
             body: model_response_observation(&response),
         })?;
         Ok(response)
     }
+}
+
+fn textual_json_schema_output_instruction(schema: &Value) -> String {
+    format!(
+        "Return only one JSON value that conforms exactly to this JSON Schema. Do not wrap it in Markdown or add explanatory text.\n<output_json_schema>\n{}\n</output_json_schema>",
+        schema
+    )
 }
 
 pub(super) async fn decode_openai_responses_response(

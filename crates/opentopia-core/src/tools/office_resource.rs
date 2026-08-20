@@ -3,10 +3,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-/// A document target is deliberately independent of the execution backend.
-/// Offline files and attachments are usable now; `liveSession` is the stable
-/// contract for a future Excel/Office add-in and is never silently treated as
-/// a filesystem path.
+/// A spreadsheet target is independent of its offline storage binding.
+/// Workspace files are mutable under workspace policy; user attachments are
+/// opaque, immutable sources addressed by attachment ID.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(
     tag = "kind",
@@ -15,19 +14,18 @@ use uuid::Uuid;
     deny_unknown_fields
 )]
 pub(super) enum OfficeResourceRef {
-    WorkspaceFile {
-        path: String,
-    },
-    Attachment {
-        attachment_id: Uuid,
-    },
-    LiveSession {
-        session_id: String,
-        document_id: String,
-    },
+    WorkspaceFile { path: String },
+    Attachment { attachment_id: Uuid },
 }
 
 impl OfficeResourceRef {
+    pub(super) fn read_binding_key(&self) -> &'static str {
+        match self {
+            Self::WorkspaceFile { .. } => "path",
+            Self::Attachment { .. } => "attachmentId",
+        }
+    }
+
     pub(super) fn offline_path(&self) -> anyhow::Result<&str> {
         match self {
             Self::WorkspaceFile { path } if !path.trim().is_empty() => Ok(path),
@@ -35,24 +33,19 @@ impl OfficeResourceRef {
             Self::Attachment { .. } => anyhow::bail!(
                 "this operation currently requires a workspaceFile; attachments are read-only spreadsheet sources"
             ),
-            Self::LiveSession { .. } => anyhow::bail!(
-                "liveSession resources require an Office live-session provider, which is not connected in this build"
-            ),
         }
     }
 
     pub(super) fn read_binding(&self) -> anyhow::Result<(&'static str, Value)> {
         match self {
             Self::WorkspaceFile { path } if !path.trim().is_empty() => {
-                Ok(("path", Value::String(path.clone())))
+                Ok((self.read_binding_key(), Value::String(path.clone())))
             }
             Self::WorkspaceFile { .. } => anyhow::bail!("workspaceFile.path must not be empty"),
-            Self::Attachment { attachment_id } => {
-                Ok(("attachmentId", Value::String(attachment_id.to_string())))
-            }
-            Self::LiveSession { .. } => anyhow::bail!(
-                "liveSession resources require an Office live-session provider, which is not connected in this build"
-            ),
+            Self::Attachment { attachment_id } => Ok((
+                self.read_binding_key(),
+                Value::String(attachment_id.to_string()),
+            )),
         }
     }
 
@@ -60,10 +53,6 @@ impl OfficeResourceRef {
         match self {
             Self::WorkspaceFile { path } => format!("file:{path}"),
             Self::Attachment { attachment_id } => format!("attachment:{attachment_id}"),
-            Self::LiveSession {
-                session_id,
-                document_id,
-            } => format!("live-session:{session_id}:{document_id}"),
         }
     }
 
@@ -81,26 +70,50 @@ impl OfficeResourceRef {
                 "attachmentId": attachment_id,
                 "writeSupported": false
             }),
-            Self::LiveSession {
-                session_id,
-                document_id,
-            } => json!({
-                "kind": "liveSession",
-                "backend": "liveOfficeSession",
-                "sessionId": session_id,
-                "documentId": document_id,
-                "available": false,
-                "reason": "No Office live-session provider is connected."
-            }),
         }
     }
 
-    pub(super) fn ensure_available(&self) -> anyhow::Result<()> {
-        if matches!(self, Self::LiveSession { .. }) {
-            anyhow::bail!(
-                "liveSession resources require an Office live-session provider, which is not connected in this build"
-            );
-        }
-        Ok(())
+    pub(super) fn supports_mutation(&self) -> bool {
+        matches!(self, Self::WorkspaceFile { .. })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_contract_distinguishes_mutable_files_from_immutable_attachments() {
+        let workspace_file: OfficeResourceRef = serde_json::from_value(json!({
+            "kind": "workspaceFile",
+            "path": "reports/book.xlsx"
+        }))
+        .expect("workspace file resource");
+        assert!(workspace_file.supports_mutation());
+        assert_eq!(workspace_file.resource_key(), "file:reports/book.xlsx");
+
+        let attachment_id = Uuid::new_v4();
+        let attachment: OfficeResourceRef = serde_json::from_value(json!({
+            "kind": "attachment",
+            "attachmentId": attachment_id
+        }))
+        .expect("attachment resource");
+        assert!(!attachment.supports_mutation());
+        assert_eq!(
+            attachment.resource_key(),
+            format!("attachment:{attachment_id}")
+        );
+        assert_eq!(attachment.read_binding().unwrap().0, "attachmentId");
+        assert!(attachment.offline_path().is_err());
+    }
+
+    #[test]
+    fn unimplemented_live_session_is_not_part_of_the_resource_contract() {
+        assert!(serde_json::from_value::<OfficeResourceRef>(json!({
+            "kind": "liveSession",
+            "sessionId": "session-1",
+            "documentId": "workbook-1"
+        }))
+        .is_err());
     }
 }

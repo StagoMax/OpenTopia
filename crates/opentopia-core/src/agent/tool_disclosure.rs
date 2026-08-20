@@ -1,9 +1,10 @@
 use super::{
     bundle_is_visible, calibrated_input_estimate, estimate_provider_tool_surface_tokens,
     external_namespace, json, mcp_tool_declares_image_inspection, redact_model_observation,
-    tool_bundle, AgentCore, AgentEventPayload, BTreeMap, CancellationToken, CanonicalModelRequest,
-    CollaborationMode, CompiledModelContext, ContextAssemblyInput, HashSet, ModelCallPurpose,
-    ModelContentPart, ModelConversationMessage, ModelResponse, ModelStreamDelta, MultiAgentMode,
+    tool_bundle, AgentCore, AgentEventPayload, Arc, AtomicBool, AtomicOrdering, BTreeMap,
+    CancellationToken, CanonicalModelRequest, CollaborationMode, CompiledModelContext,
+    ContextAssemblyInput, HashSet, ModelCallPurpose, ModelContentPart, ModelConversationMessage,
+    ModelGatewayMetricEvent, ModelResponse, ModelStreamDelta, MultiAgentMode,
     PromptCacheBreakpointPolicy, ProviderFeatureSupport, ProviderToolCall, ProviderToolCandidate,
     ProviderToolDisclosure, ProviderToolNamespace, ProviderToolResult, ProviderTransportEvent,
     ToolClass, ToolExposurePolicy, ToolSource, TurnEvents, Uuid, Value,
@@ -142,7 +143,29 @@ impl AgentCore {
             Ok(())
         };
         let mut latest_usage = None;
-        let mut on_delta = |delta| {
+        let first_token_pending = Arc::new(AtomicBool::new(false));
+        let metric_pending = Arc::clone(&first_token_pending);
+        let metric_event_sender = events.sender.clone();
+        let mut on_metric = |metric| {
+            match metric {
+                ModelGatewayMetricEvent::FirstOutputTokenReceived {
+                    request_id: metric_request_id,
+                } => {
+                    debug_assert_eq!(metric_request_id, request_id);
+                    metric_pending.store(true, AtomicOrdering::SeqCst);
+                    if let Some(sender) = &metric_event_sender {
+                        let _ = sender
+                            .send(AgentEventPayload::ProviderFirstTokenReceived { request_id });
+                    }
+                }
+            }
+            Ok(())
+        };
+        let delta_pending = Arc::clone(&first_token_pending);
+        let mut on_delta = |delta: ModelStreamDelta| {
+            if delta_pending.swap(false, AtomicOrdering::SeqCst) {
+                events.record(AgentEventPayload::ProviderFirstTokenReceived { request_id });
+            }
             match delta {
                 ModelStreamDelta::Text { text } => {
                     events.push(AgentEventPayload::ModelDelta { text });
@@ -157,10 +180,12 @@ impl AgentCore {
             }
             Ok(())
         };
-        let stream =
-            self.kernel
-                .model_gateway
-                .stream_prepared(prepared, &mut on_delta, &mut on_transport);
+        let stream = self.kernel.model_gateway.stream_prepared(
+            prepared,
+            &mut on_delta,
+            &mut on_transport,
+            &mut on_metric,
+        );
         let response = if let Some(cancellation) = cancellation {
             tokio::select! {
                 biased;
@@ -174,6 +199,9 @@ impl AgentCore {
         };
         drop(on_delta);
         drop(on_transport);
+        if first_token_pending.swap(false, AtomicOrdering::SeqCst) {
+            events.record(AgentEventPayload::ProviderFirstTokenReceived { request_id });
+        }
         let latest_usage = latest_usage.or_else(|| {
             response
                 .as_ref()
@@ -249,12 +277,9 @@ impl AgentCore {
             })
             .filter(|name| self.tool_host.model_supports_vision || name != "computer")
             .filter(|name| self.tool_is_allowed(name))
-            // The v1 action-union schema remains executable for persisted and
-            // in-flight calls, but does not compete with the small v2
-            // inspect/describe/execute protocol in ordinary model context.
-            .filter(|name| {
-                self.tool_exposure_policy == ToolExposurePolicy::Eager || name != "spreadsheet"
-            })
+            // Compatibility executors can remain callable by persisted and
+            // internal routes without any disclosure policy exposing them.
+            .filter(|name| self.tool_host.catalog.is_model_visible(name))
             // MCP tools bound as attachment-inspection backends are implementation
             // details of view_attachment, not a competing model-visible route.
             .filter(|name| {

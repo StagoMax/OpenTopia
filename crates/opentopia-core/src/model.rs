@@ -600,7 +600,7 @@ pub enum ArtifactStorageMetadata {
     Path { path: PathBuf },
 }
 
-pub const CONTEXT_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+pub const CONTEXT_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -704,6 +704,51 @@ pub struct ContextCheckpointArtifact {
     pub source_seqs: Vec<i64>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextCheckpointMetric {
+    pub name: String,
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(default)]
+    pub source_seqs: Vec<i64>,
+}
+
+/// One evidence-backed stage in the task's durable history.
+///
+/// `from_seq`/`through_seq` are the authoritative ordering keys. Timestamps are
+/// canonicalized from those events by the checkpoint service rather than
+/// trusted from model output.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextCheckpointPhase {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub from_seq: i64,
+    pub through_seq: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
+    pub objective: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_cause: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(default)]
+    pub metrics: Vec<ContextCheckpointMetric>,
+    #[serde(default)]
+    pub remaining_risks: Vec<String>,
+    #[serde(default)]
+    pub source_seqs: Vec<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextCheckpoint {
@@ -717,6 +762,8 @@ pub struct ContextCheckpoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_compatibility_hash: Option<String>,
     pub goal: String,
+    #[serde(default)]
+    pub phases: Vec<ContextCheckpointPhase>,
     #[serde(default)]
     pub user_constraints: Vec<ContextCheckpointFact>,
     #[serde(default)]
@@ -751,6 +798,7 @@ impl ContextCheckpoint {
             coverage,
             provider_compatibility_hash: None,
             goal: summary.into(),
+            phases: Vec::new(),
             user_constraints: Vec::new(),
             decisions: Vec::new(),
             workspace_state: ContextCheckpointWorkspace::default(),
@@ -789,9 +837,27 @@ pub struct ContextProjection {
 #[serde(rename_all = "camelCase")]
 pub struct ContextCompactionMetrics {
     pub source: String,
+    /// Exact logical agent request before local compaction.
     pub input_tokens: usize,
+    /// Exact logical agent request after the checkpoint starts a new epoch.
+    #[serde(default)]
+    pub post_compaction_tokens: usize,
     pub checkpoint_tokens: usize,
+    #[serde(default)]
+    pub tokens_removed: usize,
+    /// Percentage of the original request remaining after compaction.
+    #[serde(default)]
+    pub remaining_percent: usize,
     pub token_reduction_percent: usize,
+    /// Provider-reported usage for the auxiliary compaction model call.
+    #[serde(default)]
+    pub provider_input_tokens: usize,
+    #[serde(default)]
+    pub provider_output_tokens: usize,
+    #[serde(default)]
+    pub cached_input_tokens: usize,
+    #[serde(default)]
+    pub cache_hit_percent: usize,
     pub latency_ms: u64,
     pub fact_retention_percent: usize,
     pub active_constraint_retention_percent: usize,
@@ -1341,6 +1407,9 @@ pub enum AgentEventPayload {
         #[serde(default, skip_serializing_if = "Value::is_null")]
         body: Value,
     },
+    ProviderFirstTokenReceived {
+        request_id: Uuid,
+    },
     ProviderResponseReceived {
         request_id: Uuid,
         round: usize,
@@ -1521,6 +1590,7 @@ impl AgentEventPayload {
             Self::ModelRequest { .. } => "model_request",
             Self::ProviderRequestSent { .. } => "provider_request_sent",
             Self::ProviderRequestRetried { .. } => "provider_request_retried",
+            Self::ProviderFirstTokenReceived { .. } => "provider_first_token_received",
             Self::ProviderResponseReceived { .. } => "provider_response_received",
             Self::ModelDelta { .. } => "model_delta",
             Self::ReasoningDelta { .. } => "reasoning_delta",
@@ -1668,6 +1738,21 @@ mod tests {
             json!({
                 "type": "reasoning_delta",
                 "text": "检查项目结构"
+            })
+        );
+    }
+
+    #[test]
+    fn provider_first_token_uses_the_request_scoped_event_contract() {
+        let payload = AgentEventPayload::ProviderFirstTokenReceived {
+            request_id: Uuid::nil(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(payload).unwrap(),
+            json!({
+                "type": "provider_first_token_received",
+                "request_id": Uuid::nil()
             })
         );
     }

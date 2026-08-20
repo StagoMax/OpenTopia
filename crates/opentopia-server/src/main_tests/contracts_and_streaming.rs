@@ -548,6 +548,25 @@ fn conversation_stream_projection_drops_hidden_reasoning() {
 }
 
 #[test]
+fn conversation_stream_projection_keeps_first_token_metrics() {
+    let request_id = Uuid::new_v4();
+    let event = AgentEvent::new(
+        Uuid::new_v4(),
+        Some(Uuid::new_v4()),
+        6,
+        AgentEventPayload::ProviderFirstTokenReceived { request_id },
+    );
+
+    let projected = project_conversation_event(event).expect("project first-token metric");
+    assert!(matches!(
+        projected.payload,
+        AgentEventPayload::ProviderFirstTokenReceived {
+            request_id: projected_request_id
+        } if projected_request_id == request_id
+    ));
+}
+
+#[test]
 fn stream_payload_batches_merge_only_adjacent_compatible_deltas() {
     let payloads = compact_stream_payload_batch(vec![
         AgentEventPayload::ModelDelta {

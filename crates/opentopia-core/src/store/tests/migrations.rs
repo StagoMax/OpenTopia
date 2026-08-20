@@ -170,7 +170,7 @@ fn migration_ledger_records_verified_baseline_and_current_version() {
     )
     .expect("read migration ledger");
 
-    assert_eq!(records.len(), 7);
+    assert_eq!(records.len(), 10);
     assert_eq!(records[0].0, LEGACY_DATABASE_SCHEMA_VERSION);
     assert_eq!(records[0].1, "legacy_baseline_v19");
     assert_eq!(records[1].0, 20);
@@ -183,8 +183,14 @@ fn migration_ledger_records_verified_baseline_and_current_version() {
     assert_eq!(records[4].1, "agent_turn_checkpoints");
     assert_eq!(records[5].0, 24);
     assert_eq!(records[5].1, "agent_activity_projection");
-    assert_eq!(records[6].0, CURRENT_DATABASE_SCHEMA_VERSION);
+    assert_eq!(records[6].0, 25);
     assert_eq!(records[6].1, "flow_human_tasks");
+    assert_eq!(records[7].0, 26);
+    assert_eq!(records[7].1, "connections_control_plane");
+    assert_eq!(records[8].0, 27);
+    assert_eq!(records[8].1, "workflow_deployments");
+    assert_eq!(records[9].0, CURRENT_DATABASE_SCHEMA_VERSION);
+    assert_eq!(records[9].1, "workflow_activity_receipts");
     assert!(records.iter().all(|record| record.2.starts_with("sha256:")));
     assert!(records.iter().all(|record| !record.3.is_empty()));
     assert!(records
@@ -202,14 +208,24 @@ fn migration_upgrades_pre_checkpoint_v22_database() {
     {
         let store = SqliteSessionStore::open(&path).expect("create current database");
         let conn = store.conn.lock().expect("lock current database");
+        restore_pre_v28_effect_journal(&conn);
         conn.execute_batch(
             r#"
+            DROP TABLE workflow_deployments;
+            DROP TABLE connection_capability_revisions;
+            DROP TABLE connections;
+            DROP TABLE integration_definitions;
+            DROP TABLE human_tasks;
             DROP TABLE agent_activity_state;
             DROP TABLE agent_turn_checkpoints;
             DROP INDEX idx_agent_events_activity_visible;
             DROP INDEX idx_agent_events_reasoning_tail;
             DROP INDEX idx_agent_events_tool_results;
             DROP INDEX idx_agent_events_model_round;
+            DELETE FROM schema_migrations WHERE version = 28;
+            DELETE FROM schema_migrations WHERE version = 27;
+            DELETE FROM schema_migrations WHERE version = 26;
+            DELETE FROM schema_migrations WHERE version = 25;
             DELETE FROM schema_migrations WHERE version = 24;
             DELETE FROM schema_migrations WHERE version = 23;
             PRAGMA user_version = 22;
@@ -233,6 +249,70 @@ fn migration_upgrades_pre_checkpoint_v22_database() {
         .expect("inspect checkpoint table");
     assert!(checkpoint_table_exists);
     drop(conn);
+    drop(migrated);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn v26_migrates_legacy_mcp_server_into_definition_and_connection() {
+    use crate::connection::{ConnectionAuthVerificationV1, ConnectionRuntimeBindingV1};
+
+    let path = temporary_db_path("migration-v26-legacy-mcp");
+    let server_id = {
+        let store = SqliteSessionStore::open(&path).expect("create current database");
+        let mut server = McpServerConfig::new("Legacy CRM".to_string(), "crm-mcp".to_string());
+        server.env_keys = vec!["CRM_TOKEN".to_string()];
+        let server = store
+            .insert_mcp_server(server)
+            .expect("insert legacy MCP server");
+        let conn = store.conn.lock().expect("lock current database");
+        restore_pre_v28_effect_journal(&conn);
+        conn.execute_batch(
+            r#"
+            DROP TABLE workflow_deployments;
+            DROP TABLE connection_capability_revisions;
+            DROP TABLE connections;
+            DROP TABLE integration_definitions;
+            DELETE FROM schema_migrations WHERE version = 28;
+            DELETE FROM schema_migrations WHERE version = 27;
+            DELETE FROM schema_migrations WHERE version = 26;
+            PRAGMA user_version = 25;
+            "#,
+        )
+        .expect("restore v25 schema with legacy MCP data");
+        server.server_id
+    };
+
+    let migrated = SqliteSessionStore::open(&path).expect("apply v26 migration");
+    let definition = migrated
+        .get_integration_definition(server_id)
+        .expect("load migrated definition")
+        .expect("definition exists");
+    let connection = migrated
+        .get_connection(server_id)
+        .expect("load migrated connection")
+        .expect("connection exists");
+
+    assert_eq!(definition.id, server_id);
+    assert_eq!(connection.id, server_id);
+    assert_eq!(connection.integration_definition_id, definition.id);
+    assert_eq!(
+        connection.runtime_binding,
+        ConnectionRuntimeBindingV1::McpServer { server_id }
+    );
+    assert_eq!(
+        connection.auth_context.verification,
+        ConnectionAuthVerificationV1::LegacyUnverified
+    );
+    assert_eq!(connection.active_capability_revision, None);
+    assert!(
+        migrated
+            .list_connection_capability_revisions(connection.id)
+            .expect("list migrated capability revisions")
+            .is_empty(),
+        "legacy mcp_server_tools are deliberately not promoted until an explicit tools/list refresh"
+    );
+
     drop(migrated);
     let _ = std::fs::remove_file(path);
 }

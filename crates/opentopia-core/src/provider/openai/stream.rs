@@ -25,23 +25,77 @@ pub(in crate::provider) struct OpenAiStreamAccumulator {
     reasoning: String,
     reasoning_present: bool,
     tool_calls: BTreeMap<usize, StreamingToolCall>,
+    tool_call_indices: HashMap<String, usize>,
+    next_tool_call_index: usize,
     usage: Option<ModelUsage>,
     finish_reason: Option<ModelFinishReason>,
 }
 
 impl OpenAiStreamAccumulator {
+    fn resolve_tool_call_index(&mut self, value: &Value, fallback_index: usize) -> usize {
+        if let Some(index) = value
+            .get("index")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+        {
+            self.next_tool_call_index = self.next_tool_call_index.max(index.saturating_add(1));
+            if let Some(id) = tool_call_id(value) {
+                self.tool_call_indices.insert(id.to_string(), index);
+            }
+            return index;
+        }
+
+        if let Some(id) = tool_call_id(value) {
+            if let Some(index) = self.tool_call_indices.get(id).copied().or_else(|| {
+                self.tool_calls
+                    .iter()
+                    .find_map(|(index, call)| (call.id == id).then_some(*index))
+            }) {
+                return index;
+            }
+
+            let index = match self.tool_calls.get(&fallback_index) {
+                Some(call) if !call.id.is_empty() && call.id != id => self.next_unused_tool_index(),
+                _ => fallback_index,
+            };
+            self.next_tool_call_index = self.next_tool_call_index.max(index.saturating_add(1));
+            self.tool_call_indices.insert(id.to_string(), index);
+            return index;
+        }
+
+        if self.tool_calls.contains_key(&fallback_index) {
+            return fallback_index;
+        }
+        if fallback_index == 0 && self.tool_calls.len() == 1 {
+            return *self
+                .tool_calls
+                .first_key_value()
+                .expect("one tool call exists")
+                .0;
+        }
+        self.next_tool_call_index = self
+            .next_tool_call_index
+            .max(fallback_index.saturating_add(1));
+        fallback_index
+    }
+
+    fn next_unused_tool_index(&mut self) -> usize {
+        let mut index = self.next_tool_call_index;
+        while self.tool_calls.contains_key(&index) {
+            index = index.saturating_add(1);
+        }
+        self.next_tool_call_index = index.saturating_add(1);
+        index
+    }
+
     pub(in crate::provider) fn apply_tool_call_deltas(
         &mut self,
         tool_calls: &[Value],
         on_delta: &mut ModelStreamCallback<'_>,
     ) -> anyhow::Result<()> {
         for (fallback_index, value) in tool_calls.iter().enumerate() {
-            let index = value
-                .get("index")
-                .and_then(Value::as_u64)
-                .map(|value| value as usize)
-                .unwrap_or(fallback_index);
-            let id_delta = value.get("id").and_then(Value::as_str);
+            let index = self.resolve_tool_call_index(value, fallback_index);
+            let id_delta = tool_call_id(value);
             let name_delta = value
                 .pointer("/function/name")
                 .or_else(|| value.get("name"))
@@ -50,31 +104,33 @@ impl OpenAiStreamAccumulator {
                 .pointer("/function/arguments")
                 .or_else(|| value.get("arguments"))
                 .or_else(|| value.get("input"));
-            let arguments_delta = match arguments {
+            let arguments_wire = match arguments {
                 Some(Value::String(arguments)) => arguments.clone(),
                 Some(Value::Null) | None => String::new(),
                 Some(arguments) => arguments.to_string(),
             };
             let call = self.tool_calls.entry(index).or_default();
             if let Some(id) = id_delta {
-                call.id.push_str(id);
+                merge_stream_scalar(&mut call.id, id);
+                self.tool_call_indices.insert(call.id.clone(), index);
             }
             if let Some(name) = name_delta {
-                call.name.push_str(name);
+                merge_stream_scalar(&mut call.name, name);
             }
-            match arguments {
+            let arguments_delta = match arguments {
                 // Standard OpenAI streams split a JSON string across deltas.
                 Some(Value::String(_)) => {
                     call.arguments_present = true;
                     call.argument_wire_types.insert("string");
-                    call.arguments.push_str(&arguments_delta);
+                    merge_stream_text(&mut call.arguments, &arguments_wire)
                 }
                 // Compatible gateways sometimes send the completed argument
                 // object directly. Treat that as a snapshot, not a fragment.
                 Some(Value::Null) => {
                     call.argument_wire_types.insert("null");
+                    String::new()
                 }
-                None => {}
+                None => String::new(),
                 Some(value) => {
                     call.arguments_present = true;
                     call.argument_wire_types.insert(match value {
@@ -84,9 +140,9 @@ impl OpenAiStreamAccumulator {
                         Value::Number(_) => "number",
                         _ => "other",
                     });
-                    call.arguments.clone_from(&arguments_delta);
+                    replace_stream_snapshot(&mut call.arguments, &arguments_wire)
                 }
-            }
+            };
             on_delta(ModelStreamDelta::ToolCall {
                 index,
                 id: id_delta.map(str::to_string),
@@ -99,18 +155,11 @@ impl OpenAiStreamAccumulator {
 
     pub(in crate::provider) fn apply_tool_call_snapshots(&mut self, tool_calls: &[Value]) {
         for (fallback_index, value) in tool_calls.iter().enumerate() {
-            let index = value
-                .get("index")
-                .and_then(Value::as_u64)
-                .map(|value| value as usize)
-                .unwrap_or(fallback_index);
+            let index = self.resolve_tool_call_index(value, fallback_index);
             let call = self.tool_calls.entry(index).or_default();
-            if let Some(id) = value
-                .get("id")
-                .or_else(|| value.get("call_id"))
-                .and_then(Value::as_str)
-            {
+            if let Some(id) = tool_call_id(value) {
                 call.id = id.to_string();
+                self.tool_call_indices.insert(call.id.clone(), index);
             }
             if let Some(name) = value
                 .pointer("/function/name")
@@ -221,7 +270,9 @@ impl OpenAiStreamAccumulator {
             .into_iter()
             .map(|(index, call)| {
                 if call.name.is_empty() {
-                    anyhow::bail!("streamed tool call {index} was missing a function name");
+                    anyhow::bail!(
+                        "provider tool-call protocol error: streamed tool call {index} was missing a function name"
+                    );
                 }
                 let id = if call.id.is_empty() {
                     format!("call_{index}")
@@ -272,6 +323,59 @@ impl OpenAiStreamAccumulator {
                 .unwrap_or(ModelFinishReason::StreamInterrupted),
         })
     }
+}
+
+fn tool_call_id(value: &Value) -> Option<&str> {
+    value
+        .get("id")
+        .or_else(|| value.get("call_id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+}
+
+/// Compatible gateways disagree on whether string fields are true deltas,
+/// repeated snapshots, or cumulative snapshots. Preserve standard deltas while
+/// making repeated/cumulative forms idempotent.
+fn merge_stream_scalar(current: &mut String, incoming: &str) {
+    if incoming.is_empty() || incoming == current {
+        return;
+    }
+    if current.is_empty() || incoming.starts_with(current.as_str()) {
+        current.clear();
+        current.push_str(incoming);
+    } else if !current.starts_with(incoming) {
+        current.push_str(incoming);
+    }
+}
+
+/// Merge an argument string and return only the newly observable suffix. This
+/// keeps callbacks delta-shaped even when an upstream relay repeats the full
+/// argument buffer on every event.
+fn merge_stream_text(current: &mut String, incoming: &str) -> String {
+    if incoming.is_empty() || incoming == current {
+        return String::new();
+    }
+    if incoming.starts_with(current.as_str()) {
+        let delta = incoming[current.len()..].to_string();
+        current.clear();
+        current.push_str(incoming);
+        return delta;
+    }
+    current.push_str(incoming);
+    incoming.to_string()
+}
+
+fn replace_stream_snapshot(current: &mut String, incoming: &str) -> String {
+    let delta = if incoming.starts_with(current.as_str()) {
+        incoming[current.len()..].to_string()
+    } else if incoming == current {
+        String::new()
+    } else {
+        incoming.to_string()
+    };
+    current.clear();
+    current.push_str(incoming);
+    delta
 }
 
 #[derive(Debug, Default)]
@@ -533,7 +637,9 @@ impl ResponsesStreamAccumulator {
             .into_iter()
             .map(|(index, call)| {
                 if call.name.is_empty() {
-                    anyhow::bail!("Responses tool call {index} was missing a function name");
+                    anyhow::bail!(
+                        "provider tool-call protocol error: Responses tool call {index} was missing a function name"
+                    );
                 }
                 let id = if call.id.is_empty() {
                     format!("call_{index}")

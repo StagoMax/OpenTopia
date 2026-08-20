@@ -183,6 +183,10 @@ fn token_estimate_breakdown_attributes_materialized_context_and_schemas() {
         input_schema: json!({"type": "object"}),
         ..Default::default()
     }];
+    request.final_output_json_schema = Some(json!({
+        "type": "object",
+        "properties": { "answer": { "type": "string" } }
+    }));
 
     let breakdown = request.token_estimate_breakdown();
 
@@ -196,12 +200,28 @@ fn token_estimate_breakdown_attributes_materialized_context_and_schemas() {
     );
     assert!(breakdown.developer_instructions > 0);
     assert!(breakdown.tool_schemas > 0);
+    assert!(breakdown.output_schema > 0);
+    let tool_surface = breakdown
+        .details
+        .iter()
+        .find(|detail| detail.id == "tool_schemas")
+        .expect("tool surface root");
+    assert_eq!(tool_surface.tokens, breakdown.tool_schemas);
+    assert!(tool_surface
+        .children
+        .iter()
+        .any(|detail| detail.id == "direct_tool_schemas"));
+    assert!(breakdown
+        .details
+        .iter()
+        .any(|detail| detail.id == "output_schema"));
     assert_eq!(
         breakdown.total,
         breakdown.base_instructions
             + breakdown.developer_instructions
             + breakdown.current_user
             + breakdown.tool_schemas
+            + breakdown.output_schema
     );
 }
 
@@ -249,6 +269,150 @@ fn token_estimate_breakdown_treats_images_as_typed_inputs() {
         "raw image bytes must not be estimated as a serialized integer array"
     );
     assert!(breakdown.tool_results < 20_000);
+}
+
+#[test]
+fn token_estimate_breakdown_separates_native_calls_assistant_replay_and_opaque_state() {
+    let mut request = model_request();
+    request.input.tool_calls = vec![ProviderToolCall {
+        id: "call_1".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "README.md" }),
+    }];
+    request.previous_response_items = vec![
+        json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "encrypted_content": "opaque"
+        }),
+        json!({
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "read_file",
+            "arguments": "{\"path\":\"README.md\"}"
+        }),
+        json!({
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": "I will inspect it." }]
+        }),
+    ];
+
+    let breakdown = request.token_estimate_breakdown();
+    let tool_calls = breakdown
+        .details
+        .iter()
+        .find(|detail| detail.id == "tool_calls")
+        .expect("tool-call root");
+    let provider_state = breakdown
+        .details
+        .iter()
+        .find(|detail| detail.id == "provider_state")
+        .expect("provider-state root");
+    let turn_assistant = breakdown
+        .details
+        .iter()
+        .find(|detail| detail.id == "turn_assistant_state")
+        .expect("turn-assistant root");
+
+    assert!(breakdown.tool_calls > 0);
+    assert!(tool_calls
+        .children
+        .iter()
+        .any(|detail| detail.id == "read_file"));
+    assert_eq!(provider_state.children.len(), 1);
+    assert_eq!(provider_state.children[0].id, "reasoning");
+    assert_eq!(turn_assistant.children.len(), 1);
+    assert_eq!(turn_assistant.children[0].id, "message");
+    assert_eq!(turn_assistant.tokens, breakdown.turn_assistant_state);
+    assert_eq!(provider_state.tokens, breakdown.provider_state);
+    for root in &breakdown.details {
+        assert_token_detail_tree_reconciles(root);
+    }
+}
+
+#[test]
+fn token_estimate_breakdown_splits_conversation_by_role_and_content_kind() {
+    let mut request = model_request();
+    request.input.conversation = vec![
+        ModelConversationMessage {
+            role: ModelConversationRole::User,
+            content: "question".to_string(),
+            content_parts: vec![ModelContentPart::json(json!({ "selected": true }))],
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+        },
+        ModelConversationMessage {
+            role: ModelConversationRole::Assistant,
+            content: "answer".to_string(),
+            content_parts: Vec::new(),
+            tool_calls: vec![ProviderToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "README.md" }),
+            }],
+            tool_results: Vec::new(),
+        },
+    ];
+
+    let breakdown = request.token_estimate_breakdown();
+    let conversation = breakdown
+        .details
+        .iter()
+        .find(|detail| detail.id == "conversation")
+        .expect("conversation root");
+    let user = conversation
+        .children
+        .iter()
+        .find(|detail| detail.id == "user_messages")
+        .expect("user history");
+    let assistant = conversation
+        .children
+        .iter()
+        .find(|detail| detail.id == "assistant_messages")
+        .expect("assistant history");
+
+    assert!(user
+        .children
+        .iter()
+        .any(|detail| detail.id == "message_text"));
+    assert!(user
+        .children
+        .iter()
+        .any(|detail| detail.id == "typed_content"));
+    assert!(assistant
+        .children
+        .iter()
+        .any(|detail| detail.id == "historical_tool_calls"));
+    assert_eq!(
+        conversation
+            .children
+            .iter()
+            .map(|detail| detail.tokens)
+            .sum::<usize>(),
+        breakdown.conversation
+    );
+    assert_token_detail_tree_reconciles(conversation);
+}
+
+fn assert_token_detail_tree_reconciles(detail: &TokenEstimateDetail) {
+    if detail.children.is_empty() {
+        return;
+    }
+    assert_eq!(
+        detail
+            .children
+            .iter()
+            .map(|child| child.tokens)
+            .sum::<usize>(),
+        detail.tokens,
+        "detail {} must equal the sum of its children",
+        detail.id
+    );
+    for child in &detail.children {
+        assert_token_detail_tree_reconciles(child);
+    }
 }
 
 #[test]
@@ -511,6 +675,36 @@ fn chat_provider_maps_final_output_schema_to_strict_json_schema() {
 }
 
 #[test]
+fn chat_provider_materializes_output_schema_when_native_schema_is_unsupported() {
+    let mut provider =
+        OpenAiCompatibleProvider::new("https://compatible.example/v1", "test-key", "model");
+    provider.output_protocol.json_schema = ProviderFeatureSupport::Unsupported;
+    let mut request = model_request();
+    request.final_output_json_schema = Some(json!({
+        "type": "object",
+        "properties": { "outcome": { "type": "string" } },
+        "required": ["outcome"]
+    }));
+
+    let prepared = provider.prepare(Uuid::nil(), request).unwrap();
+
+    assert!(prepared.body.get("response_format").is_none());
+    let fallback = prepared.body["messages"]
+        .as_array()
+        .and_then(|messages| messages.last())
+        .expect("schema fallback message");
+    assert_eq!(fallback["role"], "system");
+    assert!(fallback["content"]
+        .as_str()
+        .unwrap()
+        .contains("<output_json_schema>"));
+    assert!(fallback["content"]
+        .as_str()
+        .unwrap()
+        .contains("\"outcome\""));
+}
+
+#[test]
 fn responses_provider_maps_final_output_schema_to_text_format() {
     let mut provider =
         OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-test");
@@ -524,6 +718,28 @@ fn responses_provider_maps_final_output_schema_to_text_format() {
     let prepared = provider.prepare(Uuid::nil(), request).unwrap();
     assert_eq!(prepared.body["text"]["format"]["type"], "json_schema");
     assert_eq!(prepared.body["text"]["format"]["strict"], true);
+}
+
+#[test]
+fn responses_provider_materializes_output_schema_when_native_schema_is_unsupported() {
+    let mut provider =
+        OpenAiResponsesProvider::new("https://compatible.example/v1", "test-key", "model");
+    provider.output_protocol.json_schema = ProviderFeatureSupport::Unsupported;
+    let mut request = model_request();
+    request.final_output_json_schema = Some(json!({
+        "type": "object",
+        "properties": { "outcome": { "type": "string" } },
+        "required": ["outcome"]
+    }));
+
+    let prepared = provider.prepare(Uuid::nil(), request).unwrap();
+
+    assert!(prepared.body.get("text").is_none());
+    let instructions = prepared.body["instructions"]
+        .as_str()
+        .expect("schema fallback instructions");
+    assert!(instructions.contains("<output_json_schema>"));
+    assert!(instructions.contains("\"outcome\""));
 }
 
 #[test]
@@ -548,6 +764,36 @@ fn responses_provider_prioritizes_native_web_search_over_supplied_search_tools()
         .as_str()
         .unwrap()
         .contains(NATIVE_WEB_SEARCH_PRIORITY_INSTRUCTION));
+}
+
+#[test]
+fn compatible_responses_relay_does_not_assume_hosted_web_search() {
+    let provider = OpenAiResponsesProvider::new("https://relay.example/v1", "test-key", "glm-5.3");
+    let prepared = provider.prepare(Uuid::nil(), tool_request()).unwrap();
+
+    assert!(!provider.native_web_search);
+    assert!(!prepared.body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["type"] == "web_search"));
+}
+
+#[test]
+fn official_openai_adapters_keep_the_prompt_cache_key_extension() {
+    let mut request = model_request();
+    request.instructions.prompt_cache_key = Some("workspace-cache".to_string());
+
+    let chat = OpenAiCompatibleProvider::new("https://api.openai.com/v1", "test-key", "gpt-5.4")
+        .prepare(Uuid::nil(), request.clone())
+        .unwrap();
+    let responses =
+        OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-5.4")
+            .prepare(Uuid::nil(), request)
+            .unwrap();
+
+    assert_eq!(chat.body["prompt_cache_key"], "workspace-cache");
+    assert_eq!(responses.body["prompt_cache_key"], "workspace-cache");
 }
 
 #[test]

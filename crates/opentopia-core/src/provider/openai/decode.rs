@@ -88,7 +88,10 @@ pub(in crate::provider) fn parse_model_usage(value: Option<&Value>) -> Option<Mo
         .get("prompt_tokens_details")
         .or_else(|| usage.get("input_tokens_details"))
         .and_then(|details| details.get("cached_tokens"))
-        .and_then(Value::as_u64);
+        .and_then(Value::as_u64)
+        // DeepSeek's OpenAI-compatible Chat Completions response exposes the
+        // same measurement as a top-level usage field.
+        .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64));
     let cache_write_tokens = usage
         .get("prompt_tokens_details")
         .or_else(|| usage.get("input_tokens_details"))

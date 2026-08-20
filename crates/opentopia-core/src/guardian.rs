@@ -722,7 +722,7 @@ async fn run_review_model(
         })?;
         let prepared = gateway.prepare(Uuid::new_v4(), canonical)?;
         let response = gateway
-            .stream_prepared(prepared, &mut |_| Ok(()), &mut |_| Ok(()))
+            .stream_prepared(prepared, &mut |_| Ok(()), &mut |_| Ok(()), &mut |_| Ok(()))
             .await?;
         if let Some(response_usage) = response.usage.as_ref() {
             accumulate_model_usage(&mut usage, response_usage);

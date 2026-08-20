@@ -173,6 +173,62 @@ async fn full_access_destructive_shell_command_still_suspends_for_user_approval(
 }
 
 #[tokio::test]
+async fn unrestricted_destructive_shell_command_runs_without_approval() {
+    let workspace = test_workspace("unrestricted-destructive-no-approval");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ModelResponse {
+            text: String::new(),
+            tool_calls: vec![ProviderToolCall {
+                id: "call_unrestricted_destructive_shell".to_string(),
+                name: "shell".to_string(),
+                // The temporary workspace is not a repository, so this
+                // exercises authorization without changing user data.
+                arguments: json!({ "command": "git reset --hard HEAD~1" }),
+            }],
+            usage: None,
+            response_id: None,
+            provider_items: Vec::new(),
+            finish_reason: ModelFinishReason::Stop,
+        },
+        ModelResponse::text("Command attempted without an approval pause."),
+    ]));
+    let agent = AgentCore::new(provider, ToolRegistry::with_builtins())
+        .with_sandbox_config(LocalSandboxConfig::danger_full_access());
+
+    let result = agent
+        .run_turn_detailed_streaming(
+            AgentTurnInput {
+                thread_id: Uuid::new_v4(),
+                user_message_id: Uuid::new_v4(),
+                workspace_root: workspace.clone(),
+                content: "Run the destructive git command without approval.".to_string(),
+                user_content: Vec::new(),
+                context_summary: None,
+                conversation: Vec::new(),
+                permission_mode: PermissionMode::Unrestricted,
+                context_budget: None,
+                provider_cursor: None,
+                store: None,
+                cancellation: None,
+            },
+            None,
+        )
+        .await
+        .expect("unrestricted command should not suspend");
+
+    assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
+    assert!(!result
+        .events
+        .iter()
+        .any(|event| matches!(event, AgentEventPayload::ApprovalRequested { .. })));
+    assert!(result
+        .events
+        .iter()
+        .any(|event| matches!(event, AgentEventPayload::ToolCallStarted { .. })));
+    let _ = fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
 async fn approved_protected_metadata_write_uses_one_shot_path_grant() {
     let workspace = test_workspace("approved-path-grant");
     let provider = Arc::new(ScriptedProvider::new(vec![

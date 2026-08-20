@@ -213,7 +213,7 @@ async fn summarize_thread_title(
     })?;
     let response = timeout(
         Duration::from_secs(45),
-        gateway.stream_prepared(prepared, &mut |_| Ok(()), &mut |_| Ok(())),
+        gateway.stream_prepared(prepared, &mut |_| Ok(()), &mut |_| Ok(()), &mut |_| Ok(())),
     )
     .await
     .map_err(|_| ApiError::gateway_timeout("thread title generation timed out"))?

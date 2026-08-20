@@ -154,17 +154,14 @@ impl AgentTurnCoordinator {
             agent.disable_all_bundled_plugins();
         }
         crate::sync_thread_attachment_tool_preloads(&self.store, session.user_task_id, &mut agent);
-        if agent.capability_projection().allow_all_mcp_servers
-            || !agent.capability_projection().mcp_servers.is_empty()
-        {
-            crate::sync_thread_mcp_tools(
-                &self.store,
-                &self.mcp_host,
-                session.user_task_id,
-                &mut agent,
-            )
-            .await;
-        }
+        crate::thread_runtime::sync_runtime_connection_tools(
+            &self.store,
+            &self.mcp_host,
+            session.user_task_id,
+            &snapshot.connection_authority,
+            &mut agent,
+        )
+        .await?;
         if !snapshot.tools.is_empty() {
             agent.restrict_to_tools(snapshot.tools.iter().map(String::as_str));
         }
@@ -448,17 +445,14 @@ impl AgentTurnCoordinator {
             agent.disable_all_bundled_plugins();
         }
         crate::sync_thread_attachment_tool_preloads(&self.store, session.user_task_id, &mut agent);
-        if agent.capability_projection().allow_all_mcp_servers
-            || !agent.capability_projection().mcp_servers.is_empty()
-        {
-            crate::sync_thread_mcp_tools(
-                &self.store,
-                &self.mcp_host,
-                session.user_task_id,
-                &mut agent,
-            )
-            .await;
-        }
+        crate::thread_runtime::sync_runtime_connection_tools(
+            &self.store,
+            &self.mcp_host,
+            session.user_task_id,
+            &snapshot.connection_authority,
+            &mut agent,
+        )
+        .await?;
         if !snapshot.tools.is_empty() {
             agent.restrict_to_tools(snapshot.tools.iter().map(String::as_str));
         }

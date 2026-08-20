@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
+pub use crate::token_breakdown::{TokenEstimateBreakdown, TokenEstimateDetail};
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextItemKind {
@@ -246,88 +248,6 @@ impl<'de> Deserialize<'de> for ModelContextItem {
             sensitivity: wire.sensitivity,
             metadata: wire.metadata,
         })
-    }
-}
-
-/// Provider-neutral estimate of the logical input carried by one model request.
-///
-/// These values are intentionally kept separate from provider-reported usage:
-/// they explain which harness modules built the request, while provider usage is
-/// the billing/accounting authority after the request completes.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct TokenEstimateBreakdown {
-    pub base_instructions: usize,
-    pub developer_instructions: usize,
-    pub repository_instructions: usize,
-    pub runtime_context: usize,
-    pub skill_instructions: usize,
-    pub summaries: usize,
-    pub checkpoints: usize,
-    pub conversation: usize,
-    pub current_user: usize,
-    pub tool_calls: usize,
-    pub tool_results: usize,
-    /// Full schemas sent directly on this request (including output schemas).
-    pub direct_tool_schemas: usize,
-    /// Names/descriptions visible before a deferred tool is selected.
-    pub deferred_tool_catalog: usize,
-    /// Schemas appended by a provider Tool Search continuation.
-    pub loaded_tool_schemas: usize,
-    /// Sum of the three tool-surface buckets above. Counted in `total` once.
-    pub tool_schemas: usize,
-    pub provider_state: usize,
-    pub other: usize,
-    pub total: usize,
-}
-
-impl TokenEstimateBreakdown {
-    pub fn from_context_items(items: &[ModelContextItem]) -> Self {
-        let mut breakdown = Self::default();
-        for item in items {
-            breakdown.add_context_item(item.kind, item.token_estimate);
-        }
-        breakdown.recalculate_total();
-        breakdown
-    }
-
-    pub fn add_context_item(&mut self, kind: ContextItemKind, tokens: usize) {
-        let bucket = match kind {
-            ContextItemKind::BaseInstructions => &mut self.base_instructions,
-            ContextItemKind::DeveloperInstructions => &mut self.developer_instructions,
-            ContextItemKind::RepositoryInstructions => &mut self.repository_instructions,
-            ContextItemKind::Environment
-            | ContextItemKind::WorldState
-            | ContextItemKind::CapabilityCatalog => &mut self.runtime_context,
-            ContextItemKind::SkillInstructions | ContextItemKind::Skill => {
-                &mut self.skill_instructions
-            }
-            ContextItemKind::Summary => &mut self.summaries,
-            ContextItemKind::Checkpoint => &mut self.checkpoints,
-            ContextItemKind::Conversation => &mut self.conversation,
-            ContextItemKind::User => &mut self.current_user,
-            ContextItemKind::ToolCall => &mut self.tool_calls,
-            ContextItemKind::ToolResult => &mut self.tool_results,
-        };
-        *bucket = bucket.saturating_add(tokens);
-    }
-
-    pub fn recalculate_total(&mut self) {
-        self.total = self
-            .base_instructions
-            .saturating_add(self.developer_instructions)
-            .saturating_add(self.repository_instructions)
-            .saturating_add(self.runtime_context)
-            .saturating_add(self.skill_instructions)
-            .saturating_add(self.summaries)
-            .saturating_add(self.checkpoints)
-            .saturating_add(self.conversation)
-            .saturating_add(self.current_user)
-            .saturating_add(self.tool_calls)
-            .saturating_add(self.tool_results)
-            .saturating_add(self.tool_schemas)
-            .saturating_add(self.provider_state)
-            .saturating_add(self.other);
     }
 }
 
