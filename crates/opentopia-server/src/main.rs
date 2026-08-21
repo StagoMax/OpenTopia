@@ -110,7 +110,10 @@ mod terminal_api;
 mod thread_runtime;
 mod turn_changes;
 mod turns;
+mod workflow_automation_api;
+mod workflow_automation_service;
 mod workflow_compiler;
+mod workflow_delivery;
 mod workflow_deployments_api;
 mod workspace_api;
 

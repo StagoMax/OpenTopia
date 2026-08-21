@@ -26,6 +26,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub use crate::workflow_automation::{WorkflowOutputSpecV1, WorkflowTriggerSpecV1};
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowAgentSpecV1 {
@@ -273,18 +275,6 @@ impl CompiledWorkflowV1 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum WorkflowTriggerSpecV1 {
-    Manual,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum WorkflowOutputSpecV1 {
-    Inbox,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DeploymentSnapshotV1 {
@@ -300,11 +290,23 @@ pub struct DeploymentSnapshotV1 {
 
 impl DeploymentSnapshotV1 {
     pub fn new(compiled_workflow: CompiledWorkflowV1, created_by: impl Into<String>) -> Self {
+        Self::new_with_io(
+            compiled_workflow,
+            WorkflowTriggerSpecV1::Manual,
+            WorkflowOutputSpecV1::Inbox,
+            created_by,
+        )
+    }
+
+    pub fn new_with_io(
+        compiled_workflow: CompiledWorkflowV1,
+        trigger: WorkflowTriggerSpecV1,
+        output: WorkflowOutputSpecV1,
+        created_by: impl Into<String>,
+    ) -> Self {
         let created_by = created_by.into();
         let id = Uuid::new_v4();
         let created_at = Utc::now();
-        let trigger = WorkflowTriggerSpecV1::Manual;
-        let output = WorkflowOutputSpecV1::Inbox;
         let bytes = serde_json::to_vec(&(id, &compiled_workflow, &trigger, &output, &created_by))
             .unwrap_or_default();
         Self {
@@ -358,6 +360,24 @@ impl WorkflowDeploymentV1 {
         compiled_workflow: CompiledWorkflowV1,
         created_by: impl Into<String>,
     ) -> Result<Self, WorkflowCompileError> {
+        Self::new_with_io(
+            name,
+            environment,
+            compiled_workflow,
+            WorkflowTriggerSpecV1::Manual,
+            WorkflowOutputSpecV1::Inbox,
+            created_by,
+        )
+    }
+
+    pub fn new_with_io(
+        name: impl Into<String>,
+        environment: impl Into<String>,
+        compiled_workflow: CompiledWorkflowV1,
+        trigger: WorkflowTriggerSpecV1,
+        output: WorkflowOutputSpecV1,
+        created_by: impl Into<String>,
+    ) -> Result<Self, WorkflowCompileError> {
         let name = name.into().trim().to_string();
         let environment = environment.into().trim().to_string();
         let created_by = created_by.into().trim().to_string();
@@ -372,7 +392,12 @@ impl WorkflowDeploymentV1 {
             name,
             environment,
             status: WorkflowDeploymentStatusV1::Active,
-            snapshot: DeploymentSnapshotV1::new(compiled_workflow, created_by.clone()),
+            snapshot: DeploymentSnapshotV1::new_with_io(
+                compiled_workflow,
+                trigger,
+                output,
+                created_by.clone(),
+            ),
             created_at: now,
             updated_at: now,
             created_by,

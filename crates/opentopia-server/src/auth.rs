@@ -127,6 +127,9 @@ pub(crate) async fn authorize(
     request: Request,
     next: Next,
 ) -> Response {
+    if request.uri().path().starts_with("/hooks/workflows/") {
+        return next.run(request).await;
+    }
     match state.auth.request_allowed(request.headers()) {
         Ok(()) => {
             if !state
@@ -203,7 +206,7 @@ impl IntoResponse for AuthRejection {
     }
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     let mut difference = left.len() ^ right.len();
     let length = left.len().max(right.len());
     for index in 0..length {

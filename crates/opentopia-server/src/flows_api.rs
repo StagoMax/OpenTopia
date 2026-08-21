@@ -1,6 +1,6 @@
 use super::{
     current_settings, ensure_experience_mode_enabled, ensure_thread, load_bound_agent_context,
-    sync_thread_bundled_plugin_activations, ApiError, AppState,
+    provider_settings_for_thread, sync_thread_bundled_plugin_activations, ApiError, AppState,
 };
 use crate::connection_operation_runtime::connection_authority_for_context;
 use crate::thread_runtime::sync_runtime_connection_tools;
@@ -15,7 +15,7 @@ use opentopia_core::{
     ExperienceSurfaceProfile, FlowDefinitionV1, FlowDraftStatusV1, FlowDraftV1, FlowRunStatusV1,
     FlowRunV1, FlowSourceV1, FlowSpecV1, FlowStoreError, FlowTrialV1, HumanTaskActionV1,
     HumanTaskStoreError, RuntimeConnectionAuthorityV1, RuntimeSurface, SessionStore,
-    ToolInvocationContext, ToolStateStore, TurnStatus,
+    ToolInvocationContext, ToolStateStore, TurnStatus, WorkflowAgentSpecV1,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -55,6 +55,7 @@ pub(crate) fn router() -> Router<AppState> {
             "/api/threads/:thread_id/flow-runs",
             get(list_flow_runs).post(start_flow_run),
         )
+        .route("/api/flow-runs", get(list_all_flow_runs))
         .route("/api/flow-runs/:run_id", get(get_flow_run))
         .route("/api/flow-runs/:run_id/pause", post(pause_flow_run))
         .route("/api/flow-runs/:run_id/resume", post(resume_flow_run))
@@ -277,6 +278,19 @@ async fn list_flow_runs(
     ))
 }
 
+async fn list_all_flow_runs(
+    State(state): State<AppState>,
+    Query(query): Query<FlowRunListQuery>,
+) -> Result<Json<Vec<FlowRunV1>>, ApiError> {
+    ensure_enterprise(&state)?;
+    Ok(Json(
+        state
+            .store
+            .list_all_flow_runs(query.status, query.limit.unwrap_or(200))
+            .map_err(flow_error)?,
+    ))
+}
+
 async fn get_flow_run(
     State(state): State<AppState>,
     Path(run_id): Path<Uuid>,
@@ -296,6 +310,16 @@ async fn start_flow_run(
         .get_flow_definition(request.flow_id.trim(), request.version)
         .map_err(flow_error)?
         .ok_or_else(|| ApiError::not_found("published Flow not found"))?;
+    if definition
+        .graph
+        .nodes
+        .iter()
+        .any(|node| node.kind == opentopia_core::GraphNodeKindV1::Agent)
+    {
+        return Err(ApiError::bad_request(
+            "published Flows with Agent nodes must run through a WorkflowDeployment so every Agent identity is frozen",
+        ));
+    }
     let (capabilities, connection_authority) = flow_execution_authority(&state, &thread)?;
     let run = FlowRunV1::new_with_connection_authority(
         thread_id,
@@ -312,6 +336,7 @@ async fn start_flow_run(
         run.id,
         run.harness_capabilities(),
         run.harness_connection_authority(),
+        run.workflow_agent_specs(),
     )
     .await?;
     spawn_flow_run(run.id, context).map_err(ApiError::from)?;
@@ -415,6 +440,7 @@ async fn resume_flow_run(
             run.id,
             run.harness_capabilities(),
             run.harness_connection_authority(),
+            run.workflow_agent_specs(),
         )
         .await?;
         spawn_flow_run(run.id, context).map_err(ApiError::from)?;
@@ -480,8 +506,17 @@ pub(crate) async fn flow_runtime_context(
     parent_run_id: Uuid,
     capabilities: CapabilityProjection,
     connection_authority: RuntimeConnectionAuthorityV1,
+    workflow_agent_specs: Vec<WorkflowAgentSpecV1>,
 ) -> Result<ToolInvocationContext, ApiError> {
     let settings = current_settings(state);
+    let selected_provider =
+        provider_settings_for_thread(&settings, thread.model_selection.as_ref());
+    validate_workflow_agent_model_policies(
+        &workflow_agent_specs,
+        &selected_provider.id,
+        &selected_provider.model,
+    )
+    .map_err(ApiError::forbidden)?;
     let harness_capabilities = ExperienceSurfaceProfile::flow_harness_capabilities(
         thread.workspace_root.clone(),
         &capabilities,
@@ -543,6 +578,22 @@ pub(crate) async fn flow_runtime_context(
     context.fork_model_context = Some(model_context);
     context.flow_harness = Some(Arc::new(agent));
     Ok(context)
+}
+
+fn validate_workflow_agent_model_policies(
+    specs: &[WorkflowAgentSpecV1],
+    provider_id: &str,
+    model_id: &str,
+) -> Result<(), String> {
+    for spec in specs {
+        if !spec.model_policy.allows(provider_id, model_id) {
+            return Err(format!(
+                "Workflow Agent node {} template {}@{} does not allow model {}:{}",
+                spec.node_id, spec.template_id, spec.template_version, provider_id, model_id,
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn draft_view(state: &AppState, draft: FlowDraftV1) -> Result<FlowDraftView, ApiError> {
@@ -627,6 +678,12 @@ struct SearchFlowsQuery {
 #[derive(Debug, Deserialize)]
 struct FlowVersionQuery {
     version: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FlowRunListQuery {
+    status: Option<FlowRunStatusV1>,
+    limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]

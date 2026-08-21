@@ -107,7 +107,7 @@ impl CapabilityProjection {
             other.allow_all_mcp_servers,
             &other.mcp_servers,
         );
-        let (allow_all_workspace_roots, workspace_roots) = intersect_scope(
+        let (allow_all_workspace_roots, workspace_roots) = intersect_workspace_scope(
             self.allow_all_workspace_roots,
             &self.workspace_roots,
             other.allow_all_workspace_roots,
@@ -155,7 +155,7 @@ impl CapabilityProjection {
             other.allow_all_mcp_servers,
             &other.mcp_servers,
         );
-        let (allow_all_workspace_roots, workspace_roots) = union_scope(
+        let (allow_all_workspace_roots, workspace_roots) = union_workspace_scope(
             self.allow_all_workspace_roots,
             &self.workspace_roots,
             other.allow_all_workspace_roots,
@@ -192,8 +192,150 @@ impl CapabilityProjection {
     }
 
     pub fn allows_workspace_root(&self, root: &Path) -> bool {
-        self.allow_all_workspace_roots || self.workspace_roots.contains(root)
+        self.allow_all_workspace_roots
+            || self
+                .workspace_roots
+                .iter()
+                .any(|allowed| workspace_roots_equal(allowed, root))
     }
+
+    /// Returns true when every capability in this projection is permitted by
+    /// `ceiling`. Workspace paths use canonical identity rather than their
+    /// serialized spelling, which is essential on Windows where the same path
+    /// may appear with or without a verbatim (`\\?\`) prefix.
+    pub fn is_subset_of(&self, ceiling: &Self) -> bool {
+        scope_is_subset(
+            self.allow_all_tools,
+            &self.tools,
+            ceiling.allow_all_tools,
+            &ceiling.tools,
+        ) && scope_is_subset(
+            self.allow_all_skills,
+            &self.skills,
+            ceiling.allow_all_skills,
+            &ceiling.skills,
+        ) && scope_is_subset(
+            self.allow_all_plugins,
+            &self.plugins,
+            ceiling.allow_all_plugins,
+            &ceiling.plugins,
+        ) && scope_is_subset(
+            self.allow_all_mcp_servers,
+            &self.mcp_servers,
+            ceiling.allow_all_mcp_servers,
+            &ceiling.mcp_servers,
+        ) && workspace_scope_is_subset(
+            self.allow_all_workspace_roots,
+            &self.workspace_roots,
+            ceiling.allow_all_workspace_roots,
+            &ceiling.workspace_roots,
+        )
+    }
+}
+
+fn scope_is_subset<T: Ord>(
+    requested_all: bool,
+    requested: &BTreeSet<T>,
+    ceiling_all: bool,
+    ceiling: &BTreeSet<T>,
+) -> bool {
+    if requested_all {
+        ceiling_all
+    } else {
+        ceiling_all || requested.is_subset(ceiling)
+    }
+}
+
+fn workspace_scope_is_subset(
+    requested_all: bool,
+    requested: &BTreeSet<PathBuf>,
+    ceiling_all: bool,
+    ceiling: &BTreeSet<PathBuf>,
+) -> bool {
+    if requested_all {
+        ceiling_all
+    } else {
+        ceiling_all
+            || requested.iter().all(|root| {
+                ceiling
+                    .iter()
+                    .any(|allowed| workspace_roots_equal(root, allowed))
+            })
+    }
+}
+
+fn workspace_root_identity(path: &Path) -> PathBuf {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(windows)]
+    {
+        let value = path.to_string_lossy().replace('/', "\\");
+        let value = if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{rest}")
+        } else if let Some(rest) = value.strip_prefix(r"\\?\") {
+            rest.to_string()
+        } else if let Some(rest) = value.strip_prefix(r"\??\") {
+            rest.to_string()
+        } else {
+            value
+        };
+        return PathBuf::from(value.to_lowercase());
+    }
+    #[cfg(not(windows))]
+    path
+}
+
+fn workspace_roots_equal(left: &Path, right: &Path) -> bool {
+    workspace_root_identity(left) == workspace_root_identity(right)
+}
+
+fn intersect_workspace_scope(
+    left_all: bool,
+    left: &BTreeSet<PathBuf>,
+    right_all: bool,
+    right: &BTreeSet<PathBuf>,
+) -> (bool, BTreeSet<PathBuf>) {
+    match (left_all, right_all) {
+        (true, true) => (true, BTreeSet::new()),
+        (true, false) => (false, normalized_workspace_roots(right)),
+        (false, true) => (false, normalized_workspace_roots(left)),
+        (false, false) => (
+            false,
+            left.iter()
+                .filter(|candidate| {
+                    right
+                        .iter()
+                        .any(|other| workspace_roots_equal(candidate, other))
+                })
+                .map(|path| workspace_root_identity(path))
+                .collect(),
+        ),
+    }
+}
+
+fn union_workspace_scope(
+    left_all: bool,
+    left: &BTreeSet<PathBuf>,
+    right_all: bool,
+    right: &BTreeSet<PathBuf>,
+) -> (bool, BTreeSet<PathBuf>) {
+    if left_all || right_all {
+        (true, BTreeSet::new())
+    } else {
+        (
+            false,
+            left.iter()
+                .chain(right.iter())
+                .map(|path| workspace_root_identity(path))
+                .collect(),
+        )
+    }
+}
+
+fn normalized_workspace_roots(roots: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
+    roots
+        .iter()
+        .map(|path| workspace_root_identity(path))
+        .collect()
 }
 
 fn intersect_scope<T: Clone + Ord>(
@@ -1140,11 +1282,10 @@ impl AgentInstanceV1 {
                 &template.spec.capabilities,
                 resolved_connection_bindings,
             ));
-        if self
+        if !self
             .execution_context
             .capabilities
-            .intersect(&template_boundary)
-            != self.execution_context.capabilities
+            .is_subset_of(&template_boundary)
         {
             return Err(AgentTemplateError::InstanceCapabilityViolation);
         }
@@ -1220,11 +1361,10 @@ impl AgentInstanceV1 {
                 &template.spec.capabilities,
                 &expected_operations,
             ));
-        if self
+        if !self
             .execution_context
             .capabilities
-            .intersect(&effective_template_boundary)
-            != self.execution_context.capabilities
+            .is_subset_of(&effective_template_boundary)
         {
             return Err(AgentTemplateError::InstanceCapabilityViolation);
         }
@@ -1537,6 +1677,17 @@ fn validate_value_against_schema(
     Ok(())
 }
 
+/// Validates a runtime value against the supported JSON Schema subset used by
+/// Agent and Workflow contracts. This keeps state, output, and external
+/// delivery boundaries on one validator instead of drifting into adapters.
+pub fn validate_json_schema_value(
+    schema: &Value,
+    value: &Value,
+    path: &str,
+) -> Result<(), AgentTemplateError> {
+    validate_value_against_schema(schema, value, path)
+}
+
 fn value_matches_type(value: &Value, expected: &str) -> bool {
     match expected {
         "null" => value.is_null(),
@@ -1590,12 +1741,12 @@ fn diff_projection(
     let previous_roots = previous
         .workspace_roots
         .iter()
-        .map(|path| path.display().to_string())
+        .map(|path| workspace_root_identity(path).display().to_string())
         .collect::<BTreeSet<_>>();
     let next_roots = next
         .workspace_roots
         .iter()
-        .map(|path| path.display().to_string())
+        .map(|path| workspace_root_identity(path).display().to_string())
         .collect::<BTreeSet<_>>();
     diff_scope(
         "workspace_root",
@@ -1635,7 +1786,7 @@ fn projection_additions(projection: &CapabilityProjection, changes: &mut Vec<Cap
     let roots = projection
         .workspace_roots
         .iter()
-        .map(|path| path.display().to_string())
+        .map(|path| workspace_root_identity(path).display().to_string())
         .collect::<BTreeSet<_>>();
     add_scope(
         "workspace_root",
@@ -1911,6 +2062,27 @@ mod tests {
         assert!(effective.allows_tool("read_file"));
         assert!(!effective.allows_tool("shell"));
         assert!(!effective.allows_tool("write_file"));
+    }
+
+    #[test]
+    fn workspace_projection_uses_canonical_path_identity() {
+        let canonical = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let lexical = std::env::current_dir().unwrap().join(".");
+        let mut left = CapabilityProjection::deny_all();
+        left.workspace_roots.insert(lexical.clone());
+        let mut right = CapabilityProjection::deny_all();
+        right.workspace_roots.insert(canonical.clone());
+
+        let intersection = left.intersect(&right);
+        let union = left.union(&right);
+
+        assert!(left.allows_workspace_root(&canonical));
+        assert!(right.allows_workspace_root(&lexical));
+        assert!(intersection.allows_workspace_root(&canonical));
+        assert!(union.allows_workspace_root(&lexical));
+        assert_eq!(union.workspace_roots.len(), 1);
+        assert!(left.is_subset_of(&right));
+        assert!(right.is_subset_of(&left));
     }
 
     #[test]

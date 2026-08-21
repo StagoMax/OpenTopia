@@ -80,6 +80,93 @@ fn workflow_deployment_store_is_queryable_and_cas_protected() {
         vec![inserted.clone()]
     );
 
+    let release = crate::WorkflowReleaseV1::new(
+        "deployable-flow-production",
+        "production",
+        thread.id,
+        &inserted,
+        crate::WorkflowTriggerSpecV1::Webhook {
+            trigger_id: Uuid::new_v4(),
+            token_ref: "env:WORKFLOW_TEST_TOKEN".to_string(),
+        },
+        "release-manager",
+    )
+    .expect("release");
+    store
+        .insert_workflow_release(&release)
+        .expect("insert release");
+    assert_eq!(
+        store
+            .get_workflow_release_by_trigger(release.trigger.trigger_id().expect("trigger id"))
+            .expect("load release"),
+        Some(release.clone())
+    );
+
+    let mut invocation = crate::WorkflowTriggerInvocationV1::accepted(
+        &release,
+        "request-1",
+        inserted.id,
+        &json!({"orderId": 42}),
+    )
+    .expect("invocation");
+    store
+        .insert_workflow_trigger_invocation(&invocation)
+        .expect("insert invocation");
+    let run = crate::FlowRunV1::new_from_deployment(thread.id, &inserted, json!({}))
+        .expect("deployed run");
+    store.insert_flow_run(&run).expect("insert deployed run");
+    invocation.flow_run_id = Some(run.id);
+    invocation.status = crate::WorkflowTriggerInvocationStatusV1::Started;
+    invocation.updated_at = Utc::now();
+    store
+        .update_workflow_trigger_invocation(&invocation)
+        .expect("start invocation");
+
+    let mut receipt = crate::WorkflowDeliveryReceiptV1::pending(run.id, inserted.id, "inbox");
+    store
+        .insert_workflow_delivery_receipt(&receipt)
+        .expect("insert receipt");
+    let receipt_revision = receipt.revision;
+    receipt.begin_attempt();
+    receipt.mark_delivered(None, Some(json!({"stored": true})));
+    store
+        .update_workflow_delivery_receipt(&receipt, receipt_revision)
+        .expect("complete receipt");
+    let task = crate::HumanTaskV1::delivery_handoff(
+        thread.id,
+        receipt.id,
+        "Confirm delivery",
+        "Confirm downstream processing",
+        None,
+        json!({}),
+    );
+    store
+        .insert_human_task(&task)
+        .expect("insert non-Flow HumanTask");
+    assert_eq!(
+        store.get_human_task(task.id).expect("load task"),
+        Some(task)
+    );
+    let evaluation = crate::WorkflowEvaluationV1::new(
+        run.id,
+        inserted.id,
+        "fixture-evaluator",
+        0.9,
+        true,
+        vec!["quality".to_string()],
+        None,
+    )
+    .expect("evaluation");
+    store
+        .insert_workflow_evaluation(&evaluation)
+        .expect("insert evaluation");
+    assert_eq!(
+        store
+            .list_workflow_evaluations(Some(inserted.id))
+            .expect("list evaluations"),
+        vec![evaluation]
+    );
+
     let mut disabled = inserted.clone();
     disabled.disable();
     let updated = store

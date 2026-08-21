@@ -541,6 +541,24 @@ impl AgentCore {
         self.capability_projection = self.capability_projection.intersect(projection);
     }
 
+    /// Keeps the prepared execution authority and the mutable agent catalog on
+    /// the same attenuated projection. Flow nodes clone a prepared harness and
+    /// then narrow it to their own compiled Agent identity; changing only the
+    /// catalog would leave the clone in an invalid (and unsafe) split state.
+    fn align_execution_authority_with_capabilities(&mut self) -> anyhow::Result<()> {
+        let Some(authority) = self.execution_authority.as_ref() else {
+            anyhow::bail!("AgentCore must be prepared before attenuating execution authority")
+        };
+        anyhow::ensure!(
+            self.capability_projection
+                .is_subset_of(authority.capability_projection()),
+            "Agent capability attenuation cannot widen its execution authority"
+        );
+        self.execution_authority =
+            Some(authority.with_projection(self.capability_projection.clone())?);
+        Ok(())
+    }
+
     fn retain_external_tools_for_projection(&mut self) {
         let allowed_names = self
             .tool_host
@@ -1547,14 +1565,14 @@ impl AgentCore {
         );
         anyhow::ensure!(
             self.capability_projection == *authority.capability_projection()
-                && request.effective_capabilities
-                    == request
-                        .effective_capabilities
-                        .intersect(authority.capability_projection()),
+                && request
+                    .effective_capabilities
+                    .is_subset_of(authority.capability_projection()),
             "Flow node capabilities exceed the Agent execution authority"
         );
         let mut agent = self.clone();
         agent.restrict_capabilities(&request.effective_capabilities);
+        agent.align_execution_authority_with_capabilities()?;
         agent.retain_external_tools_for_context(&request.context)?;
         agent.retain_external_tools_for_projection();
         agent.set_tool_call_budget(request.remaining_tool_calls);
@@ -1646,57 +1664,28 @@ impl AgentCore {
                 .and_then(Value::as_u64)
                 .and_then(|value| u32::try_from(value).ok())
                 .context("Flow Agent node requires a valid templateVersion")?;
-            if let Some(spec) = request.workflow_agent_spec.as_ref() {
-                anyhow::ensure!(
-                    spec.node_id == request.node.id
-                        && spec.template_id == reference
-                        && spec.template_version == template_version,
-                    "Workflow Agent spec does not match its DeploymentSnapshot graph node"
-                );
-                agent.restrict_capabilities(&spec.capabilities);
-                agent.retain_external_tools_for_projection();
-                agent.append_additional_developer_instructions(&format!(
-                    "[DeploymentSnapshot Agent identity]\nTemplate: {}@{}\nTemplate content hash: {}\nName: {}\nOwner: {}\nRisk class: {:?}\nInstructions:\n{}",
-                    spec.template_id,
-                    spec.template_version,
-                    spec.template_content_hash,
-                    spec.name,
-                    spec.owner,
-                    spec.risk_class,
-                    spec.instructions,
-                ));
-            } else {
-                // Compatibility path for unpublished trial Runs. Production
-                // deployments never re-resolve Agent identity at execution time.
-                let store = request
-                    .context
-                    .state
-                    .as_ref()
-                    .context("Flow Agent node requires a persistent SessionStore")?;
-                let store = store.flow_session_store();
-                let template = store
-                    .get_published_agent_template_version(reference, template_version)?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "published Agent template not found: {reference}@{template_version}"
-                        )
-                    })?;
-                anyhow::ensure!(
-                    template.spec.connection_bindings.is_empty(),
-                    "Flow Agent node Connection bindings require a compiled DeploymentSnapshot"
-                );
-                agent.restrict_capabilities(&template.spec.capabilities);
-                agent.retain_external_tools_for_projection();
-                agent.append_additional_developer_instructions(&format!(
-                    "[Pinned enterprise Agent identity]\nTemplate: {}@{}\nName: {}\nOwner: {}\nRisk class: {:?}\nInstructions:\n{}",
-                    template.template_id,
-                    template.version,
-                    template.name,
-                    template.owner,
-                    template.spec.risk_class,
-                    template.spec.instructions,
-                ));
-            }
+            let spec = request.workflow_agent_spec.as_ref().context(
+                "Flow Agent nodes require a compiled WorkflowAgentSpec; deploy the published Workflow before running it",
+            )?;
+            anyhow::ensure!(
+                spec.node_id == request.node.id
+                    && spec.template_id == reference
+                    && spec.template_version == template_version,
+                "Workflow Agent spec does not match its DeploymentSnapshot graph node"
+            );
+            agent.restrict_capabilities(&spec.capabilities);
+            agent.align_execution_authority_with_capabilities()?;
+            agent.retain_external_tools_for_projection();
+            agent.append_additional_developer_instructions(&format!(
+                "[DeploymentSnapshot Agent identity]\nTemplate: {}@{}\nTemplate content hash: {}\nName: {}\nOwner: {}\nRisk class: {:?}\nInstructions:\n{}",
+                spec.template_id,
+                spec.template_version,
+                spec.template_content_hash,
+                spec.name,
+                spec.owner,
+                spec.risk_class,
+                spec.instructions,
+            ));
         }
         let node_contract = match request.node.kind {
             GraphNodeKindV1::Agent => format!(

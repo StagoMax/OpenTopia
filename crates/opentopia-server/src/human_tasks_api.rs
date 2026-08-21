@@ -1,12 +1,14 @@
 use super::{flows_api, ApiError, AppState};
+use crate::workflow_delivery::deliver_run_output;
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use opentopia_core::{
     prepare_flow_interrupt_resume, prepare_flow_resume, resolve_flow_approval, spawn_flow_run,
-    FlowRunStatusV1, HumanTaskActionV1, HumanTaskStatusV1, HumanTaskStoreError, HumanTaskTypeV1,
-    HumanTaskV1, SessionStore,
+    FlowRunStatusV1, HumanTaskActionV1, HumanTaskSourceKindV1, HumanTaskStatusV1,
+    HumanTaskStoreError, HumanTaskTypeV1, HumanTaskV1, SessionStore, WorkflowDeliveryReceiptV1,
+    WorkflowDeliveryStatusV1,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -40,9 +42,9 @@ async fn list_human_tasks(
         .into_iter()
         .filter(|task| query.kind.map_or(true, |kind| task.task_type == kind))
         .filter(|task| {
-            query
-                .flow_run_id
-                .map_or(true, |flow_run_id| task.source_id == flow_run_id)
+            query.flow_run_id.map_or(true, |flow_run_id| {
+                task.source_kind == HumanTaskSourceKindV1::FlowRun && task.source_id == flow_run_id
+            })
         })
         .collect();
     Ok(Json(tasks))
@@ -78,12 +80,30 @@ async fn resolve_human_task(
         });
     if task.status != HumanTaskStatusV1::Pending {
         if resolution_matches(&task, request.action, &idempotency_key) {
-            let run = state
-                .store
-                .get_flow_run(task.source_id)
-                .map_err(human_task_error)?
-                .ok_or_else(|| ApiError::not_found("Flow run not found"))?;
-            return Ok(Json(ResolveHumanTaskResponse { task, run }));
+            let (run, delivery_receipt) = match task.source_kind {
+                HumanTaskSourceKindV1::FlowRun => (
+                    Some(
+                        state
+                            .store
+                            .get_flow_run(task.source_id)
+                            .map_err(human_task_error)?
+                            .ok_or_else(|| ApiError::not_found("Flow run not found"))?,
+                    ),
+                    None,
+                ),
+                HumanTaskSourceKindV1::DeliveryReceipt => (
+                    None,
+                    state
+                        .store
+                        .get_workflow_delivery_receipt(task.source_id)
+                        .map_err(human_task_error)?,
+                ),
+            };
+            return Ok(Json(ResolveHumanTaskResponse {
+                task,
+                run,
+                delivery_receipt,
+            }));
         }
         return Err(ApiError::conflict("Human task is no longer pending"));
     }
@@ -92,6 +112,9 @@ async fn resolve_human_task(
             "Human task revision conflict; current revision is {}",
             task.revision
         )));
+    }
+    if task.source_kind == HumanTaskSourceKindV1::DeliveryReceipt {
+        return resolve_delivery_human_task(state, task, request, idempotency_key).await;
     }
     let mut run = state
         .store
@@ -285,7 +308,8 @@ async fn resolve_human_task(
                 .ok_or_else(|| ApiError::not_found("Flow run not found"))?;
             return Ok(Json(ResolveHumanTaskResponse {
                 task: current,
-                run: current_run,
+                run: Some(current_run),
+                delivery_receipt: None,
             }));
         }
         Err(error) => return Err(human_task_error(error)),
@@ -300,11 +324,126 @@ async fn resolve_human_task(
             run.id,
             run.harness_capabilities(),
             run.harness_connection_authority(),
+            run.workflow_agent_specs(),
         )
         .await?;
         spawn_flow_run(run.id, context).map_err(ApiError::from)?;
     }
-    Ok(Json(ResolveHumanTaskResponse { task, run }))
+    let delivery_receipt = if run.status == FlowRunStatusV1::Succeeded {
+        Some(
+            deliver_run_output(&state, &run, false)
+                .await
+                .map_err(|error| ApiError::bad_gateway(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    Ok(Json(ResolveHumanTaskResponse {
+        task,
+        run: Some(run),
+        delivery_receipt,
+    }))
+}
+
+async fn resolve_delivery_human_task(
+    state: AppState,
+    mut task: HumanTaskV1,
+    request: ResolveHumanTaskRequest,
+    idempotency_key: String,
+) -> Result<Json<ResolveHumanTaskResponse>, ApiError> {
+    let actor = "local_operator";
+    if task
+        .claimed_by
+        .as_deref()
+        .is_some_and(|claimed_by| claimed_by != actor)
+    {
+        return Err(ApiError::conflict(format!(
+            "Human task is claimed by {}",
+            task.claimed_by.as_deref().unwrap_or_default()
+        )));
+    }
+    let mut receipt = state
+        .store
+        .get_workflow_delivery_receipt(task.source_id)
+        .map_err(human_task_error)?
+        .ok_or_else(|| ApiError::not_found("DeliveryReceipt not found"))?;
+    match (task.task_type, request.action) {
+        (HumanTaskTypeV1::Recovery, HumanTaskActionV1::Retry) => {
+            let run = state
+                .store
+                .get_flow_run(receipt.run_id)
+                .map_err(human_task_error)?
+                .ok_or_else(|| ApiError::not_found("Flow run not found"))?;
+            receipt = deliver_run_output(&state, &run, true)
+                .await
+                .map_err(|error| ApiError::bad_gateway(error.to_string()))?;
+            if receipt.status == WorkflowDeliveryStatusV1::Failed {
+                return Err(ApiError::bad_gateway(
+                    receipt
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "Workflow output delivery failed".to_string()),
+                ));
+            }
+        }
+        (HumanTaskTypeV1::Recovery, HumanTaskActionV1::Cancel)
+        | (HumanTaskTypeV1::Manual, HumanTaskActionV1::Cancel) => {
+            let expected = receipt.revision;
+            receipt.mark_cancelled();
+            receipt = state
+                .store
+                .update_workflow_delivery_receipt(&receipt, expected)
+                .map_err(human_task_error)?;
+        }
+        (HumanTaskTypeV1::Manual, HumanTaskActionV1::Acknowledge) => {
+            let expected = receipt.revision;
+            receipt.mark_delivered(
+                None,
+                Some(serde_json::json!({
+                    "acknowledgedBy": actor,
+                    "humanTaskId": task.id,
+                })),
+            );
+            receipt = state
+                .store
+                .update_workflow_delivery_receipt(&receipt, expected)
+                .map_err(human_task_error)?;
+        }
+        (HumanTaskTypeV1::Recovery, _) => {
+            return Err(ApiError::bad_request(
+                "delivery recovery tasks only accept retry or cancel",
+            ))
+        }
+        (HumanTaskTypeV1::Manual, _) => {
+            return Err(ApiError::bad_request(
+                "delivery handoff tasks only accept acknowledge or cancel",
+            ))
+        }
+        _ => {
+            return Err(ApiError::bad_request(
+                "unsupported DeliveryReceipt task kind",
+            ))
+        }
+    }
+
+    task.resolve_with_command(
+        request.action,
+        request.note.as_deref(),
+        actor,
+        Some(Uuid::new_v5(&task.id, idempotency_key.as_bytes())),
+        Some(&idempotency_key),
+        request.response,
+    )
+    .map_err(ApiError::from)?;
+    task = state
+        .store
+        .update_human_task(&task, request.expected_revision)
+        .map_err(human_task_error)?;
+    Ok(Json(ResolveHumanTaskResponse {
+        task,
+        run: None,
+        delivery_receipt: Some(receipt),
+    }))
 }
 
 async fn claim_human_task(
@@ -422,5 +561,8 @@ struct AssignHumanTaskRequest {
 #[serde(rename_all = "camelCase")]
 pub(super) struct ResolveHumanTaskResponse {
     task: HumanTaskV1,
-    run: opentopia_core::FlowRunV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run: Option<opentopia_core::FlowRunV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery_receipt: Option<WorkflowDeliveryReceiptV1>,
 }

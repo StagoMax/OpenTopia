@@ -272,10 +272,9 @@ impl FlowNodeHarness for PreparedAgentRun {
             "Flow node sandbox does not match its prepared Agent run"
         );
         anyhow::ensure!(
-            request.effective_capabilities
-                == request
-                    .effective_capabilities
-                    .intersect(self.authority.capability_projection()),
+            request
+                .effective_capabilities
+                .is_subset_of(self.authority.capability_projection()),
             "Flow node capabilities exceed its prepared Agent run"
         );
         self.agent.execute_prepared_flow_node(request).await
@@ -292,10 +291,9 @@ impl FlowNodeHarness for PreparedAgentRun {
             "Flow resume permission mode does not match its prepared Agent run"
         );
         anyhow::ensure!(
-            request.effective_capabilities
-                == request
-                    .effective_capabilities
-                    .intersect(self.authority.capability_projection()),
+            request
+                .effective_capabilities
+                .is_subset_of(self.authority.capability_projection()),
             "Flow resume capabilities exceed its prepared Agent run"
         );
         anyhow::ensure!(
@@ -437,5 +435,34 @@ mod tests {
         assert!(draft.flow_harness_override.is_none());
         let prepared = draft.finalize().unwrap();
         assert!(prepared.agent.flow_harness_override.is_some());
+    }
+
+    #[test]
+    fn prepared_flow_clone_attenuates_catalog_and_authority_together() {
+        let agent = AgentCore::default();
+        let draft = agent
+            .begin_run(AgentRunConfig::using_current_provider(
+                authority(),
+                AgentRunIdentity::root(Uuid::new_v4(), 1),
+            ))
+            .unwrap();
+        let prepared = draft.finalize().unwrap();
+        let mut flow_agent = prepared.agent.clone();
+        let narrowed = CapabilityProjection::only_tools(["library_search"]);
+
+        flow_agent.restrict_capabilities(&narrowed);
+        flow_agent
+            .align_execution_authority_with_capabilities()
+            .unwrap();
+
+        assert_eq!(flow_agent.capability_projection, narrowed);
+        assert_eq!(
+            flow_agent
+                .execution_authority
+                .as_ref()
+                .unwrap()
+                .capability_projection(),
+            &narrowed
+        );
     }
 }

@@ -38,7 +38,10 @@ pub(crate) fn router() -> Router<AppState> {
             "/api/agent-templates/:template_id/versions/:version/connection-access",
             get(get_agent_template_connection_access),
         )
-        .route("/api/agent-instances", post(create_agent_instance))
+        .route(
+            "/api/agent-instances",
+            get(list_agent_instances).post(create_agent_instance),
+        )
         .route(
             "/api/agent-instances/:instance_id",
             get(get_agent_instance).patch(patch_agent_instance),
@@ -275,6 +278,23 @@ async fn create_agent_instance(
             .map_err(control_error)?;
     }
     Ok(Json(CreateAgentInstanceResponse { instance, bound }))
+}
+
+async fn list_agent_instances(
+    State(state): State<AppState>,
+    Query(query): Query<AgentInstanceListQuery>,
+) -> Result<Json<Vec<AgentInstanceV1>>, ApiError> {
+    ensure_enterprise(&state)?;
+    Ok(Json(
+        state
+            .store
+            .list_agent_instances(
+                query.template_id.as_deref(),
+                query.status,
+                query.limit.unwrap_or(200),
+            )
+            .map_err(control_error)?,
+    ))
 }
 
 fn require_valid_connection_access(
@@ -541,6 +561,14 @@ struct CreateAgentInstanceRequest {
     initial_state: Value,
     #[serde(default = "default_true")]
     bind_to_thread: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentInstanceListQuery {
+    template_id: Option<String>,
+    status: Option<AgentInstanceStatusV1>,
+    limit: Option<u32>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]

@@ -60,6 +60,10 @@ fn remove_post_legacy_agent_runtime_tables(conn: &Connection) {
     restore_pre_v28_effect_journal(conn);
     conn.execute_batch(
         r#"
+        DROP TABLE IF EXISTS workflow_evaluations;
+        DROP TABLE IF EXISTS workflow_delivery_receipts;
+        DROP TABLE IF EXISTS workflow_trigger_invocations;
+        DROP TABLE IF EXISTS workflow_releases;
         DROP TABLE IF EXISTS workflow_deployments;
         DROP TABLE IF EXISTS connection_capability_revisions;
         DROP TABLE IF EXISTS connections;
@@ -72,6 +76,68 @@ fn remove_post_legacy_agent_runtime_tables(conn: &Connection) {
         "#,
     )
     .expect("remove post-legacy agent runtime tables");
+}
+
+/// Tests that advertise a v25 schema must restore the Flow-only HumanTask
+/// constraint introduced by that version. Dropping only the v29 automation
+/// tables leaves a newer polymorphic table behind and invalidates the fixture's
+/// canonical schema fingerprint.
+fn restore_v25_human_tasks(conn: &Connection) {
+    conn.execute_batch(
+        r#"
+        PRAGMA foreign_keys = OFF;
+        DROP INDEX idx_human_tasks_active_source_boundary;
+        DROP INDEX idx_human_tasks_status_updated;
+        DROP INDEX idx_human_tasks_thread_status_updated;
+        DROP INDEX idx_human_tasks_flow_run_status;
+        ALTER TABLE human_tasks RENAME TO human_tasks_v29_source;
+        CREATE TABLE human_tasks (
+            id TEXT PRIMARY KEY,
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            thread_id TEXT NOT NULL,
+            source_kind TEXT NOT NULL CHECK(source_kind IN ('flow_run')),
+            source_id TEXT NOT NULL,
+            source_node_run_id TEXT,
+            task_type TEXT NOT NULL CHECK(task_type IN (
+                'approval',
+                'input_request',
+                'output_review',
+                'recovery',
+                'reconnect',
+                'data_correction',
+                'manual'
+            )),
+            status TEXT NOT NULL CHECK(status IN ('pending', 'completed', 'cancelled')),
+            document_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            resolved_at TEXT,
+            FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE,
+            FOREIGN KEY(source_id) REFERENCES flow_runs(id) ON DELETE CASCADE
+        );
+        INSERT INTO human_tasks (
+            id, revision, thread_id, source_kind, source_id, source_node_run_id,
+            task_type, status, document_json, created_at, updated_at, resolved_at
+        )
+        SELECT
+            id, revision, thread_id, source_kind, source_id, source_node_run_id,
+            task_type, status, document_json, created_at, updated_at, resolved_at
+        FROM human_tasks_v29_source
+        WHERE source_kind = 'flow_run';
+        DROP TABLE human_tasks_v29_source;
+        CREATE UNIQUE INDEX idx_human_tasks_active_source_boundary
+            ON human_tasks(source_kind, source_id, source_node_run_id, task_type)
+            WHERE status = 'pending';
+        CREATE INDEX idx_human_tasks_status_updated
+            ON human_tasks(status, updated_at DESC);
+        CREATE INDEX idx_human_tasks_thread_status_updated
+            ON human_tasks(thread_id, status, updated_at DESC);
+        CREATE INDEX idx_human_tasks_flow_run_status
+            ON human_tasks(source_id, status, updated_at DESC);
+        PRAGMA foreign_keys = ON;
+        "#,
+    )
+    .expect("restore the v25 HumanTask constraint");
 }
 
 #[test]
@@ -233,6 +299,20 @@ fn agent_template_versions_publish_and_instances_remain_isolated() {
     assert_eq!(
         store.list_thread_agent_instances(thread.id).unwrap().len(),
         2
+    );
+    assert_eq!(
+        store
+            .list_agent_instances(None, Some(AgentInstanceStatusV1::Active), 50)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        store
+            .list_agent_instances(Some("case-worker"), None, 1)
+            .unwrap()
+            .len(),
+        1
     );
 
     let updated = store

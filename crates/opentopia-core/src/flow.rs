@@ -787,8 +787,7 @@ fn validate_capability_scope(
     available: &CapabilityProjection,
     error: &mut impl FnMut(&str, String, Option<String>, Option<usize>, &str),
 ) {
-    let effective = requested.intersect(available);
-    if effective != *requested {
+    if !requested.is_subset_of(available) {
         error(
             "flow.capability.expansion",
             "requested capabilities exceed the active ExecutionContext".to_string(),

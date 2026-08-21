@@ -6,7 +6,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use opentopia_core::{
     spawn_flow_run, FlowRunV1, SessionStore, WorkflowCompileError, WorkflowDeploymentStatusV1,
-    WorkflowDeploymentStoreError, WorkflowDeploymentV1,
+    WorkflowDeploymentStoreError, WorkflowDeploymentV1, WorkflowOutputSpecV1,
+    WorkflowTriggerSpecV1,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -69,10 +70,20 @@ async fn create_workflow_deployment(
         .ok_or_else(|| ApiError::not_found("published Flow definition not found"))?;
     let compiled = compile_published_workflow(&state.store, &definition)
         .map_err(|error| ApiError::conflict(error.to_string()))?;
-    let deployment = WorkflowDeploymentV1::new(
+    let trigger = request.trigger.unwrap_or(WorkflowTriggerSpecV1::Manual);
+    let output = request.output.unwrap_or(WorkflowOutputSpecV1::Inbox);
+    trigger
+        .validate()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    output
+        .validate()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let deployment = WorkflowDeploymentV1::new_with_io(
         request.name,
         request.environment,
         compiled,
+        trigger,
+        output,
         request.created_by,
     )
     .map_err(workflow_compile_error)?;
@@ -130,6 +141,7 @@ async fn start_deployed_workflow_run(
         run.id,
         run.harness_capabilities(),
         run.harness_connection_authority(),
+        run.workflow_agent_specs(),
     )
     .await?;
     spawn_flow_run(run.id, context).map_err(ApiError::from)?;
@@ -180,6 +192,10 @@ struct CreateWorkflowDeploymentRequest {
     name: String,
     environment: String,
     created_by: String,
+    #[serde(default)]
+    trigger: Option<WorkflowTriggerSpecV1>,
+    #[serde(default)]
+    output: Option<WorkflowOutputSpecV1>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

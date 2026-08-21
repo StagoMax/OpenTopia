@@ -170,7 +170,7 @@ fn migration_ledger_records_verified_baseline_and_current_version() {
     )
     .expect("read migration ledger");
 
-    assert_eq!(records.len(), 10);
+    assert_eq!(records.len(), 11);
     assert_eq!(records[0].0, LEGACY_DATABASE_SCHEMA_VERSION);
     assert_eq!(records[0].1, "legacy_baseline_v19");
     assert_eq!(records[1].0, 20);
@@ -189,8 +189,10 @@ fn migration_ledger_records_verified_baseline_and_current_version() {
     assert_eq!(records[7].1, "connections_control_plane");
     assert_eq!(records[8].0, 27);
     assert_eq!(records[8].1, "workflow_deployments");
-    assert_eq!(records[9].0, CURRENT_DATABASE_SCHEMA_VERSION);
+    assert_eq!(records[9].0, 28);
     assert_eq!(records[9].1, "workflow_activity_receipts");
+    assert_eq!(records[10].0, CURRENT_DATABASE_SCHEMA_VERSION);
+    assert_eq!(records[10].1, "workflow_automation");
     assert!(records.iter().all(|record| record.2.starts_with("sha256:")));
     assert!(records.iter().all(|record| !record.3.is_empty()));
     assert!(records
@@ -211,6 +213,10 @@ fn migration_upgrades_pre_checkpoint_v22_database() {
         restore_pre_v28_effect_journal(&conn);
         conn.execute_batch(
             r#"
+            DROP TABLE workflow_evaluations;
+            DROP TABLE workflow_delivery_receipts;
+            DROP TABLE workflow_trigger_invocations;
+            DROP TABLE workflow_releases;
             DROP TABLE workflow_deployments;
             DROP TABLE connection_capability_revisions;
             DROP TABLE connections;
@@ -222,6 +228,7 @@ fn migration_upgrades_pre_checkpoint_v22_database() {
             DROP INDEX idx_agent_events_reasoning_tail;
             DROP INDEX idx_agent_events_tool_results;
             DROP INDEX idx_agent_events_model_round;
+            DELETE FROM schema_migrations WHERE version = 29;
             DELETE FROM schema_migrations WHERE version = 28;
             DELETE FROM schema_migrations WHERE version = 27;
             DELETE FROM schema_migrations WHERE version = 26;
@@ -267,12 +274,18 @@ fn v26_migrates_legacy_mcp_server_into_definition_and_connection() {
             .expect("insert legacy MCP server");
         let conn = store.conn.lock().expect("lock current database");
         restore_pre_v28_effect_journal(&conn);
+        restore_v25_human_tasks(&conn);
         conn.execute_batch(
             r#"
+            DROP TABLE workflow_evaluations;
+            DROP TABLE workflow_delivery_receipts;
+            DROP TABLE workflow_trigger_invocations;
+            DROP TABLE workflow_releases;
             DROP TABLE workflow_deployments;
             DROP TABLE connection_capability_revisions;
             DROP TABLE connections;
             DROP TABLE integration_definitions;
+            DELETE FROM schema_migrations WHERE version = 29;
             DELETE FROM schema_migrations WHERE version = 28;
             DELETE FROM schema_migrations WHERE version = 27;
             DELETE FROM schema_migrations WHERE version = 26;

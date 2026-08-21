@@ -9,7 +9,7 @@ use crate::enterprise::{AgentTemplateStatusV1, AgentTemplateVersionV1};
 use crate::flow::{
     definition_from_draft, FlowDefinitionV1, FlowDraftStatusV1, FlowDraftV1, FlowTrialV1,
 };
-use crate::flow_runtime::FlowRunV1;
+use crate::flow_runtime::{FlowRunStatusV1, FlowRunV1};
 use crate::human_task::{HumanTaskStatusV1, HumanTaskV1};
 use crate::model::{
     AgentEvent, AgentEventPayload, Approval, ApprovalStatus, Artifact, ArtifactMetadata,
@@ -44,6 +44,7 @@ mod legacy_schema;
 mod project_repository;
 mod settings_mcp_repository;
 mod sqlite_runtime;
+mod workflow_automation_repository;
 use agent_flow_repository::query_flow_draft;
 use flow_runtime_repository::{
     insert_human_task_conn, update_flow_run_conn, update_human_task_conn,
@@ -131,6 +132,22 @@ pub enum WorkflowDeploymentStoreError {
     NotFound(Uuid),
     #[error("Workflow deployment revision conflict; current revision is {0}")]
     RevisionConflict(u32),
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum WorkflowAutomationStoreError {
+    #[error("Workflow release not found: {0}")]
+    ReleaseNotFound(Uuid),
+    #[error("Workflow release revision conflict; current revision is {0}")]
+    ReleaseRevisionConflict(u32),
+    #[error("Workflow trigger invocation already exists with different input")]
+    InvocationInputConflict,
+    #[error("Workflow delivery receipt not found: {0}")]
+    DeliveryReceiptNotFound(Uuid),
+    #[error("Workflow delivery receipt revision conflict; current revision is {0}")]
+    DeliveryReceiptRevisionConflict(u32),
+    #[error("Workflow evaluation already exists for this run and evaluator")]
+    EvaluationConflict,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -767,6 +784,34 @@ impl SessionStore for SqliteSessionStore {
             deserialize_json_column::<FlowRunV1>,
         )?;
         collect_rows(rows)
+    }
+
+    fn list_all_flow_runs(
+        &self,
+        status: Option<FlowRunStatusV1>,
+        limit: u32,
+    ) -> anyhow::Result<Vec<FlowRunV1>> {
+        let conn = self.read_connection();
+        let limit = i64::from(limit.clamp(1, 500));
+        match status {
+            Some(status) => {
+                let mut stmt = conn.prepare(
+                    "SELECT document_json FROM flow_runs WHERE status = ?1 ORDER BY updated_at DESC LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(
+                    params![status.as_str(), limit],
+                    deserialize_json_column::<FlowRunV1>,
+                )?;
+                collect_rows(rows)
+            }
+            None => {
+                let mut stmt = conn.prepare(
+                    "SELECT document_json FROM flow_runs ORDER BY updated_at DESC LIMIT ?1",
+                )?;
+                let rows = stmt.query_map(params![limit], deserialize_json_column::<FlowRunV1>)?;
+                collect_rows(rows)
+            }
+        }
     }
 
     fn update_flow_run(

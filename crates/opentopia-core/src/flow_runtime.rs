@@ -315,7 +315,7 @@ impl FlowRunV1 {
     ) -> anyhow::Result<Self> {
         let effective_capabilities = definition.capabilities.intersect(available_capabilities);
         anyhow::ensure!(
-            effective_capabilities == definition.capabilities,
+            definition.capabilities.is_subset_of(available_capabilities),
             "the current ExecutionContext is narrower than the published Flow capability snapshot"
         );
         let spec = definition.to_spec();
@@ -453,6 +453,20 @@ impl FlowRunV1 {
         self.deployment_snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.compiled_workflow.agent_spec(node_id))
+    }
+
+    pub fn workflow_agent_specs(&self) -> Vec<WorkflowAgentSpecV1> {
+        self.deployment_snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .compiled_workflow
+                    .agent_specs
+                    .values()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn effective_capabilities_for_node(&self, node_id: &str) -> CapabilityProjection {
@@ -2060,7 +2074,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     struct NeverCalledHarness;
 
@@ -2072,6 +2086,32 @@ mod tests {
     struct InterruptHarness {
         starts: AtomicUsize,
         resumes: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct SpecRecordingHarness {
+        specs: Mutex<Vec<WorkflowAgentSpecV1>>,
+    }
+
+    #[async_trait]
+    impl FlowNodeHarness for SpecRecordingHarness {
+        async fn execute_flow_node(
+            &self,
+            request: FlowNodeExecutionRequestV1,
+        ) -> anyhow::Result<FlowNodeExecutionOutcomeV1> {
+            let spec = request
+                .workflow_agent_spec
+                .context("Agent execution must receive its frozen WorkflowAgentSpec")?;
+            anyhow::ensure!(request.effective_capabilities == spec.capabilities);
+            self.specs.lock().expect("spec mutex").push(spec);
+            Ok(FlowNodeExecutionOutcomeV1::Completed(
+                FlowNodeExecutionResultV1 {
+                    output: json!({"reviewed": true}),
+                    tool_calls: 0,
+                    transcript: Vec::new(),
+                },
+            ))
+        }
     }
 
     impl InterruptHarness {
@@ -2449,6 +2489,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deployed_agent_node_executes_only_its_frozen_workflow_agent_spec() {
+        let store = Arc::new(SqliteSessionStore::open(":memory:").expect("open store"));
+        let thread = store
+            .create_thread_with_mode(
+                Some("Frozen workflow Agent".to_string()),
+                PathBuf::from("."),
+                ExperienceMode::Flow,
+            )
+            .expect("create Flow thread");
+        let definition = definition(
+            vec![
+                runtime_node(
+                    "agent",
+                    GraphNodeKindV1::Agent,
+                    json!({"reference": "reviewer", "templateVersion": 7}),
+                ),
+                runtime_node("output", GraphNodeKindV1::Output, json!({})),
+            ],
+            vec![edge("agent", "output")],
+        );
+        let agent_spec = WorkflowAgentSpecV1 {
+            node_id: "agent".to_string(),
+            template_id: "reviewer".to_string(),
+            template_version: 7,
+            template_content_hash: "sha256:frozen-reviewer".to_string(),
+            name: "Frozen reviewer".to_string(),
+            owner: "risk-team".to_string(),
+            instructions: "Use only the frozen reviewer policy".to_string(),
+            capabilities: CapabilityProjection::deny_all(),
+            resource_grants: Vec::new(),
+            model_policy: crate::AgentModelPolicyV1::unrestricted(),
+            state_schema: json!({"type": "object"}),
+            output_schema: json!({"type": "object"}),
+            risk_class: AgentRiskClassV1::Medium,
+            connection_bindings: Vec::new(),
+            connection_authority: RuntimeConnectionAuthorityV1::Structured {
+                operations: Vec::new(),
+            },
+        };
+        let compiled = crate::CompiledWorkflowV1::compile(&definition, vec![agent_spec])
+            .expect("compile workflow");
+        let deployment = crate::WorkflowDeploymentV1::new(
+            "Frozen workflow",
+            "production",
+            compiled,
+            "release-manager",
+        )
+        .expect("deployment");
+        let run = FlowRunV1::new_from_deployment(thread.id, &deployment, json!({"case": 1}))
+            .expect("create run");
+        let run_id = run.id;
+        store.insert_flow_run(&run).expect("persist run");
+        let harness = Arc::new(SpecRecordingHarness::default());
+        let mut context = runtime_context(store.clone(), thread.id);
+        context.flow_harness = Some(harness.clone());
+
+        spawn_flow_run(run_id, context).expect("spawn run");
+        wait_for_status(&store, run_id, FlowRunStatusV1::WaitingHuman).await;
+
+        let specs = harness.specs.lock().expect("spec mutex");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].template_id, "reviewer");
+        assert_eq!(specs[0].template_version, 7);
+        assert_eq!(specs[0].template_content_hash, "sha256:frozen-reviewer");
+        assert_eq!(specs[0].instructions, "Use only the frozen reviewer policy");
+    }
+
+    #[tokio::test]
     async fn deterministic_flow_runs_to_persisted_output() {
         let store = Arc::new(SqliteSessionStore::open(":memory:").expect("open store"));
         let thread = store
@@ -2503,6 +2611,15 @@ mod tests {
         assert_eq!(completed.superstep, 2);
         assert_eq!(completed.checkpoint_history.len(), 2);
         assert!(completed.active_checkpoint.is_none());
+        assert_eq!(
+            store
+                .list_all_flow_runs(Some(FlowRunStatusV1::Succeeded), 20)
+                .expect("list global Flow runs")
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![run.id]
+        );
     }
 
     #[tokio::test]

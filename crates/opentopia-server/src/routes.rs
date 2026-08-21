@@ -29,6 +29,7 @@ fn platform_routes() -> Router<AppState> {
         .merge(agent_templates_api::router())
         .merge(connections_api::router())
         .merge(workflow_deployments_api::router())
+        .merge(workflow_automation_api::router())
         .merge(contributions_api::router())
         .merge(flows_api::router())
         .merge(human_tasks_api::router())

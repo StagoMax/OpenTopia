@@ -5,7 +5,7 @@ use crate::connection::{
 use crate::effect_journal::{EffectIntent, EffectJournalRecord, EffectStatus};
 use crate::enterprise::AgentTemplateVersionV1;
 use crate::flow::{FlowDefinitionV1, FlowDraftV1, FlowTrialV1};
-use crate::flow_runtime::FlowRunV1;
+use crate::flow_runtime::{FlowRunStatusV1, FlowRunV1};
 use crate::human_task::{HumanTaskStatusV1, HumanTaskV1};
 use crate::model::{
     AgentEvent, Approval, ApprovalStatus, Artifact, ArtifactMetadata, ExperienceMode, GoalSnapshot,
@@ -371,6 +371,11 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
     fn insert_flow_run(&self, run: &FlowRunV1) -> anyhow::Result<FlowRunV1>;
     fn get_flow_run(&self, run_id: Uuid) -> anyhow::Result<Option<FlowRunV1>>;
     fn list_flow_runs(&self, thread_id: Uuid) -> anyhow::Result<Vec<FlowRunV1>>;
+    fn list_all_flow_runs(
+        &self,
+        status: Option<FlowRunStatusV1>,
+        limit: u32,
+    ) -> anyhow::Result<Vec<FlowRunV1>>;
     fn update_flow_run(&self, run: &FlowRunV1, expected_revision: u32)
         -> anyhow::Result<FlowRunV1>;
     fn insert_human_task(&self, task: &HumanTaskV1) -> anyhow::Result<HumanTaskV1>;

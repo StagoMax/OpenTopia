@@ -1,8 +1,9 @@
 use super::*;
 use crate::effect_journal::{EffectKind, EffectSideEffectClass};
 use crate::enterprise::{
-    AgentBudgetV1, AgentInstanceV1, AgentModelBindingV1, AgentModelPolicyV1, AgentRiskClassV1,
-    AgentTemplateError, AgentTemplateSpecV1, CapabilityProjection, ExperienceSurfaceProfile,
+    AgentBudgetV1, AgentInstanceStatusV1, AgentInstanceV1, AgentModelBindingV1, AgentModelPolicyV1,
+    AgentRiskClassV1, AgentTemplateError, AgentTemplateSpecV1, CapabilityProjection,
+    ExperienceSurfaceProfile,
 };
 use crate::mcp::{McpServerConfig, McpToolDescriptor};
 use crate::model::{

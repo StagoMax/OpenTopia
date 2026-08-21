@@ -80,6 +80,7 @@ pub mod tools;
 pub mod turn_inbox;
 pub mod work_form;
 pub mod workflow;
+pub mod workflow_automation;
 pub mod workflow_interrupt;
 pub mod workflow_state;
 pub mod workspace;
@@ -192,13 +193,14 @@ pub use effect_journal::{
     EffectJournalRecord, EffectKind, EffectSideEffectClass, EffectStatus,
 };
 pub use enterprise::{
-    AgentBudgetV1, AgentDefinitionV1, AgentInstanceStatusV1, AgentInstanceV1, AgentModelBindingV1,
-    AgentModelPolicyV1, AgentRiskClassV1, AgentTemplateDiffV1, AgentTemplateError,
-    AgentTemplateSpecV1, AgentTemplateStatusV1, AgentTemplateVersionV1, AuditEventV1,
-    CapabilityChangeKindV1, CapabilityChangeV1, CapabilityProjection, DataClassification,
-    EnterpriseExecutionContextV1, EvidenceRecordV1, ExecutionBoundaryError, ExecutionIdentityRoute,
-    ExecutionIdentityRouter, ExecutionResourceGrantV1, ExperienceSurfaceProfile, ResourceKind,
-    ENTERPRISE_SCHEMA_VERSION_V1, MAX_AGENT_DELEGATION_DEPTH,
+    validate_json_schema_value, AgentBudgetV1, AgentDefinitionV1, AgentInstanceStatusV1,
+    AgentInstanceV1, AgentModelBindingV1, AgentModelPolicyV1, AgentRiskClassV1,
+    AgentTemplateDiffV1, AgentTemplateError, AgentTemplateSpecV1, AgentTemplateStatusV1,
+    AgentTemplateVersionV1, AuditEventV1, CapabilityChangeKindV1, CapabilityChangeV1,
+    CapabilityProjection, DataClassification, EnterpriseExecutionContextV1, EvidenceRecordV1,
+    ExecutionBoundaryError, ExecutionIdentityRoute, ExecutionIdentityRouter,
+    ExecutionResourceGrantV1, ExperienceSurfaceProfile, ResourceKind, ENTERPRISE_SCHEMA_VERSION_V1,
+    MAX_AGENT_DELEGATION_DEPTH,
 };
 pub use enterprise_connection_grants::{
     connection_bindings_are_subset, connection_model_tool_name, diff_connection_bindings,
@@ -429,6 +431,11 @@ pub use work_form::{WorkForm, WorkFormStatus, WorkItem, WorkItemStatus, WorkScop
 pub use workflow::{
     CompiledWorkflowV1, DeploymentSnapshotV1, WorkflowAgentSpecV1, WorkflowCompileError,
     WorkflowDeploymentStatusV1, WorkflowDeploymentV1, WorkflowOutputSpecV1, WorkflowTriggerSpecV1,
+};
+pub use workflow_automation::{
+    WorkflowDeliveryReceiptV1, WorkflowDeliveryStatusV1, WorkflowEvaluationV1,
+    WorkflowReleaseStatusV1, WorkflowReleaseV1, WorkflowTriggerInvocationStatusV1,
+    WorkflowTriggerInvocationV1, WORKFLOW_AUTOMATION_SCHEMA_VERSION_V1,
 };
 pub use workflow_interrupt::{
     AgentContinuationEnvelopeV1, FlowNodeInterruptV1, FlowResumeCommandV1, FlowResumeSignalV1,

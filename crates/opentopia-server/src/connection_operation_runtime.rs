@@ -16,12 +16,12 @@ use std::sync::Arc;
 /// Integration/Connection, requiring reauthentication, changing the active
 /// capability revision, or removing an operation takes effect for an already
 /// running Turn.
-pub(super) struct StoreConnectionOperationInvocationGate {
+pub(crate) struct StoreConnectionOperationInvocationGate {
     store: Arc<SqliteSessionStore>,
 }
 
 impl StoreConnectionOperationInvocationGate {
-    pub(super) fn new(store: Arc<SqliteSessionStore>) -> Self {
+    pub(crate) fn new(store: Arc<SqliteSessionStore>) -> Self {
         Self { store }
     }
 }

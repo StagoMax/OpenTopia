@@ -59,12 +59,14 @@ impl HumanTaskStatusV1 {
 #[serde(rename_all = "snake_case")]
 pub enum HumanTaskSourceKindV1 {
     FlowRun,
+    DeliveryReceipt,
 }
 
 impl HumanTaskSourceKindV1 {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::FlowRun => "flow_run",
+            Self::DeliveryReceipt => "delivery_receipt",
         }
     }
 }
@@ -141,6 +143,88 @@ pub struct HumanTaskV1 {
 }
 
 impl HumanTaskV1 {
+    pub fn delivery_handoff(
+        thread_id: Uuid,
+        receipt_id: Uuid,
+        title: impl Into<String>,
+        description: impl Into<String>,
+        assigned_to: Option<String>,
+        payload: Value,
+    ) -> Self {
+        Self::delivery_task(
+            thread_id,
+            receipt_id,
+            HumanTaskTypeV1::Manual,
+            title.into(),
+            description.into(),
+            vec![HumanTaskActionV1::Acknowledge, HumanTaskActionV1::Cancel],
+            assigned_to,
+            payload,
+            24,
+        )
+    }
+
+    pub fn delivery_recovery(
+        thread_id: Uuid,
+        receipt_id: Uuid,
+        description: impl Into<String>,
+        payload: Value,
+    ) -> Self {
+        Self::delivery_task(
+            thread_id,
+            receipt_id,
+            HumanTaskTypeV1::Recovery,
+            "恢复 Flow 输出投递".to_string(),
+            description.into(),
+            vec![HumanTaskActionV1::Retry, HumanTaskActionV1::Cancel],
+            None,
+            payload,
+            4,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn delivery_task(
+        thread_id: Uuid,
+        receipt_id: Uuid,
+        task_type: HumanTaskTypeV1,
+        title: String,
+        description: String,
+        allowed_actions: Vec<HumanTaskActionV1>,
+        assigned_to: Option<String>,
+        payload: Value,
+        due_hours: i64,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            schema_version: HUMAN_TASK_SCHEMA_VERSION_V1,
+            id: stable_task_id(receipt_id, task_type.as_str(), "delivery"),
+            revision: 1,
+            thread_id,
+            source_kind: HumanTaskSourceKindV1::DeliveryReceipt,
+            source_id: receipt_id,
+            source_node_run_id: None,
+            source_node_id: None,
+            task_type,
+            status: HumanTaskStatusV1::Pending,
+            title,
+            description,
+            allowed_actions,
+            payload,
+            action_schema: None,
+            assigned_to,
+            claimed_by: None,
+            claimed_at: None,
+            due_at: Some(now + Duration::hours(due_hours)),
+            checkpoint_id: None,
+            continuation_id: None,
+            resolution: None,
+            created_at: now,
+            updated_at: now,
+            resolved_at: None,
+        }
+    }
+
     pub fn flow_approval(
         thread_id: Uuid,
         flow_run_id: Uuid,

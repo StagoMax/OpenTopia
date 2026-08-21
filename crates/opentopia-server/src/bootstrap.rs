@@ -234,6 +234,7 @@ async fn assemble_application(args: &Args) -> anyhow::Result<AppState> {
         resources: crate::resource_registry::ResourceRegistry::default(),
     };
     spawn_turn_queue_worker(state.clone(), queued_threads);
+    crate::workflow_automation_service::start_workflow_automation_worker(state.clone());
     Ok(state)
 }
 

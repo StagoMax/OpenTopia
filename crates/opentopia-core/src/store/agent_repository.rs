@@ -274,6 +274,51 @@ impl SqliteSessionStore {
         collect_rows(rows)
     }
 
+    pub fn list_agent_instances(
+        &self,
+        template_id: Option<&str>,
+        status: Option<AgentInstanceStatusV1>,
+        limit: u32,
+    ) -> anyhow::Result<Vec<AgentInstanceV1>> {
+        let conn = self.read_connection();
+        let limit = i64::from(limit.clamp(1, 500));
+        match (template_id, status) {
+            (Some(template_id), Some(status)) => {
+                let mut stmt = conn.prepare(
+                    "SELECT document_json FROM agent_instances WHERE template_id = ?1 AND status = ?2 ORDER BY updated_at DESC LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(
+                    params![template_id, status.as_str(), limit],
+                    deserialize_agent_instance,
+                )?;
+                collect_rows(rows)
+            }
+            (Some(template_id), None) => {
+                let mut stmt = conn.prepare(
+                    "SELECT document_json FROM agent_instances WHERE template_id = ?1 ORDER BY updated_at DESC LIMIT ?2",
+                )?;
+                let rows =
+                    stmt.query_map(params![template_id, limit], deserialize_agent_instance)?;
+                collect_rows(rows)
+            }
+            (None, Some(status)) => {
+                let mut stmt = conn.prepare(
+                    "SELECT document_json FROM agent_instances WHERE status = ?1 ORDER BY updated_at DESC LIMIT ?2",
+                )?;
+                let rows =
+                    stmt.query_map(params![status.as_str(), limit], deserialize_agent_instance)?;
+                collect_rows(rows)
+            }
+            (None, None) => {
+                let mut stmt = conn.prepare(
+                    "SELECT document_json FROM agent_instances ORDER BY updated_at DESC LIMIT ?1",
+                )?;
+                let rows = stmt.query_map(params![limit], deserialize_agent_instance)?;
+                collect_rows(rows)
+            }
+        }
+    }
+
     pub fn bind_thread_agent_instance(
         &self,
         thread_id: Uuid,
@@ -417,4 +462,10 @@ impl SqliteSessionStore {
         tx.commit()?;
         Ok(instance)
     }
+}
+
+fn deserialize_agent_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentInstanceV1> {
+    let document: String = row.get(0)?;
+    serde_json::from_str(&document)
+        .map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error)))
 }

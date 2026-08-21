@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 pub(crate) const LEGACY_DATABASE_SCHEMA_VERSION: i64 = 19;
-pub(crate) const CURRENT_DATABASE_SCHEMA_VERSION: i64 = 28;
+pub(crate) const CURRENT_DATABASE_SCHEMA_VERSION: i64 = 29;
 
 const LEGACY_BASELINE_NAME: &str = "legacy_baseline_v19";
 const MIGRATION_LEDGER_SQL: &str = include_str!("migrations/0019_legacy_baseline.sql");
@@ -121,6 +121,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "workflow_activity_receipts",
         sql: include_str!("migrations/0028_workflow_activity_receipts.sql"),
         verify: verify_v28,
+    },
+    Migration {
+        version: 29,
+        name: "workflow_automation",
+        sql: include_str!("migrations/0029_workflow_automation.sql"),
+        verify: verify_v29,
     },
 ];
 
@@ -636,6 +642,42 @@ fn verify_v28(conn: &Connection) -> anyhow::Result<()> {
     for index in ["idx_effect_journal_turn", "idx_effect_journal_recovery"] {
         anyhow::ensure!(index_exists(conn, index)?, "{index} index is missing");
     }
+    Ok(())
+}
+
+fn verify_v29(conn: &Connection) -> anyhow::Result<()> {
+    for table in [
+        "workflow_releases",
+        "workflow_trigger_invocations",
+        "workflow_delivery_receipts",
+        "workflow_evaluations",
+        "human_tasks",
+    ] {
+        anyhow::ensure!(table_exists(conn, table)?, "{table} table is missing");
+    }
+    for index in [
+        "idx_workflow_releases_status_trigger",
+        "idx_workflow_releases_environment_updated",
+        "idx_workflow_trigger_invocations_release_updated",
+        "idx_workflow_trigger_invocations_status_updated",
+        "idx_workflow_trigger_invocations_trigger_created",
+        "idx_workflow_delivery_receipts_status_updated",
+        "idx_workflow_delivery_receipts_deployment_updated",
+        "idx_workflow_evaluations_deployment_created",
+    ] {
+        anyhow::ensure!(index_exists(conn, index)?, "{index} index is missing");
+    }
+    let human_task_sql = table_sql(conn, "human_tasks")?
+        .context("human_tasks table is missing")?
+        .to_ascii_lowercase();
+    anyhow::ensure!(
+        human_task_sql.contains("delivery_receipt"),
+        "human_tasks must accept DeliveryReceipt sources"
+    );
+    anyhow::ensure!(
+        !human_task_sql.contains("foreign key(source_id) references flow_runs"),
+        "human_tasks source_id must be polymorphic"
+    );
     Ok(())
 }
 
