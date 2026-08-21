@@ -130,7 +130,7 @@
         {
           "kind": "source-test",
           "purpose": "regression",
-          "file": "../../crates/opentopia-core/src/provider.rs",
+          "file": "../../crates/opentopia-core/src/provider/tests/fundamentals.rs",
           "anchor": "fn chat_stream_without_terminal_event_remains_interrupted",
           "command": "cargo test -p opentopia-core chat_stream_without_terminal_event_remains_interrupted"
         },
@@ -170,7 +170,7 @@
         {
           "kind": "source-test",
           "purpose": "regression",
-          "file": "../../crates/opentopia-core/src/provider.rs",
+          "file": "../../crates/opentopia-core/src/provider/tests/fundamentals.rs",
           "anchor": "fn model_decision_rejects_tool_call_finish_without_calls",
           "command": "cargo test -p opentopia-core model_decision_rejects_tool_call_finish_without_calls"
         },
@@ -272,7 +272,7 @@
         {
           "kind": "source-test",
           "purpose": "regression",
-          "file": "../../crates/opentopia-core/src/agent.rs",
+          "file": "../../crates/opentopia-core/src/agent/tests/long_turn_and_context.rs",
           "anchor": "async fn provider_tool_loop_supports_multiple_rounds",
           "command": "cargo test -p opentopia-core provider_tool_loop_supports_multiple_rounds"
         },
@@ -310,7 +310,7 @@
         {
           "kind": "source-test",
           "purpose": "regression",
-          "file": "../../crates/opentopia-core/src/provider.rs",
+          "file": "../../crates/opentopia-core/src/provider/tests/stream_transport.rs",
           "anchor": "async fn openai_provider_reconnects_after_initial_network_failure",
           "command": "cargo test -p opentopia-core openai_provider_reconnects_after_initial_network_failure"
         }
@@ -378,7 +378,7 @@
         {
           "kind": "source-test",
           "purpose": "regression",
-          "file": "../../crates/opentopia-core/src/agent.rs",
+          "file": "../../crates/opentopia-core/src/agent/tests/long_turn_and_context.rs",
           "anchor": "async fn eight_tool_rounds_continue_without_approval",
           "command": "cargo test -p opentopia-core eight_tool_rounds_continue_without_approval"
         }
