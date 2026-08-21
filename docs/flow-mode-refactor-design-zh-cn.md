@@ -1,6 +1,6 @@
 # OpenTopia 企业 Agent 与 Workflow 重构设计方案
 
-> 状态：设计提案 v1.9（Phase 3 Durable Interrupt / HumanTask Resume 已实现）
+> 状态：设计提案 v2.0（Phase 3.1 Per-node Agent Runtime 与 Phase 4 Enterprise Surface 已实现）
 > 日期：2026-08-20
 > 输入：`Flow模式重构.md`、当前仓库实现、`docs/enterprise-agent-platform-design-zh-cn.md`
 > 范围：企业 Agent 与 Workflow 控制面、模板、状态图运行时、部署、触发器、输出、连接器权限、人工任务和桌面 UI
@@ -1213,29 +1213,141 @@ AgentContinuation.resume（恢复 Agent 延续状态，不从节点开头重放�
 
 首版 API 为 `GET /api/human-tasks`、`GET /api/human-tasks/{id}`、`POST /api/human-tasks/{id}/assign`、`POST /api/human-tasks/{id}/claim` 和 `POST /api/human-tasks/{id}/resolve`。`resolve` 接收 expectedRevision、action、idempotencyKey、note 和可选结构化 response；Run 与 HumanTask 通过同一个存储事务和 CAS 一起更新。
 
-Phase 3 的明确边界：本阶段已经验证动态 Agent interrupt 在同一 checkpoint/node attempt 上恢复，但后台真实 HTTP 验收采用确定性的显式 Approval + OutputReview，不依赖外部模型账号；Flow 图中每个 Agent 节点独立解析自身 Agent Template/Connection execution context 仍属于下一阶段；生产输出复核目前是部署级固定默认值，尚未提供可配置 ReviewPolicy；当前本地部署的 claim actor 是 `local_operator`，组织身份、队列路由和升级策略将在企业身份层接入后扩展。
+Phase 3 的明确边界：本阶段已经验证动态 Agent interrupt 在同一 checkpoint/node attempt 上恢复，但后台真实 HTTP 验收采用确定性的显式 Approval + OutputReview，不依赖外部模型账号；生产输出复核目前是部署级固定默认值，尚未提供可配置 ReviewPolicy；当前本地部署的 claim actor 是 `local_operator`，组织身份、队列路由和升级策略将在企业身份层接入后扩展。Flow 图中每个 Agent 节点的独立身份和 Connection execution context 已由紧随其后的 Phase 3.1 补齐。
 
 Phase 3 退出条件：人工动作可从一致 checkpoint 恢复原 WorkflowRun；动态 Agent 不会从节点开头重放；Inbox 与 Run 内联入口共享同一 HumanTask；重复动作不会重复执行 continuation；具有不确定副作用的恢复先进入 reconciliation；生产部署输出必须经过人工复核，并记录完整命令、检查点、延续状态和活动回执。
 
 2026-08-20 已完成后台真实 Topia 验收：隐藏的隔离 Server 通过正式 HTTP API 完成 Thread → FlowDraft → Validate → Simulate → Publish → WorkflowDeployment → Run；Approval HumanTask 完成 assign、claim、approve 和同 key 重复提交，随后生产输出生成独立 OutputReview HumanTask并完成 claim、approve 和同 key 重复提交。两类重复动作均返回同一 commandId，最终 Run 为 `succeeded`、`outputReviewRequired=true`、`outputReviewed=true`，待处理任务为 0。可重复执行入口为 `scripts/verify-flow-human-tasks.ps1`；本次结果保存在 `.opentopia/evaluations/flow-human-tasks-502bf29616574795920c2478cd62027b/result.json`。同时重新执行 `scripts/verify-flow-superstep.ps1`，确认 Phase 2B 的 4 个 Checkpoint、并行 left/right 两条 Pending Write 和稳定 Reducer 结果在新增输出复核后保持成立。两次服务均使用独立数据库和端口、隐藏窗口，并按精确 PID 回收，未调用 Computer Use。
 
+### Phase 3.1：Per-node Agent Runtime（逐节点 Agent 运行时）
+
+Phase 3.1 解决“一个 Flow 中的多个 Agent 必须各自继承其 Agent Template，而不能共享根 Agent 身份或重新读取可变模板”的执行隔离问题。
+
+```text
+AgentTemplateVersion（Agent 模板版本）
+        │ Publish / 发布
+        ▼
+WorkflowCompiler（工作流编译器）
+        │ freeze identity + grants / 冻结身份与授权
+        ▼
+WorkflowAgentSpec（逐节点 Agent 快照）
+        │ included in / 写入
+        ▼
+DeploymentSnapshot（部署快照）
+        │ starts
+        ▼
+WorkflowRun（工作流运行）
+        │ per node / 每个节点分别投影
+        ▼
+ExecutionAuthority + ConnectionAuthority
+（执行权限 + Connection 操作权限）
+```
+
+实现不变量如下：
+
+- `WorkflowAgentSpec` 按节点冻结 templateId、templateVersion、template contentHash、名称、owner、instructions、CapabilityProjection、ModelPolicy、状态/输出 schema、风险等级、Connection bindings 和精确 operation authority；
+- Deployment Run 只使用 `DeploymentSnapshot` 中的 Agent 快照。Agent Harness 不再在运行时读取当前 Published Template；缺少编译快照的 Agent 节点直接 fail closed；
+- 含 Agent 节点的可变 Published Flow 不能直接运行，必须先创建 `WorkflowDeployment`，避免“验证时一个版本、执行时另一个版本”；
+- 每个节点的能力目录、ExecutionAuthority 和 ConnectionAuthority 同步原子收窄。结构化 Connection 按固定 `serverId + providerToolName + fingerprint` 调用，并在每次调用前重新检查账号、认证、状态和 active capability revision；
+- 不同 Agent 节点可以引用不同模板、说明、模型策略和 Connection operation。根 Flow Harness 只持有所有节点能力的执行上限，实际节点只能看到自身快照的交集；
+- Run 的 pause/resume、HumanTask resume 和进程恢复继续使用冻结快照，不回读当前模板或 thread MCP 开关；
+- Workspace 权限使用规范化路径身份比较；Windows 的普通路径与 `\\?\` verbatim 路径不会被误判为不同授权，也不会因字符串交集丢失权限。
+
+Phase 3.1 退出条件：一个 Deployment 中至少两个 Agent 节点能以不同的冻结模板身份执行；修改当前模板不会改变已部署或已启动 Run；缺少快照、模型不匹配、Connection 失效、operation 被移除或权限扩大都会在外部调用前 fail closed；直接运行可变 Agent Flow 被拒绝。
+
+2026-08-21 已完成后台真实 Topia 验收：隐藏的隔离 Server 使用 Mock Provider 和正式 HTTP API 创建两个具有不同 instructions 的 Published Agent Template、两个 Agent Instance、一个双 Agent Workflow 和 WorkflowDeployment；DeploymentSnapshot 固定两个 `WorkflowAgentSpec`，两个 Agent 节点均真实执行成功，OutputReview HumanTask 审批后 Run 为 `succeeded`。同时确认直接运行可变 Agent Flow 返回 HTTP 400。可重复执行入口为 `scripts/verify-flow-enterprise-surface.ps1`，本次成功结果保存在 `.opentopia/evaluations/flow-enterprise-39233fa6101e4d75b2dbb1eba23a2d32/result.json`。服务使用独立数据库、插件/runtime/artifact 目录、隐藏窗口和精确 PID 回收，未调用 Computer Use。
+
 ### Phase 4：Agent / Workflow 企业 Surface
 
-- Flow 从 Tool Stage 升级为完整产品 Surface；
-- 建立 Overview、Agents、Workflow Templates、Deployments、Runs、Connections 和 Trust 导航；
-- 原始 JSON 降级为高级模式；
-- 增加自然语言 Agent 模板创建和结构化权限选择器。
+- Flow 已从会话右侧 Tool Stage 升级为完整 Enterprise Surface；
+- 固定一级导航为 Overview、Inbox、Agents、Workflow Templates、Deployments、Runs、Connections、Trust 和 Knowledge。Connections 不再沉入 Library；
+- 左侧 Contextual Collection（上下文列表）随一级导航切换，分别显示 HumanTask、Agent、Workflow、Deployment、Run、Connection 或 Trust signal，不与会话条目混排；
+- Overview 由全局服务端查询聚合 Agent、Workflow、Deployment、Run、HumanTask 和 Connection 状态，不扫描所有 Conversation；
+- 新增全局 `GET /api/agent-instances` 与 `GET /api/flow-runs`，支持服务端状态筛选和 limit；Desktop 共享 Store 并行加载各产品集合，主页面和侧栏复用同一选择与缓存；
+- Workflow Templates 提供 Outcome、Agent Template、Approval 三类业务输入，并在内部生成 `Agent -> Approval? -> Output` Graph；用户可完成 Create Draft → Validate → Trial → Publish，不需要编写 Graph JSON；
+- Agent Template 的常用表单聚焦名称、职责、自然语言说明和结构化 Connection operation。resource/state/output schema、工具、Skill、Plugin、模型及委派设置收进 Advanced；
+- Deployment Run 默认只要求自然语言输入，并转换为稳定对象；原始 JSON override 留在 Advanced；
+- Runs 提供全局状态、节点进度和更新时间；Trust 聚合等待人工处理、失败 Run、Connection 重新认证/降级等可行动信号；
+- 新页面采用既有 Design Tokens、UI primitives、键盘焦点语义、可恢复 loading/error/empty 状态和 reduced-motion 规则。
+
+```text
+Primary Navigation（固定一级导航）
+        │
+        ├── Contextual Collection（上下文对象列表）
+        │
+        └── Enterprise Workspace（企业工作区主页面）
+                 │
+                 └── Shared Enterprise Store（共享数据与选择状态）
+                          │ parallel queries / 并行查询
+                          ├── Agents / Agent 实例
+                          ├── Workflows / 工作流模板
+                          ├── Deployments / 部署
+                          ├── Runs / 运行
+                          ├── HumanTasks / 人工任务
+                          └── Connections / 外部连接
+```
 
 退出条件：非开发用户不接触 JSON，也能完成 Agent、Workflow Template、Deployment、审查和 Run 追踪。
 
+2026-08-21 Phase 4 已完成：Desktop 自动化测试、类型检查、Design System 检查和 HTTP contract coverage 均通过；同一套后台真实 Topia 验收确认全局 Agents、Runs、Templates、Workflows、Deployments、Connections 和 pending HumanTasks API 从隔离数据库返回持久化对象，其中 Agents=2、Runs=1、Templates=2、Workflows=1、Deployments=1，最终 pending HumanTasks=0。
+
 ### Phase 5：外部触发、输出与优化闭环
 
-- Webhook、Schedule、Event Subscription；
-- App/Webhook/消息输出和 DeliveryReceipt；
-- 评测、失败聚类、版本 Canary 和回滚；
-- 非 Agent HumanTask 接入统一 Inbox。
+Phase 5 把 Deployment 从“可手动运行的不可变快照”提升为完整 Automation Control Plane。Trigger endpoint 不直接绑定某个 Deployment，而是绑定稳定 Release Channel；这样 Canary、提升和回滚不会改变外部系统保存的 URL 或 Event Subscription ID。
 
-退出条件：外部事件到结果交付具备认证、幂等、DLP、权限、审计和恢复闭环。
+```text
+External Event（外部事件）
+  ├── Webhook（带 Token 的外部接口）
+  ├── Schedule（持久化定时触发）
+  └── Event Subscription（事件订阅）
+                         │
+                         ▼
+Release Channel（发布通道：稳定 triggerId + 环境）
+  ├── Primary Deployment（主部署）
+  ├── Canary Deployment（灰度部署 + 确定性流量比例）
+  └── Previous Primary（上一主版本：回滚目标）
+                         │ idempotencyKey hash / 幂等键确定性选路
+                         ▼
+TriggerInvocation（触发调用：固定输入哈希、部署与 FlowRun）
+                         │
+                         ▼
+WorkflowRun + DeploymentSnapshot（运行 + 不可变部署快照）
+                         │ OutputReview / 输出审查
+                         ▼
+Output Delivery（输出投递）
+  ├── Inbox（运行记录）
+  ├── Webhook（外部 Webhook）
+  ├── Connection Operation（App/MCP/消息操作）
+  └── HumanTask（人工业务交接）
+                         │
+                         ▼
+DeliveryReceipt（投递收据：CAS、attempt、状态、Provider 结果）
+  ├── Evaluation（评测）→ Failure Cluster（失败聚类）
+  └── Recovery HumanTask（恢复人工任务）→ Unified Inbox（统一收件箱）
+```
+
+图中英文名称对应产品、HTTP 和代码领域对象，括号中的中文解释说明其职责。实现不变量如下：
+
+- `WorkflowRelease` 是稳定发布通道，保存 `releaseKey / environment / threadId / trigger / primary / canary / previousPrimary / revision`。外部 Webhook URL 只包含稳定 `triggerId`；Canary、Promote 和 Rollback 使用 revision CAS，不原地修改 DeploymentSnapshot；
+- Canary 按 `releaseId + idempotencyKey` 的 SHA-256 桶确定性选路。同一个业务请求重试始终进入同一个 Deployment；比例只允许 1–99%，Canary 必须是同环境的 active Deployment；提升后保存上一 Primary，回滚前再次确认目标仍然 active；
+- `WorkflowTriggerInvocation` 对 `(releaseId, idempotencyKey)` 建唯一约束，固定输入哈希、选中的 Deployment 和 FlowRun。相同 key + 相同输入返回原 Run；相同 key + 不同输入返回 409，不能重复执行；
+- Webhook 使用独立 `x-opentopia-trigger-token`，服务端只持久化 `env:NAME` 引用并采用常量时间比较；公共 Hook 不要求本机 API Bearer，但不会绕过 Trigger 自身认证。每个 trigger 建立持久化的一分钟调用计数索引，默认 120 次/分钟；幂等重试不被限流阻断；
+- Schedule 的 `nextFireAt` 和 interval 属于 Release 文档。单例 worker 先用 revision CAS 原子推进下次触发时间，再创建带稳定 due-time key 的 TriggerInvocation；进程重启不会把同一时间片触发两次；
+- Event Subscription 通过受保护的事件分发 API 按 `source + eventType` 精确匹配 active Release；一个事件可以扇出到多个 Release，每个 Release 拥有独立幂等边界；
+- `DeploymentSnapshot.output` 冻结 Inbox、Webhook、ConnectionOperation 或 HumanTask 配置。Webhook 只保存 endpoint 与 credential reference；ConnectionOperation 保存固定 connection/revision/operation/server/nativeTool/fingerprint，调用前继续经过 live Connection gate 和 exact MCP route；
+- 输出只有在生产 `OutputReview` 批准、Run 成功后才会投递。投递前使用 Workflow output schema 校验值；向外部 Webhook/Connection 发送时执行 1 MiB payload 上限与 credential-like field DLP 检查，发现 password/secret/API key/access token 等字段会 fail closed，并要求改用 credential reference；
+- 每个 Run 只有一个稳定 `DeliveryReceipt`，Provider 调用前先用 revision CAS 认领 attempt，并携带稳定 idempotency key。Delivered/WaitingHuman/Cancelled 不自动重放；进程在外呼中断后把超过安全窗口的 Pending 标记为 indeterminate failure，创建 Recovery HumanTask，由操作者检查 Provider 后显式 Retry；
+- Webhook 只把有界响应摘要写入 Receipt；ConnectionOperation 的 Provider 结果经过类型化 MCP 结果序列化；HumanTask 输出创建 sourceKind=`delivery_receipt` 的业务交接任务。输出失败也创建同一来源的 Recovery HumanTask；
+- v29 将 HumanTask 来源升级为 `flow_run | delivery_receipt`，去掉 FlowRun-only 多态外键。统一 Inbox、分派、认领和 resolve API 使用同一个 humanTaskId；交接支持 Acknowledge/Cancel，恢复支持 Retry/Cancel，响应中的 FlowRun 和 DeliveryReceipt 均为按来源可选；
+- `WorkflowEvaluation` 对 `(runId, evaluator)` 幂等，保存 score/pass/labels/note；服务端按 Deployment 聚合 Run 状态、交付状态、pass rate、average score 和规范化 failure clusters。Evaluation 不修改历史 Run 或 Deployment；
+- Desktop 增加固定一级 `Automation / 自动化与投递`，按需加载 Release、Invocation、Receipt 和 Evaluation Summary，不增加其他 Flow 页面的启动请求；页面提供 Release 创建、Canary、Promote、Rollback、Disable、Delivery Retry 和失败聚类，Deployment 编辑器负责冻结 Inbox/Webhook/HumanTask output；
+- SQLite v29 为 Release、TriggerInvocation、DeliveryReceipt 和 Evaluation 建立独立表与查询索引；这些对象不是 Thread 消息投影，因此全局控制台无需扫描会话或反序列化所有 Run 才能显示待处理状态。
+
+Phase 5 的明确边界：当前 Schedule worker 是单进程 SQLite/CAS 调度器，适合本地优先 Desktop；多节点集群需引入 lease owner 和 heartbeat，而不能假设 SQLite CAS 等于分布式 leader election。Event Subscription 首版由受保护的统一事件入口接收，具体 CRM/ERP Provider 的订阅生命周期属于对应 IntegrationDefinition/Connection adapter。DLP 首版是输出 schema、大小边界、凭据字段阻断和人工 OutputReview；组织级字段分类规则、保留策略与法务策略引擎应作为后续 Trust Policy 扩展，不应硬编码进每个 Output adapter。
+
+退出条件：外部事件到结果交付具备认证、限流、幂等、DLP、操作级权限、持久化审计和人工恢复闭环；同一个幂等请求不产生第二个 Run 或第二次投递；Canary/Promote/Rollback 不改变 triggerId；非 Agent HumanTask 在统一 Inbox 中可处理。
+
+2026-08-21 已完成后台真实 Topia 验收：隐藏的隔离 Server 与本地 Webhook Sink 通过正式 HTTP API 验证公共 Webhook 独立 Token、错误 Token 拒绝、相同 key 复用同一 TriggerInvocation/Run、相同 key 不同输入返回 409、每分钟限流返回 429；OutputReview 后 Webhook 收到 credential reference 解析出的 Bearer 和稳定 DeliveryReceipt idempotency key。验收还完成 Evaluation 幂等与 pass-rate 聚合、25% Canary → Promote → Rollback、Event Subscription 幂等分发、Schedule 单次 due invocation、HumanTask Output 的非 Agent 统一 Inbox Acknowledge，以及 Webhook 首次 503 后 Recovery HumanTask 显式 Retry 成功。可重复执行入口为 `scripts/verify-flow-automation.ps1`，Webhook Sink 为 `scripts/workflow-webhook-sink.mjs`；结果保存在 `.opentopia/evaluations/flow-automation-b14c5ab4264740ac83303cda43c8184b/result.json`。两项进程均使用隐藏窗口、隔离数据库/runtime/plugin/artifact 目录并按精确 PID 回收，未调用 Computer Use。
 
 ## 13. MVP 范围
 
@@ -1247,10 +1359,10 @@ MVP 必须包含：
 - 独立 Agent 可以直接对话，并自动拥有模板中的 Library、Connection 和工具；
 - MCP-first IntegrationDefinition、账号级 Connection、能力发现和最小权限；
 - WorkflowDefinition 包含 WorkflowAgentSpecs、Graph、Trigger 和 Output；
-- WorkflowDeployment、manual trigger、Inbox output；
+- WorkflowDeployment、Release Channel、Webhook/Schedule/Event trigger 与类型化 Output；
 - HumanTask、中断恢复和全部输出人工审查；
 - WorkflowDefinition/Deployment 静态验证、Trial、发布和运行快照；
-- Overview、Agents、Workflow Templates、Deployments、Runs、Inbox、Connections；
+- Overview、Agents、Workflow Templates、Deployments、Automation、Runs、Inbox、Connections；
 - 全链路 AuditEvent。
 
 MVP 暂不包含：
@@ -1260,7 +1372,6 @@ MVP 暂不包含：
 - 自动扩大权限、自动发布模板或自动跳过人工审查；
 - 通用 RPA 和所有企业 App 适配；
 - 跨租户协作和通用分布式补偿事务；
-- 非 Agent 外部 Inbox 来源的完整业务规则，仅预留 source contract。
 
 ## 14. 验收标准
 
