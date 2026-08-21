@@ -1,6 +1,7 @@
 import { ArrowLeft, Boxes, LoaderCircle } from "lucide-react";
 import { useMemo, useState, type FormEvent } from "react";
 import { Button, Panel, Select, TextField } from "../ui";
+import type { WorkflowOutput } from "../../types";
 import type {
   WorkflowDeploymentsSnapshot,
   WorkflowDeploymentsStore,
@@ -27,20 +28,56 @@ export function WorkflowDeploymentEditor({
   );
   const [environment, setEnvironment] = useState("production");
   const [createdBy, setCreatedBy] = useState("local-user");
+  const [outputKind, setOutputKind] = useState<WorkflowOutput["kind"]>("inbox");
+  const [webhookEndpoint, setWebhookEndpoint] = useState("");
+  const [webhookCredentialRef, setWebhookCredentialRef] = useState("");
+  const [humanTaskTitle, setHumanTaskTitle] = useState(
+    "Review downstream delivery",
+  );
+  const [humanTaskDescription, setHumanTaskDescription] = useState(
+    "确认 Flow 输出已被下游业务流程接收。",
+  );
+  const [humanTaskAssignee, setHumanTaskAssignee] = useState("");
   const busy = snapshot.busyAction === "create";
+  const outputReady =
+    outputKind === "inbox" ||
+    (outputKind === "webhook" && webhookEndpoint.trim()) ||
+    (outputKind === "human_task" &&
+      humanTaskTitle.trim() &&
+      humanTaskDescription.trim());
   const canSubmit = Boolean(
-    selectedDefinition && name.trim() && environment.trim() && createdBy.trim(),
+    selectedDefinition &&
+    name.trim() &&
+    environment.trim() &&
+    createdBy.trim() &&
+    outputReady,
   );
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!selectedDefinition || !canSubmit || busy) return;
+    const output: WorkflowOutput =
+      outputKind === "webhook"
+        ? {
+            kind: "webhook",
+            endpoint: webhookEndpoint.trim(),
+            credentialRef: webhookCredentialRef.trim() || undefined,
+          }
+        : outputKind === "human_task"
+          ? {
+              kind: "human_task",
+              title: humanTaskTitle.trim(),
+              description: humanTaskDescription.trim(),
+              assignedTo: humanTaskAssignee.trim() || undefined,
+            }
+          : { kind: "inbox" };
     await store.create({
       flowId: selectedDefinition.flowId,
       flowVersion: selectedDefinition.version,
       name: name.trim(),
       environment: environment.trim(),
       createdBy: createdBy.trim(),
+      output,
     });
   }
 
@@ -139,6 +176,74 @@ export function WorkflowDeploymentEditor({
 
           <section className="workflow-deployment-form-section">
             <header>
+              <h3>Output contract / 输出契约</h3>
+              <p>
+                输出目标冻结在 Deployment Snapshot；投递状态写入
+                DeliveryReceipt。
+              </p>
+            </header>
+            <label className="workflow-deployment-select-field">
+              <span>Output / 输出</span>
+              <Select
+                label="Output / 输出"
+                onChange={(value) =>
+                  setOutputKind(value as WorkflowOutput["kind"])
+                }
+                options={[
+                  { value: "inbox", label: "Inbox / 运行记录" },
+                  { value: "webhook", label: "Webhook / 外部接口" },
+                  { value: "human_task", label: "HumanTask / 人工交接" },
+                ]}
+                value={outputKind}
+              />
+            </label>
+            {outputKind === "webhook" ? (
+              <div className="workflow-deployment-form-grid">
+                <TextField
+                  hint="公网目标必须使用 HTTPS；本地测试允许 loopback HTTP"
+                  label="Endpoint / 接口地址"
+                  onChange={(event) => setWebhookEndpoint(event.target.value)}
+                  required
+                  value={webhookEndpoint}
+                />
+                <TextField
+                  hint="只保存引用，例如 env:FLOW_OUTPUT_TOKEN"
+                  label="Credential ref / 凭据引用"
+                  onChange={(event) =>
+                    setWebhookCredentialRef(event.target.value)
+                  }
+                  value={webhookCredentialRef}
+                />
+              </div>
+            ) : null}
+            {outputKind === "human_task" ? (
+              <div className="workflow-deployment-form-grid">
+                <TextField
+                  label="Task title / 任务标题"
+                  onChange={(event) => setHumanTaskTitle(event.target.value)}
+                  required
+                  value={humanTaskTitle}
+                />
+                <TextField
+                  label="Description / 说明"
+                  onChange={(event) =>
+                    setHumanTaskDescription(event.target.value)
+                  }
+                  required
+                  value={humanTaskDescription}
+                />
+                <TextField
+                  hint="可留空，由 Inbox 中的操作员领取"
+                  label="Assignee / 负责人"
+                  onChange={(event) => setHumanTaskAssignee(event.target.value)}
+                  value={humanTaskAssignee}
+                />
+              </div>
+            ) : null}
+          </section>
+
+          <section className="workflow-deployment-form-section">
+            <header>
               <h3>Identity / 部署标识</h3>
               <p>环境是部署标签；本阶段不会自动连接外部 CI/CD 环境。</p>
             </header>
@@ -167,7 +272,9 @@ export function WorkflowDeploymentEditor({
           </section>
 
           <footer className="workflow-deployment-editor__footer">
-            <span>Trigger: Manual / 手动 · Output: Inbox / 收件箱</span>
+            <span>
+              Trigger: Release Channel / 发布通道 · Output: {outputKind}
+            </span>
             <Button
               disabled={!canSubmit || busy}
               type="submit"

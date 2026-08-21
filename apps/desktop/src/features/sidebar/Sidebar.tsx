@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import {
   Archive,
+  Activity,
+  Bot,
   BriefcaseBusiness,
   Cable,
   Check,
@@ -16,6 +18,7 @@ import {
   GitPullRequest,
   Inbox,
   Library,
+  LayoutDashboard,
   Loader2,
   MessageCircle,
   MoreHorizontal,
@@ -24,8 +27,10 @@ import {
   Plug,
   Plus,
   Rocket,
+  RadioTower,
   Search,
   Settings,
+  ShieldCheck,
   SquarePen,
   Workflow,
   X,
@@ -55,6 +60,74 @@ type ProjectHoverState = {
 
 const PROJECT_THREAD_PREVIEW_LIMIT = 10;
 
+const FLOW_NAVIGATION_ITEMS = [
+  {
+    view: "overview",
+    label: "Overview",
+    description: "运行态势",
+    icon: LayoutDashboard,
+  },
+  {
+    view: "inbox",
+    label: "Inbox",
+    description: "审批 / 恢复",
+    icon: Inbox,
+  },
+  {
+    view: "agents",
+    label: "Agents",
+    description: "模板 / 身份",
+    icon: Bot,
+  },
+  {
+    view: "workflow-templates",
+    label: "Workflow Templates",
+    description: "编排 / 发布",
+    icon: Workflow,
+  },
+  {
+    view: "deployments",
+    label: "Deployments",
+    description: "部署 / 触发",
+    icon: Rocket,
+  },
+  {
+    view: "automation",
+    label: "Automation",
+    description: "触发 / 投递",
+    icon: RadioTower,
+  },
+  {
+    view: "runs",
+    label: "Runs",
+    description: "追踪 / 恢复",
+    icon: Activity,
+  },
+  {
+    view: "connections",
+    label: "Connections",
+    description: "MCP / CRM / ERP",
+    icon: Cable,
+  },
+  {
+    view: "trust",
+    label: "Trust",
+    description: "权限 / 风险",
+    icon: ShieldCheck,
+  },
+  {
+    view: "knowledge",
+    label: "Knowledge",
+    description: "RAG / 资料库",
+    icon: Library,
+  },
+] as const satisfies ReadonlyArray<{
+  view: Exclude<FlowPrimaryView, "conversation">;
+  label: string;
+  description: string;
+  icon: typeof Workflow;
+}>;
+
 export function Sidebar({
   projects,
   threads,
@@ -66,10 +139,7 @@ export function Sidebar({
   experienceMode,
   flowModeEnabled,
   newTaskOpen,
-  flowInboxOpen,
-  flowDeploymentsOpen,
-  flowConnectionsOpen,
-  flowKnowledgeOpen,
+  activeFlowPrimaryView,
   pluginsOpen,
   contextualCollection,
   onExperienceModeChange,
@@ -101,10 +171,7 @@ export function Sidebar({
   experienceMode: ExperienceMode;
   flowModeEnabled: boolean;
   newTaskOpen: boolean;
-  flowInboxOpen: boolean;
-  flowDeploymentsOpen: boolean;
-  flowConnectionsOpen: boolean;
-  flowKnowledgeOpen: boolean;
+  activeFlowPrimaryView: FlowPrimaryView | null;
   pluginsOpen: boolean;
   contextualCollection?: ReactNode;
   onExperienceModeChange(mode: ExperienceMode): void;
@@ -288,38 +355,22 @@ export function Sidebar({
           </button>
           {experienceMode === "flow" ? (
             <>
-              <button
-                aria-current={flowInboxOpen ? "page" : undefined}
-                onClick={() => onOpenFlowPrimaryView("inbox")}
-              >
-                <Inbox aria-hidden="true" size={15} />
-                <span>Inbox</span>
-                <small>审批 / 恢复</small>
-              </button>
-              <button
-                aria-current={flowDeploymentsOpen ? "page" : undefined}
-                onClick={() => onOpenFlowPrimaryView("deployments")}
-              >
-                <Rocket aria-hidden="true" size={15} />
-                <span>Deployments</span>
-                <small>部署 / 触发</small>
-              </button>
-              <button
-                aria-current={flowConnectionsOpen ? "page" : undefined}
-                onClick={() => onOpenFlowPrimaryView("connections")}
-              >
-                <Cable aria-hidden="true" size={15} />
-                <span>Connections</span>
-                <small>MCP / CRM / ERP</small>
-              </button>
-              <button
-                aria-current={flowKnowledgeOpen ? "page" : undefined}
-                onClick={() => onOpenFlowPrimaryView("knowledge")}
-              >
-                <Library aria-hidden="true" size={15} />
-                <span>Knowledge</span>
-                <small>RAG / 资料库</small>
-              </button>
+              {FLOW_NAVIGATION_ITEMS.map((item) => {
+                const Icon = item.icon;
+                return (
+                  <button
+                    aria-current={
+                      activeFlowPrimaryView === item.view ? "page" : undefined
+                    }
+                    key={item.view}
+                    onClick={() => onOpenFlowPrimaryView(item.view)}
+                  >
+                    <Icon aria-hidden="true" size={15} />
+                    <span>{item.label}</span>
+                    <small>{item.description}</small>
+                  </button>
+                );
+              })}
             </>
           ) : null}
           <button disabled title="拉取请求 · 未实现">

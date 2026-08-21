@@ -9,3 +9,4 @@ export * from "./types/platform";
 export * from "./types/plugins";
 export * from "./types/provider";
 export * from "./types/workspace";
+export * from "./types/workflowAutomation";

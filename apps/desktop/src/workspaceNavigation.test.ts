@@ -8,6 +8,24 @@ const { resolveSidebarDestination } = (await import(
 )) as typeof WorkspaceNavigationModule;
 
 test("maps fixed Flow navigation to one primary destination", () => {
+  for (const [flowPrimaryView, destination] of [
+    ["overview", "flow-overview"],
+    ["agents", "flow-agents"],
+    ["workflow-templates", "flow-workflow-templates"],
+    ["automation", "flow-automation"],
+    ["runs", "flow-runs"],
+    ["trust", "flow-trust"],
+  ] as const) {
+    assert.equal(
+      resolveSidebarDestination({
+        experienceMode: "flow",
+        flowPrimaryView,
+        toolStageOpen: false,
+        activeToolKind: null,
+      }),
+      destination,
+    );
+  }
   assert.equal(
     resolveSidebarDestination({
       experienceMode: "flow",

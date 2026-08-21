@@ -452,30 +452,9 @@ export function AgentTemplatePanel({
               }
             />
             <TextAreaField
-              label="身份指令"
+              label="用自然语言描述 Agent 的角色、目标和工作方式"
               value={form.instructions}
               onChange={(value) => setFormValue(setForm, "instructions", value)}
-            />
-            <TextField
-              label="工具（逗号分隔）"
-              value={form.tools}
-              onChange={(event) =>
-                setFormValue(setForm, "tools", event.target.value)
-              }
-            />
-            <TextField
-              label="Skill（逗号分隔）"
-              value={form.skills}
-              onChange={(event) =>
-                setFormValue(setForm, "skills", event.target.value)
-              }
-            />
-            <TextField
-              label="插件（逗号分隔）"
-              value={form.plugins}
-              onChange={(event) =>
-                setFormValue(setForm, "plugins", event.target.value)
-              }
             />
             <AgentTemplateConnectionGrantsField
               client={client}
@@ -492,47 +471,6 @@ export function AgentTemplatePanel({
                   legacyAllowAllMcpServers: false,
                   mcpServers: "",
                 }))
-              }
-            />
-            <TextField
-              label="工作目录（逗号分隔）"
-              value={form.workspaceRoots}
-              onChange={(event) =>
-                setFormValue(setForm, "workspaceRoots", event.target.value)
-              }
-            />
-            <TextField
-              label="模型（provider:model）"
-              value={form.models}
-              onChange={(event) =>
-                setFormValue(setForm, "models", event.target.value)
-              }
-            />
-            <TextAreaField
-              label="资源绑定 JSON"
-              value={form.resourceGrants}
-              onChange={(value) =>
-                setFormValue(setForm, "resourceGrants", value)
-              }
-              mono
-            />
-            <TextAreaField
-              label="状态 Schema"
-              value={form.stateSchema}
-              onChange={(value) => setFormValue(setForm, "stateSchema", value)}
-              mono
-            />
-            <TextAreaField
-              label="输出 Schema"
-              value={form.outputSchema}
-              onChange={(value) => setFormValue(setForm, "outputSchema", value)}
-              mono
-            />
-            <TextField
-              label="可委派模板（逗号分隔）"
-              value={form.delegates}
-              onChange={(event) =>
-                setFormValue(setForm, "delegates", event.target.value)
               }
             />
             <label className="agent-template-panel__field">
@@ -553,6 +491,77 @@ export function AgentTemplatePanel({
                 <option value="critical">关键</option>
               </select>
             </label>
+            <details className="agent-template-panel__advanced">
+              <summary>Advanced / 高级能力与 JSON Schema</summary>
+              <div className="agent-template-panel__advanced-fields">
+                <TextField
+                  label="工具（逗号分隔）"
+                  value={form.tools}
+                  onChange={(event) =>
+                    setFormValue(setForm, "tools", event.target.value)
+                  }
+                />
+                <TextField
+                  label="Skill（逗号分隔）"
+                  value={form.skills}
+                  onChange={(event) =>
+                    setFormValue(setForm, "skills", event.target.value)
+                  }
+                />
+                <TextField
+                  label="插件（逗号分隔）"
+                  value={form.plugins}
+                  onChange={(event) =>
+                    setFormValue(setForm, "plugins", event.target.value)
+                  }
+                />
+                <TextField
+                  label="工作目录（逗号分隔）"
+                  value={form.workspaceRoots}
+                  onChange={(event) =>
+                    setFormValue(setForm, "workspaceRoots", event.target.value)
+                  }
+                />
+                <TextField
+                  label="模型（provider:model）"
+                  value={form.models}
+                  onChange={(event) =>
+                    setFormValue(setForm, "models", event.target.value)
+                  }
+                />
+                <TextAreaField
+                  label="资源绑定 JSON"
+                  value={form.resourceGrants}
+                  onChange={(value) =>
+                    setFormValue(setForm, "resourceGrants", value)
+                  }
+                  mono
+                />
+                <TextAreaField
+                  label="状态 Schema"
+                  value={form.stateSchema}
+                  onChange={(value) =>
+                    setFormValue(setForm, "stateSchema", value)
+                  }
+                  mono
+                />
+                <TextAreaField
+                  label="输出 Schema"
+                  value={form.outputSchema}
+                  onChange={(value) =>
+                    setFormValue(setForm, "outputSchema", value)
+                  }
+                  mono
+                />
+                <TextField
+                  label="可委派模板（逗号分隔）"
+                  value={form.delegates}
+                  onChange={(event) =>
+                    setFormValue(setForm, "delegates", event.target.value)
+                  }
+                />
+              </div>
+            </details>
             <div className="agent-template-panel__actions">
               <Button
                 variant="quiet"

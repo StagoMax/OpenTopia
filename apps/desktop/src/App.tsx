@@ -10,7 +10,19 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import { Cable, Inbox, Library, Rocket, X } from "lucide-react";
+import {
+  Activity,
+  Bot,
+  Cable,
+  Inbox,
+  LayoutDashboard,
+  Library,
+  Rocket,
+  RadioTower,
+  ShieldCheck,
+  Workflow,
+  X,
+} from "lucide-react";
 import { ApiClient } from "./api/client";
 import type { StreamHandle } from "./api/client";
 import type {
@@ -24,14 +36,14 @@ import {
 } from "./components/ApprovalDialog";
 import { PlanChoiceCard } from "./components/PlanChoiceCard";
 import type { ImagePreviewSource } from "./components/PreviewHost";
-import { FlowLibraryPanel } from "./components/FlowLibraryPanel";
 import { ConnectionSidebarCollection } from "./components/connections";
 import {
   WorkflowDeploymentSidebarCollection,
-  WorkflowDeploymentsPanel,
 } from "./components/workflowDeployments";
-import { HumanTaskInboxPanel } from "./components/HumanTaskInboxPanel";
-import { LibraryPanel } from "./components/LibraryPanel";
+import {
+  EnterpriseSidebarCollection,
+  FlowEnterpriseWorkspace,
+} from "./components/enterprise";
 import {
   SettingsPanel as RedesignedSettingsPanel,
   type SettingsTab,
@@ -4055,16 +4067,20 @@ export function App() {
             newTaskOpen={
               sidebarDestination === "conversation" && activeThreadId === null
             }
-            flowInboxOpen={sidebarDestination === "flow-inbox"}
-            flowDeploymentsOpen={sidebarDestination === "flow-deployments"}
-            flowConnectionsOpen={sidebarDestination === "flow-connections"}
-            flowKnowledgeOpen={sidebarDestination === "flow-knowledge"}
+            activeFlowPrimaryView={
+              flowPrimarySurface ? flowPrimaryView : null
+            }
             pluginsOpen={sidebarDestination === "plugins"}
             contextualCollection={
               sidebarDestination === "flow-deployments" && client ? (
                 <WorkflowDeploymentSidebarCollection client={client} />
               ) : sidebarDestination === "flow-connections" && client ? (
                 <ConnectionSidebarCollection client={client} />
+              ) : flowPrimarySurface && client ? (
+                <EnterpriseSidebarCollection
+                  client={client}
+                  view={flowPrimaryView}
+                />
               ) : undefined
             }
             onExperienceModeChange={changeExperienceMode}
@@ -4149,26 +4165,14 @@ export function App() {
             <ThreadHeader
               thread={flowPrimarySurface ? null : activeThread}
               headingIcon={
-                flowPrimaryView === "inbox" ? (
-                  <Inbox aria-hidden="true" size={15} />
-                ) : flowPrimaryView === "deployments" ? (
-                  <Rocket aria-hidden="true" size={15} />
-                ) : flowPrimaryView === "connections" ? (
-                  <Cable aria-hidden="true" size={15} />
-                ) : flowPrimaryView === "knowledge" ? (
-                  <Library aria-hidden="true" size={15} />
-                ) : undefined
+                flowPrimarySurface
+                  ? flowPrimaryHeadingIcon(flowPrimaryView)
+                  : undefined
               }
               title={
-                flowPrimaryView === "inbox"
-                  ? "Inbox / 待处理"
-                  : flowPrimaryView === "deployments"
-                    ? "Deployments / 部署"
-                    : flowPrimaryView === "connections"
-                      ? "Connections / 连接"
-                      : flowPrimaryView === "knowledge"
-                        ? "Knowledge / 知识库"
-                        : undefined
+                flowPrimarySurface
+                  ? flowPrimaryHeadingTitle(flowPrimaryView)
+                  : undefined
               }
               showThreadControls={!flowPrimarySurface}
               toolStageOpen={toolStageOpen}
@@ -4214,23 +4218,19 @@ export function App() {
             {conversationFileDrop.isDraggingFiles ? (
               <ConversationFileDropTarget />
             ) : null}
-            {flowPrimaryView === "inbox" ? (
-              <HumanTaskInboxPanel client={client} />
-            ) : flowPrimaryView === "deployments" ? (
-              client ? (
-                <WorkflowDeploymentsPanel
-                  activeFlowThreadId={
-                    activeThread?.experienceMode === "flow"
-                      ? activeThread.id
-                      : null
-                  }
-                  client={client}
-                />
-              ) : null
-            ) : flowPrimaryView === "connections" ? (
-              <FlowLibraryPanel client={client} />
-            ) : flowPrimaryView === "knowledge" ? (
-              <LibraryPanel client={client} />
+            {flowPrimarySurface && client ? (
+              <FlowEnterpriseWorkspace
+                client={client}
+                onNavigate={(view) => setFlowPrimaryView(view)}
+                settings={settings}
+                threadId={
+                  activeThread?.experienceMode === "flow"
+                    ? activeThread.id
+                    : null
+                }
+                view={flowPrimaryView as Exclude<FlowPrimaryView, "conversation">}
+                workspaceRoot={currentWorkspaceRoot}
+              />
             ) : serverStatus === "offline" ? (
               <OfflineState
                 backendUrl={platform?.backendUrl}
@@ -4983,6 +4983,34 @@ function mergeArtifactDescriptors(
     ];
   }
   return next;
+}
+
+function flowPrimaryHeadingIcon(view: FlowPrimaryView) {
+  if (view === "overview") return <LayoutDashboard aria-hidden="true" size={15} />;
+  if (view === "agents") return <Bot aria-hidden="true" size={15} />;
+  if (view === "workflow-templates") return <Workflow aria-hidden="true" size={15} />;
+  if (view === "inbox") return <Inbox aria-hidden="true" size={15} />;
+  if (view === "deployments") return <Rocket aria-hidden="true" size={15} />;
+  if (view === "automation") return <RadioTower aria-hidden="true" size={15} />;
+  if (view === "runs") return <Activity aria-hidden="true" size={15} />;
+  if (view === "connections") return <Cable aria-hidden="true" size={15} />;
+  if (view === "trust") return <ShieldCheck aria-hidden="true" size={15} />;
+  if (view === "knowledge") return <Library aria-hidden="true" size={15} />;
+  return undefined;
+}
+
+function flowPrimaryHeadingTitle(view: FlowPrimaryView): string | undefined {
+  if (view === "overview") return "Overview / 运行总览";
+  if (view === "agents") return "Agents / Agent 身份";
+  if (view === "workflow-templates") return "Workflow Templates / 工作流模板";
+  if (view === "inbox") return "Inbox / 待处理";
+  if (view === "deployments") return "Deployments / 部署";
+  if (view === "automation") return "Automation / 自动化与投递";
+  if (view === "runs") return "Runs / 运行追踪";
+  if (view === "connections") return "Connections / 连接";
+  if (view === "trust") return "Trust / 信任中心";
+  if (view === "knowledge") return "Knowledge / 知识库";
+  return undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

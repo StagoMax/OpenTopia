@@ -1,13 +1,29 @@
 import type { ExperienceMode } from "./types";
 
 export type FlowPrimaryView =
-  "conversation" | "inbox" | "deployments" | "connections" | "knowledge";
+  | "conversation"
+  | "overview"
+  | "agents"
+  | "workflow-templates"
+  | "inbox"
+  | "deployments"
+  | "automation"
+  | "runs"
+  | "connections"
+  | "trust"
+  | "knowledge";
 
 export type SidebarDestination =
   | "conversation"
+  | "flow-overview"
+  | "flow-agents"
+  | "flow-workflow-templates"
   | "flow-inbox"
   | "flow-deployments"
+  | "flow-automation"
+  | "flow-runs"
   | "flow-connections"
+  | "flow-trust"
   | "flow-knowledge"
   | "plugins";
 

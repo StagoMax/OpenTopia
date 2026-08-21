@@ -349,6 +349,24 @@
   font-size: var(--font-size-sm);
 }
 
+.agent-template-panel__advanced {
+  border-top: 1px solid var(--border-subtle);
+  padding-top: var(--space-4);
+}
+
+.agent-template-panel__advanced summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+}
+
+.agent-template-panel__advanced-fields {
+  display: grid;
+  gap: var(--space-4);
+  margin-top: var(--space-4);
+}
+
 .agent-template-panel__message {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);

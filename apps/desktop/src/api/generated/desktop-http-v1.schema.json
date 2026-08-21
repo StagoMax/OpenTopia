@@ -6963,7 +6963,8 @@
     },
     "HumanTaskSourceKindV1": {
       "enum": [
-        "flow_run"
+        "flow_run",
+        "delivery_receipt"
       ],
       "type": "string"
     },
@@ -10746,15 +10747,31 @@
     },
     "ResolveHumanTaskResponse": {
       "properties": {
+        "deliveryReceipt": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/WorkflowDeliveryReceiptV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "run": {
-          "$ref": "#/definitions/FlowRunV1"
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FlowRunV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "task": {
           "$ref": "#/definitions/HumanTaskV1"
         }
       },
       "required": [
-        "run",
         "task"
       ],
       "type": "object"
@@ -13753,6 +13770,100 @@
       ],
       "type": "object"
     },
+    "WorkflowDeliveryReceiptV1": {
+      "properties": {
+        "attempt": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "deliveredAt": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "deploymentId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "idempotencyKey": {
+          "type": "string"
+        },
+        "outputKind": {
+          "type": "string"
+        },
+        "providerResult": true,
+        "responseStatus": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "revision": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "runId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "schemaVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "status": {
+          "$ref": "#/definitions/WorkflowDeliveryStatusV1"
+        },
+        "updatedAt": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "attempt",
+        "createdAt",
+        "deploymentId",
+        "id",
+        "idempotencyKey",
+        "outputKind",
+        "revision",
+        "runId",
+        "schemaVersion",
+        "status",
+        "updatedAt"
+      ],
+      "type": "object"
+    },
+    "WorkflowDeliveryStatusV1": {
+      "enum": [
+        "pending",
+        "delivered",
+        "failed",
+        "waiting_human",
+        "cancelled"
+      ],
+      "type": "string"
+    },
     "WorkflowDeploymentStatusV1": {
       "enum": [
         "active",
@@ -13811,6 +13922,149 @@
         "snapshot",
         "status",
         "updatedAt"
+      ],
+      "type": "object"
+    },
+    "WorkflowEvaluationSummary": {
+      "properties": {
+        "averageScore": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "deliveryStatusCounts": {
+          "additionalProperties": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "deploymentId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "evaluationCount": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "failureClusters": {
+          "items": {
+            "$ref": "#/definitions/WorkflowFailureCluster"
+          },
+          "type": "array"
+        },
+        "passRate": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "runStatusCounts": {
+          "additionalProperties": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "totalRuns": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "deliveryStatusCounts",
+        "deploymentId",
+        "evaluationCount",
+        "failureClusters",
+        "runStatusCounts",
+        "totalRuns"
+      ],
+      "type": "object"
+    },
+    "WorkflowEvaluationV1": {
+      "properties": {
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "deploymentId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "evaluator": {
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "labels": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "passed": {
+          "type": "boolean"
+        },
+        "runId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "schemaVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "score": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "createdAt",
+        "deploymentId",
+        "evaluator",
+        "id",
+        "passed",
+        "runId",
+        "schemaVersion",
+        "score"
+      ],
+      "type": "object"
+    },
+    "WorkflowFailureCluster": {
+      "properties": {
+        "count": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "key": {
+          "type": "string"
+        },
+        "sample": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "count",
+        "key",
+        "sample"
       ],
       "type": "object"
     },
@@ -13905,6 +14159,25 @@
       ],
       "type": "object"
     },
+    "WorkflowInvocationResult": {
+      "properties": {
+        "invocation": {
+          "$ref": "#/definitions/WorkflowTriggerInvocationV1"
+        },
+        "reused": {
+          "type": "boolean"
+        },
+        "run": {
+          "$ref": "#/definitions/FlowRunV1"
+        }
+      },
+      "required": [
+        "invocation",
+        "reused",
+        "run"
+      ],
+      "type": "object"
+    },
     "WorkflowOutputSpecV1": {
       "oneOf": [
         {
@@ -13918,6 +14191,76 @@
           },
           "required": [
             "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "credential_ref": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "endpoint": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "webhook"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "endpoint",
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "connection_operation"
+              ],
+              "type": "string"
+            },
+            "operation": {
+              "$ref": "#/definitions/ExecutionConnectionOperationV1"
+            }
+          },
+          "required": [
+            "kind",
+            "operation"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "assigned_to": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "description": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "human_task"
+              ],
+              "type": "string"
+            },
+            "title": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "description",
+            "kind",
+            "title"
           ],
           "type": "object"
         }
@@ -13981,6 +14324,97 @@
       ],
       "type": "object"
     },
+    "WorkflowReleaseStatusV1": {
+      "enum": [
+        "active",
+        "disabled"
+      ],
+      "type": "string"
+    },
+    "WorkflowReleaseV1": {
+      "properties": {
+        "canaryDeploymentId": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "canaryPercent": {
+          "format": "uint8",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "createdBy": {
+          "type": "string"
+        },
+        "environment": {
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "previousPrimaryDeploymentId": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "primaryDeploymentId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "releaseKey": {
+          "type": "string"
+        },
+        "revision": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "schemaVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "status": {
+          "$ref": "#/definitions/WorkflowReleaseStatusV1"
+        },
+        "threadId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "trigger": {
+          "$ref": "#/definitions/WorkflowTriggerSpecV1"
+        },
+        "updatedAt": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "canaryPercent",
+        "createdAt",
+        "createdBy",
+        "environment",
+        "id",
+        "primaryDeploymentId",
+        "releaseKey",
+        "revision",
+        "schemaVersion",
+        "status",
+        "threadId",
+        "trigger",
+        "updatedAt"
+      ],
+      "type": "object"
+    },
     "WorkflowSuperstepNodeV1": {
       "properties": {
         "attempt": {
@@ -14005,6 +14439,82 @@
       ],
       "type": "object"
     },
+    "WorkflowTriggerInvocationStatusV1": {
+      "enum": [
+        "accepted",
+        "started",
+        "failed"
+      ],
+      "type": "string"
+    },
+    "WorkflowTriggerInvocationV1": {
+      "properties": {
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "deploymentId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "flowRunId": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "idempotencyKey": {
+          "type": "string"
+        },
+        "inputHash": {
+          "type": "string"
+        },
+        "releaseId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "schemaVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "status": {
+          "$ref": "#/definitions/WorkflowTriggerInvocationStatusV1"
+        },
+        "triggerId": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "updatedAt": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "createdAt",
+        "deploymentId",
+        "id",
+        "idempotencyKey",
+        "inputHash",
+        "releaseId",
+        "schemaVersion",
+        "status",
+        "triggerId",
+        "updatedAt"
+      ],
+      "type": "object"
+    },
     "WorkflowTriggerSpecV1": {
       "oneOf": [
         {
@@ -14018,6 +14528,86 @@
           },
           "required": [
             "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "webhook"
+              ],
+              "type": "string"
+            },
+            "token_ref": {
+              "type": "string"
+            },
+            "trigger_id": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "token_ref",
+            "trigger_id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "interval_seconds": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "kind": {
+              "enum": [
+                "schedule"
+              ],
+              "type": "string"
+            },
+            "next_fire_at": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "trigger_id": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          "required": [
+            "interval_seconds",
+            "kind",
+            "next_fire_at",
+            "trigger_id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "event_type": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "event_subscription"
+              ],
+              "type": "string"
+            },
+            "source": {
+              "type": "string"
+            },
+            "trigger_id": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          "required": [
+            "event_type",
+            "kind",
+            "source",
+            "trigger_id"
           ],
           "type": "object"
         }
@@ -14435,6 +15025,12 @@
     "createWorkflowDeployment": {
       "$ref": "#/definitions/WorkflowDeploymentV1"
     },
+    "createWorkflowEvaluation": {
+      "$ref": "#/definitions/WorkflowEvaluationV1"
+    },
+    "createWorkflowRelease": {
+      "$ref": "#/definitions/WorkflowReleaseV1"
+    },
     "decideApproval": {
       "$ref": "#/definitions/ApprovalDecisionResponse"
     },
@@ -14452,6 +15048,15 @@
     },
     "disableWorkflowDeployment": {
       "$ref": "#/definitions/WorkflowDeploymentV1"
+    },
+    "disableWorkflowRelease": {
+      "$ref": "#/definitions/WorkflowReleaseV1"
+    },
+    "dispatchWorkflowEvent": {
+      "items": {
+        "$ref": "#/definitions/WorkflowInvocationResult"
+      },
+      "type": "array"
     },
     "ensureTerminalSession": {
       "$ref": "#/definitions/TerminalSessionResponse"
@@ -14608,6 +15213,12 @@
     "getWorkflowDeployment": {
       "$ref": "#/definitions/WorkflowDeploymentV1"
     },
+    "getWorkflowEvaluationSummary": {
+      "$ref": "#/definitions/WorkflowEvaluationSummary"
+    },
+    "getWorkflowRelease": {
+      "$ref": "#/definitions/WorkflowReleaseV1"
+    },
     "getWorkspaceDiff": {
       "$ref": "#/definitions/WorkspaceDiff"
     },
@@ -14626,6 +15237,15 @@
     "invokeMediaHandler": {
       "$ref": "#/definitions/MediaHandlerInvocationResponse"
     },
+    "invokeWorkflowRelease": {
+      "$ref": "#/definitions/WorkflowInvocationResult"
+    },
+    "listAgentInstances": {
+      "items": {
+        "$ref": "#/definitions/AgentInstanceV1"
+      },
+      "type": "array"
+    },
     "listAgentTemplates": {
       "items": {
         "$ref": "#/definitions/AgentTemplateVersionView"
@@ -14635,6 +15255,12 @@
     "listAgents": {
       "items": {
         "$ref": "#/definitions/AgentListItem"
+      },
+      "type": "array"
+    },
+    "listAllFlowRuns": {
+      "items": {
+        "$ref": "#/definitions/FlowRunV1"
       },
       "type": "array"
     },
@@ -14785,9 +15411,33 @@
       },
       "type": "array"
     },
+    "listWorkflowDeliveryReceipts": {
+      "items": {
+        "$ref": "#/definitions/WorkflowDeliveryReceiptV1"
+      },
+      "type": "array"
+    },
     "listWorkflowDeployments": {
       "items": {
         "$ref": "#/definitions/WorkflowDeploymentV1"
+      },
+      "type": "array"
+    },
+    "listWorkflowEvaluations": {
+      "items": {
+        "$ref": "#/definitions/WorkflowEvaluationV1"
+      },
+      "type": "array"
+    },
+    "listWorkflowReleases": {
+      "items": {
+        "$ref": "#/definitions/WorkflowReleaseV1"
+      },
+      "type": "array"
+    },
+    "listWorkflowTriggerInvocations": {
+      "items": {
+        "$ref": "#/definitions/WorkflowTriggerInvocationV1"
       },
       "type": "array"
     },
@@ -14808,6 +15458,9 @@
     },
     "previewTurnUndo": {
       "$ref": "#/definitions/TurnUndoPreview"
+    },
+    "promoteWorkflowRelease": {
+      "$ref": "#/definitions/WorkflowReleaseV1"
     },
     "publishAgentTemplateVersion": {
       "$ref": "#/definitions/AgentTemplateVersionView"
@@ -14851,8 +15504,14 @@
     "retryManagedPowerShell": {
       "$ref": "#/definitions/ShellRuntimeStatus"
     },
+    "retryWorkflowDelivery": {
+      "$ref": "#/definitions/WorkflowDeliveryReceiptV1"
+    },
     "revertWorkspaceFile": {
       "$ref": "#/definitions/WorkspaceDiffActionResponse"
+    },
+    "rollbackWorkflowRelease": {
+      "$ref": "#/definitions/WorkflowReleaseV1"
     },
     "runBrowserCommand": {
       "$ref": "#/definitions/BrowserOutput"
@@ -14895,6 +15554,9 @@
     },
     "setThreadPlugin": {
       "$ref": "#/definitions/PluginView"
+    },
+    "setWorkflowReleaseCanary": {
+      "$ref": "#/definitions/WorkflowReleaseV1"
     },
     "setupWindowsSandbox": {
       "$ref": "#/definitions/WindowsSandboxSetupStatus"
@@ -15003,12 +15665,16 @@
     "createProject",
     "createThread",
     "createWorkflowDeployment",
+    "createWorkflowEvaluation",
+    "createWorkflowRelease",
     "decideApproval",
     "deleteAgentTemplateVersion",
     "deleteMcpServer",
     "deleteProject",
     "deleteThread",
     "disableWorkflowDeployment",
+    "disableWorkflowRelease",
+    "dispatchWorkflowEvent",
     "ensureTerminalSession",
     "executeLocalGit",
     "generateThreadTitle",
@@ -15041,14 +15707,19 @@
     "getTurnFileDiffPreview",
     "getWindowsSandboxSetup",
     "getWorkflowDeployment",
+    "getWorkflowEvaluationSummary",
+    "getWorkflowRelease",
     "getWorkspaceDiff",
     "health",
     "ingestSagText",
     "installPlugin",
     "interruptAgent",
     "invokeMediaHandler",
+    "invokeWorkflowRelease",
+    "listAgentInstances",
     "listAgentTemplates",
     "listAgents",
+    "listAllFlowRuns",
     "listArtifacts",
     "listComputerWindows",
     "listConnectionCapabilityRevisions",
@@ -15074,13 +15745,18 @@
     "listThreadAgentInstances",
     "listThreadMcpServers",
     "listThreads",
+    "listWorkflowDeliveryReceipts",
     "listWorkflowDeployments",
+    "listWorkflowEvaluations",
+    "listWorkflowReleases",
+    "listWorkflowTriggerInvocations",
     "listWorkspaceTree",
     "logoutCodexAccount",
     "observeComputerWindow",
     "pauseFlowRun",
     "postPluginAppMessage",
     "previewTurnUndo",
+    "promoteWorkflowRelease",
     "publishAgentTemplateVersion",
     "publishFlowDraft",
     "readWorkspaceFile",
@@ -15095,7 +15771,9 @@
     "resumeFlowRun",
     "retryManagedOfficeRuntime",
     "retryManagedPowerShell",
+    "retryWorkflowDelivery",
     "revertWorkspaceFile",
+    "rollbackWorkflowRelease",
     "runBrowserCommand",
     "runGitWorkflow",
     "searchFlows",
@@ -15109,6 +15787,7 @@
     "setThreadMcpServer",
     "setThreadModel",
     "setThreadPlugin",
+    "setWorkflowReleaseCanary",
     "setupWindowsSandbox",
     "simulateFlowDraft",
     "startCodexLogin",

@@ -1,6 +1,11 @@
 import { useEffect, useMemo, useSyncExternalStore } from "react";
 import type { ApiClient } from "../../api/client";
-import type { FlowDefinition, FlowRun, WorkflowDeployment } from "../../types";
+import type {
+  FlowDefinition,
+  FlowRun,
+  WorkflowDeployment,
+  WorkflowOutput,
+} from "../../types";
 import { sortFlowDefinitions, sortWorkflowDeployments } from "./model";
 
 export type WorkflowDeploymentsSnapshot = {
@@ -106,6 +111,7 @@ export class WorkflowDeploymentsStore {
     name: string;
     environment: string;
     createdBy: string;
+    output?: WorkflowOutput;
   }): Promise<boolean> {
     this.update({ busyAction: "create", error: null, notice: null });
     try {

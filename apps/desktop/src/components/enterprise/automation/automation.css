@@ -1,0 +1,257 @@
+.automation-page {
+  gap: var(--space-5);
+}
+
+.automation-state {
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: var(--space-2);
+  min-block-size: 100%;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.automation-spin {
+  animation: automation-spin calc(var(--motion-standard) * 5) linear infinite;
+}
+
+.automation-feedback {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-block: var(--space-4);
+  border: 1px solid var(--success);
+  border-radius: var(--radius-sm);
+  background: var(--success-subtle);
+  padding: var(--space-3) var(--space-4);
+  color: var(--success);
+  font-size: var(--font-size-sm);
+}
+
+.automation-feedback.is-error {
+  border-color: var(--danger);
+  background: var(--danger-subtle);
+  color: var(--danger);
+}
+
+.automation-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--space-3);
+}
+
+.automation-metric {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: var(--space-1) var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-subtle);
+  padding: var(--space-3) var(--space-4);
+  color: var(--text-secondary);
+}
+
+.automation-metric svg {
+  grid-row: 1 / span 2;
+  color: var(--accent);
+}
+
+.automation-metric strong {
+  color: var(--text);
+  font-size: var(--font-size-xl);
+}
+
+.automation-metric small,
+.automation-definition-list dt,
+.automation-definition-list dd,
+.automation-release-list small,
+.automation-receipts small,
+.automation-cluster small,
+.automation-summary small {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.automation-metric.is-danger svg,
+.automation-metric.is-danger strong {
+  color: var(--danger);
+}
+
+.automation-layout {
+  display: grid;
+  grid-template-columns: minmax(15rem, 0.72fr) minmax(0, 1.5fr);
+  align-items: start;
+  gap: var(--space-5);
+}
+
+.automation-detail {
+  display: grid;
+  gap: var(--space-5);
+  min-inline-size: 0;
+}
+
+.automation-release-list,
+.automation-receipts {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.automation-release-list button {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-3);
+  inline-size: 100%;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  padding: var(--space-3);
+  color: var(--text);
+  text-align: start;
+}
+
+.automation-release-list button:hover,
+.automation-release-list button[aria-current="true"] {
+  border-color: var(--border);
+  background: var(--surface-hover);
+}
+
+.automation-release-list button:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.automation-release-list span,
+.automation-receipts span,
+.automation-cluster span {
+  display: grid;
+  min-inline-size: 0;
+  gap: var(--space-1);
+}
+
+.automation-release-list strong,
+.automation-release-list small,
+.automation-receipts strong,
+.automation-receipts small,
+.automation-cluster strong,
+.automation-cluster small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.automation-create-form,
+.automation-actions {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.automation-form-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-4);
+}
+
+.automation-warning {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  color: var(--warning);
+  font-size: var(--font-size-sm);
+}
+
+.automation-definition-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+  margin: 0 0 var(--space-4);
+}
+
+.automation-definition-list div {
+  display: grid;
+  gap: var(--space-1);
+  border-block-end: 1px solid var(--border-subtle);
+  padding-block-end: var(--space-2);
+}
+
+.automation-definition-list dd {
+  margin: 0;
+  color: var(--text-secondary);
+}
+
+.automation-actions {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: end;
+}
+
+.automation-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--space-3);
+  min-block-size: var(--control-height-lg);
+}
+
+.automation-summary > span {
+  display: grid;
+  gap: var(--space-1);
+  border-inline-start: 2px solid var(--border-strong);
+  padding-inline-start: var(--space-3);
+}
+
+.automation-summary strong {
+  color: var(--text);
+}
+
+.automation-cluster,
+.automation-receipts li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: var(--space-3);
+  margin: 0;
+  border-block-start: 1px solid var(--border-subtle);
+  padding-block: var(--space-3);
+  color: var(--text-secondary);
+}
+
+.automation-cluster .is-error,
+.automation-receipts .is-error {
+  color: var(--danger);
+}
+
+.automation-muted {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+}
+
+@keyframes automation-spin {
+  to {
+    transform: rotate(1turn);
+  }
+}
+
+@media (max-width: 64rem) {
+  .automation-layout,
+  .automation-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .automation-metrics,
+  .automation-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .automation-spin {
+    animation: none;
+  }
+}

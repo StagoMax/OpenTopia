@@ -4,7 +4,7 @@
 export type WorkspaceDiffScope = "staged" | "unstaged";
 export type HumanTaskActionV1 =
   "approve" | "reject" | "retry" | "resume" | "submit" | "reconnect" | "acknowledge" | "cancel";
-export type HumanTaskSourceKindV1 = "flow_run";
+export type HumanTaskSourceKindV1 = "flow_run" | "delivery_receipt";
 export type HumanTaskStatusV1 = "pending" | "completed" | "cancelled";
 export type HumanTaskTypeV1 =
   | "approval"
@@ -66,14 +66,54 @@ export type AgentRiskClassV1 = "low" | "medium" | "high" | "critical";
 export type LoopExhaustionActionV1 = "require_human" | "return_partial" | "fail";
 export type GraphNodeKindV1 =
   "agent" | "skill" | "tool" | "condition" | "validator" | "approval" | "join" | "loop" | "output";
-export type WorkflowOutputSpecV1 = {
-  kind: "inbox";
-  [k: string]: unknown;
-};
-export type WorkflowTriggerSpecV1 = {
-  kind: "manual";
-  [k: string]: unknown;
-};
+export type WorkflowOutputSpecV1 =
+  | {
+      kind: "inbox";
+      [k: string]: unknown;
+    }
+  | {
+      credential_ref?: string | null;
+      endpoint: string;
+      kind: "webhook";
+      [k: string]: unknown;
+    }
+  | {
+      kind: "connection_operation";
+      operation: ExecutionConnectionOperationV1;
+      [k: string]: unknown;
+    }
+  | {
+      assigned_to?: string | null;
+      description: string;
+      kind: "human_task";
+      title: string;
+      [k: string]: unknown;
+    };
+export type WorkflowTriggerSpecV1 =
+  | {
+      kind: "manual";
+      [k: string]: unknown;
+    }
+  | {
+      kind: "webhook";
+      token_ref: string;
+      trigger_id: string;
+      [k: string]: unknown;
+    }
+  | {
+      interval_seconds: number;
+      kind: "schedule";
+      next_fire_at: string;
+      trigger_id: string;
+      [k: string]: unknown;
+    }
+  | {
+      event_type: string;
+      kind: "event_subscription";
+      source: string;
+      trigger_id: string;
+      [k: string]: unknown;
+    };
 export type FlowNodeRunStatusV1 =
   | "running"
   | "waiting_approval"
@@ -130,6 +170,8 @@ export type CapabilityDiscoveryKindV1 = "mcp_tools_list" | "static";
 export type IntegrationKindV1 = "mcp" | "oauth_api" | "database" | "local_app";
 export type McpLifecycleStatus = "not_started" | "starting" | "ready" | "error" | "disabled";
 export type WorkflowDeploymentStatusV1 = "active" | "disabled";
+export type WorkflowReleaseStatusV1 = "active" | "disabled";
+export type WorkflowTriggerInvocationStatusV1 = "accepted" | "started" | "failed";
 export type GitWorkflowActionKind =
   | "status"
   | "list_branches"
@@ -860,6 +902,8 @@ export type ProviderDriverTrust = "built_in" | "signed";
 export type SkillScope = "workspace" | "user";
 export type TerminalEventKind =
   "started" | "stdout" | "stderr" | "finished" | "cancelled" | "error";
+export type WorkflowDeliveryStatusV1 =
+  "pending" | "delivered" | "failed" | "waiting_human" | "cancelled";
 export type WorkspaceEntryKind = "file" | "directory" | "symlink" | "other";
 export type TurnUndoConflictKind =
   | "unavailable"
@@ -940,12 +984,16 @@ export interface DesktopHttpResponsesV1 {
   createProject: Project;
   createThread: Thread;
   createWorkflowDeployment: WorkflowDeploymentV1;
+  createWorkflowEvaluation: WorkflowEvaluationV1;
+  createWorkflowRelease: WorkflowReleaseV1;
   decideApproval: ApprovalDecisionResponse;
   deleteAgentTemplateVersion: DeleteResponse;
   deleteMcpServer: DeleteResponse;
   deleteProject: DeleteResponse;
   deleteThread: DeleteResponse;
   disableWorkflowDeployment: WorkflowDeploymentV1;
+  disableWorkflowRelease: WorkflowReleaseV1;
+  dispatchWorkflowEvent: WorkflowInvocationResult[];
   ensureTerminalSession: TerminalSessionResponse;
   executeLocalGit: LocalGitV1Response;
   generateThreadTitle: GenerateThreadTitleResponse;
@@ -983,14 +1031,19 @@ export interface DesktopHttpResponsesV1 {
   getTurnStatus?: TurnRecord | null;
   getWindowsSandboxSetup: WindowsSandboxSetupStatus;
   getWorkflowDeployment: WorkflowDeploymentV1;
+  getWorkflowEvaluationSummary: WorkflowEvaluationSummary;
+  getWorkflowRelease: WorkflowReleaseV1;
   getWorkspaceDiff: WorkspaceDiff;
   health: HealthResponse;
   ingestSagText: LibraryIngestionResponseView;
   installPlugin: PluginView;
   interruptAgent: DeleteResponse;
   invokeMediaHandler: MediaHandlerInvocationResponse;
+  invokeWorkflowRelease: WorkflowInvocationResult;
+  listAgentInstances: AgentInstanceV1[];
   listAgentTemplates: AgentTemplateVersionView[];
   listAgents: AgentListItem[];
+  listAllFlowRuns: FlowRunV1[];
   listArtifacts: ArtifactMetadata[];
   listComputerWindows: WindowTarget[];
   listConnectionCapabilityRevisions: ConnectionCapabilityRevisionV1[];
@@ -1016,13 +1069,18 @@ export interface DesktopHttpResponsesV1 {
   listThreadAgentInstances: AgentInstanceV1[];
   listThreadMcpServers: ThreadMcpServerView[];
   listThreads: Thread[];
+  listWorkflowDeliveryReceipts: WorkflowDeliveryReceiptV1[];
   listWorkflowDeployments: WorkflowDeploymentV1[];
+  listWorkflowEvaluations: WorkflowEvaluationV1[];
+  listWorkflowReleases: WorkflowReleaseV1[];
+  listWorkflowTriggerInvocations: WorkflowTriggerInvocationV1[];
   listWorkspaceTree: WorkspaceTree;
   logoutCodexAccount: DeleteResponse;
   observeComputerWindow: ComputerObservation;
   pauseFlowRun: FlowRunV1;
   postPluginAppMessage: AppViewMessage;
   previewTurnUndo: TurnUndoPreview;
+  promoteWorkflowRelease: WorkflowReleaseV1;
   publishAgentTemplateVersion: AgentTemplateVersionView;
   publishFlowDraft: FlowDefinitionV1;
   readWorkspaceFile: WorkspaceFilePreview;
@@ -1037,7 +1095,9 @@ export interface DesktopHttpResponsesV1 {
   resumeFlowRun: FlowRunV1;
   retryManagedOfficeRuntime: OfficeRuntimeStatus;
   retryManagedPowerShell: ShellRuntimeStatus;
+  retryWorkflowDelivery: WorkflowDeliveryReceiptV1;
   revertWorkspaceFile: WorkspaceDiffActionResponse;
+  rollbackWorkflowRelease: WorkflowReleaseV1;
   runBrowserCommand: BrowserOutput;
   runGitWorkflow: GitWorkflowResponse;
   searchFlows: FlowDefinitionV1[];
@@ -1051,6 +1111,7 @@ export interface DesktopHttpResponsesV1 {
   setThreadMcpServer: ThreadMcpServer;
   setThreadModel: Thread;
   setThreadPlugin: PluginView;
+  setWorkflowReleaseCanary: WorkflowReleaseV1;
   setupWindowsSandbox: WindowsSandboxSetupStatus;
   simulateFlowDraft: FlowTrialV1;
   startCodexLogin: CodexLoginStart;
@@ -1956,9 +2017,61 @@ export interface WorkflowDeploymentV1 {
   updatedAt: string;
   [k: string]: unknown;
 }
+export interface WorkflowEvaluationV1 {
+  createdAt: string;
+  deploymentId: string;
+  evaluator: string;
+  id: string;
+  labels?: string[];
+  note?: string | null;
+  passed: boolean;
+  runId: string;
+  schemaVersion: number;
+  score: number;
+  [k: string]: unknown;
+}
+export interface WorkflowReleaseV1 {
+  canaryDeploymentId?: string | null;
+  canaryPercent: number;
+  createdAt: string;
+  createdBy: string;
+  environment: string;
+  id: string;
+  previousPrimaryDeploymentId?: string | null;
+  primaryDeploymentId: string;
+  releaseKey: string;
+  revision: number;
+  schemaVersion: number;
+  status: WorkflowReleaseStatusV1;
+  threadId: string;
+  trigger: WorkflowTriggerSpecV1;
+  updatedAt: string;
+  [k: string]: unknown;
+}
 export interface ApprovalDecisionResponse {
   accepted: boolean;
   executed: boolean;
+  [k: string]: unknown;
+}
+export interface WorkflowInvocationResult {
+  invocation: WorkflowTriggerInvocationV1;
+  reused: boolean;
+  run: FlowRunV1;
+  [k: string]: unknown;
+}
+export interface WorkflowTriggerInvocationV1 {
+  createdAt: string;
+  deploymentId: string;
+  error?: string | null;
+  flowRunId?: string | null;
+  id: string;
+  idempotencyKey: string;
+  inputHash: string;
+  releaseId: string;
+  schemaVersion: number;
+  status: WorkflowTriggerInvocationStatusV1;
+  triggerId: string;
+  updatedAt: string;
   [k: string]: unknown;
 }
 export interface LocalGitV1Response {
@@ -3051,6 +3164,27 @@ export interface WindowsSandboxSetupComponents {
   onlineIdentity: boolean;
   [k: string]: unknown;
 }
+export interface WorkflowEvaluationSummary {
+  averageScore?: number | null;
+  deliveryStatusCounts: {
+    [k: string]: number;
+  };
+  deploymentId: string;
+  evaluationCount: number;
+  failureClusters: WorkflowFailureCluster[];
+  passRate?: number | null;
+  runStatusCounts: {
+    [k: string]: number;
+  };
+  totalRuns: number;
+  [k: string]: unknown;
+}
+export interface WorkflowFailureCluster {
+  count: number;
+  key: string;
+  sample: string;
+  [k: string]: unknown;
+}
 export interface HealthResponse {
   apiVersion: number;
   officeRuntime: OfficeRuntimeStatus;
@@ -3592,6 +3726,24 @@ export interface ThreadMcpServer {
   updatedAt: string;
   [k: string]: unknown;
 }
+export interface WorkflowDeliveryReceiptV1 {
+  attempt: number;
+  createdAt: string;
+  deliveredAt?: string | null;
+  deploymentId: string;
+  error?: string | null;
+  id: string;
+  idempotencyKey: string;
+  outputKind: string;
+  providerResult?: unknown;
+  responseStatus?: number | null;
+  revision: number;
+  runId: string;
+  schemaVersion: number;
+  status: WorkflowDeliveryStatusV1;
+  updatedAt: string;
+  [k: string]: unknown;
+}
 export interface WorkspaceTree {
   entries: WorkspaceEntry[];
   path: string;
@@ -3698,7 +3850,8 @@ export interface ConnectionCapabilityDiffView {
   [k: string]: unknown;
 }
 export interface ResolveHumanTaskResponse {
-  run: FlowRunV1;
+  deliveryReceipt?: WorkflowDeliveryReceiptV1 | null;
+  run?: FlowRunV1 | null;
   task: HumanTaskV1;
   [k: string]: unknown;
 }

@@ -6,6 +6,8 @@ import {
   Inbox,
   Play,
   ShieldCheck,
+  Send,
+  UserRoundCheck,
   Workflow,
 } from "lucide-react";
 import { useMemo, useState } from "react";
@@ -23,7 +25,8 @@ export function WorkflowDeploymentDetails({
   deployment: WorkflowDeployment;
   store: WorkflowDeploymentsStore;
 }) {
-  const [inputText, setInputText] = useState("{}");
+  const [inputText, setInputText] = useState("");
+  const [advancedInputText, setAdvancedInputText] = useState("");
   const [inputError, setInputError] = useState<string | null>(null);
   const [confirmDisable, setConfirmDisable] = useState(false);
   const workflow = deployment.snapshot.compiledWorkflow;
@@ -40,15 +43,23 @@ export function WorkflowDeploymentDetails({
     0,
   );
   const busy = Boolean(store.getSnapshot().busyAction);
+  const OutputIcon =
+    deployment.snapshot.output.kind === "webhook"
+      ? Send
+      : deployment.snapshot.output.kind === "human_task"
+        ? UserRoundCheck
+        : Inbox;
 
   async function run() {
     if (!activeFlowThreadId) return;
-    let input: unknown;
-    try {
-      input = JSON.parse(inputText);
-    } catch {
-      setInputError("Input 必须是有效 JSON。请修正后再运行。");
-      return;
+    let input: unknown = inputText.trim() ? { request: inputText.trim() } : {};
+    if (advancedInputText.trim()) {
+      try {
+        input = JSON.parse(advancedInputText);
+      } catch {
+        setInputError("Advanced Input 必须是有效 JSON。请修正后再运行。");
+        return;
+      }
     }
     setInputError(null);
     await store.run(activeFlowThreadId, deployment, input);
@@ -107,13 +118,13 @@ export function WorkflowDeploymentDetails({
           <div className="workflow-deployment-runtime-contract">
             <span>
               <Play aria-hidden="true" size={16} />
-              <strong>Manual Trigger</strong>
-              <small>手动触发器</small>
+              <strong>{deployment.snapshot.trigger.kind} Trigger</strong>
+              <small>快照触发契约</small>
             </span>
             <span>
-              <Inbox aria-hidden="true" size={16} />
-              <strong>Inbox Output</strong>
-              <small>收件箱输出</small>
+              <OutputIcon aria-hidden="true" size={16} />
+              <strong>{deployment.snapshot.output.kind} Output</strong>
+              <small>DeliveryReceipt 追踪</small>
             </span>
             <span>
               <ShieldCheck aria-hidden="true" size={16} />
@@ -166,17 +177,29 @@ export function WorkflowDeploymentDetails({
         <Panel title="Manual Run / 手动运行">
           <div className="workflow-deployment-run-form">
             <label>
-              <span>Input JSON / 输入</span>
+              <span>Task input / 任务输入</span>
               <textarea
                 aria-describedby={
                   inputError ? "workflow-deployment-input-error" : undefined
                 }
                 aria-invalid={Boolean(inputError)}
                 onChange={(event) => setInputText(event.target.value)}
-                spellCheck={false}
+                placeholder="用自然语言描述本次运行要处理的对象或目标。"
                 value={inputText}
               />
             </label>
+            <details className="workflow-deployment-advanced-input">
+              <summary>Advanced / 使用结构化 JSON 输入</summary>
+              <label>
+                <span>JSON override / JSON 覆盖</span>
+                <textarea
+                  onChange={(event) => setAdvancedInputText(event.target.value)}
+                  placeholder='例如 {"caseId":"case-1"}'
+                  spellCheck={false}
+                  value={advancedInputText}
+                />
+              </label>
+            </details>
             {inputError ? (
               <span id="workflow-deployment-input-error" role="alert">
                 {inputError}

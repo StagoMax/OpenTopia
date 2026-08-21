@@ -1,5 +1,10 @@
 import type { ExperienceMode } from "./base";
 import type {
+  WorkflowDeliveryReceipt,
+  WorkflowOutput,
+  WorkflowTrigger,
+} from "./workflowAutomation";
+import type {
   CapabilityActivationSnapshot,
   CapabilityProjection,
   PluginContributionRecord,
@@ -321,8 +326,8 @@ export type DeploymentSnapshot = {
   schemaVersion: number;
   id: string;
   compiledWorkflow: CompiledWorkflow;
-  trigger: { kind: "manual" };
-  output: { kind: "inbox" };
+  trigger: WorkflowTrigger;
+  output: WorkflowOutput;
   contentHash: string;
   createdAt: string;
   createdBy: string;
@@ -494,7 +499,7 @@ export type HumanTask = {
   id: string;
   revision: number;
   threadId: string;
-  sourceKind: "flow_run";
+  sourceKind: "flow_run" | "delivery_receipt";
   sourceId: string;
   sourceNodeRunId?: string | null;
   sourceNodeId?: string | null;
@@ -527,7 +532,8 @@ export type HumanTask = {
 
 export type HumanTaskResolutionResult = {
   task: HumanTask;
-  run: FlowRun;
+  run?: FlowRun | null;
+  deliveryReceipt?: WorkflowDeliveryReceipt | null;
 };
 
 export type ThreadCapabilities = {
