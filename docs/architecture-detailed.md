@@ -545,6 +545,8 @@ Windows shell 由统一运行时解析器选择，优先级为：`OPENTOPIA_POWE
 
 Office 能力不发现或依赖用户 `PATH` 中的 Python。`runtime/office/runtime-lock.json` 固定可搬移的 `python-build-standalone` Python 版本、六个桌面目标的直接下载地址与 SHA-256，以及 OpenPyXL 依赖 wheel；发布构建把完整独立运行时放入应用资源，开发或资源损坏场景则通过同一受管理运行时下载器安装到版本化缓存。Python 发行包和 wheel 全部校验后才在独立暂存目录中安装、探测版本，并通过目录重命名原子启用。失败时 Office 操作保留 Rust 原生后备实现，并可从“设置 → 高级 → Office Python 运行时”手动重试。`OPENTOPIA_OFFICE_RUNTIME_ROOT` 可指定已准备的离线运行时，`OPENTOPIA_OFFICE_RUNTIME_AUTO_INSTALL=false` 可关闭后台安装。
 
+编码代理使用独立的通用工具运行时，不依赖 Codex 或其他宿主应用的私有安装目录。Windows 核心工具清单在 `runtime/agent-tools/runtime-lock.json` 中固定 `ripgrep` 与 MinGit 的版本、下载地址、体积上限和 SHA-256；`scripts/prepare-agent-tools-runtime.ps1` 在隔离暂存目录中解压并探测真实版本，生成包含各可执行文件哈希和 PATH 条目的 `agent-tools-runtime.json` 后原子启用。桌面启动时再次验证外层发行清单、内层工具清单和可执行文件哈希，再把受管目录置于后端 PATH 最前面，因此模型发出的 `rg`、`git` 命令与内置工作区搜索使用同一稳定边界。开发态可运行准备脚本或用 `OPENTOPIA_AGENT_TOOLS_ROOT` 指向经过准备的离线目录；Node、通用 Python 和媒体工具仍按能力延迟扩展，不进入始终加载的核心包。
+
 所有内置文件变更入口把 `.ps1` 规范化为 UTF-8 BOM，使同一脚本在 PowerShell 7 和 Windows PowerShell 5.1 下都能按相同 Unicode 源码解析；控制台 UTF-8 设置只负责进程 I/O，不能替代脚本源码编码策略。
 
 ### 13.3 打包
@@ -553,11 +555,14 @@ Office 能力不发现或依赖用户 `PATH` 中的 Python。`runtime/office/run
 
 1. 构建 release 版 `opentopia-server`；
 2. 从版本化缓存复用或准备独立 Office Python，并校验 v2 manifest；
-3. 将服务端、Office 运行时和平台 helper 暂存到 `.runtime-stage`；
-4. 在 Windows 上校验 Codex restricted-token sandbox helper；
-5. 构建桌面前端并调用 `electron-builder`。
+3. 在 Windows 上准备固定版本的 `ripgrep` 与 MinGit，并校验归档、可执行文件和版本；
+4. 将服务端、Office 运行时、代理工具运行时和平台 helper 暂存到 `.runtime-stage`；
+5. 在 Windows 上校验 Codex restricted-token sandbox helper；
+6. 构建桌面前端并调用 `electron-builder`。
 
 `scripts/prepare-office-runtime.ps1` 不再接受构建机 Python 来创建 venv；它只接受锁文件指定的独立发行包，或通过 `-PythonArchive` 使用 SHA-256 匹配的离线归档。完整的已准备目录也可以通过 `-OfficeRuntimeSource` 直接传给 `scripts/build-desktop.ps1`。
+
+`scripts/prepare-agent-tools-runtime.ps1` 默认准备当前 Windows 架构的版本化缓存；离线构建可分别传入 `-RipgrepArchive`、`-GitArchive`，或通过 `-AgentToolsRuntimeSource` 把完整的已准备目录交给 `scripts/build-desktop.ps1`。MinGit 是面向第三方嵌入的非交互 Git 子集，完整目录必须一起打包，不能只复制 `git.exe`。
 
 `scripts/check.ps1` 运行 `cargo check --workspace`、桌面 TypeScript typecheck 和前端 build。它是基础静态/构建验证，不替代 Provider、沙箱、浏览器或端到端人工验证。
 
