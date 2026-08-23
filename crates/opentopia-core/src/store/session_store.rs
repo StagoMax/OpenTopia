@@ -131,6 +131,11 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         elapsed_seconds: u64,
     ) -> anyhow::Result<Option<GoalSnapshot>>;
     fn append_message(&self, message: Message) -> anyhow::Result<Message>;
+    fn append_conversation_batch(
+        &self,
+        messages: Vec<Message>,
+        events: Vec<AgentEvent>,
+    ) -> anyhow::Result<Vec<AgentEvent>>;
     fn list_messages(&self, thread_id: Uuid) -> anyhow::Result<Vec<Message>>;
     fn enqueue_turn_message(&self, thread_id: Uuid, message_id: Uuid) -> anyhow::Result<()>;
     fn list_queued_turn_messages(&self, thread_id: Uuid) -> anyhow::Result<Vec<Uuid>>;

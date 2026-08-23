@@ -28,6 +28,7 @@ pub(crate) struct WorkspaceExecutionCapsule {
     environment: Vec<(OsString, OsString)>,
     path_entries: Vec<PathBuf>,
     read_roots: Vec<PathBuf>,
+    managed_runtime_roots: Vec<PathBuf>,
     issues: Vec<WorkspaceCapabilityIssue>,
     fingerprint: String,
 }
@@ -55,6 +56,10 @@ impl WorkspaceExecutionCapsule {
         &self.read_roots
     }
 
+    pub(crate) fn managed_runtime_roots(&self) -> &[PathBuf] {
+        &self.managed_runtime_roots
+    }
+
     pub(crate) fn issues(&self) -> &[WorkspaceCapabilityIssue] {
         &self.issues
     }
@@ -69,6 +74,7 @@ struct CapsuleBuilder {
     environment: BTreeMap<String, (OsString, OsString)>,
     path_entries: Vec<PathBuf>,
     read_roots: Vec<PathBuf>,
+    managed_runtime_roots: Vec<PathBuf>,
     issues: Vec<WorkspaceCapabilityIssue>,
 }
 
@@ -132,6 +138,7 @@ impl CapsuleBuilder {
                 self.insert_env("COREPACK_HOME", runtime.corepack_home.as_os_str());
                 self.push_path_entry(runtime.shims);
                 self.push_read_root(runtime.root);
+                self.push_managed_runtime_root(runtime.permission_root);
             }
             Err(error) => {
                 self.issues.push(WorkspaceCapabilityIssue {
@@ -156,18 +163,27 @@ impl CapsuleBuilder {
         push_unique_path(&mut self.read_roots, normalized_canonical_path(&path));
     }
 
+    fn push_managed_runtime_root(&mut self, path: PathBuf) {
+        push_unique_path(
+            &mut self.managed_runtime_roots,
+            normalized_canonical_path(&path),
+        );
+    }
+
     fn finish(self) -> WorkspaceExecutionCapsule {
         let environment = self.environment.into_values().collect::<Vec<_>>();
         let fingerprint = capsule_fingerprint(
             &environment,
             &self.path_entries,
             &self.read_roots,
+            &self.managed_runtime_roots,
             &self.issues,
         );
         WorkspaceExecutionCapsule {
             environment,
             path_entries: self.path_entries,
             read_roots: self.read_roots,
+            managed_runtime_roots: self.managed_runtime_roots,
             issues: self.issues,
             fingerprint,
         }
@@ -177,6 +193,7 @@ impl CapsuleBuilder {
 #[derive(Debug)]
 struct ManagedPnpmRuntime {
     root: PathBuf,
+    permission_root: PathBuf,
     corepack_home: PathBuf,
     shims: PathBuf,
 }
@@ -325,8 +342,10 @@ fn validate_managed_pnpm(root: &Path, version: &str) -> anyhow::Result<ManagedPn
         validate_unix_node_shim(&pnpm_shim)?;
         validate_unix_node_shim(&pnpx_shim)?;
     }
+    let permission_root = normalized_canonical_path(root.parent().unwrap_or(root));
     Ok(ManagedPnpmRuntime {
         root: normalized_canonical_path(root),
+        permission_root,
         corepack_home: normalized_canonical_path(&corepack_home),
         shims: normalized_canonical_path(&shims),
     })
@@ -573,6 +592,7 @@ fn capsule_fingerprint(
     environment: &[(OsString, OsString)],
     path_entries: &[PathBuf],
     read_roots: &[PathBuf],
+    managed_runtime_roots: &[PathBuf],
     issues: &[WorkspaceCapabilityIssue],
 ) -> String {
     let mut digest = Sha256::new();
@@ -589,6 +609,11 @@ fn capsule_fingerprint(
     }
     for path in read_roots {
         digest.update(b"read\0");
+        digest.update(path.as_os_str().to_string_lossy().as_bytes());
+        digest.update([0xff]);
+    }
+    for path in managed_runtime_roots {
+        digest.update(b"managed-runtime\0");
         digest.update(path.as_os_str().to_string_lossy().as_bytes());
         digest.update([0xff]);
     }
@@ -657,6 +682,7 @@ mod tests {
         let first = prepare_managed_pnpm_at("10.30.0", &state, &[source.clone()])
             .expect("prepare managed pnpm");
         assert!(first.root.starts_with(&state));
+        assert_eq!(first.permission_root, normalized_canonical_path(&state));
         assert!(first.corepack_home.join("v1/pnpm/10.30.0").is_dir());
         assert!(first.shims.is_dir());
         if std::process::Command::new("node")

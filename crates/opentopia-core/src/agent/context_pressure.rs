@@ -402,7 +402,13 @@ fn provider_item_survives_local_checkpoint(
     // function calls remain because they are explicit, inspectable evidence.
     !matches!(
         item.get("type").and_then(Value::as_str),
-        Some("compaction" | "reasoning" | "openai_chat_assistant_state")
+        Some(
+            "compaction"
+                | "reasoning"
+                | "openai_chat_assistant_state"
+                | crate::provider::PROVIDER_TRANSCRIPT_STATE_TYPE
+                | crate::provider::PROVIDER_TRANSCRIPT_CANDIDATE_TYPE
+        )
     )
 }
 
@@ -421,6 +427,14 @@ mod tests {
         ));
         assert!(!provider_item_survives_local_checkpoint(
             &json!({"type": "reasoning", "encrypted_content": "opaque"}),
+            &covered,
+        ));
+        assert!(!provider_item_survives_local_checkpoint(
+            &json!({
+                "type": crate::provider::PROVIDER_TRANSCRIPT_STATE_TYPE,
+                "format": "openai_chat_native_messages_v1",
+                "items": [],
+            }),
             &covered,
         ));
         assert!(!provider_item_survives_local_checkpoint(

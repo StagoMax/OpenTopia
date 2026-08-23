@@ -381,11 +381,14 @@ pub(crate) fn historical_context_model_request(
     previous_summary: Option<&ContextSummary>,
     provider_response_items: &[Value],
 ) -> ModelRequest {
+    let (provider_transcript, previous_response_items) =
+        opentopia_core::split_provider_transcript_state(provider_response_items.to_vec());
     let mut request = ModelRequest {
         instructions: Default::default(),
         input: Default::default(),
         tool_candidates: Vec::new(),
-        previous_response_items: provider_response_items.to_vec(),
+        previous_response_items,
+        provider_transcript,
         previous_response_id: None,
         prompt_cache_breakpoint_policy: Default::default(),
         final_output_json_schema: None,
@@ -443,6 +446,10 @@ fn assemble_current_context_compaction_request(
         current.input.current_user.message,
         time_index,
     );
+    let mut previous_response_items = current.previous_response_items.clone();
+    if let Some(transcript) = current.provider_transcript.as_ref() {
+        previous_response_items.push(opentopia_core::provider_transcript_state_item(transcript));
+    }
 
     DefaultContextAssembler.compile(ContextAssemblyInput {
         model_context: &instructions,
@@ -456,7 +463,7 @@ fn assemble_current_context_compaction_request(
         tool_candidates: Vec::new(),
         previous_tool_calls: current.input.tool_calls.clone(),
         tool_results: current.input.tool_results.clone(),
-        previous_response_items: current.previous_response_items.clone(),
+        previous_response_items,
         // Always fork into a fresh provider call. The resulting checkpoint
         // starts another fresh provider epoch in Agent Core.
         previous_response_id: None,

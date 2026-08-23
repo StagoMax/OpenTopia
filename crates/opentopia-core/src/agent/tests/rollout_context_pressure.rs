@@ -348,6 +348,7 @@ fn context_pressure_counts_typed_tool_content_and_preserves_sub_threshold_histor
         },
         tool_candidates: Vec::new(),
         previous_response_items: Vec::new(),
+        provider_transcript: None,
         previous_response_id: None,
         prompt_cache_breakpoint_policy: PromptCacheBreakpointPolicy::AppendOnlyUsers,
         final_output_json_schema: None,

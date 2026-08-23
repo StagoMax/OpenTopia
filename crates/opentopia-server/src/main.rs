@@ -954,6 +954,16 @@ fn publish_payloads(
     turn_id: Option<Uuid>,
     payloads: Vec<AgentEventPayload>,
 ) {
+    publish_payloads_with_messages(state, thread_id, turn_id, Vec::new(), payloads);
+}
+
+fn publish_payloads_with_messages(
+    state: &AppState,
+    thread_id: Uuid,
+    turn_id: Option<Uuid>,
+    messages: Vec<Message>,
+    payloads: Vec<AgentEventPayload>,
+) {
     if payloads.is_empty() {
         return;
     }
@@ -1004,7 +1014,7 @@ fn publish_payloads(
         })
         .map(|payload| AgentEvent::new(thread_id, turn_id, 0, payload))
         .collect();
-    match state.store.append_events(events) {
+    match state.store.append_conversation_batch(messages, events) {
         Ok(events) => {
             for event in events {
                 state.events.publish(event);
@@ -2821,11 +2831,10 @@ fn persist_and_publish_payloads(
     payloads: Vec<AgentEventPayload>,
 ) {
     let mut projected_payloads = Vec::with_capacity(payloads.len());
+    let mut conversation_messages = Vec::new();
     for payload in payloads {
         if let AgentEventPayload::AssistantMessage { message } = &payload {
-            if let Err(err) = state.store.append_message(message.clone()) {
-                error!(?err, "failed to persist assistant message");
-            }
+            conversation_messages.push(message.clone());
         }
         let tool_message = match &payload {
             AgentEventPayload::ToolCallStarted { call } => Some(Message {
@@ -2847,9 +2856,7 @@ fn persist_and_publish_payloads(
             _ => None,
         };
         if let Some(message) = tool_message {
-            if let Err(err) = state.store.append_message(message) {
-                error!(?err, "failed to persist typed tool history");
-            }
+            conversation_messages.push(message);
         }
         if let AgentEventPayload::ApprovalRequested {
             approval_id,
@@ -2890,7 +2897,13 @@ fn persist_and_publish_payloads(
             projected_payloads.push(AgentEventPayload::GoalUpdated { snapshot });
         }
     }
-    publish_payloads(state, thread_id, Some(turn_id), projected_payloads);
+    publish_payloads_with_messages(
+        state,
+        thread_id,
+        Some(turn_id),
+        conversation_messages,
+        projected_payloads,
+    );
 }
 
 const EVENT_PERSIST_BATCH_SIZE: usize = 256;

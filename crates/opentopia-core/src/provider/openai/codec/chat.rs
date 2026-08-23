@@ -13,6 +13,11 @@ use crate::settings::{ProviderFeatureSupport, ProviderToolProtocolCapabilities};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
+pub(in crate::provider) const OPENAI_CHAT_NATIVE_TRANSCRIPT_FORMAT: &str =
+    "openai_chat_native_messages_v1";
+pub(in crate::provider) const OPENAI_CHAT_PORTABLE_TRANSCRIPT_FORMAT: &str =
+    "openai_chat_portable_messages_v1";
+
 pub(in crate::provider) fn openai_instruction_messages(request: &ModelRequest) -> Vec<Value> {
     scoped_instruction_messages(request, true)
         .into_iter()
@@ -46,9 +51,12 @@ pub(in crate::provider) fn openai_messages_with_reasoning(
     request: &ModelRequest,
     replay_chat_reasoning: bool,
 ) -> Vec<Value> {
-    let mut messages = openai_instruction_messages(request);
-
-    append_openai_conversation(&mut messages, request, replay_chat_reasoning, false);
+    let mut messages = cached_openai_transcript(request, OPENAI_CHAT_NATIVE_TRANSCRIPT_FORMAT)
+        .unwrap_or_else(|| {
+            let mut messages = openai_instruction_messages(request);
+            append_openai_conversation(&mut messages, request, replay_chat_reasoning, false);
+            messages
+        });
     messages.push(json!({
         "role": "user",
         "content": openai_message_content(&request.input.current_user.message, &request.input.current_user.content)
@@ -83,15 +91,19 @@ pub(in crate::provider) fn openai_portable_messages_with_reasoning(
     request: &ModelRequest,
     replay_chat_reasoning: bool,
 ) -> Vec<Value> {
-    let lineage_system = scoped_instruction_messages(request, true)
-        .into_iter()
-        .map(|(_, content)| content)
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    let mut messages = (!lineage_system.trim().is_empty())
-        .then(|| vec![json!({ "role": "system", "content": lineage_system })])
-        .unwrap_or_default();
-    append_openai_conversation(&mut messages, request, replay_chat_reasoning, true);
+    let mut messages = cached_openai_transcript(request, OPENAI_CHAT_PORTABLE_TRANSCRIPT_FORMAT)
+        .unwrap_or_else(|| {
+            let lineage_system = scoped_instruction_messages(request, true)
+                .into_iter()
+                .map(|(_, content)| content)
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let mut messages = (!lineage_system.trim().is_empty())
+                .then(|| vec![json!({ "role": "system", "content": lineage_system })])
+                .unwrap_or_default();
+            append_openai_conversation(&mut messages, request, replay_chat_reasoning, true);
+            messages
+        });
     messages.push(json!({
         "role": "user",
         "content": openai_message_content(&request.input.current_user.message, &request.input.current_user.content)
@@ -158,6 +170,14 @@ pub(in crate::provider) fn openai_portable_messages_with_reasoning(
         }));
     }
     messages
+}
+
+fn cached_openai_transcript(request: &ModelRequest, format: &str) -> Option<Vec<Value>> {
+    request
+        .provider_transcript
+        .as_ref()
+        .filter(|transcript| transcript.format == format && !transcript.items.is_empty())
+        .map(|transcript| transcript.items.clone())
 }
 
 pub(in crate::provider) fn append_openai_conversation(

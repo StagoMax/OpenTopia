@@ -6,9 +6,9 @@ use crate::model_context::{
     ContextSensitivity, ModelContextItem,
 };
 use crate::provider::{
-    ModelConversationMessage, ModelConversationRole, ModelInputLedger, ModelRequest,
-    ModelUserInput, PromptCacheBreakpointPolicy, ProviderToolCall, ProviderToolCandidate,
-    ProviderToolDisclosure, ProviderToolResult,
+    split_provider_transcript_state, ModelConversationMessage, ModelConversationRole,
+    ModelInputLedger, ModelRequest, ModelUserInput, PromptCacheBreakpointPolicy, ProviderToolCall,
+    ProviderToolCandidate, ProviderToolDisclosure, ProviderToolResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -198,6 +198,13 @@ impl ContextAssembler for DefaultContextAssembler {
             final_output_json_schema,
         } = input;
 
+        // Provider cursors may carry one exact wire transcript alongside
+        // opaque assistant state. Promote it to a dedicated in-memory field so
+        // codecs can extend it linearly, and keep the internal envelope out of
+        // provider-native item replay and request telemetry.
+        let (provider_transcript, previous_response_items) =
+            split_provider_transcript_state(previous_response_items);
+
         let mut tool_candidates = tool_candidates;
         sort_tool_candidates(&mut tool_candidates);
         let mut context_items = model_context.items.clone();
@@ -331,6 +338,7 @@ impl ContextAssembler for DefaultContextAssembler {
             },
             tool_candidates,
             previous_response_items,
+            provider_transcript,
             previous_response_id,
             prompt_cache_breakpoint_policy,
             final_output_json_schema,
@@ -388,6 +396,12 @@ fn context_manifest(
     let dynamic = json!({
         "input": request.input,
         "previousResponseItems": request.previous_response_items,
+        "providerTranscript": request.provider_transcript.as_ref().map(|transcript| json!({
+            "format": transcript.format,
+            "contentHash": content_fingerprint(
+                canonical_json_string(&Value::Array(transcript.items.clone())).as_bytes()
+            ),
+        })),
         "finalOutputJsonSchema": request.final_output_json_schema,
         "toolCandidates": request.tool_candidates,
         "volatileContext": materialized.items.iter().filter(|item| {
@@ -422,12 +436,26 @@ fn context_manifest(
         ),
         provider_visible: true,
     });
-    let mut provider_prefix_segments = vec![stable_prefix_hash.clone()];
-    provider_prefix_segments.extend(request.input.conversation.iter().map(|message| {
-        content_fingerprint(
-            canonical_json_string(&serde_json::to_value(message).unwrap_or(Value::Null)).as_bytes(),
-        )
-    }));
+    let mut provider_prefix_segments = request
+        .provider_transcript
+        .as_ref()
+        .map(|transcript| {
+            transcript
+                .items
+                .iter()
+                .map(|item| content_fingerprint(canonical_json_string(item).as_bytes()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| {
+            let mut segments = vec![stable_prefix_hash.clone()];
+            segments.extend(request.input.conversation.iter().map(|message| {
+                content_fingerprint(
+                    canonical_json_string(&serde_json::to_value(message).unwrap_or(Value::Null))
+                        .as_bytes(),
+                )
+            }));
+            segments
+        });
     let current_user_segment = ModelConversationMessage {
         role: ModelConversationRole::User,
         content: request.input.current_user.message.clone(),
@@ -622,6 +650,39 @@ mod tests {
             first.manifest().dynamic_tail_hash,
             second.manifest().dynamic_tail_hash
         );
+    }
+
+    #[test]
+    fn provider_transcript_state_is_promoted_out_of_native_response_items() {
+        let context = CompiledModelContext::default();
+        let transcript = crate::provider::ProviderWireTranscript {
+            format: "test_wire_v1".to_string(),
+            items: vec![json!({ "role": "user", "content": "prior" })],
+        };
+        let native_state = json!({
+            "type": "reasoning",
+            "id": "reasoning_1",
+            "encrypted_content": "opaque",
+        });
+        let mut assembly = input(&context, "next");
+        assembly.previous_response_items = vec![
+            crate::provider::provider_transcript_state_item(&transcript),
+            native_state.clone(),
+        ];
+
+        let request = DefaultContextAssembler
+            .compile(assembly)
+            .expect("request compiles");
+
+        assert_eq!(request.logical().provider_transcript, Some(transcript));
+        assert_eq!(
+            request.logical().previous_response_items,
+            vec![native_state]
+        );
+        assert!(serde_json::to_value(request.logical())
+            .unwrap()
+            .get("providerTranscript")
+            .is_none());
     }
 
     #[test]

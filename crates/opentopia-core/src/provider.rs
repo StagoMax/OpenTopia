@@ -55,6 +55,7 @@ use openai::{
     parse_model_response_body_with_tools, responses_input, responses_tool_result_output,
     responses_tools, OpenAiStreamAccumulator, ResponsesStreamAccumulator,
     INVALID_TOOL_ARGUMENTS_JSON_KEY, OPENAI_CHAT_ASSISTANT_STATE_TYPE,
+    OPENAI_CHAT_NATIVE_TRANSCRIPT_FORMAT, OPENAI_CHAT_PORTABLE_TRANSCRIPT_FORMAT,
 };
 
 use transport::{
@@ -132,6 +133,77 @@ pub struct ModelInputLedger {
     pub tool_results: Vec<ProviderToolResult>,
 }
 
+/// Exact provider-visible transcript retained at a successful turn boundary.
+///
+/// This is deliberately separate from the provider-neutral conversation
+/// projection. The projection remains the durable recovery source, while this
+/// value preserves byte ordering for adapters whose prompt cache requires the
+/// next request to extend the previous wire transcript without rebuilding it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderWireTranscript {
+    pub format: String,
+    pub items: Vec<Value>,
+}
+
+pub(crate) const PROVIDER_TRANSCRIPT_STATE_TYPE: &str = "opentopia_provider_wire_transcript";
+pub(crate) const PROVIDER_TRANSCRIPT_CANDIDATE_TYPE: &str =
+    "opentopia_provider_wire_transcript_candidate";
+
+pub fn provider_transcript_state_item(transcript: &ProviderWireTranscript) -> Value {
+    json!({
+        "type": PROVIDER_TRANSCRIPT_STATE_TYPE,
+        "format": &transcript.format,
+        "items": &transcript.items,
+    })
+}
+
+pub(crate) fn provider_transcript_candidate_item(transcript: &ProviderWireTranscript) -> Value {
+    json!({
+        "type": PROVIDER_TRANSCRIPT_CANDIDATE_TYPE,
+        "format": &transcript.format,
+        "items": &transcript.items,
+    })
+}
+
+pub(crate) fn provider_wire_transcript(item: &Value) -> Option<ProviderWireTranscript> {
+    let item_type = item.get("type").and_then(Value::as_str)?;
+    if !matches!(
+        item_type,
+        PROVIDER_TRANSCRIPT_STATE_TYPE | PROVIDER_TRANSCRIPT_CANDIDATE_TYPE
+    ) {
+        return None;
+    }
+    Some(ProviderWireTranscript {
+        format: item.get("format")?.as_str()?.to_string(),
+        items: item.get("items")?.as_array()?.clone(),
+    })
+}
+
+pub(crate) fn provider_item_is_internal_transcript(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some(PROVIDER_TRANSCRIPT_STATE_TYPE | PROVIDER_TRANSCRIPT_CANDIDATE_TYPE)
+    )
+}
+
+pub fn split_provider_transcript_state(
+    items: Vec<Value>,
+) -> (Option<ProviderWireTranscript>, Vec<Value>) {
+    let transcript = items
+        .iter()
+        .rev()
+        .find(|item| {
+            item.get("type").and_then(Value::as_str) == Some(PROVIDER_TRANSCRIPT_STATE_TYPE)
+        })
+        .and_then(provider_wire_transcript);
+    let provider_items = items
+        .into_iter()
+        .filter(|item| !provider_item_is_internal_transcript(item))
+        .collect();
+    (transcript, provider_items)
+}
+
 /// Canonical logical shape consumed by provider codecs.
 ///
 /// `instructions` contains only classified instruction/context modules. Typed
@@ -150,6 +222,12 @@ pub struct ModelRequest {
     pub tool_candidates: Vec<ProviderToolCandidate>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub previous_response_items: Vec<Value>,
+    /// Internal wire-cache continuation extracted from provider state. It is
+    /// intentionally omitted from request/event serialization: the exact
+    /// transcript can be large and is already persisted once in the provider
+    /// cursor. Provider codecs consume it directly in memory.
+    #[serde(skip)]
+    pub provider_transcript: Option<ProviderWireTranscript>,
     /// Continue a stored Responses API chain. The logical request still carries
     /// the complete replay context so the adapter can recover if this cursor is
     /// unknown or expired.
@@ -380,6 +458,10 @@ pub struct PreparedProviderRequest {
     /// request before it crosses the provider boundary.
     pub cache_trace: Option<crate::model::ProviderCacheTrace>,
     pub logical_request: ModelRequest,
+    /// Exact ordered input emitted by an adapter that supports transcript
+    /// continuation. The transport attaches the successful assistant output
+    /// before handing the resulting cursor candidate back to the runtime.
+    pub wire_transcript: Option<ProviderWireTranscript>,
     /// Exact function-tool contracts compiled for this provider request. The
     /// response decoder uses the same artifacts that produced the advertised
     /// schemas to restore provider wire arguments to the canonical tool shape.
@@ -584,6 +666,7 @@ pub trait ModelProvider: Send + Sync {
             cache_trace: crate::build_provider_cache_trace(&body, None, false),
             body,
             logical_request: request,
+            wire_transcript: None,
             tool_contracts: Vec::new(),
             response_commit,
         })

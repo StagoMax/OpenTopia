@@ -1065,12 +1065,6 @@ impl ToolRuntime for LocalToolRuntime {
         insert_approval_execution_metadata(&mut result.metadata, approval_granted, None);
         merge_metadata_overlay(&mut result.metadata, metadata_overlay.as_ref());
         insert_work_item_metadata(&mut result.metadata, active_work_item_id.as_deref());
-        result = normalize_tool_result_at_ingress(
-            &name,
-            result,
-            result_store.as_ref(),
-            result_thread_id,
-        );
         if tool_class == ToolClass::WorkForm {
             let persistence = (|| -> anyhow::Result<()> {
                 if let (Some(store), Some(form)) = (
@@ -1095,6 +1089,12 @@ impl ToolRuntime for LocalToolRuntime {
         }
         insert_tool_execution_duration(&mut result.metadata, &execution_started_at);
         crate::tool_error::ensure_tool_error_record(&mut result);
+        result = normalize_tool_result_at_ingress(
+            &name,
+            result,
+            result_store.as_ref(),
+            result_thread_id,
+        );
         events.push(AgentEventPayload::ToolCallFinished {
             result: result.clone(),
         });

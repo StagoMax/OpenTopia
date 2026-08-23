@@ -6,6 +6,7 @@ pub(in crate::provider) use chat::{
     compile_openai_tools, legacy_tool_observation, normalize_provider_tool_calls,
     openai_messages_with_reasoning, openai_portable_messages_with_reasoning,
     responses_system_instructions, OPENAI_CHAT_ASSISTANT_STATE_TYPE,
+    OPENAI_CHAT_NATIVE_TRANSCRIPT_FORMAT, OPENAI_CHAT_PORTABLE_TRANSCRIPT_FORMAT,
 };
 #[cfg(test)]
 pub(in crate::provider) use chat::{

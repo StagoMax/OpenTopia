@@ -26,6 +26,20 @@ fn schema_manifest_compares_indexes_by_column_identity_not_legacy_ordinal() {
 }
 
 #[test]
+fn persistent_store_uses_a_wider_wal_checkpoint_window() {
+    let path = temporary_db_path("wal-checkpoint-window");
+    let store = SqliteSessionStore::open(&path).expect("open persistent store");
+    let checkpoint_pages: i64 = store
+        .conn
+        .lock()
+        .expect("lock store")
+        .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
+        .expect("read WAL checkpoint window");
+
+    assert_eq!(checkpoint_pages, 4_096);
+}
+
+#[test]
 fn migration_reconciles_mislabeled_v19_goals_and_preserves_retired_data() {
     let store = SqliteSessionStore::open(":memory:").expect("open memory store");
     let thread = store

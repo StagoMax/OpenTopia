@@ -122,6 +122,7 @@ mod tests {
             input: Default::default(),
             tool_candidates: Vec::new(),
             previous_response_items: Vec::new(),
+            provider_transcript: None,
             previous_response_id: None,
             prompt_cache_breakpoint_policy: Default::default(),
             final_output_json_schema: None,

@@ -1,24 +1,23 @@
-use crate::model::{Artifact, ModelContentPart, ToolResult};
+use crate::model::{ModelContentPart, ToolResult};
 use crate::model_context::content_fingerprint;
+use crate::tool_output_truncation::{
+    ensure_output_artifact, formatted_truncate_text, output_artifact_id_from_metadata,
+    replace_matching_text_content, token_budget_bytes, truncate_middle_bytes,
+    with_artifact_reference, HISTORY_TOOL_OUTPUT_MAX_TOKENS,
+};
 use crate::tool_state::ToolStateStore;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 const ENVELOPE_KEY: &str = "toolResultEnvelope";
 const ENVELOPE_SCHEMA_VERSION: u64 = 1;
-const SEARCH_MODEL_OUTPUT_MAX_BYTES: usize = 12_000;
-const SHELL_SUCCESS_OUTPUT_MAX_BYTES: usize = 8_000;
-const FAILURE_OUTPUT_MAX_BYTES: usize = 12_000;
-const GENERIC_SUCCESS_OUTPUT_MAX_BYTES: usize = 12_000;
-const GENERIC_SUCCESS_NORMALIZE_AFTER_BYTES: usize = 16_000;
-const STRUCTURED_CONTENT_MAX_BYTES: usize = 12_000;
 const PROVIDER_METADATA_MAX_BYTES: usize = 4_000;
-const PROVIDER_RESULT_MAX_NON_MEDIA_BYTES: usize = 36_000;
+const PROVIDER_RESULT_MAX_NON_MEDIA_BYTES: usize =
+    token_budget_bytes(HISTORY_TOOL_OUTPUT_MAX_TOKENS) + PROVIDER_METADATA_MAX_BYTES;
 
-/// Builds the immutable, provider-visible form of a tool result exactly once,
-/// before the first model round can observe it. If normalization would discard
-/// text, the original output is persisted as an artifact first. When artifact
-/// storage is unavailable, the lossless result is retained instead.
+/// Applies the tool-agnostic history safety budget exactly once, before the
+/// first model round can observe the result. Tool-specific producer adapters
+/// normally keep their output below this 1.2x serialization budget already.
 pub(crate) fn normalize_tool_result_at_ingress(
     tool_name: &str,
     mut result: ToolResult,
@@ -30,85 +29,74 @@ pub(crate) fn normalize_tool_result_at_ingress(
     }
 
     let raw_output = result.output.clone();
-    let is_error = tool_result_is_error(&result);
-    let (mut candidate, mut strategy) = match tool_name {
-        "shell" => compact_shell_output(&raw_output, &result.metadata, is_error),
-        "search" => (
-            compact_search_output(&raw_output, SEARCH_MODEL_OUTPUT_MAX_BYTES),
-            "search_matches",
-        ),
-        _ if is_error => (
-            compact_failure_output(&raw_output, FAILURE_OUTPUT_MAX_BYTES),
-            "failure_diagnostics",
-        ),
-        _ if raw_output.len() > GENERIC_SUCCESS_NORMALIZE_AFTER_BYTES => (
-            compact_head_tail(&raw_output, GENERIC_SUCCESS_OUTPUT_MAX_BYTES),
-            "bounded_head_tail",
-        ),
-        _ => (raw_output.clone(), "passthrough"),
-    };
-
-    let oversized_structured_content = result.content.iter().any(|part| {
-        matches!(
-            part,
+    let max_bytes = token_budget_bytes(HISTORY_TOOL_OUTPUT_MAX_TOKENS);
+    let output_json = serde_json::from_str::<Value>(&raw_output).ok();
+    let structured_bytes = result
+        .content
+        .iter()
+        .filter_map(|part| match part {
             ModelContentPart::Json { value }
-                if serde_json::to_vec(value)
-                    .map(|encoded| encoded.len() > STRUCTURED_CONTENT_MAX_BYTES)
-                    .unwrap_or(true)
-        )
-    });
-    if candidate == raw_output && oversized_structured_content {
-        candidate = compact_head_tail(&raw_output, GENERIC_SUCCESS_OUTPUT_MAX_BYTES);
-        strategy = "bounded_structured_content";
-    }
+                if raw_output.len() <= max_bytes && output_json.as_ref() == Some(value) =>
+            {
+                None
+            }
+            ModelContentPart::Json { value } => {
+                serde_json::to_vec(value).ok().map(|value| value.len())
+            }
+            _ => None,
+        })
+        .fold(0usize, usize::saturating_add);
+    let structured_budget = structured_bytes.min(max_bytes / 2);
+    let output_budget = max_bytes.saturating_sub(structured_budget);
+    let output_tokens = output_budget
+        .saturating_sub(512)
+        .checked_div(4)
+        .unwrap_or_default()
+        .max(1);
+    let candidate = formatted_truncate_text(&raw_output, output_tokens);
+    // Interactive control payloads are protocol state rather than tool prose.
+    // Their metadata must remain intact even when it exceeds the replay budget.
+    let enforce_provider_budget = tool_name != "request_user_input";
+    let oversized_content = has_oversized_non_media_content(&result.content, max_bytes)
+        || (enforce_provider_budget
+            && provider_visible_tool_result_bytes(&result) > PROVIDER_RESULT_MAX_NON_MEDIA_BYTES);
+    let source_artifact_id = output_artifact_id_from_metadata(&result.metadata);
 
-    if candidate == raw_output && !oversized_structured_content {
+    if candidate == raw_output && !oversized_content {
+        let storage = if source_artifact_id.is_some() {
+            "artifact_backed"
+        } else {
+            "inline"
+        };
         insert_envelope_metadata(
             &mut result.metadata,
-            strategy,
-            "inline",
+            "history_safety_passthrough",
+            storage,
             raw_output.len(),
             raw_output.len(),
-            None,
+            source_artifact_id,
             &raw_output,
         );
         debug_assert!(
-            provider_visible_tool_result_bytes(&result) <= PROVIDER_RESULT_MAX_NON_MEDIA_BYTES
+            !enforce_provider_budget
+                || provider_visible_tool_result_bytes(&result)
+                    <= PROVIDER_RESULT_MAX_NON_MEDIA_BYTES
         );
         return result;
     }
 
-    let existing_artifact_id = artifact_id_from_metadata(&result.metadata);
-    let reused_artifact = existing_artifact_id.is_some();
-    let artifact_id = existing_artifact_id.or_else(|| {
-        let (Some(store), Some(thread_id)) = (store, thread_id) else {
-            return None;
-        };
-        let artifact = Artifact::inline(
-            thread_id,
-            "tool_output",
-            "text/plain; charset=utf-8",
-            raw_output.clone(),
-            json!({
-                "source": "tool_result_ingress",
-                "callId": result.call_id,
-                "toolName": tool_name,
-                "outputBytes": raw_output.len(),
-                "outputFingerprint": content_fingerprint(raw_output.as_bytes()),
-                "toolResultMetadata": result.metadata.clone(),
-            }),
-        );
-        store
-            .insert_artifact(artifact)
-            .ok()
-            .map(|artifact| artifact.id)
-    });
-
-    let Some(artifact_id) = artifact_id else {
+    let Some(artifact_id) = ensure_output_artifact(
+        tool_name,
+        &mut result,
+        &raw_output,
+        store,
+        thread_id,
+        "tool_result_history_ingress",
+    ) else {
         // Saving tokens must never destroy the only copy of a tool result.
         insert_envelope_metadata(
             &mut result.metadata,
-            strategy,
+            "history_safety_middle",
             "inline_artifact_unavailable",
             raw_output.len(),
             raw_output.len(),
@@ -118,25 +106,20 @@ pub(crate) fn normalize_tool_result_at_ingress(
         return result;
     };
 
-    let normalized_output = format!(
-        "{}\n\n[Full output artifact: {artifact_id}]",
-        candidate.trim_end()
-    );
+    let normalized_output = with_artifact_reference(&candidate, artifact_id);
     replace_matching_text_content(&mut result.content, &raw_output, &normalized_output);
+    bound_text_content(&mut result.content, max_bytes);
     bound_structured_content(
         tool_name,
         &mut result.content,
-        STRUCTURED_CONTENT_MAX_BYTES,
+        structured_budget,
         artifact_id,
     );
     result.output = normalized_output;
-    if !reused_artifact {
-        insert_artifact_metadata(&mut result.metadata, artifact_id, raw_output.len());
-    }
     let output_bytes = result.output.len();
     insert_envelope_metadata(
         &mut result.metadata,
-        strategy,
+        "history_safety_middle",
         "artifact_backed",
         raw_output.len(),
         output_bytes,
@@ -144,7 +127,8 @@ pub(crate) fn normalize_tool_result_at_ingress(
         &raw_output,
     );
     debug_assert!(
-        provider_visible_tool_result_bytes(&result) <= PROVIDER_RESULT_MAX_NON_MEDIA_BYTES
+        !enforce_provider_budget
+            || provider_visible_tool_result_bytes(&result) <= PROVIDER_RESULT_MAX_NON_MEDIA_BYTES
     );
     result
 }
@@ -301,27 +285,91 @@ fn compact_filesystem_metadata(metadata: &mut serde_json::Map<String, Value>) {
     }
 }
 
+fn has_oversized_non_media_content(content: &[ModelContentPart], max_bytes: usize) -> bool {
+    let mut total = 0usize;
+    for part in content {
+        let bytes = match part {
+            ModelContentPart::Text { text } => text.len(),
+            ModelContentPart::Json { value } => serde_json::to_vec(value)
+                .map(|encoded| encoded.len())
+                .unwrap_or(usize::MAX),
+            ModelContentPart::Image { .. } | ModelContentPart::Resource { .. } => 0,
+        };
+        total = total.saturating_add(bytes);
+        if total > max_bytes {
+            return true;
+        }
+    }
+    false
+}
+
+fn bound_text_content(content: &mut Vec<ModelContentPart>, max_bytes: usize) {
+    let mut remaining = max_bytes;
+    let mut omitted = 0usize;
+    let mut bounded = Vec::with_capacity(content.len());
+    for part in std::mem::take(content) {
+        match part {
+            ModelContentPart::Text { .. } if remaining == 0 => omitted += 1,
+            ModelContentPart::Text { text } => {
+                if text.len() <= remaining {
+                    remaining = remaining.saturating_sub(text.len());
+                    bounded.push(ModelContentPart::text(text));
+                } else {
+                    let snippet = truncate_middle_bytes(&text, remaining);
+                    if snippet.is_empty() {
+                        omitted += 1;
+                    } else {
+                        bounded.push(ModelContentPart::text(snippet));
+                    }
+                    remaining = 0;
+                }
+            }
+            media_or_json => bounded.push(media_or_json),
+        }
+    }
+    if omitted > 0 {
+        bounded.push(ModelContentPart::text(format!(
+            "[omitted {omitted} text items ...]"
+        )));
+    }
+    *content = bounded;
+}
+
 fn bound_structured_content(
     tool_name: &str,
     content: &mut [ModelContentPart],
     max_bytes: usize,
     artifact_id: Uuid,
 ) {
+    let mut remaining = max_bytes;
     for part in content {
         let ModelContentPart::Json { value } = part else {
             continue;
         };
-        let exceeds_limit = serde_json::to_vec(value)
-            .map(|encoded| encoded.len() > max_bytes)
-            .unwrap_or(true);
-        if !exceeds_limit {
+        let encoded_bytes = serde_json::to_vec(value)
+            .map(|encoded| encoded.len())
+            .unwrap_or(usize::MAX);
+        if encoded_bytes <= remaining {
+            remaining = remaining.saturating_sub(encoded_bytes);
             continue;
         }
-        *value = if matches!(tool_name, "spreadsheet" | "spreadsheet_execute") {
-            compact_spreadsheet_json(value, max_bytes, artifact_id)
+
+        let compacted =
+            if remaining >= 1_000 && matches!(tool_name, "spreadsheet" | "spreadsheet_execute") {
+                compact_spreadsheet_json(value, remaining, artifact_id)
+            } else {
+                compact_generic_json(value, artifact_id)
+            };
+        let compacted_bytes = serde_json::to_vec(&compacted)
+            .map(|encoded| encoded.len())
+            .unwrap_or(usize::MAX);
+        if compacted_bytes <= remaining {
+            *value = compacted;
+            remaining = remaining.saturating_sub(compacted_bytes);
         } else {
-            compact_generic_json(value, artifact_id)
-        };
+            *value = Value::Null;
+            remaining = remaining.saturating_sub(4);
+        }
     }
 }
 
@@ -487,274 +535,6 @@ fn compact_provider_metadata(metadata: &Value) -> Value {
     Value::Object(compacted)
 }
 
-fn compact_shell_output(raw: &str, metadata: &Value, is_error: bool) -> (String, &'static str) {
-    let Some((command, stdout, stderr)) = parse_shell_envelope(raw) else {
-        return if is_error {
-            (
-                compact_failure_output(raw, FAILURE_OUTPUT_MAX_BYTES),
-                "shell_failure_diagnostics",
-            )
-        } else if raw.len() > SHELL_SUCCESS_OUTPUT_MAX_BYTES {
-            (
-                compact_head_tail(raw, SHELL_SUCCESS_OUTPUT_MAX_BYTES),
-                "shell_success_head_tail",
-            )
-        } else {
-            (raw.to_string(), "passthrough")
-        };
-    };
-
-    let duration = metadata.get("durationMs").and_then(Value::as_u64);
-    let exit_code = metadata.get("exitCode").and_then(Value::as_i64);
-    let mut header = format!("$ {command}");
-    if let Some(exit_code) = exit_code {
-        header.push_str(&format!("\n[exit code: {exit_code}"));
-        if let Some(duration) = duration {
-            header.push_str(&format!(", duration: {duration} ms"));
-        }
-        header.push(']');
-    } else if let Some(duration) = duration {
-        header.push_str(&format!("\n[duration: {duration} ms]"));
-    }
-
-    if is_error {
-        if raw.len() <= FAILURE_OUTPUT_MAX_BYTES {
-            return (raw.to_string(), "passthrough");
-        }
-        let mut sections = vec![header];
-        let stderr_excerpt = diagnostic_excerpt(stderr, FAILURE_OUTPUT_MAX_BYTES * 2 / 3);
-        if !stderr_excerpt.trim().is_empty() {
-            sections.push(format!("[stderr diagnostics]\n{stderr_excerpt}"));
-        }
-        let stdout_excerpt = diagnostic_excerpt(stdout, FAILURE_OUTPUT_MAX_BYTES / 3);
-        if !stdout_excerpt.trim().is_empty() {
-            sections.push(format!("[stdout diagnostics]\n{stdout_excerpt}"));
-        }
-        return (
-            compact_head_tail(&sections.join("\n\n"), FAILURE_OUTPUT_MAX_BYTES),
-            "shell_failure_diagnostics",
-        );
-    }
-
-    if raw.len() <= SHELL_SUCCESS_OUTPUT_MAX_BYTES {
-        return (raw.to_string(), "passthrough");
-    }
-    let body_budget = SHELL_SUCCESS_OUTPUT_MAX_BYTES.saturating_sub(header.len() + 32);
-    let mut sections = vec![header];
-    if !stdout.trim().is_empty() {
-        sections.push(format!(
-            "[stdout]\n{}",
-            compact_head_tail(stdout, body_budget * 3 / 4)
-        ));
-    }
-    if !stderr.trim().is_empty() {
-        sections.push(format!(
-            "[stderr]\n{}",
-            compact_head_tail(stderr, body_budget / 4)
-        ));
-    }
-    (
-        compact_head_tail(&sections.join("\n\n"), SHELL_SUCCESS_OUTPUT_MAX_BYTES),
-        "shell_success_head_tail",
-    )
-}
-
-fn parse_shell_envelope(raw: &str) -> Option<(&str, &str, &str)> {
-    const STDOUT_MARKER: &str = "\n\n[stdout]\n";
-    const STDERR_MARKER: &str = "\n\n[stderr]\n";
-    let stdout_at = raw.find(STDOUT_MARKER)?;
-    let header = &raw[..stdout_at];
-    let command = header.strip_prefix("$ ")?;
-    let body = &raw[stdout_at + STDOUT_MARKER.len()..];
-    let stderr_at = body.rfind(STDERR_MARKER)?;
-    Some((
-        command,
-        &body[..stderr_at],
-        &body[stderr_at + STDERR_MARKER.len()..],
-    ))
-}
-
-fn compact_search_output(raw: &str, max_bytes: usize) -> String {
-    if raw.len() <= max_bytes {
-        return raw.to_string();
-    }
-    let units = if raw.contains("\n--\n") {
-        raw.split("\n--\n").collect::<Vec<_>>()
-    } else {
-        raw.lines().collect::<Vec<_>>()
-    };
-    let separator = if raw.contains("\n--\n") {
-        "\n--\n"
-    } else {
-        "\n"
-    };
-    let mut kept = Vec::new();
-    let reserve = 96usize;
-    let budget = max_bytes.saturating_sub(reserve);
-    let mut bytes = 0usize;
-    for unit in &units {
-        let next = unit.len() + usize::from(!kept.is_empty()) * separator.len();
-        if bytes + next > budget {
-            if kept.is_empty() {
-                kept.push(utf8_prefix(unit, budget).to_string());
-            }
-            break;
-        }
-        kept.push((*unit).to_string());
-        bytes += next;
-    }
-    let omitted = units.len().saturating_sub(kept.len());
-    let mut output = kept.join(separator);
-    output.push_str(&format!(
-        "\n\n[{omitted} additional search match block(s) omitted from model context]"
-    ));
-    output
-}
-
-fn compact_failure_output(raw: &str, max_bytes: usize) -> String {
-    if raw.len() <= max_bytes {
-        return raw.to_string();
-    }
-    diagnostic_excerpt(raw, max_bytes)
-}
-
-fn diagnostic_excerpt(raw: &str, max_bytes: usize) -> String {
-    let lines = raw.lines().collect::<Vec<_>>();
-    if lines.is_empty() {
-        return String::new();
-    }
-    let mut selected = vec![false; lines.len()];
-    for (index, line) in lines.iter().enumerate() {
-        if is_diagnostic_line(line) {
-            let start = index.saturating_sub(1);
-            let end = (index + 2).min(lines.len() - 1);
-            selected[start..=end].fill(true);
-        }
-    }
-    // Build/test tools commonly put their authoritative summary at the end.
-    let tail_start = lines.len().saturating_sub(24);
-    selected[tail_start..].fill(true);
-
-    let mut rendered = Vec::new();
-    let mut previous = None;
-    for (index, line) in lines.iter().enumerate() {
-        if !selected[index] {
-            continue;
-        }
-        if previous.is_some_and(|previous| index > previous + 1) {
-            rendered.push("[... unrelated output omitted ...]".to_string());
-        }
-        rendered.push((*line).to_string());
-        previous = Some(index);
-    }
-    compact_head_tail(&rendered.join("\n"), max_bytes)
-}
-
-fn is_diagnostic_line(line: &str) -> bool {
-    let normalized = line.trim().to_ascii_lowercase();
-    if normalized.is_empty()
-        || normalized.contains("0 errors")
-        || normalized.contains("0 failed")
-        || normalized.contains("errors: 0")
-        || normalized.contains("failed: 0")
-    {
-        return false;
-    }
-    [
-        "error",
-        "fatal",
-        "failed",
-        "failure",
-        "exception",
-        "traceback",
-        "panic",
-        "not found",
-        "no such file",
-        "cannot ",
-        "could not",
-        "denied",
-        "invalid",
-        "timed out",
-        "timeout",
-        "undefined reference",
-        "categoryinfo",
-        "fullyqualifiederrorid",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
-}
-
-fn compact_head_tail(raw: &str, max_bytes: usize) -> String {
-    if raw.len() <= max_bytes {
-        return raw.to_string();
-    }
-    let marker_reserve = 80usize.min(max_bytes);
-    let content_budget = max_bytes.saturating_sub(marker_reserve);
-    let head_budget = content_budget * 2 / 3;
-    let tail_budget = content_budget.saturating_sub(head_budget);
-    let head = utf8_prefix(raw, head_budget);
-    let tail = utf8_suffix(raw, tail_budget);
-    let omitted = raw.len().saturating_sub(head.len() + tail.len());
-    format!("{head}\n\n[{omitted} bytes omitted]\n\n{tail}")
-}
-
-fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
-    let mut end = value.len().min(max_bytes);
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
-}
-
-fn utf8_suffix(value: &str, max_bytes: usize) -> &str {
-    let mut start = value.len().saturating_sub(max_bytes);
-    while start < value.len() && !value.is_char_boundary(start) {
-        start += 1;
-    }
-    &value[start..]
-}
-
-fn replace_matching_text_content(content: &mut [ModelContentPart], raw: &str, normalized: &str) {
-    for part in content {
-        if let ModelContentPart::Text { text } = part {
-            if text == raw {
-                *text = normalized.to_string();
-            }
-        }
-    }
-}
-
-fn artifact_id_from_metadata(metadata: &Value) -> Option<Uuid> {
-    metadata
-        .get("artifactId")
-        .and_then(Value::as_str)
-        .and_then(|value| Uuid::parse_str(value).ok())
-        .or_else(|| {
-            metadata
-                .pointer("/artifact/id")
-                .and_then(Value::as_str)
-                .and_then(|value| Uuid::parse_str(value).ok())
-        })
-}
-
-fn insert_artifact_metadata(metadata: &mut Value, artifact_id: Uuid, raw_bytes: usize) {
-    ensure_object(metadata);
-    let Some(object) = metadata.as_object_mut() else {
-        return;
-    };
-    object.insert("artifactId".to_string(), json!(artifact_id));
-    object.insert("artifactKind".to_string(), json!("tool_output"));
-    object.insert(
-        "artifact".to_string(),
-        json!({
-            "id": artifact_id,
-            "kind": "tool_output",
-            "contentType": "text/plain; charset=utf-8",
-            "bytes": raw_bytes,
-        }),
-    );
-}
-
 #[allow(clippy::too_many_arguments)]
 fn insert_envelope_metadata(
     metadata: &mut Value,
@@ -809,17 +589,17 @@ pub fn tool_result_is_error(result: &ToolResult) -> bool {
 
 fn bound_metadata_error_strings(object: &mut serde_json::Map<String, Value>) {
     if let Some(Value::String(error)) = object.get_mut("error") {
-        *error = compact_failure_output(error, 2_000);
+        *error = truncate_middle_bytes(error, 2_000);
     }
     if let Some(record) = object.get_mut("errorRecord").and_then(Value::as_object_mut) {
         if let Some(Value::String(message)) = record.get_mut("message") {
-            *message = compact_failure_output(message, 2_000);
+            *message = truncate_middle_bytes(message, 2_000);
         }
         if let Some(causes) = record.get_mut("causes").and_then(Value::as_array_mut) {
             causes.truncate(8);
             for cause in causes {
                 if let Value::String(cause) = cause {
-                    *cause = compact_failure_output(cause, 1_000);
+                    *cause = truncate_middle_bytes(cause, 1_000);
                 }
             }
         }
@@ -828,7 +608,7 @@ fn bound_metadata_error_strings(object: &mut serde_json::Map<String, Value>) {
         chain.truncate(8);
         for cause in chain {
             if let Value::String(cause) = cause {
-                *cause = compact_failure_output(cause, 1_000);
+                *cause = truncate_middle_bytes(cause, 1_000);
             }
         }
     }
@@ -842,22 +622,7 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn failure_compaction_finds_diagnostic_in_the_middle_and_keeps_tail() {
-        let raw = format!(
-            "{}\nerror[E0425]: cannot find value `target` in this scope\n  --> src/lib.rs:42:9\n{}\nfinal test summary: FAILED",
-            "ordinary build chatter\n".repeat(900),
-            "more unrelated chatter\n".repeat(900),
-        );
-        let compacted = compact_failure_output(&raw, FAILURE_OUTPUT_MAX_BYTES);
-
-        assert!(compacted.contains("error[E0425]"));
-        assert!(compacted.contains("src/lib.rs:42:9"));
-        assert!(compacted.contains("final test summary: FAILED"));
-        assert!(compacted.len() <= FAILURE_OUTPUT_MAX_BYTES);
-    }
-
-    #[test]
-    fn normalized_result_is_artifact_backed_and_idempotent() {
+    fn source_truncation_is_artifact_backed_and_history_does_not_truncate_twice() {
         let store = Arc::new(SqliteSessionStore::open(":memory:").expect("open store"));
         let state = ToolStateStore::new(store.clone());
         let thread = store
@@ -865,7 +630,7 @@ mod tests {
             .expect("create thread");
         let raw = format!(
             "$ cargo test\n\n[stdout]\n{}done\n\n[stderr]\n",
-            "passing test output\n".repeat(1_000)
+            "passing test output\n".repeat(3_000)
         );
         let result = ToolResult {
             call_id: Uuid::new_v4(),
@@ -880,9 +645,26 @@ mod tests {
             }),
         };
 
-        let normalized =
-            normalize_tool_result_at_ingress("shell", result, Some(&state), Some(thread.id));
+        let source_bounded = crate::tool_output_truncation::truncate_tool_result_at_source(
+            "shell",
+            result,
+            crate::tool_output_truncation::ToolOutputSourceKind::Shell,
+            Some(&state),
+            Some(thread.id),
+        );
+        assert_eq!(
+            source_bounded.metadata["toolOutputTruncation"]["stage"],
+            "tool_output_source"
+        );
+        let source_output = source_bounded.output.clone();
+        let normalized = normalize_tool_result_at_ingress(
+            "shell",
+            source_bounded,
+            Some(&state),
+            Some(thread.id),
+        );
         assert!(normalized.output.len() < raw.len());
+        assert_eq!(normalized.output, source_output);
         assert!(normalized.output.contains("Full output artifact"));
         assert_eq!(
             normalized.metadata[ENVELOPE_KEY]["stage"],
@@ -1107,7 +889,10 @@ mod tests {
             .pointer("/result/nextRow")
             .and_then(Value::as_u64)
             .is_some_and(|row| row > 10));
-        assert!(serde_json::to_vec(value).unwrap().len() <= STRUCTURED_CONTENT_MAX_BYTES);
+        assert!(
+            serde_json::to_vec(value).unwrap().len()
+                <= token_budget_bytes(HISTORY_TOOL_OUTPUT_MAX_TOKENS)
+        );
         assert!(
             provider_visible_tool_result_bytes(&normalized) <= PROVIDER_RESULT_MAX_NON_MEDIA_BYTES
         );
@@ -1122,21 +907,5 @@ mod tests {
         assert!(
             matches!(artifact.storage, ArtifactStorage::Inline { content } if content == output)
         );
-    }
-
-    #[test]
-    fn search_compaction_keeps_complete_early_match_blocks() {
-        let block = |index: usize| {
-            format!(
-                "src/file_{index}.rs:{index}:1\n> {index} | matching source {}",
-                "x".repeat(300)
-            )
-        };
-        let raw = (1..=100).map(block).collect::<Vec<_>>().join("\n--\n");
-        let compacted = compact_search_output(&raw, SEARCH_MODEL_OUTPUT_MAX_BYTES);
-
-        assert!(compacted.contains("src/file_1.rs:1:1"));
-        assert!(compacted.contains("additional search match block(s) omitted"));
-        assert!(compacted.len() <= SEARCH_MODEL_OUTPUT_MAX_BYTES);
     }
 }

@@ -3,7 +3,9 @@ use super::{
     ModelInputContent, ModelRequest, ProviderToolCall, ProviderToolCandidate,
     ProviderToolDisclosure, ProviderToolResult,
 };
-use crate::model_context::{estimate_tokens, TokenEstimateBreakdown, TokenEstimateDetail};
+use crate::model_context::{
+    estimate_tokens, ContextCacheScope, TokenEstimateBreakdown, TokenEstimateDetail,
+};
 use crate::token_breakdown::{merge_sibling_details, reconcile_detail_children};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -22,7 +24,26 @@ impl ModelRequest {
     /// Provider adapters add their own framing, so actual response usage remains
     /// authoritative and is used to report the estimate error.
     pub fn token_estimate_breakdown(&self) -> TokenEstimateBreakdown {
-        let mut breakdown = TokenEstimateBreakdown::from_context_items(&self.instructions.items);
+        let mut breakdown = if self.provider_transcript.is_some() {
+            // The retained wire transcript already owns stable/thread
+            // instructions. Count only the newly appended volatile context to
+            // avoid charging the same prefix twice.
+            let volatile_items = self
+                .instructions
+                .items
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item.cache_scope,
+                        ContextCacheScope::Turn | ContextCacheScope::Round
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            TokenEstimateBreakdown::from_context_items(&volatile_items)
+        } else {
+            TokenEstimateBreakdown::from_context_items(&self.instructions.items)
+        };
 
         let conversation_children = conversation_details(self);
         breakdown.conversation = conversation_children.iter().map(|child| child.tokens).sum();
@@ -170,6 +191,13 @@ impl ModelRequest {
 }
 
 fn conversation_details(request: &ModelRequest) -> Vec<TokenEstimateDetail> {
+    if let Some(transcript) = request.provider_transcript.as_ref() {
+        return vec![TokenEstimateDetail::leaf(
+            "provider_wire_transcript",
+            "Retained provider transcript",
+            estimate_serialized_tokens(&transcript.items),
+        )];
+    }
     merge_sibling_details(
         request
             .input

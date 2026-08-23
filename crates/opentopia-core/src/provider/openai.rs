@@ -5,7 +5,7 @@ use super::{
     ModelFinishReason, ModelProvider, ModelRequest, ModelResponse, ModelStreamCallback,
     ModelStreamDelta, PreparedProviderRequest, ProviderAdapterError, ProviderEnv,
     ProviderResponseCommitMode, ProviderToolCandidate, ProviderTransportCallback,
-    ProviderTransportEvent,
+    ProviderTransportEvent, ProviderWireTranscript,
 };
 use crate::model::ProviderRetryKind;
 use crate::settings::{
@@ -46,6 +46,9 @@ pub(in crate::provider) use codec::{
 pub(in crate::provider) use codec::{
     normalize_provider_arguments, openai_messages, openai_portable_messages,
     openai_strict_function_schema, openai_tools, responses_tool_result_output, responses_tools,
+};
+pub(in crate::provider) use codec::{
+    OPENAI_CHAT_NATIVE_TRANSCRIPT_FORMAT, OPENAI_CHAT_PORTABLE_TRANSCRIPT_FORMAT,
 };
 pub(in crate::provider) use decode::parse_model_response_body_with_tools;
 #[cfg(test)]
@@ -112,6 +115,16 @@ impl OpenAiChatCodec {
             ProviderInstructionEncoding::PortableChatEnvelope
             | ProviderInstructionEncoding::FoldDeveloperIntoSystem => {
                 openai_portable_messages_with_reasoning(request, replay_reasoning)
+            }
+        }
+    }
+
+    fn transcript_format(&self) -> &'static str {
+        match self.instruction_encoding {
+            ProviderInstructionEncoding::NativeRoles => OPENAI_CHAT_NATIVE_TRANSCRIPT_FORMAT,
+            ProviderInstructionEncoding::PortableChatEnvelope
+            | ProviderInstructionEncoding::FoldDeveloperIntoSystem => {
+                OPENAI_CHAT_PORTABLE_TRANSCRIPT_FORMAT
             }
         }
     }
@@ -1310,6 +1323,10 @@ impl OpenAiCompatibleProvider {
                 }));
             }
         }
+        let wire_transcript = ProviderWireTranscript {
+            format: self.chat_codec.transcript_format().to_string(),
+            items: messages.clone(),
+        };
         let tool_capable = !request.tool_candidates.is_empty();
         let compiled_tools = compile_openai_tools(&request.tool_candidates, self.tool_protocol);
         let stream = !tool_capable
@@ -1375,6 +1392,7 @@ impl OpenAiCompatibleProvider {
             cache_trace: crate::build_provider_cache_trace(&payload, None, false),
             body: payload,
             logical_request: request,
+            wire_transcript: Some(wire_transcript),
             tool_contracts: compiled_tools.contracts,
             response_commit: if tool_capable {
                 ProviderResponseCommitMode::Atomic
@@ -1828,6 +1846,7 @@ impl OpenAiResponsesProvider {
             cache_trace: crate::build_provider_cache_trace(&payload, None, false),
             body: payload,
             logical_request: request,
+            wire_transcript: None,
             tool_contracts: compiled_tools.contracts,
             response_commit: if tool_capable {
                 ProviderResponseCommitMode::Atomic

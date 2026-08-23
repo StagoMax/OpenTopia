@@ -1542,23 +1542,118 @@ impl SessionStore for SqliteSessionStore {
     }
 
     fn append_message(&self, message: Message) -> anyhow::Result<Message> {
-        let conn = self.conn.lock().expect("sqlite mutex poisoned");
-        let parts_json = serde_json::to_string(&message.parts)?;
-        conn.execute(
-            r#"
-            INSERT INTO messages (id, thread_id, role, parts_json, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5)
-            "#,
-            params![
-                message.id.to_string(),
-                message.thread_id.to_string(),
-                message.role.as_str(),
-                parts_json,
-                message.created_at.to_rfc3339(),
-            ],
-        )?;
-        touch_thread(&conn, message.thread_id)?;
-        Ok(message)
+        let stored = message.clone();
+        self.append_conversation_batch(vec![message], Vec::new())?;
+        Ok(stored)
+    }
+
+    fn append_conversation_batch(
+        &self,
+        messages: Vec<Message>,
+        mut events: Vec<AgentEvent>,
+    ) -> anyhow::Result<Vec<AgentEvent>> {
+        let Some(thread_id) = events
+            .first()
+            .map(|event| event.thread_id)
+            .or_else(|| messages.first().map(|message| message.thread_id))
+        else {
+            return Ok(events);
+        };
+        anyhow::ensure!(
+            events.iter().all(|event| event.thread_id == thread_id)
+                && messages
+                    .iter()
+                    .all(|message| message.thread_id == thread_id),
+            "a conversation batch must belong to one thread"
+        );
+
+        let mut conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let tx = conn.transaction()?;
+        for message in messages {
+            let parts_json = serde_json::to_string(&message.parts)?;
+            tx.execute(
+                r#"
+                INSERT INTO messages (id, thread_id, role, parts_json, created_at)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                "#,
+                params![
+                    message.id.to_string(),
+                    message.thread_id.to_string(),
+                    message.role.as_str(),
+                    parts_json,
+                    message.created_at.to_rfc3339(),
+                ],
+            )?;
+        }
+
+        let first_seq: i64 = if events.is_empty() {
+            0
+        } else {
+            tx.query_row(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE thread_id = ?1",
+                params![thread_id.to_string()],
+                |row| row.get(0),
+            )?
+        };
+        let mut completed_stream_turn_ids = HashSet::new();
+        for (offset, event) in events.iter_mut().enumerate() {
+            event.seq = first_seq + i64::try_from(offset)?;
+            let payload_json = serde_json::to_string(&event.payload)?;
+            let conversation_payload_json =
+                conversation_payload_json(&event.payload, &payload_json)?;
+            tx.execute(
+                r#"
+                INSERT INTO events (id, thread_id, turn_id, seq, kind, payload_json, created_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "#,
+                params![
+                    event.id.to_string(),
+                    event.thread_id.to_string(),
+                    event.turn_id.as_ref().map(|id| id.to_string()),
+                    event.seq,
+                    event.kind(),
+                    payload_json,
+                    event.created_at.to_rfc3339(),
+                ],
+            )?;
+            if let Some(conversation_payload_json) = conversation_payload_json {
+                tx.execute(
+                    r#"
+                    INSERT INTO conversation_events (
+                        id, thread_id, turn_id, seq, payload_json, created_at
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    "#,
+                    params![
+                        event.id.to_string(),
+                        event.thread_id.to_string(),
+                        event.turn_id.as_ref().map(|id| id.to_string()),
+                        event.seq,
+                        conversation_payload_json,
+                        event.created_at.to_rfc3339(),
+                    ],
+                )?;
+            }
+            if matches!(&event.payload, AgentEventPayload::AssistantMessage { .. }) {
+                if let Some(turn_id) = event.turn_id {
+                    completed_stream_turn_ids.insert(turn_id);
+                }
+            }
+        }
+        for turn_id in completed_stream_turn_ids {
+            tx.execute(
+                r#"
+                DELETE FROM conversation_events
+                WHERE thread_id = ?1
+                  AND turn_id = ?2
+                  AND id IN (SELECT id FROM events WHERE kind = 'model_delta')
+                "#,
+                params![thread_id.to_string(), turn_id.to_string()],
+            )?;
+        }
+        touch_thread(&tx, thread_id)?;
+        tx.commit()?;
+        Ok(events)
     }
 
     fn list_messages(&self, thread_id: Uuid) -> anyhow::Result<Vec<Message>> {
@@ -1914,84 +2009,8 @@ impl SessionStore for SqliteSessionStore {
             .context("single-event append returned no event")
     }
 
-    fn append_events(&self, mut events: Vec<AgentEvent>) -> anyhow::Result<Vec<AgentEvent>> {
-        let Some(thread_id) = events.first().map(|event| event.thread_id) else {
-            return Ok(events);
-        };
-        anyhow::ensure!(
-            events.iter().all(|event| event.thread_id == thread_id),
-            "an event batch must belong to one thread"
-        );
-
-        let mut conn = self.conn.lock().expect("sqlite mutex poisoned");
-        let tx = conn.transaction()?;
-        let first_seq: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE thread_id = ?1",
-            params![thread_id.to_string()],
-            |row| row.get(0),
-        )?;
-        let mut completed_stream_turn_ids = HashSet::new();
-        for (offset, event) in events.iter_mut().enumerate() {
-            event.seq = first_seq + i64::try_from(offset)?;
-            let payload_json = serde_json::to_string(&event.payload)?;
-            let conversation_payload_json =
-                conversation_payload_json(&event.payload, &payload_json)?;
-            tx.execute(
-                r#"
-                INSERT INTO events (id, thread_id, turn_id, seq, kind, payload_json, created_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                "#,
-                params![
-                    event.id.to_string(),
-                    event.thread_id.to_string(),
-                    event.turn_id.as_ref().map(|id| id.to_string()),
-                    event.seq,
-                    event.kind(),
-                    payload_json,
-                    event.created_at.to_rfc3339(),
-                ],
-            )?;
-            if let Some(conversation_payload_json) = conversation_payload_json {
-                tx.execute(
-                    r#"
-                    INSERT INTO conversation_events (
-                        id, thread_id, turn_id, seq, payload_json, created_at
-                    )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                    "#,
-                    params![
-                        event.id.to_string(),
-                        event.thread_id.to_string(),
-                        event.turn_id.as_ref().map(|id| id.to_string()),
-                        event.seq,
-                        conversation_payload_json,
-                        event.created_at.to_rfc3339(),
-                    ],
-                )?;
-            }
-            if matches!(&event.payload, AgentEventPayload::AssistantMessage { .. }) {
-                if let Some(turn_id) = event.turn_id {
-                    completed_stream_turn_ids.insert(turn_id);
-                }
-            }
-        }
-        // The assistant message is the durable snapshot of a completed model
-        // stream. Historical deltas remain in the diagnostic event log, while
-        // the conversation projection stays small and quick to restore.
-        for turn_id in completed_stream_turn_ids {
-            tx.execute(
-                r#"
-                DELETE FROM conversation_events
-                WHERE thread_id = ?1
-                  AND turn_id = ?2
-                  AND id IN (SELECT id FROM events WHERE kind = 'model_delta')
-                "#,
-                params![thread_id.to_string(), turn_id.to_string()],
-            )?;
-        }
-        touch_thread(&tx, thread_id)?;
-        tx.commit()?;
-        Ok(events)
+    fn append_events(&self, events: Vec<AgentEvent>) -> anyhow::Result<Vec<AgentEvent>> {
+        self.append_conversation_batch(Vec::new(), events)
     }
 
     fn list_events(

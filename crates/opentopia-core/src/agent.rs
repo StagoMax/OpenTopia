@@ -55,14 +55,18 @@ use crate::prompt_runtime::{
 };
 use crate::provider::{
     estimate_provider_tool_surface_tokens, invalid_tool_arguments_json_details,
-    normalize_tool_argument_keys, redact_model_observation, tool_input_schema_error,
-    IncompleteReason, ModelConversationMessage, ModelConversationRole, ModelDecision,
-    ModelProvider, ModelRequest, ModelResponse, ModelStreamDelta, ModelUsage,
-    PromptCacheBreakpointPolicy, ProviderToolCall, ProviderToolCandidate, ProviderToolDisclosure,
-    ProviderToolNamespace, ProviderToolResult, ProviderTransportEvent,
+    normalize_tool_argument_keys, provider_transcript_state_item, provider_wire_transcript,
+    redact_model_observation, tool_input_schema_error, IncompleteReason, ModelConversationMessage,
+    ModelConversationRole, ModelDecision, ModelProvider, ModelRequest, ModelResponse,
+    ModelStreamDelta, ModelUsage, PromptCacheBreakpointPolicy, ProviderToolCall,
+    ProviderToolCandidate, ProviderToolDisclosure, ProviderToolNamespace, ProviderToolResult,
+    ProviderTransportEvent, PROVIDER_TRANSCRIPT_CANDIDATE_TYPE, PROVIDER_TRANSCRIPT_STATE_TYPE,
 };
 #[cfg(test)]
-use crate::provider::{MockProvider, ModelInputLedger, ModelUserInput};
+use crate::provider::{
+    provider_transcript_candidate_item, MockProvider, ModelInputLedger, ModelUserInput,
+    ProviderWireTranscript,
+};
 use crate::round_compaction::RoundContextCompactor;
 use crate::sandbox::{LocalSandboxConfig, SandboxMode};
 use crate::settings::{
@@ -135,7 +139,7 @@ use crate::provider::ModelFinishReason;
 const FINALIZATION_GUARD_TOOL_NAME: &str = "runtime_finalization_guard";
 const MAX_FINALIZATION_GUARD_ACTIVATIONS: usize = 3;
 const TOOL_SEARCH_NAME: &str = "tool_search";
-const MAX_TOOL_SEARCH_RESULTS: usize = 12;
+const MAX_TOOL_SEARCH_RESULTS: usize = 8;
 const AUTOMATIC_TOOL_DISCLOSURE_COUNT_THRESHOLD: usize = 24;
 const AUTOMATIC_TOOL_DISCLOSURE_TOKEN_THRESHOLD: usize = 12_000;
 const DEFAULT_EAGER_OFFICE_TOOLS: [(&str, &str); 5] = [
@@ -2020,10 +2024,32 @@ fn finalize_provider_turn(
 }
 
 fn replayable_provider_state_items(items: &[Value]) -> Vec<Value> {
+    let provider_transcript = items
+        .iter()
+        .rev()
+        .find(|item| {
+            item.get("type").and_then(Value::as_str) == Some(PROVIDER_TRANSCRIPT_CANDIDATE_TYPE)
+        })
+        .and_then(provider_wire_transcript)
+        .or_else(|| {
+            items
+                .iter()
+                .rev()
+                .find(|item| {
+                    item.get("type").and_then(Value::as_str) == Some(PROVIDER_TRANSCRIPT_STATE_TYPE)
+                })
+                .and_then(provider_wire_transcript)
+        });
     let mut replayable = items
         .iter()
         .filter(|item| match item.get("type").and_then(Value::as_str) {
-            Some("compaction" | "openai_chat_assistant_state") => true,
+            Some("compaction") => true,
+            // Once an exact Chat transcript exists, historical assistant
+            // grouping/reasoning is already embedded at its original wire
+            // position. Retaining those annotations would duplicate state and
+            // inflate every later request; current-turn states are folded into
+            // the next completed transcript candidate.
+            Some("openai_chat_assistant_state") => provider_transcript.is_none(),
             Some("reasoning") => item
                 .get("encrypted_content")
                 .and_then(Value::as_str)
@@ -2045,6 +2071,9 @@ fn replayable_provider_state_items(items: &[Value]) -> Vec<Value> {
             .map(|id| seen_ids.insert(id.to_string()))
             .unwrap_or(true)
     });
+    if let Some(transcript) = provider_transcript {
+        replayable.push(provider_transcript_state_item(&transcript));
+    }
     replayable
 }
 

@@ -97,6 +97,87 @@ fn chat_tool_history_appends_provider_state_without_reordering_runtime_observati
 }
 
 #[test]
+fn chat_cross_turn_transcript_is_extended_without_reclassifying_history() {
+    let call = ProviderToolCall {
+        id: "call_previous".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "previous.txt" }),
+    };
+    let result = ProviderToolResult {
+        call_id: call.id.clone(),
+        name: call.name.clone(),
+        output: "previous output".to_string(),
+        content: Vec::new(),
+        is_error: false,
+        metadata: json!({}),
+    };
+    let mut previous = layered_model_request();
+    previous.input.current_user.message = "first turn".to_string();
+    previous.input.tool_calls = vec![call.clone()];
+    previous.input.tool_results = vec![result.clone()];
+    previous.previous_response_items = vec![json!({
+        "type": OPENAI_CHAT_ASSISTANT_STATE_TYPE,
+        "content": "",
+        "tool_call_ids": [&call.id],
+    })];
+
+    for (format, encode) in [
+        (
+            OPENAI_CHAT_NATIVE_TRANSCRIPT_FORMAT,
+            openai_messages as fn(&ModelRequest) -> Vec<Value>,
+        ),
+        (
+            OPENAI_CHAT_PORTABLE_TRANSCRIPT_FORMAT,
+            openai_portable_messages as fn(&ModelRequest) -> Vec<Value>,
+        ),
+    ] {
+        let previous_request = encode(&previous);
+        let mut completed_transcript = previous_request.clone();
+        completed_transcript.push(json!({
+            "role": "assistant",
+            "content": "first answer",
+        }));
+
+        let mut next = layered_model_request();
+        next.input.current_user.message = "second turn".to_string();
+        // This is the legacy durable projection. It intentionally has a
+        // different shape from the prior wire request; the cursor transcript
+        // must own replay ordering whenever it is available.
+        next.input.conversation = vec![ModelConversationMessage {
+            role: ModelConversationRole::Assistant,
+            content: "reconstructed history that must not be inserted".to_string(),
+            content_parts: Vec::new(),
+            tool_calls: vec![call.clone()],
+            tool_results: vec![result.clone()],
+        }];
+        next.provider_transcript = Some(ProviderWireTranscript {
+            format: format.to_string(),
+            items: completed_transcript.clone(),
+        });
+
+        let next_request = encode(&next);
+        assert_eq!(
+            next_request[..completed_transcript.len()],
+            completed_transcript,
+            "the next turn must append to the exact completed wire transcript"
+        );
+        assert_eq!(next_request[completed_transcript.len()]["role"], "user");
+        assert_eq!(
+            next_request[completed_transcript.len()]["content"],
+            "second turn"
+        );
+        assert!(!next_request.iter().any(|message| {
+            message["content"] == "reconstructed history that must not be inserted"
+        }));
+        assert_eq!(
+            previous_request,
+            next_request[..previous_request.len()],
+            "the full prior request remains a strict prefix across the turn boundary"
+        );
+    }
+}
+
+#[test]
 fn portable_chat_envelope_preserves_structured_cross_turn_tool_history() {
     let mut request = model_request();
     request.input.conversation = vec![

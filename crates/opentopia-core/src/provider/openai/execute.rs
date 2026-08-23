@@ -1,8 +1,9 @@
 use super::super::{
-    apply_provider_auth, provider_rejected_image_input, rejected_chat_profile_capability,
-    request_image_part_count, truncate_observation_text, ModelResponse, ModelStreamCallback,
-    PreparedProviderRequest, ProviderAdapterError, ProviderResponseCommitMode,
-    ProviderTransportCallback, ProviderTransportEvent,
+    apply_provider_auth, provider_rejected_image_input, provider_transcript_candidate_item,
+    rejected_chat_profile_capability, request_image_part_count, truncate_observation_text,
+    ModelFinishReason, ModelResponse, ModelStreamCallback, PreparedProviderRequest,
+    ProviderAdapterError, ProviderResponseCommitMode, ProviderTransportCallback,
+    ProviderTransportEvent,
 };
 use super::recovery::{
     recover_streamed_tool_call_non_streaming, schedule_rate_limited_stream_retry,
@@ -168,9 +169,29 @@ impl OpenAiCompatibleProvider {
                 response_id: response.response_id.clone(),
                 body: model_response_observation(&response),
             })?;
+            attach_completed_chat_transcript(&mut response, &prepared);
             return Ok(response);
         }
     }
+}
+
+fn attach_completed_chat_transcript(
+    response: &mut ModelResponse,
+    prepared: &PreparedProviderRequest,
+) {
+    if response.finish_reason != ModelFinishReason::Stop || !response.tool_calls.is_empty() {
+        return;
+    }
+    let Some(mut transcript) = prepared.wire_transcript.clone() else {
+        return;
+    };
+    transcript.items.push(json!({
+        "role": "assistant",
+        "content": &response.text,
+    }));
+    response
+        .provider_items
+        .push(provider_transcript_candidate_item(&transcript));
 }
 
 impl OpenAiResponsesProvider {
@@ -321,5 +342,52 @@ fn stream_decode_error_observation(error: &anyhow::Error) -> Value {
         })
     } else {
         tool_call_protocol_error_observation(error, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::{provider_wire_transcript, ModelRequest, ProviderWireTranscript};
+    use uuid::Uuid;
+
+    #[test]
+    fn completed_chat_response_produces_a_transcript_cursor_candidate() {
+        let transcript = ProviderWireTranscript {
+            format: "openai_chat_native_messages_v1".to_string(),
+            items: vec![json!({ "role": "user", "content": "question" })],
+        };
+        let prepared = PreparedProviderRequest {
+            request_id: Uuid::nil(),
+            adapter: "openai_chat_completions".to_string(),
+            method: "POST".to_string(),
+            endpoint: "https://example.test/chat/completions".to_string(),
+            body: json!({}),
+            observation_body: json!({}),
+            cache_trace: None,
+            logical_request: ModelRequest {
+                instructions: Default::default(),
+                input: Default::default(),
+                tool_candidates: Vec::new(),
+                previous_response_items: Vec::new(),
+                provider_transcript: None,
+                previous_response_id: None,
+                prompt_cache_breakpoint_policy: Default::default(),
+                final_output_json_schema: None,
+            },
+            wire_transcript: Some(transcript.clone()),
+            tool_contracts: Vec::new(),
+            response_commit: ProviderResponseCommitMode::Streaming,
+        };
+        let mut response = ModelResponse::text("answer");
+
+        attach_completed_chat_transcript(&mut response, &prepared);
+
+        let completed =
+            provider_wire_transcript(&response.provider_items[0]).expect("transcript candidate");
+        assert_eq!(completed.format, transcript.format);
+        assert_eq!(completed.items[..transcript.items.len()], transcript.items);
+        assert_eq!(completed.items.last().unwrap()["role"], "assistant");
+        assert_eq!(completed.items.last().unwrap()["content"], "answer");
     }
 }

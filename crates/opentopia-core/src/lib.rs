@@ -73,6 +73,7 @@ mod store_migrations;
 mod token_breakdown;
 mod tool_adapter;
 mod tool_error;
+mod tool_output_truncation;
 mod tool_result_ingress;
 pub mod tool_runtime;
 pub mod tool_state;
@@ -348,15 +349,15 @@ pub use prompt_runtime::{
 pub use provider::{
     configured_provider_from_settings, estimate_provider_tool_surface_tokens,
     guardian_provider_from_settings, negotiate_provider_settings, provider_from_settings,
-    redact_model_observation, AnthropicMessagesProvider, CodexAccountManager, CodexAccountStatus,
-    CodexAppServerProvider, CodexLoginStart, IncompleteReason, MockProvider,
-    ModelConversationMessage, ModelConversationRole, ModelDecision, ModelFinishReason,
-    ModelInputContent, ModelProvider, ModelRequest, ModelResponse, ModelStreamDelta, ModelUsage,
-    OpenAiCompatibleProvider, OpenAiResponsesProvider, PreparedProviderRequest,
-    PromptCacheBreakpointPolicy, ProviderAdapterError, ProviderDriverDescriptor,
-    ProviderDriverRegistry, ProviderDriverTrust, ProviderNegotiationResult, ProviderToolCall,
-    ProviderToolCandidate, ProviderToolDisclosure, ProviderToolNamespace, ProviderToolResult,
-    ProviderTransportEvent,
+    provider_transcript_state_item, redact_model_observation, split_provider_transcript_state,
+    AnthropicMessagesProvider, CodexAccountManager, CodexAccountStatus, CodexAppServerProvider,
+    CodexLoginStart, IncompleteReason, MockProvider, ModelConversationMessage,
+    ModelConversationRole, ModelDecision, ModelFinishReason, ModelInputContent, ModelProvider,
+    ModelRequest, ModelResponse, ModelStreamDelta, ModelUsage, OpenAiCompatibleProvider,
+    OpenAiResponsesProvider, PreparedProviderRequest, PromptCacheBreakpointPolicy,
+    ProviderAdapterError, ProviderDriverDescriptor, ProviderDriverRegistry, ProviderDriverTrust,
+    ProviderNegotiationResult, ProviderToolCall, ProviderToolCandidate, ProviderToolDisclosure,
+    ProviderToolNamespace, ProviderToolResult, ProviderTransportEvent, ProviderWireTranscript,
 };
 pub(crate) use provider_cache_trace::build_provider_cache_trace;
 pub use round_compaction::{

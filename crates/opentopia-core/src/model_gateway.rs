@@ -255,6 +255,7 @@ mod tests {
                 observation_body: serde_json::json!({"encoded": true}),
                 cache_trace: None,
                 logical_request: request,
+                wire_transcript: None,
                 tool_contracts: Vec::new(),
                 response_commit: ProviderResponseCommitMode::Streaming,
             })
@@ -353,6 +354,7 @@ mod tests {
                 observation_body: serde_json::json!({}),
                 cache_trace: None,
                 logical_request: request,
+                wire_transcript: None,
                 tool_contracts: Vec::new(),
                 response_commit: ProviderResponseCommitMode::Atomic,
             })

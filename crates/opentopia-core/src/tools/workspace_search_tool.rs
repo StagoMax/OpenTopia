@@ -7,6 +7,7 @@ use crate::execution::{ExecRequest, ExecutionContext, ExecutionEnvironment};
 use crate::execution_authorization::{ProcessLifetime, ToolExecutionIntent};
 use crate::model::{ToolCall, ToolResult};
 use crate::policy::{PolicyDecision, PolicyEngine};
+use crate::tool_output_truncation::{truncate_tool_result_at_source, ToolOutputSourceKind};
 use anyhow::Context;
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -151,7 +152,13 @@ impl TypedTool for WorkspaceSearchTool {
             content: Vec::new(),
             metadata,
         };
-        Ok(tool_result)
+        Ok(truncate_tool_result_at_source(
+            "workspace_search",
+            tool_result,
+            ToolOutputSourceKind::WorkspaceSearch,
+            ctx.state.as_ref(),
+            ctx.thread_id,
+        ))
     }
 }
 

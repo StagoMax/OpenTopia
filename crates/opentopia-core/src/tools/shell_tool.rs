@@ -12,6 +12,7 @@ use crate::execution_authorization::{
 use crate::model::{ModelContentPart, ToolCall, ToolResult};
 use crate::policy::{ApprovalRequired, PolicyDecision};
 use crate::shell_analysis::{analyze_shell_command, ShellCapability, ShellCommandAnalysis};
+use crate::tool_output_truncation::{truncate_tool_result_at_source, ToolOutputSourceKind};
 use anyhow::Context;
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -533,7 +534,7 @@ impl TypedTool for ShellTool {
                     ))
                     .into());
                 }
-                return shell_completed_result(
+                let result = shell_completed_result(
                     call_id,
                     command,
                     &workdir,
@@ -544,7 +545,14 @@ impl TypedTool for ShellTool {
                     chunk.job.success,
                     chunk.job.truncated,
                     chunk.job.sandbox,
-                );
+                )?;
+                return Ok(truncate_tool_result_at_source(
+                    "shell",
+                    result,
+                    ToolOutputSourceKind::Shell,
+                    ctx.state.as_ref(),
+                    ctx.thread_id,
+                ));
             }
 
             return shell_background_result(call_id, &job, &workdir, true, Some(yield_time_ms));
@@ -568,7 +576,7 @@ impl TypedTool for ShellTool {
             ))
             .into());
         }
-        shell_completed_result(
+        let result = shell_completed_result(
             call_id,
             command,
             &workdir,
@@ -579,7 +587,14 @@ impl TypedTool for ShellTool {
             output.success,
             output.truncated,
             output.sandbox,
-        )
+        )?;
+        Ok(truncate_tool_result_at_source(
+            "shell",
+            result,
+            ToolOutputSourceKind::Shell,
+            ctx.state.as_ref(),
+            ctx.thread_id,
+        ))
     }
 }
 
@@ -639,9 +654,9 @@ fn shell_completed_result(
         "$ {}\n\n[stdout]\n{}\n\n[stderr]\n{}",
         command, stdout, stderr
     );
-    // The ingress normalizer stores this lossless envelope as an artifact before
-    // it creates the bounded model-facing view. The UI uses the smaller stream
-    // previews below and therefore does not need the artifact in its timeline.
+    // The shell output adapter applies the producer budget immediately after
+    // this lossless envelope is built. The UI uses the smaller stream previews
+    // below and therefore does not need the artifact in its timeline.
     let result = ToolResult {
         call_id,
         output: full_combined,

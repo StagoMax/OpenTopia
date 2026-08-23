@@ -5,6 +5,7 @@ use crate::mcp::{McpCallResult, McpToolDescriptor};
 use crate::mcp_host::McpExtensionHost;
 use crate::model::{ModelContentPart, ToolCall, ToolResult};
 use crate::policy::{PolicyDecision, ToolPermissionDescriptor};
+use crate::tool_output_truncation::{truncate_tool_result_at_source, ToolOutputSourceKind};
 use crate::{
     mcp_operation_fingerprint, ConnectionOperationInvocationGate, ConnectionOperationRuntimeRoute,
     ExecutionConnectionOperationV1,
@@ -195,12 +196,19 @@ impl Tool for McpToolWrapper {
             metadata["modelToolName"] = json!(operation.model_tool_name);
         }
 
-        Ok(ToolResult {
+        let tool_result = ToolResult {
             call_id: call.id,
             output: result.output,
             content,
             metadata,
-        })
+        };
+        Ok(truncate_tool_result_at_source(
+            &self.descriptor.public_name,
+            tool_result,
+            ToolOutputSourceKind::Mcp,
+            ctx.state.as_ref(),
+            ctx.thread_id,
+        ))
     }
 }
 

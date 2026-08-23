@@ -612,6 +612,40 @@ fn chat_assistant_state_is_replayable_across_turns() {
     );
 }
 
+#[test]
+fn completed_wire_transcript_supersedes_redundant_chat_assistant_state() {
+    let old_transcript = ProviderWireTranscript {
+        format: "openai_chat_native_messages_v1".to_string(),
+        items: vec![json!({ "role": "user", "content": "old" })],
+    };
+    let completed_transcript = ProviderWireTranscript {
+        format: old_transcript.format.clone(),
+        items: vec![
+            json!({ "role": "user", "content": "old" }),
+            json!({ "role": "assistant", "content": "done" }),
+        ],
+    };
+    let retained = replayable_provider_state_items(&[
+        provider_transcript_state_item(&old_transcript),
+        json!({
+            "type": "openai_chat_assistant_state",
+            "content": "",
+            "tool_call_ids": ["call_old"],
+        }),
+        provider_transcript_candidate_item(&completed_transcript),
+    ]);
+
+    assert_eq!(retained.len(), 1);
+    assert_eq!(
+        provider_wire_transcript(&retained[0]),
+        Some(completed_transcript)
+    );
+    assert_eq!(
+        retained[0].get("type").and_then(Value::as_str),
+        Some(PROVIDER_TRANSCRIPT_STATE_TYPE)
+    );
+}
+
 #[tokio::test]
 async fn provider_request_does_not_prefetch_workspace_listing() {
     let workspace = test_workspace("no-workspace-preflight");

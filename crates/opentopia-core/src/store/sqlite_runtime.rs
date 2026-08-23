@@ -15,13 +15,16 @@ use std::sync::{
     Mutex, MutexGuard,
 };
 
+const SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const WAL_AUTOCHECKPOINT_PAGES: i64 = 4_096;
+
 fn open_read_connection(path: &Path) -> anyhow::Result<Connection> {
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .with_context(|| format!("failed to open SQLite read connection {}", path.display()))?;
-    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
     connection.execute_batch(
         r#"
         PRAGMA query_only = ON;
@@ -230,6 +233,7 @@ impl SqliteSessionStore {
 
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open sqlite db {}", path.display()))?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         let mut store = Self {
             conn: Mutex::new(conn),
             read_connections: Vec::new(),
@@ -237,6 +241,14 @@ impl SqliteSessionStore {
         };
         store.migrate()?;
         if path != Path::new(":memory:") {
+            {
+                let conn = store.conn.lock().expect("sqlite mutex poisoned");
+                // Keep automatic checkpoints off the high-frequency 4 MiB
+                // default cadence. A larger passive window reduces how often
+                // event commits inherit checkpoint work without weakening the
+                // database's existing FULL durability policy.
+                conn.pragma_update(None, "wal_autocheckpoint", WAL_AUTOCHECKPOINT_PAGES)?;
+            }
             store.read_connections = (0..4)
                 .map(|_| open_read_connection(path))
                 .collect::<anyhow::Result<Vec<_>>>()?

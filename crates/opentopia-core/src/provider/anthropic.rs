@@ -258,6 +258,7 @@ impl AnthropicMessagesProvider {
             cache_trace: crate::build_provider_cache_trace(&payload, None, false),
             body: payload,
             logical_request: request,
+            wire_transcript: None,
             tool_contracts: Vec::new(),
             response_commit: if tool_capable {
                 ProviderResponseCommitMode::Atomic
@@ -786,6 +787,7 @@ mod tests {
             },
             tool_candidates: Vec::new(),
             previous_response_items: Vec::new(),
+            provider_transcript: None,
             previous_response_id: None,
             prompt_cache_breakpoint_policy: PromptCacheBreakpointPolicy::StableOnly,
             final_output_json_schema: None,

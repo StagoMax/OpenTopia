@@ -29,6 +29,7 @@ fn model_request() -> ModelRequest {
         },
         tool_candidates: Vec::new(),
         previous_response_items: Vec::new(),
+        provider_transcript: None,
         previous_response_id: None,
         prompt_cache_breakpoint_policy: PromptCacheBreakpointPolicy::StableOnly,
         final_output_json_schema: None,

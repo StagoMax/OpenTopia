@@ -69,6 +69,38 @@ fn sqlite_store_appends_event_batches_with_contiguous_sequences() {
 }
 
 #[test]
+fn sqlite_store_commits_messages_and_events_in_one_conversation_batch() {
+    let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+    let thread = store
+        .create_thread(None, PathBuf::from("C:/workspace/conversation-batch"))
+        .expect("create thread");
+    let message = Message::text(thread.id, MessageRole::Tool, "tool output");
+    let stored = store
+        .append_conversation_batch(
+            vec![message.clone()],
+            vec![AgentEvent::new(
+                thread.id,
+                Some(Uuid::new_v4()),
+                0,
+                AgentEventPayload::ModelDelta {
+                    text: "progress".to_string(),
+                },
+            )],
+        )
+        .expect("append conversation batch");
+
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].seq, 1);
+    let messages = store.list_messages(thread.id).expect("list messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].id, message.id);
+    assert_eq!(
+        store.list_events(thread.id, None).expect("list events")[0].id,
+        stored[0].id
+    );
+}
+
+#[test]
 fn completed_assistant_message_replaces_historical_stream_in_conversation_view() {
     let store = SqliteSessionStore::open(":memory:").expect("open memory store");
     let thread = store
