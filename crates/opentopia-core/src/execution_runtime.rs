@@ -53,6 +53,7 @@ const UNIX_BASE_ENV: &[&str] = &["PATH", "LANG", "LC_ALL", "LC_CTYPE", "SHELL"];
 pub(crate) struct ResolvedRuntime {
     pub program: PathBuf,
     pub read_roots: Vec<PathBuf>,
+    pub managed_runtime_roots: Vec<PathBuf>,
     pub sandbox_home: Option<PathBuf>,
     pub environment: Vec<(OsString, OsString)>,
 }
@@ -70,6 +71,7 @@ pub(crate) fn resolve_runtime(
     let environment = resolve_execution_environment(request, capsule)?;
     let program = resolve_executable(&request.program, cwd, &environment)?;
     let mut roots = BTreeSet::new();
+    let mut managed_runtime_roots = BTreeSet::new();
     if let Some(parent) = program.parent() {
         roots.insert(canonical_or_original(parent));
     }
@@ -100,10 +102,17 @@ pub(crate) fn resolve_runtime(
             }
             roots.insert(canonical_or_original(root));
         }
+        for root in capsule.managed_runtime_roots() {
+            if root.is_dir() {
+                managed_runtime_roots.insert(canonical_or_original(root));
+            }
+        }
     }
     roots.extend(runtime_roots_from_environment(&environment)?);
 
-    let sandbox_home = config.effective_sandbox_home(workspace_root);
+    let sandbox_home = config
+        .effective_sandbox_home(workspace_root)
+        .map(|home| normalized_canonical_path(&home));
     if config.is_enabled() {
         if let Some(home) = sandbox_home.as_ref() {
             prepare_sandbox_home(home)?;
@@ -113,6 +122,7 @@ pub(crate) fn resolve_runtime(
     Ok(ResolvedRuntime {
         program,
         read_roots: roots.into_iter().collect(),
+        managed_runtime_roots: managed_runtime_roots.into_iter().collect(),
         sandbox_home,
         environment,
     })

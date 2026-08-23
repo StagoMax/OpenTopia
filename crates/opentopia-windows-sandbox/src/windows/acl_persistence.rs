@@ -1,5 +1,8 @@
+use super::acl_ledger::{
+    load_acl_ledger, save_acl_ledger, PersistentAclEntry, PersistentAclKind, PersistentAclLedger,
+};
 use super::acl_transaction::{
-    propagate_inherited_dacl, update_dacl, AclTransaction, NamedAclMutex,
+    dacl_has_explicit_access, propagate_inherited_dacl, update_dacl, AclTransaction, NamedAclMutex,
 };
 use super::process_launch::{last_error, wide};
 use super::security_token::{effective_file_access, SidBuffer};
@@ -7,7 +10,7 @@ use super::{
     broker_exchange_root, normalized_capability_path, SandboxRequest,
     ACL_ENTRY_PERMISSIONS_VERSION, CAPABILITY_NAMESPACE, CAPABILITY_PRINCIPAL_PREFIX,
     LEGACY_CAPABILITY_PRINCIPAL, LEGACY_SCOPED_CAPABILITY_PRINCIPAL_PREFIX,
-    WORKSPACE_WRITE_PERMISSIONS,
+    MANAGED_PATH_TRAVERSAL_PERMISSIONS, WORKSPACE_WRITE_PERMISSIONS,
 };
 use anyhow::{Context, Result};
 use opentopia_sandbox_protocol::ReadProvisioning;
@@ -16,12 +19,13 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::ptr;
 use uuid::Uuid;
-use windows_sys::Win32::Foundation::HANDLE;
-use windows_sys::Win32::Security::Authorization::REVOKE_ACCESS;
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Security::Authorization::{DENY_ACCESS, GRANT_ACCESS, REVOKE_ACCESS};
 use windows_sys::Win32::Security::{LookupAccountNameW, PSID};
 use windows_sys::Win32::Storage::FileSystem::{
-    MoveFileExW, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, MOVEFILE_REPLACE_EXISTING,
-    MOVEFILE_WRITE_THROUGH,
+    CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 
 pub(super) fn ensure_broker_exchange_permissions(
@@ -38,12 +42,14 @@ pub(super) fn ensure_broker_exchange_permissions(
     let _guards = NamedAclMutex::acquire_paths([path.as_path()])?;
     let mut transaction = AclTransaction::default();
     transaction.grant(&path, sid, true, WORKSPACE_WRITE_PERMISSIONS)?;
+    let object_generation = acl_object_generation(&path);
     let entry = PersistentAclEntry {
         account: account.to_string(),
         path,
         kind: PersistentAclKind::Write,
         sid: SidBuffer::copy_from_sid(sid)?.0,
         permissions_version: ACL_ENTRY_PERMISSIONS_VERSION,
+        object_generation,
     };
     let _ledger_guard = NamedAclMutex::acquire_metadata()?;
     let mut ledger = load_acl_ledger()?;
@@ -58,91 +64,43 @@ pub(super) fn ensure_broker_exchange_permissions(
     Ok(())
 }
 
-const ACL_LEDGER_VERSION: u32 = 1;
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum PersistentAclKind {
-    Read,
-    Write,
-    DenyRead,
-    DenyWrite,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-struct PersistentAclEntry {
-    account: String,
-    path: std::path::PathBuf,
-    kind: PersistentAclKind,
-    #[serde(default)]
-    sid: Vec<u8>,
-    #[serde(default = "legacy_acl_entry_permissions_version")]
-    permissions_version: u32,
-}
-
-fn legacy_acl_entry_permissions_version() -> u32 {
-    1
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct PersistentAclLedger {
-    version: u32,
-    entries: Vec<PersistentAclEntry>,
-}
-
-impl Default for PersistentAclLedger {
-    fn default() -> Self {
-        Self {
-            version: ACL_LEDGER_VERSION,
-            entries: Vec::new(),
-        }
+fn acl_object_generation(path: &Path) -> String {
+    match windows_file_identity(path) {
+        Ok(identity) => identity,
+        Err(error) => format!("unavailable:{error:#}"),
     }
 }
 
-fn acl_ledger_path() -> std::path::PathBuf {
-    crate::setup::state_dir().join("acl-ledger.json")
-}
-
-fn load_acl_ledger() -> Result<PersistentAclLedger> {
-    let path = acl_ledger_path();
-    if !path.exists() {
-        return Ok(PersistentAclLedger::default());
-    }
-    let mut ledger: PersistentAclLedger = serde_json::from_slice(
-        &std::fs::read(&path).with_context(|| format!("read ACL ledger {}", path.display()))?,
-    )
-    .with_context(|| format!("parse ACL ledger {}", path.display()))?;
-    if ledger.version != ACL_LEDGER_VERSION {
-        anyhow::bail!(
-            "unsupported ACL ledger version {} (expected {})",
-            ledger.version,
-            ACL_LEDGER_VERSION
-        )
-    }
-    ledger.entries.retain(|entry| entry.path.exists());
-    Ok(ledger)
-}
-
-fn save_acl_ledger(ledger: &PersistentAclLedger) -> Result<()> {
-    let path = acl_ledger_path();
-    crate::setup::ensure_parent(&path)?;
-    let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    std::fs::write(&temporary, serde_json::to_vec_pretty(ledger)?)
-        .with_context(|| format!("write ACL ledger temporary file {}", temporary.display()))?;
-    let temporary_w = wide(temporary.as_os_str());
-    let path_w = wide(path.as_os_str());
-    let moved = unsafe {
-        MoveFileExW(
-            temporary_w.as_ptr(),
-            path_w.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+fn windows_file_identity(path: &Path) -> Result<String> {
+    let name = wide(path.as_os_str());
+    let handle = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            ptr::null_mut(),
         )
     };
-    if moved == 0 {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(last_error("publish ACL ledger with MoveFileExW"));
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(last_error("Get directory identity CreateFileW"));
     }
-    Ok(())
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    let inspected = unsafe { GetFileInformationByHandle(handle, &mut information) };
+    let inspection_error = (inspected == 0).then(std::io::Error::last_os_error);
+    unsafe { CloseHandle(handle) };
+    if let Some(error) = inspection_error {
+        anyhow::bail!("GetFileInformationByHandle failed: {error}");
+    }
+    Ok(format!(
+        "{}:{:08x}{:08x}:{}",
+        information.dwVolumeSerialNumber,
+        information.nFileIndexHigh,
+        information.nFileIndexLow,
+        information.dwFileAttributes
+    ))
 }
 
 pub(super) fn verify_persistent_user_permissions(
@@ -196,6 +154,71 @@ pub(super) fn verify_persistent_user_permissions(
     )
 }
 
+pub(super) fn verify_managed_runtime_group_permissions(
+    request: &SandboxRequest,
+    group: &str,
+    token: HANDLE,
+) -> Result<()> {
+    let ledger = load_acl_ledger()?;
+    let mut missing = Vec::new();
+    let roots = request
+        .filesystem
+        .managed_runtime_roots
+        .iter()
+        .filter(|path| path.is_dir())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for root in &roots {
+        let recorded = ledger.entries.iter().any(|entry| {
+            entry.account.eq_ignore_ascii_case(group)
+                && entry.path == *root
+                && entry.kind == PersistentAclKind::ManagedRuntimeRead
+                && entry.permissions_version == ACL_ENTRY_PERMISSIONS_VERSION
+                && entry.object_generation == acl_object_generation(root)
+        });
+        if !recorded
+            || !effective_file_access(token, root, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)?
+        {
+            missing.push(root.display().to_string());
+        }
+    }
+    for ancestor in managed_path_traversal_ancestors(request) {
+        if !effective_file_access(token, &ancestor, MANAGED_PATH_TRAVERSAL_PERMISSIONS)? {
+            missing.push(format!("traverse:{}", ancestor.display()));
+        }
+    }
+    for capability in request
+        .filesystem
+        .read_execute
+        .iter()
+        .filter(|capability| capability.provisioning == ReadProvisioning::Managed)
+        .filter(|capability| {
+            request
+                .filesystem
+                .managed_runtime_roots
+                .iter()
+                .any(|root| path_starts_with(&capability.path, root))
+        })
+    {
+        if !effective_file_access(
+            token,
+            &capability.path,
+            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+        )? {
+            missing.push(capability.path.display().to_string());
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    missing.sort();
+    missing.dedup();
+    anyhow::bail!(
+        "stage=provision_acl managed runtime group '{group}' is not prepared for this policy scope: {}. Run `opentopia-sandbox provision` before command startup",
+        missing.join(", ")
+    )
+}
+
 pub(super) fn verify_persistent_capability_permissions(
     request: &SandboxRequest,
     principal: &str,
@@ -203,11 +226,12 @@ pub(super) fn verify_persistent_capability_permissions(
 ) -> Result<()> {
     let desired = capability_acl_entries(request, principal, sid)?;
     let ledger = load_acl_ledger()?;
-    let missing = desired
-        .iter()
-        .filter(|entry| !ledger.entries.contains(entry))
-        .map(|entry| format!("{:?}:{}", entry.kind, entry.path.display()))
-        .collect::<Vec<_>>();
+    let mut missing = Vec::new();
+    for entry in &desired {
+        if !ledger.entries.contains(entry) || !capability_acl_is_installed(entry, sid)? {
+            missing.push(format!("{:?}:{}", entry.kind, entry.path.display()));
+        }
+    }
     if missing.is_empty() {
         return Ok(());
     }
@@ -215,6 +239,261 @@ pub(super) fn verify_persistent_capability_permissions(
         "stage=provision_acl capability scope '{principal}' is not prepared: {}. Run `opentopia-sandbox provision` before command startup",
         missing.join(", ")
     )
+}
+
+fn managed_path_traversal_ancestors(request: &SandboxRequest) -> BTreeSet<std::path::PathBuf> {
+    let managed_paths = request
+        .filesystem
+        .read_execute
+        .iter()
+        .filter(|capability| capability.provisioning == ReadProvisioning::Managed)
+        .map(|capability| capability.path.as_path())
+        .chain(request.filesystem.write.iter().map(|path| path.as_path()))
+        .chain(
+            request
+                .filesystem
+                .managed_runtime_roots
+                .iter()
+                .map(|path| path.as_path()),
+        );
+    let mut ancestors = BTreeSet::new();
+    for path in managed_paths.filter(|path| path.exists()) {
+        for ancestor in path.ancestors().skip(1) {
+            if ancestor.is_dir() {
+                ancestors.insert(ancestor.to_path_buf());
+            }
+        }
+    }
+    ancestors
+}
+
+/// Reconcile OpenTopia-managed roots against the stable sandbox group.
+/// Runtime parents receive inheritable RX for future generations; ancestors
+/// of any managed read/write root receive only a non-inheriting
+/// traverse/read-attributes ACE when their effective access is missing.
+pub(super) fn ensure_managed_runtime_group_permissions(
+    request: &SandboxRequest,
+    group: &str,
+    group_sid: PSID,
+    token: HANDLE,
+) -> Result<()> {
+    let roots = request
+        .filesystem
+        .managed_runtime_roots
+        .iter()
+        .filter(|path| path.is_dir())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let targets = request
+        .filesystem
+        .read_execute
+        .iter()
+        .filter(|capability| capability.provisioning == ReadProvisioning::Managed)
+        .map(|capability| capability.path.clone())
+        .filter(|path| roots.iter().any(|root| path_starts_with(path, root)))
+        .collect::<BTreeSet<_>>();
+    let ancestors = managed_path_traversal_ancestors(request);
+    let sid_bytes = SidBuffer::copy_from_sid(group_sid)?.0;
+    let ledger = load_acl_ledger()?;
+    let root_is_recorded = |root: &Path| {
+        ledger.entries.iter().any(|entry| {
+            entry.account.eq_ignore_ascii_case(group)
+                && entry.path == root
+                && entry.kind == PersistentAclKind::ManagedRuntimeRead
+                && entry.sid == sid_bytes
+                && entry.permissions_version == ACL_ENTRY_PERMISSIONS_VERSION
+                && entry.object_generation == acl_object_generation(root)
+        })
+    };
+    let historical_root_is_recorded = |root: &Path| {
+        ledger.entries.iter().any(|entry| {
+            entry.account.eq_ignore_ascii_case(group)
+                && entry.path == root
+                && entry.kind == PersistentAclKind::ManagedRuntimeRead
+                && entry.sid == sid_bytes
+                && entry.permissions_version == ACL_ENTRY_PERMISSIONS_VERSION
+        })
+    };
+    let mut roots_to_reconcile = BTreeSet::new();
+    let mut root_ledger_updates = Vec::new();
+    for root in &roots {
+        let effective =
+            effective_file_access(token, root, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)?;
+        if !root_is_recorded(root) && historical_root_is_recorded(root) && effective {
+            root_ledger_updates.push(PersistentAclEntry {
+                account: group.to_string(),
+                path: root.clone(),
+                kind: PersistentAclKind::ManagedRuntimeRead,
+                sid: sid_bytes.clone(),
+                permissions_version: ACL_ENTRY_PERMISSIONS_VERSION,
+                object_generation: acl_object_generation(root),
+            });
+        } else if !root_is_recorded(root) || !effective {
+            roots_to_reconcile.insert(root.clone());
+        }
+    }
+    for target in &targets {
+        if !effective_file_access(token, target, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)? {
+            roots_to_reconcile.extend(
+                roots
+                    .iter()
+                    .filter(|root| path_starts_with(target, root))
+                    .cloned(),
+            );
+        }
+    }
+    let mut inaccessible_ancestors = Vec::new();
+    for ancestor in &ancestors {
+        if !effective_file_access(token, ancestor, MANAGED_PATH_TRAVERSAL_PERMISSIONS)? {
+            inaccessible_ancestors.push(ancestor.clone());
+        }
+    }
+    if !root_ledger_updates.is_empty() {
+        let _ledger_guard = NamedAclMutex::acquire_metadata()?;
+        let mut latest = load_acl_ledger()?;
+        for entry in root_ledger_updates {
+            latest.entries.retain(|existing| {
+                !existing.account.eq_ignore_ascii_case(&entry.account)
+                    || existing.path != entry.path
+                    || existing.kind != entry.kind
+            });
+            latest.entries.push(entry);
+        }
+        save_acl_ledger(&latest)?;
+    }
+    if roots_to_reconcile.is_empty() && inaccessible_ancestors.is_empty() {
+        crate::logging::event(
+            "access_check",
+            format!("managed runtime group ACL already effective for {group}"),
+        );
+        return Ok(());
+    }
+
+    let _guards = NamedAclMutex::acquire_paths(
+        roots_to_reconcile
+            .iter()
+            .map(|path| path.as_path())
+            .chain(targets.iter().map(|path| path.as_path()))
+            .chain(inaccessible_ancestors.iter().map(|path| path.as_path())),
+    )?;
+    let mut ledger = load_acl_ledger()?;
+    let mut transaction = AclTransaction::default();
+    let mut applied_entries = Vec::new();
+    // Native runtimes such as Node query metadata for every path component.
+    // Grant only traverse/read-attributes on inaccessible ancestors and do not
+    // inherit it, so the sandbox still cannot list or read sibling content.
+    for ancestor in &inaccessible_ancestors {
+        let entry = PersistentAclEntry {
+            account: group.to_string(),
+            path: ancestor.clone(),
+            kind: PersistentAclKind::ManagedRuntimeTraverse,
+            sid: sid_bytes.clone(),
+            permissions_version: ACL_ENTRY_PERMISSIONS_VERSION,
+            object_generation: acl_object_generation(ancestor),
+        };
+        revoke_replaced_acl_principals(&ledger, &entry)?;
+        transaction.grant_without_child_propagation(
+            ancestor,
+            group_sid,
+            MANAGED_PATH_TRAVERSAL_PERMISSIONS,
+        )?;
+        ledger.entries.retain(|existing| {
+            !existing.account.eq_ignore_ascii_case(&entry.account)
+                || existing.path != entry.path
+                || existing.kind != entry.kind
+        });
+        ledger.entries.push(entry.clone());
+        applied_entries.push(entry);
+    }
+    for root in &roots_to_reconcile {
+        let entry = PersistentAclEntry {
+            account: group.to_string(),
+            path: root.clone(),
+            kind: PersistentAclKind::ManagedRuntimeRead,
+            sid: sid_bytes.clone(),
+            permissions_version: ACL_ENTRY_PERMISSIONS_VERSION,
+            object_generation: acl_object_generation(root),
+        };
+        revoke_replaced_acl_principals(&ledger, &entry)?;
+        crate::logging::event(
+            "apply_acl",
+            format!(
+                "reconciling inherited managed runtime permissions for {group} at {}",
+                root.display()
+            ),
+        );
+        transaction.grant(
+            root,
+            group_sid,
+            true,
+            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+        )?;
+        propagate_inherited_dacl(root)?;
+        ledger.entries.retain(|existing| {
+            !existing.account.eq_ignore_ascii_case(&entry.account)
+                || existing.path != entry.path
+                || existing.kind != entry.kind
+        });
+        ledger.entries.push(entry.clone());
+        applied_entries.push(entry);
+    }
+    // A child can explicitly disable inheritance. Repair only those managed
+    // generation roots that remain inaccessible after parent propagation.
+    for target in &targets {
+        if effective_file_access(token, target, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)? {
+            continue;
+        }
+        let entry = PersistentAclEntry {
+            account: group.to_string(),
+            path: target.clone(),
+            kind: PersistentAclKind::ManagedRuntimeRead,
+            sid: sid_bytes.clone(),
+            permissions_version: ACL_ENTRY_PERMISSIONS_VERSION,
+            object_generation: acl_object_generation(target),
+        };
+        revoke_replaced_acl_principals(&ledger, &entry)?;
+        transaction.grant(
+            target,
+            group_sid,
+            true,
+            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+        )?;
+        ledger.entries.retain(|existing| {
+            !existing.account.eq_ignore_ascii_case(&entry.account)
+                || existing.path != entry.path
+                || existing.kind != entry.kind
+        });
+        ledger.entries.push(entry.clone());
+        applied_entries.push(entry);
+    }
+    for target in roots.iter().chain(targets.iter()) {
+        anyhow::ensure!(
+            effective_file_access(token, target, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)?,
+            "stage=apply_acl managed runtime group {group} is still unable to read/execute {} after ACL reconciliation",
+            target.display()
+        );
+    }
+    for ancestor in &ancestors {
+        anyhow::ensure!(
+            effective_file_access(token, ancestor, MANAGED_PATH_TRAVERSAL_PERMISSIONS)?,
+            "stage=apply_acl managed runtime group {group} is still unable to traverse {} after ACL reconciliation",
+            ancestor.display()
+        );
+    }
+
+    let _ledger_guard = NamedAclMutex::acquire_metadata()?;
+    let mut latest = load_acl_ledger()?;
+    for entry in applied_entries {
+        latest.entries.retain(|existing| {
+            !existing.account.eq_ignore_ascii_case(&entry.account)
+                || existing.path != entry.path
+                || existing.kind != entry.kind
+        });
+        latest.entries.push(entry);
+    }
+    save_acl_ledger(&latest)?;
+    transaction.commit();
+    Ok(())
 }
 
 pub(super) fn ensure_persistent_user_permissions(
@@ -225,7 +504,6 @@ pub(super) fn ensure_persistent_user_permissions(
     write_sid: PSID,
     token: HANDLE,
 ) -> Result<()> {
-    let ledger = load_acl_ledger()?;
     let mut desired = Vec::new();
     for path in request
         .filesystem
@@ -233,14 +511,7 @@ pub(super) fn ensure_persistent_user_permissions(
         .iter()
         .filter(|path| path.exists())
     {
-        let deny_entry_installed = ledger.entries.iter().any(|entry| {
-            entry.account.eq_ignore_ascii_case(account)
-                && entry.path == *path
-                && entry.kind == PersistentAclKind::DenyRead
-        });
-        if !deny_entry_installed
-            && effective_file_access(token, path, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)?
-        {
+        if effective_file_access(token, path, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)? {
             desired.push((path.clone(), PersistentAclKind::DenyRead));
         }
     }
@@ -322,11 +593,9 @@ pub(super) fn ensure_persistent_user_permissions(
             kind: kind.clone(),
             sid: entry_sid_bytes.clone(),
             permissions_version: ACL_ENTRY_PERMISSIONS_VERSION,
+            object_generation: acl_object_generation(&path),
         };
         revoke_replaced_acl_principals(&ledger, &entry)?;
-        if ledger.entries.contains(&entry) {
-            continue;
-        }
         crate::logging::event(
             "apply_acl",
             format!(
@@ -342,6 +611,9 @@ pub(super) fn ensure_persistent_user_permissions(
                 true,
                 FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
             )?,
+            PersistentAclKind::ManagedRuntimeRead | PersistentAclKind::ManagedRuntimeTraverse => {
+                unreachable!()
+            }
             PersistentAclKind::Write => {
                 transaction.grant(&path, acl_sid, true, WORKSPACE_WRITE_PERMISSIONS)?
             }
@@ -351,7 +623,7 @@ pub(super) fn ensure_persistent_user_permissions(
                 true,
                 FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
             )?,
-            PersistentAclKind::DenyWrite => unreachable!(),
+            PersistentAclKind::DenyWrite | PersistentAclKind::Unknown(_) => unreachable!(),
         }
         ledger.entries.retain(|existing| {
             existing.account != entry.account
@@ -478,6 +750,7 @@ pub(super) fn migrate_dedicated_user_write_acls_to_group(
             kind: PersistentAclKind::Write,
             sid: group_sid_bytes.clone(),
             permissions_version: ACL_ENTRY_PERMISSIONS_VERSION,
+            object_generation: acl_object_generation(path),
         });
     }
     let propagation_roots = stale_paths.iter().filter(|candidate| {
@@ -522,18 +795,16 @@ pub(super) fn ensure_persistent_capability_permissions(
     if desired_entries.is_empty() {
         return Ok(());
     }
-    if !desired_entries.is_empty() {
-        let ledger = load_acl_ledger()?;
-        if desired_entries
-            .iter()
-            .all(|entry| ledger.entries.contains(entry))
-        {
-            crate::logging::event(
-                "access_check",
-                format!("capability ACL already provisioned for {principal}"),
-            );
-            return Ok(());
-        }
+    let existing_ledger = load_acl_ledger()?;
+    if desired_entries
+        .iter()
+        .all(|entry| existing_ledger.entries.contains(entry))
+    {
+        crate::logging::event(
+            "access_check",
+            format!("capability ACL already provisioned for {principal}"),
+        );
+        return Ok(());
     }
     let preliminary_ledger = load_acl_ledger()?;
     let legacy_paths = preliminary_ledger
@@ -550,7 +821,28 @@ pub(super) fn ensure_persistent_capability_permissions(
     )?;
     let mut ledger = load_acl_ledger()?;
     let mut transaction = AclTransaction::default();
-    let mut applied_entries = Vec::new();
+    let mut ledger_updates = Vec::new();
+    for desired in &desired_entries {
+        if ledger.entries.contains(desired) {
+            continue;
+        }
+        let historical = ledger.entries.iter().any(|entry| {
+            entry.account == desired.account
+                && entry.path == desired.path
+                && entry.kind == desired.kind
+                && entry.sid == desired.sid
+                && entry.permissions_version == desired.permissions_version
+        });
+        if historical && capability_acl_is_installed(desired, sid)? {
+            ledger.entries.retain(|entry| {
+                entry.account != desired.account
+                    || entry.path != desired.path
+                    || entry.kind != desired.kind
+            });
+            ledger.entries.push(desired.clone());
+            ledger_updates.push(desired.clone());
+        }
+    }
     let legacy_entries = ledger
         .entries
         .iter()
@@ -578,7 +870,11 @@ pub(super) fn ensure_persistent_capability_permissions(
                 transaction.grant(&path, sid, true, WORKSPACE_WRITE_PERMISSIONS)?
             }
             PersistentAclKind::DenyWrite => transaction.deny_write(&path, sid, true)?,
-            PersistentAclKind::Read | PersistentAclKind::DenyRead => unreachable!(),
+            PersistentAclKind::Read
+            | PersistentAclKind::ManagedRuntimeRead
+            | PersistentAclKind::ManagedRuntimeTraverse
+            | PersistentAclKind::DenyRead
+            | PersistentAclKind::Unknown(_) => unreachable!(),
         }
         ledger.entries.retain(|existing| {
             existing.account != entry.account
@@ -586,15 +882,15 @@ pub(super) fn ensure_persistent_capability_permissions(
                 || existing.kind != entry.kind
         });
         ledger.entries.push(entry.clone());
-        applied_entries.push(entry);
+        ledger_updates.push(entry);
     }
-    if !legacy_entries.is_empty() || !applied_entries.is_empty() {
+    if !legacy_entries.is_empty() || !ledger_updates.is_empty() {
         let _ledger_guard = NamedAclMutex::acquire_metadata()?;
         let mut latest = load_acl_ledger()?;
         latest
             .entries
             .retain(|entry| entry.account != LEGACY_CAPABILITY_PRINCIPAL);
-        for entry in applied_entries {
+        for entry in ledger_updates {
             latest.entries.retain(|existing| {
                 existing.account != entry.account
                     || existing.path != entry.path
@@ -606,6 +902,25 @@ pub(super) fn ensure_persistent_capability_permissions(
     }
     transaction.commit();
     Ok(())
+}
+
+fn capability_acl_is_installed(entry: &PersistentAclEntry, sid: PSID) -> Result<bool> {
+    match entry.kind {
+        PersistentAclKind::Write => {
+            dacl_has_explicit_access(&entry.path, sid, GRANT_ACCESS, WORKSPACE_WRITE_PERMISSIONS)
+        }
+        PersistentAclKind::DenyWrite => dacl_has_explicit_access(
+            &entry.path,
+            sid,
+            DENY_ACCESS,
+            super::WRITE_RESTRICTION_PERMISSIONS,
+        ),
+        PersistentAclKind::Read
+        | PersistentAclKind::ManagedRuntimeRead
+        | PersistentAclKind::ManagedRuntimeTraverse
+        | PersistentAclKind::DenyRead
+        | PersistentAclKind::Unknown(_) => Ok(false),
+    }
 }
 
 fn capability_acl_entries(
@@ -636,12 +951,16 @@ fn capability_acl_entries(
                 .cloned()
                 .map(|path| (path, PersistentAclKind::DenyWrite)),
         )
-        .map(|(path, kind)| PersistentAclEntry {
-            account: principal.to_string(),
-            path,
-            kind,
-            sid: sid_bytes.clone(),
-            permissions_version: ACL_ENTRY_PERMISSIONS_VERSION,
+        .map(|(path, kind)| {
+            let object_generation = acl_object_generation(&path);
+            PersistentAclEntry {
+                account: principal.to_string(),
+                path,
+                kind,
+                sid: sid_bytes.clone(),
+                permissions_version: ACL_ENTRY_PERMISSIONS_VERSION,
+                object_generation,
+            }
         })
         .collect())
 }
@@ -686,6 +1005,7 @@ pub(crate) fn revoke_dedicated_user_permissions(accounts: &[&str]) -> Result<()>
         })
         .cloned()
         .collect::<Vec<_>>();
+    reject_unknown_cleanup_entries(&targets, "dedicated-user sandbox teardown")?;
     let _guards = NamedAclMutex::acquire_paths(targets.iter().map(|entry| entry.path.as_path()))?;
     let mut revoked = BTreeSet::new();
     for entry in &targets {
@@ -733,6 +1053,7 @@ pub(crate) fn cleanup_workspace_acl(args: &[String]) -> Result<i32> {
         .filter(|entry| path_starts_with(&entry.path, &workspace))
         .cloned()
         .collect::<Vec<_>>();
+    reject_unknown_cleanup_entries(&targets, "workspace ACL cleanup")?;
     let _guards = NamedAclMutex::acquire_paths(targets.iter().map(|entry| entry.path.as_path()))?;
     let mut revoked = BTreeSet::new();
     for entry in targets
@@ -762,6 +1083,17 @@ pub(crate) fn cleanup_workspace_acl(args: &[String]) -> Result<i32> {
         revoked.len()
     );
     Ok(0)
+}
+
+fn reject_unknown_cleanup_entries(entries: &[PersistentAclEntry], operation: &str) -> Result<()> {
+    if let Some(entry) = entries.iter().find(|entry| entry.kind.is_unknown()) {
+        anyhow::bail!(
+            "{operation} requires a newer sandbox helper because ACL kind {:?} at {} is unknown; the entry was preserved without changing its ACL",
+            entry.kind,
+            entry.path.display()
+        )
+    }
+    Ok(())
 }
 
 pub(super) fn path_starts_with(path: &Path, root: &Path) -> bool {
@@ -870,10 +1202,12 @@ pub(super) fn capability_principal(request: &SandboxRequest) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        acl_principal_sid, capability_principal, path_starts_with, SandboxRequest,
+        acl_object_generation, acl_principal_sid, capability_principal,
+        managed_path_traversal_ancestors, path_starts_with, SandboxRequest,
         CAPABILITY_PRINCIPAL_PREFIX, LEGACY_SCOPED_CAPABILITY_PRINCIPAL_PREFIX,
     };
     use crate::{BackendMode, NetworkMode};
+    use opentopia_sandbox_protocol::{ReadExecuteCapability, ReadProvisioning};
     use std::path::Path;
     use uuid::Uuid;
 
@@ -938,6 +1272,58 @@ mod tests {
         assert!(migration.contains("transaction.grant(path, group_sid"));
         assert!(migration.contains("REVOKE_ACCESS"));
         assert!(migration.contains("propagate_inherited_dacl(root)"));
+    }
+
+    #[test]
+    fn acl_object_generation_changes_when_a_directory_is_replaced() {
+        let path =
+            std::env::temp_dir().join(format!("opentopia-acl-generation-test-{}", Uuid::new_v4()));
+        std::fs::create_dir(&path).expect("create first directory generation");
+        let first = acl_object_generation(&path);
+        std::fs::remove_dir(&path).expect("remove first directory generation");
+        std::fs::create_dir(&path).expect("create replacement directory generation");
+        let replacement = acl_object_generation(&path);
+        std::fs::remove_dir(&path).expect("remove replacement directory generation");
+
+        assert_ne!(first, replacement);
+    }
+
+    #[test]
+    fn traversal_ancestors_cover_managed_paths_but_not_external_runtime_branches() {
+        let root = std::env::temp_dir().join(format!(
+            "opentopia-managed-traversal-test-{}",
+            Uuid::new_v4()
+        ));
+        let managed_branch = root.join("managed-branch");
+        let managed_leaf = managed_branch.join("leaf");
+        let write_branch = root.join("write-branch");
+        let write_leaf = write_branch.join("leaf");
+        let external_branch = root.join("external-branch");
+        let external_leaf = external_branch.join("leaf");
+        let stable_runtime = root.join("runtime-parent");
+        for path in [&managed_leaf, &write_leaf, &external_leaf, &stable_runtime] {
+            std::fs::create_dir_all(path).expect("create traversal test path");
+        }
+        let mut request = capability_request(&[]);
+        request.filesystem.read_execute = vec![
+            ReadExecuteCapability {
+                path: managed_leaf,
+                provisioning: ReadProvisioning::Managed,
+            },
+            ReadExecuteCapability {
+                path: external_leaf,
+                provisioning: ReadProvisioning::ExistingOnly,
+            },
+        ];
+        request.filesystem.write = vec![write_leaf];
+        request.filesystem.managed_runtime_roots = vec![stable_runtime];
+
+        let ancestors = managed_path_traversal_ancestors(&request);
+        assert!(ancestors.contains(&managed_branch));
+        assert!(ancestors.contains(&write_branch));
+        assert!(!ancestors.contains(&external_branch));
+
+        std::fs::remove_dir_all(&root).expect("remove traversal test tree");
     }
 
     fn capability_request(write_roots: &[&str]) -> SandboxRequest {

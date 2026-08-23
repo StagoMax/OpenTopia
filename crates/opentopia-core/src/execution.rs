@@ -889,6 +889,11 @@ OPENTOPIA_SANDBOX_ERROR {"version":1,"stage":"broker","nonce":"abc123","message"
         let outside = std::env::temp_dir().join(format!("opentopia-core-host-read-{id}"));
         let sandbox_home = std::env::temp_dir().join(format!("opentopia-core-home-{id}"));
         std::fs::create_dir_all(&root).expect("create dedicated workspace");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"packageManager":"pnpm@10.30.0"}"#,
+        )
+        .expect("declare managed pnpm runtime");
         std::fs::create_dir_all(&outside).expect("create host read fixture");
         let external_read = outside.join("input.txt");
         let external_write = outside.join("blocked.txt");
@@ -929,6 +934,21 @@ OPENTOPIA_SANDBOX_ERROR {"version":1,"stage":"broker","nonce":"abc123","message"
                 && String::from_utf8_lossy(&nested_runtime.stdout).contains("cargo"),
             "nested PATH runtime failed: {}",
             String::from_utf8_lossy(&nested_runtime.stderr)
+        );
+
+        let managed_pnpm = env
+            .exec(
+                ExecRequest::shell("pnpm --version"),
+                ExecutionContext::with_timeout(Duration::from_secs(60)),
+            )
+            .await
+            .expect("managed pnpm command should start in dedicated-user sandbox");
+        assert!(
+            managed_pnpm.success
+                && String::from_utf8_lossy(&managed_pnpm.stdout).contains("10.30.0"),
+            "managed pnpm failed inside dedicated-user sandbox\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&managed_pnpm.stdout),
+            String::from_utf8_lossy(&managed_pnpm.stderr)
         );
 
         // Node-based tools normally launch compilers, workers, or another Node

@@ -129,13 +129,14 @@ fn parse_request(args: impl IntoIterator<Item = String>) -> Result<SandboxReques
             std::process::exit(0);
         }
         _ => anyhow::bail!(
-            "usage: opentopia-sandbox run --cwd <absolute-path> [--interactive] [--read-root <absolute-path>] [--runtime-root <absolute-path>] [--write-root <absolute-path>] [--runtime-home <absolute-path>] [--protect <absolute-path>] [--timeout-ms <milliseconds>] [--termination-timeout-ms <milliseconds>] --network <deny|internet> -- <program> [args...]"
+            "usage: opentopia-sandbox run --cwd <absolute-path> [--interactive] [--read-root <absolute-path>] [--managed-runtime-root <absolute-path>] [--runtime-root <absolute-path>] [--write-root <absolute-path>] [--runtime-home <absolute-path>] [--protect <absolute-path>] [--timeout-ms <milliseconds>] [--termination-timeout-ms <milliseconds>] --network <deny|internet> -- <program> [args...]"
         ),
     }
 
     let mut interactive = false;
     let mut cwd = None;
     let mut read_roots = Vec::new();
+    let mut managed_runtime_roots = Vec::new();
     let mut runtime_roots = Vec::new();
     let mut write_roots = Vec::new();
     let mut runtime_home = None;
@@ -160,6 +161,10 @@ fn parse_request(args: impl IntoIterator<Item = String>) -> Result<SandboxReques
             "--interactive" => interactive = true,
             "--cwd" => cwd = Some(absolute_path(next_value("--cwd", &mut args)?)?),
             "--read-root" => read_roots.push(absolute_path(next_value("--read-root", &mut args)?)?),
+            "--managed-runtime-root" => managed_runtime_roots.push(absolute_path(next_value(
+                "--managed-runtime-root",
+                &mut args,
+            )?)?),
             "--runtime-root" => {
                 runtime_roots.push(absolute_path(next_value("--runtime-root", &mut args)?)?)
             }
@@ -258,11 +263,29 @@ fn parse_request(args: impl IntoIterator<Item = String>) -> Result<SandboxReques
             )
         }
     }
+    managed_runtime_roots.sort();
+    managed_runtime_roots.dedup();
+    for root in &managed_runtime_roots {
+        anyhow::ensure!(
+            root.is_dir(),
+            "managed runtime root does not exist or is not a directory: {}",
+            root.display()
+        );
+        anyhow::ensure!(
+            read_execute.iter().any(|capability| {
+                capability.provisioning == ReadProvisioning::Managed
+                    && path_is_within(&capability.path, root)
+            }),
+            "managed runtime root {} does not contain any managed read capability",
+            root.display()
+        );
+    }
     Ok(SandboxRequest {
         interactive,
         cwd,
         filesystem: FilesystemCapabilities {
             read_execute,
+            managed_runtime_roots,
             write: write_roots,
             deny_read: denied_read_paths,
             deny_write: protected_paths,
@@ -414,5 +437,38 @@ mod tests {
         assert_eq!(request.max_output_bytes, Some(65_536));
         assert_eq!(request.backend, super::BackendMode::Unelevated);
         assert_eq!(request.command, ["cmd.exe", "/d", "/c", "echo ok"]);
+    }
+
+    #[test]
+    fn managed_runtime_root_must_own_a_managed_read_capability() {
+        let root = std::env::temp_dir().join(format!(
+            "opentopia-managed-runtime-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let generation = root.join("10.30.0");
+        std::fs::create_dir_all(&generation).expect("create managed runtime fixture");
+        let root_arg = root.to_string_lossy().into_owned();
+        let generation_arg = generation.to_string_lossy().into_owned();
+        let request = parse_request(
+            vec![
+                "run".to_string(),
+                "--cwd".to_string(),
+                root_arg.clone(),
+                "--read-root".to_string(),
+                generation_arg,
+                "--managed-runtime-root".to_string(),
+                root_arg,
+                "--network".to_string(),
+                "internet".to_string(),
+                "--".to_string(),
+                "cmd.exe".to_string(),
+            ]
+            .into_iter(),
+        )
+        .expect("parse managed runtime request");
+
+        assert_eq!(request.filesystem.managed_runtime_roots.len(), 1);
+        assert_eq!(request.filesystem.read_execute.len(), 1);
+        std::fs::remove_dir_all(root).expect("remove managed runtime fixture");
     }
 }

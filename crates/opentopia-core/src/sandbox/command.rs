@@ -351,6 +351,15 @@ pub(super) fn build_windows_sandbox_command_with_binary(
     for root in &managed_read_roots {
         sandbox_args.extend(["--read-root".to_string(), path_to_string(root)]);
     }
+    for root in dedup_paths(options.managed_runtime_roots.clone())
+        .into_iter()
+        .filter(|root| root.is_dir())
+    {
+        sandbox_args.extend([
+            "--managed-runtime-root".to_string(),
+            path_to_string(&absolute_path(root)),
+        ]);
+    }
     for root in immutable_runtime_roots
         .into_iter()
         .filter(|root| root.exists())
@@ -421,7 +430,7 @@ pub(super) fn build_windows_sandbox_command_with_binary(
     ]);
     let mut preparation_args = sandbox_args.clone();
     preparation_args[0] = "provision".to_string();
-    let preparation_key = preparation_args.join("\u{0}");
+    let preparation_key = windows_preparation_key(&preparation_args);
     sandbox_args.push("--".to_string());
     sandbox_args.push(program.to_string());
     sandbox_args.extend(args.iter().cloned());
@@ -465,6 +474,96 @@ pub(super) fn build_windows_sandbox_command_with_binary(
             .to_string(),
         },
     })
+}
+
+fn windows_preparation_key(args: &[String]) -> String {
+    const PATH_FLAGS: &[&str] = &[
+        "--cwd",
+        "--read-root",
+        "--managed-runtime-root",
+        "--runtime-root",
+        "--write-root",
+        "--runtime-home",
+        "--protect",
+        "--allow-protected-root",
+        "--deny-read",
+    ];
+    let mut key = args.join("\u{0}");
+    for pair in args.windows(2) {
+        if !PATH_FLAGS.contains(&pair[0].as_str()) {
+            continue;
+        }
+        key.push('\0');
+        key.push_str(&pair[0]);
+        key.push('=');
+        key.push_str(&filesystem_object_identity(Path::new(&pair[1])));
+    }
+    key
+}
+
+#[cfg(windows)]
+fn filesystem_object_identity(path: &Path) -> String {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let name = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let handle = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return format!("unavailable:{}", std::io::Error::last_os_error());
+    }
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    let inspected = unsafe { GetFileInformationByHandle(handle, &mut information) };
+    let inspection_error = (inspected == 0).then(std::io::Error::last_os_error);
+    unsafe { CloseHandle(handle) };
+    if let Some(error) = inspection_error {
+        return format!("unavailable:{error}");
+    }
+    format!(
+        "{}:{:08x}{:08x}:{}",
+        information.dwVolumeSerialNumber,
+        information.nFileIndexHigh,
+        information.nFileIndexLow,
+        information.dwFileAttributes
+    )
+}
+
+#[cfg(not(windows))]
+fn filesystem_object_identity(path: &Path) -> String {
+    use std::time::UNIX_EPOCH;
+
+    match std::fs::metadata(path) {
+        Ok(metadata) => format!(
+            "{}:{}",
+            metadata.len(),
+            metadata
+                .created()
+                .ok()
+                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                .map(|value| value.as_nanos())
+                .unwrap_or_default()
+        ),
+        Err(error) => format!("unavailable:{:?}", error.kind()),
+    }
 }
 
 fn windows_sandbox_environment_keys() -> Vec<String> {

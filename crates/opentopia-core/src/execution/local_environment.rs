@@ -470,6 +470,7 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             &SandboxLaunchOptions {
                 interactive: false,
                 runtime_read_roots: runtime.read_roots.clone(),
+                managed_runtime_roots: runtime.managed_runtime_roots.clone(),
                 environment_keys: environment_keys(&runtime),
                 additional_denied_read_paths: request.requirements.deny_read_paths.clone(),
                 additional_protected_paths: request.requirements.deny_write_paths.clone(),
@@ -766,6 +767,7 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             &SandboxLaunchOptions {
                 interactive: false,
                 runtime_read_roots: runtime.read_roots.clone(),
+                managed_runtime_roots: runtime.managed_runtime_roots.clone(),
                 environment_keys: environment_keys(&runtime),
                 additional_denied_read_paths: request.requirements.deny_read_paths.clone(),
                 additional_protected_paths: request.requirements.deny_write_paths.clone(),

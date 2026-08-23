@@ -591,6 +591,7 @@ pub struct SandboxPreparationPlan {
 pub struct SandboxLaunchOptions {
     pub interactive: bool,
     pub runtime_read_roots: Vec<PathBuf>,
+    pub managed_runtime_roots: Vec<PathBuf>,
     pub environment_keys: Vec<String>,
     pub additional_denied_read_paths: Vec<PathBuf>,
     pub additional_protected_paths: Vec<PathBuf>,

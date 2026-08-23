@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub const SANDBOX_PROTOCOL_SCHEMA: &str = "ai.opentopia.sandbox.protocol";
-pub const SANDBOX_PROTOCOL_VERSION: u32 = 3;
+pub const SANDBOX_PROTOCOL_VERSION: u32 = 5;
 pub const SANDBOX_SETUP_STATUS_SCHEMA: &str = "ai.opentopia.sandbox.setup-status";
 pub const SANDBOX_SETUP_STATUS_VERSION: u32 = 2;
 pub const REQUIRED_SANDBOX_FEATURES: &[&str] = &[
@@ -11,11 +11,13 @@ pub const REQUIRED_SANDBOX_FEATURES: &[&str] = &[
     "run.denied_read_paths",
     "run.filesystem_capabilities.v1",
     "run.interactive",
+    "run.managed_runtime_roots.v1",
     "run.protected_roots",
     "run.resource_limits",
     "run.runtime_roots",
     "run.explicit_acl_provisioning.v1",
     "setup.lifecycle.v1",
+    "state.acl_ledger.v2",
 ];
 
 /// Filesystem access requested by one sandbox launch. Read access and write
@@ -27,6 +29,12 @@ pub const REQUIRED_SANDBOX_FEATURES: &[&str] = &[
 #[serde(rename_all = "camelCase")]
 pub struct FilesystemCapabilities {
     pub read_execute: Vec<ReadExecuteCapability>,
+    /// Stable OpenTopia-owned parents of replaceable runtime generations.
+    /// The Windows dedicated-user backend grants its managed sandbox group an
+    /// inheritable read/execute ACE here so newly published generations keep
+    /// working without per-account, per-version ACL entries.
+    #[serde(default)]
+    pub managed_runtime_roots: Vec<PathBuf>,
     pub write: Vec<PathBuf>,
     pub deny_read: Vec<PathBuf>,
     pub deny_write: Vec<PathBuf>,
@@ -208,6 +216,7 @@ mod tests {
                 path: PathBuf::from(r"J:\Python311"),
                 provisioning: ReadProvisioning::ExistingOnly,
             }],
+            managed_runtime_roots: vec![PathBuf::from(r"J:\OpenTopia\runtimes")],
             write: vec![PathBuf::from(r"J:\workspace")],
             runtime_home: Some(PathBuf::from(r"J:\sandbox-home")),
             ..Default::default()

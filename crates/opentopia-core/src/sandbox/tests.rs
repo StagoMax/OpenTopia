@@ -402,6 +402,86 @@ fn windows_external_runtime_is_provisioned_as_a_managed_read_root() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[test]
+fn windows_managed_runtime_parent_is_projected_separately_from_generation() {
+    let root =
+        std::env::temp_dir().join(format!("opentopia-managed-runtime-plan-{}", Uuid::new_v4()));
+    let workspace = root.join("workspace");
+    let runtime_root = root.join("runtimes").join("pnpm");
+    let generation = runtime_root.join("10.30.0");
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    std::fs::create_dir_all(&generation).expect("create runtime generation");
+
+    let plan = build_windows_sandbox_command_with_binary(
+        std::env::current_exe().expect("current executable"),
+        "node.exe",
+        &sample_args(),
+        &workspace,
+        &workspace,
+        &LocalSandboxConfig::enforce(),
+        &SandboxLaunchOptions {
+            runtime_read_roots: vec![generation.clone()],
+            managed_runtime_roots: vec![runtime_root.clone()],
+            ..Default::default()
+        },
+    )
+    .expect("build managed runtime sandbox plan");
+
+    assert!(plan.args.windows(2).any(|args| {
+        args[0] == "--read-root" && windows_path_starts_with(Path::new(&args[1]), &generation)
+    }));
+    assert!(plan.args.windows(2).any(|args| {
+        args[0] == "--managed-runtime-root"
+            && windows_path_starts_with(Path::new(&args[1]), &runtime_root)
+    }));
+    let preparation = plan.preparation.expect("managed runtime preparation");
+    assert!(preparation
+        .args
+        .iter()
+        .any(|arg| arg == "--managed-runtime-root"));
+    std::fs::remove_dir_all(root).expect("remove managed runtime plan fixture");
+}
+
+#[test]
+fn windows_preparation_cache_invalidates_when_runtime_generation_is_replaced() {
+    let root = std::env::temp_dir().join(format!(
+        "opentopia-runtime-generation-plan-{}",
+        Uuid::new_v4()
+    ));
+    let workspace = root.join("workspace");
+    let runtime_root = root.join("runtimes");
+    let generation = runtime_root.join("current");
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    std::fs::create_dir_all(&generation).expect("create first runtime generation");
+    let options = SandboxLaunchOptions {
+        runtime_read_roots: vec![generation.clone()],
+        managed_runtime_roots: vec![runtime_root],
+        ..Default::default()
+    };
+    let build = || {
+        build_windows_sandbox_command_with_binary(
+            std::env::current_exe().expect("current executable"),
+            "node.exe",
+            &sample_args(),
+            &workspace,
+            &workspace,
+            &LocalSandboxConfig::enforce(),
+            &options,
+        )
+        .expect("build runtime generation plan")
+        .preparation
+        .expect("runtime generation preparation")
+        .key
+    };
+
+    let first_key = build();
+    std::fs::remove_dir_all(&generation).expect("remove first runtime generation");
+    std::fs::create_dir_all(&generation).expect("publish replacement runtime generation");
+    let second_key = build();
+    assert_ne!(first_key, second_key);
+    std::fs::remove_dir_all(root).expect("remove generation cache fixture");
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_path_containment_normalizes_verbatim_namespaces() {

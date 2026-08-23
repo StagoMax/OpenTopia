@@ -8,12 +8,16 @@ use std::ptr;
 use uuid::Uuid;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT};
 use windows_sys::Win32::Security::Authorization::{
-    GetNamedSecurityInfoW, ProgressInvokeNever, SetEntriesInAclW, SetNamedSecurityInfoW,
-    TreeResetNamedSecurityInfoW, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS, REVOKE_ACCESS,
-    SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_W,
+    GetExplicitEntriesFromAclW, GetNamedSecurityInfoW, ProgressInvokeNever, SetEntriesInAclW,
+    SetNamedSecurityInfoW, TreeResetNamedSecurityInfoW, DENY_ACCESS, EXPLICIT_ACCESS_W,
+    GRANT_ACCESS, REVOKE_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
-    DACL_SECURITY_INFORMATION, PSID, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+    EqualSid, InitializeSecurityDescriptor, SetFileSecurityW, SetSecurityDescriptorDacl,
+    DACL_SECURITY_INFORMATION, PSID, SECURITY_DESCRIPTOR, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
 };
 use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 
@@ -56,6 +60,20 @@ impl AclTransaction {
         Ok(())
     }
 
+    pub(super) fn grant_without_child_propagation(
+        &mut self,
+        path: &Path,
+        sid: PSID,
+        permissions: u32,
+    ) -> Result<()> {
+        self.changes.push(AclChange {
+            path: path.to_path_buf(),
+            sid: SidBuffer::copy_from_sid(sid)?.0,
+        });
+        self.persist()?;
+        update_dacl_without_child_propagation(path, sid, GRANT_ACCESS, permissions)
+    }
+
     pub(super) fn deny_write(&mut self, path: &Path, sid: PSID, inherit: bool) -> Result<()> {
         self.deny(path, sid, inherit, WRITE_RESTRICTION_PERMISSIONS)
     }
@@ -83,11 +101,25 @@ impl AclTransaction {
 
     fn persist(&self) -> Result<()> {
         crate::setup::ensure_parent(&self.journal_path)?;
-        std::fs::write(
-            &self.journal_path,
-            serde_json::to_vec_pretty(&self.changes)?,
-        )
-        .with_context(|| format!("write ACL recovery journal {}", self.journal_path.display()))
+        let temporary = self
+            .journal_path
+            .with_extension(format!("json.{}.tmp", std::process::id()));
+        std::fs::write(&temporary, serde_json::to_vec_pretty(&self.changes)?)
+            .with_context(|| format!("write ACL recovery journal {}", temporary.display()))?;
+        let temporary_w = wide(temporary.as_os_str());
+        let journal_w = wide(self.journal_path.as_os_str());
+        let published = unsafe {
+            MoveFileExW(
+                temporary_w.as_ptr(),
+                journal_w.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if published == 0 {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(last_error("publish ACL recovery journal with MoveFileExW"));
+        }
+        Ok(())
     }
 }
 
@@ -96,7 +128,9 @@ impl Drop for AclTransaction {
         let mut recovered = true;
         for change in self.changes.iter().rev() {
             let mut sid = SidBuffer(change.sid.clone());
-            recovered &= update_dacl(&change.path, sid.as_ptr(), REVOKE_ACCESS, false, 0).is_ok();
+            recovered &=
+                update_dacl_without_child_propagation(&change.path, sid.as_ptr(), REVOKE_ACCESS, 0)
+                    .is_ok();
         }
         if recovered {
             let _ = std::fs::remove_file(&self.journal_path);
@@ -116,23 +150,54 @@ pub(super) fn recover_acl_transactions() -> Result<()> {
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
         }
-        let changes: Vec<AclChange> = serde_json::from_slice(
-            &std::fs::read(&path)
-                .with_context(|| format!("read ACL recovery journal {}", path.display()))?,
-        )
-        .with_context(|| format!("parse ACL recovery journal {}", path.display()))?;
+        let Some(changes) = read_acl_journal(&path)? else {
+            continue;
+        };
         let _guards =
             NamedAclMutex::acquire_paths(changes.iter().map(|change| change.path.as_path()))?;
+        // A live transaction holds the same path locks. It can commit and
+        // remove its journal while recovery waits, so re-read only after the
+        // locks are owned. Missing then means another process completed the
+        // transaction or its recovery; both are successful outcomes.
+        let Some(changes) = read_acl_journal(&path)? else {
+            continue;
+        };
         for change in changes.iter().rev() {
             let mut sid = SidBuffer(change.sid.clone());
-            apply_dacl_change(&change.path, sid.as_ptr(), REVOKE_ACCESS, false, 0).with_context(
-                || format!("recover interrupted ACL transaction {}", path.display()),
-            )?;
+            // Remove the explicit scope-root ACE without recursively walking a
+            // potentially huge workspace during command startup. Partial
+            // inherited ACEs carry the same scope-specific SID and are inert
+            // outside that policy; the next provision reconciles the root and
+            // its object generation authoritatively.
+            update_dacl_without_child_propagation(&change.path, sid.as_ptr(), REVOKE_ACCESS, 0)
+                .with_context(|| {
+                    format!("recover interrupted ACL transaction {}", path.display())
+                })?;
         }
-        std::fs::remove_file(&path)
-            .with_context(|| format!("remove recovered ACL journal {}", path.display()))?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("remove recovered ACL journal {}", path.display()))
+            }
+        }
     }
     Ok(())
+}
+
+fn read_acl_journal(path: &Path) -> Result<Option<Vec<AclChange>>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read ACL recovery journal {}", path.display()))
+        }
+    };
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse ACL recovery journal {}", path.display()))
+        .map(Some)
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -270,6 +335,147 @@ pub(super) fn update_dacl(
         )
     }
     Ok(())
+}
+
+pub(super) fn dacl_has_explicit_access(
+    path: &Path,
+    sid: PSID,
+    access_mode: i32,
+    permissions: u32,
+) -> Result<bool> {
+    let name = wide(path.as_os_str());
+    let mut dacl = ptr::null_mut();
+    let mut descriptor = ptr::null_mut();
+    let get_result = unsafe {
+        GetNamedSecurityInfoW(
+            name.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut dacl,
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if get_result != 0 {
+        anyhow::bail!(
+            "GetNamedSecurityInfoW failed while inspecting {}: {get_result}",
+            path.display()
+        )
+    }
+    let mut count = 0;
+    let mut entries = ptr::null_mut();
+    let entries_result = if dacl.is_null() {
+        0
+    } else {
+        unsafe { GetExplicitEntriesFromAclW(dacl, &mut count, &mut entries) }
+    };
+    let found = if entries_result == 0 && !entries.is_null() {
+        unsafe { std::slice::from_raw_parts(entries, count as usize) }
+            .iter()
+            .any(|entry| {
+                entry.grfAccessMode == access_mode
+                    && entry.grfAccessPermissions & permissions == permissions
+                    && entry.Trustee.TrusteeForm == TRUSTEE_IS_SID
+                    && !entry.Trustee.ptstrName.is_null()
+                    && unsafe { EqualSid(entry.Trustee.ptstrName.cast(), sid) } != 0
+            })
+    } else {
+        false
+    };
+    if !entries.is_null() {
+        unsafe { windows_sys::Win32::Foundation::LocalFree(entries.cast()) };
+    }
+    if !descriptor.is_null() {
+        unsafe { windows_sys::Win32::Foundation::LocalFree(descriptor.cast()) };
+    }
+    if entries_result != 0 {
+        anyhow::bail!(
+            "GetExplicitEntriesFromAclW failed while inspecting {}: {entries_result}",
+            path.display()
+        )
+    }
+    Ok(found)
+}
+
+/// Update only the named directory. `SetNamedSecurityInfoW` automatically
+/// propagates inheritable ACEs from a container's complete DACL, which can
+/// turn a one-directory traversal grant into a scan of an entire user profile.
+/// `SetFileSecurityW` applies this absolute descriptor without walking child
+/// objects; the new ACE itself is deliberately non-inheriting.
+fn update_dacl_without_child_propagation(
+    path: &Path,
+    sid: PSID,
+    access_mode: i32,
+    permissions: u32,
+) -> Result<()> {
+    let name = wide(path.as_os_str());
+    let mut old_dacl = ptr::null_mut();
+    let mut source_descriptor = ptr::null_mut();
+    let get_result = unsafe {
+        GetNamedSecurityInfoW(
+            name.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut old_dacl,
+            ptr::null_mut(),
+            &mut source_descriptor,
+        )
+    };
+    if get_result != 0 {
+        anyhow::bail!(
+            "GetNamedSecurityInfoW failed for {}: {get_result}",
+            path.display()
+        )
+    }
+    let entry = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: permissions,
+        grfAccessMode: access_mode,
+        grfInheritance: 0,
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: ptr::null_mut(),
+            MultipleTrusteeOperation: 0,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN_VALUE,
+            ptstrName: sid.cast(),
+        },
+    };
+    let mut new_dacl = ptr::null_mut();
+    let entries_result = unsafe { SetEntriesInAclW(1, &entry, old_dacl, &mut new_dacl) };
+    if !source_descriptor.is_null() {
+        unsafe { windows_sys::Win32::Foundation::LocalFree(source_descriptor.cast()) };
+    }
+    if entries_result != 0 {
+        anyhow::bail!(
+            "SetEntriesInAclW failed for {}: {entries_result}",
+            path.display()
+        )
+    }
+
+    let mut descriptor = SECURITY_DESCRIPTOR::default();
+    let descriptor_ptr: *mut std::ffi::c_void =
+        (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast();
+    let applied = (|| -> Result<()> {
+        if unsafe { InitializeSecurityDescriptor(descriptor_ptr, 1) } == 0 {
+            return Err(last_error("InitializeSecurityDescriptor"));
+        }
+        if unsafe { SetSecurityDescriptorDacl(descriptor_ptr, 1, new_dacl, 0) } == 0 {
+            return Err(last_error("SetSecurityDescriptorDacl"));
+        }
+        if unsafe { SetFileSecurityW(name.as_ptr(), DACL_SECURITY_INFORMATION, descriptor_ptr) }
+            == 0
+        {
+            return Err(last_error("SetFileSecurityW without child propagation"));
+        }
+        Ok(())
+    })();
+    if !new_dacl.is_null() {
+        unsafe { windows_sys::Win32::Foundation::LocalFree(new_dacl.cast()) };
+    }
+    applied
 }
 
 /// Rebuild descendant inherited ACEs from the directory's current DACL while

@@ -1,8 +1,18 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 
 const ENV_KEYS_VARIABLE: &str = "OPENTOPIA_SANDBOX_ENV_KEYS";
+const SINGLE_PATH_ENV_KEYS: &[&str] = &[
+    "USERPROFILE",
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "TEMP",
+    "TMP",
+];
 const DEFAULT_ENV_KEYS: &[&str] = &[
     "SystemRoot",
     "WINDIR",
@@ -64,10 +74,16 @@ pub(crate) fn current_environment_block(
             continue;
         }
         if allowed.contains(&normalized) {
+            let value = if SINGLE_PATH_ENV_KEYS.contains(&normalized.as_str()) {
+                native_path(Path::new(&value)).into_os_string()
+            } else {
+                value
+            };
             values.insert(normalized, (key, value));
         }
     }
     if let Some(cwd) = cwd {
+        let cwd = native_path(cwd);
         let display = cwd.as_os_str().to_string_lossy();
         if display.as_bytes().get(1) == Some(&b':') {
             let key = OsString::from(format!("={}:", display[..1].to_ascii_uppercase()));
@@ -78,6 +94,7 @@ pub(crate) fn current_environment_block(
         }
     }
     if let Some(home) = profile_home {
+        let home = native_path(home);
         insert_value(&mut values, "USERPROFILE", home.as_os_str());
         insert_value(&mut values, "HOME", home.as_os_str());
         insert_value(
@@ -110,6 +127,20 @@ pub(crate) fn current_environment_block(
     block
 }
 
+/// Environment variables are consumed by language runtimes and user tools,
+/// not Win32 file APIs. Keep the extended namespace for ACL operations, but
+/// expose the ordinary DOS/UNC spelling at the process-environment boundary.
+fn native_path(path: &Path) -> PathBuf {
+    let display = path.as_os_str().to_string_lossy();
+    if let Some(unc) = display.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{unc}"));
+    }
+    if let Some(native) = display.strip_prefix(r"\\?\") {
+        return PathBuf::from(native);
+    }
+    path.to_path_buf()
+}
+
 fn insert_value(values: &mut BTreeMap<String, (OsString, OsString)>, key: &str, value: &OsStr) {
     values.insert(
         key.to_ascii_uppercase(),
@@ -120,11 +151,26 @@ fn insert_value(values: &mut BTreeMap<String, (OsString, OsString)>, key: &str, 
 #[cfg(test)]
 mod tests {
     use super::current_environment_block;
+    use std::path::Path;
 
     #[test]
     fn environment_block_is_double_nul_terminated() {
         let block = current_environment_block(None, None, false);
         assert!(block.len() >= 2);
         assert_eq!(&block[block.len() - 2..], &[0, 0]);
+    }
+
+    #[test]
+    fn environment_paths_use_native_windows_spelling() {
+        let block = current_environment_block(
+            Some(Path::new(r"\\?\J:\workspace")),
+            Some(Path::new(r"\\?\C:\sandbox-home")),
+            false,
+        );
+        let decoded = String::from_utf16_lossy(&block);
+        assert!(decoded.contains("USERPROFILE=C:\\sandbox-home\0"));
+        assert!(decoded.contains("TEMP=C:\\sandbox-home\\tmp\0"));
+        assert!(decoded.contains("=J:=J:\\workspace\0"));
+        assert!(!decoded.contains(r"\\?\"));
     }
 }

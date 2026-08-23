@@ -19,7 +19,7 @@ use windows_sys::Win32::Security::Authorization::{
 use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PSID, SUB_CONTAINERS_ONLY_INHERIT};
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-    WRITE_DAC,
+    FILE_READ_ATTRIBUTES, FILE_TRAVERSE, WRITE_DAC,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{
     SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX,
@@ -43,6 +43,7 @@ const GENERIC_ALL: u32 = 0x1000_0000;
 const WORKSPACE_WRITE_PERMISSIONS: u32 =
     FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD;
 const WRITE_RESTRICTION_PERMISSIONS: u32 = FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD;
+const MANAGED_PATH_TRAVERSAL_PERMISSIONS: u32 = FILE_TRAVERSE | FILE_READ_ATTRIBUTES;
 const ACL_ENTRY_PERMISSIONS_VERSION: u32 = 2;
 
 #[repr(C)]
@@ -50,6 +51,7 @@ struct TokenDefaultDaclInfo {
     default_dacl: *mut windows_sys::Win32::Security::ACL,
 }
 
+mod acl_ledger;
 mod acl_persistence;
 mod acl_transaction;
 mod process_launch;
@@ -57,9 +59,10 @@ mod security_token;
 
 use acl_persistence::{
     account_sid, acl_principal_sid, capability_principal, ensure_broker_exchange_permissions,
-    ensure_persistent_capability_permissions, ensure_persistent_user_permissions,
-    migrate_dedicated_user_write_acls_to_group, migrate_legacy_dedicated_user_acls,
-    path_starts_with, verify_persistent_capability_permissions, verify_persistent_user_permissions,
+    ensure_managed_runtime_group_permissions, ensure_persistent_capability_permissions,
+    ensure_persistent_user_permissions, migrate_dedicated_user_write_acls_to_group,
+    migrate_legacy_dedicated_user_acls, path_starts_with, verify_managed_runtime_group_permissions,
+    verify_persistent_capability_permissions, verify_persistent_user_permissions,
 };
 pub(super) use acl_persistence::{
     cleanup_workspace_acl, has_dedicated_user_permissions, revoke_dedicated_user_permissions,
@@ -178,6 +181,12 @@ pub(super) fn prepare_setup_canaries() -> Result<()> {
         let request = setup_canary_request(network)?;
         provision_dedicated_user(&request)
             .with_context(|| format!("provision {:?} dedicated-user execution canary", network))?;
+        replace_setup_canary_runtime_generation(network).with_context(|| {
+            format!(
+                "replace {:?} managed-runtime generation after ACL provisioning",
+                network
+            )
+        })?;
     }
     Ok(())
 }
@@ -231,6 +240,13 @@ fn setup_canary_request(network: NetworkMode) -> Result<SandboxRequest> {
         NetworkMode::Deny => "offline-home",
         NetworkMode::Internet => "online-home",
     });
+    let managed_runtime_path = root.join("managed-runtime");
+    let runtime_generation_path = managed_runtime_path.join(match network {
+        NetworkMode::Deny => "offline-generation",
+        NetworkMode::Internet => "online-generation",
+    });
+    let runtime_marker_path = runtime_generation_path.join("canary.txt");
+    let canary_script_path = workspace_path.join("managed-runtime-canary.ps1");
     std::fs::create_dir_all(&workspace_path).with_context(|| {
         format!(
             "create sandbox canary workspace {}",
@@ -239,12 +255,45 @@ fn setup_canary_request(network: NetworkMode) -> Result<SandboxRequest> {
     })?;
     std::fs::create_dir_all(&home_path)
         .with_context(|| format!("create sandbox canary home {}", home_path.display()))?;
+    std::fs::create_dir_all(&runtime_generation_path).with_context(|| {
+        format!(
+            "create managed-runtime canary generation {}",
+            runtime_generation_path.display()
+        )
+    })?;
+    std::fs::write(
+        &runtime_marker_path,
+        b"opentopia-managed-runtime-canary\r\n",
+    )
+    .with_context(|| format!("write runtime canary {}", runtime_marker_path.display()))?;
+    std::fs::write(
+        &canary_script_path,
+        b"param([string]$Marker)\r\nGet-Content -LiteralPath $Marker\r\n",
+    )
+    .with_context(|| {
+        format!(
+            "write sandbox canary script {}",
+            canary_script_path.display()
+        )
+    })?;
     let workspace = workspace_path
         .canonicalize()
         .context("canonicalize sandbox canary workspace")?;
     let home = home_path
         .canonicalize()
         .context("canonicalize sandbox canary home")?;
+    let managed_runtime = managed_runtime_path
+        .canonicalize()
+        .context("canonicalize managed-runtime canary root")?;
+    let runtime_generation = runtime_generation_path
+        .canonicalize()
+        .context("canonicalize managed-runtime canary generation")?;
+    let runtime_marker = runtime_marker_path
+        .canonicalize()
+        .context("canonicalize managed-runtime canary marker")?;
+    let canary_script = canary_script_path
+        .canonicalize()
+        .context("canonicalize managed-runtime canary script")?;
     let system_root = std::env::var_os("SystemRoot")
         .map(std::path::PathBuf::from)
         .context("SystemRoot is unavailable for sandbox canary")?
@@ -273,7 +322,12 @@ fn setup_canary_request(network: NetworkMode) -> Result<SandboxRequest> {
                     path: system_root,
                     provisioning: ReadProvisioning::ExistingOnly,
                 },
+                ReadExecuteCapability {
+                    path: runtime_generation,
+                    provisioning: ReadProvisioning::Managed,
+                },
             ],
+            managed_runtime_roots: vec![managed_runtime],
             write: vec![workspace, home.clone()],
             runtime_home: Some(home),
             ..Default::default()
@@ -288,16 +342,52 @@ fn setup_canary_request(network: NetworkMode) -> Result<SandboxRequest> {
         command: vec![
             native_path(&command).to_string_lossy().into_owned(),
             "-NoProfile".to_string(),
-            "-Command".to_string(),
-            "Write-Output opentopia-sandbox-canary".to_string(),
+            "-NonInteractive".to_string(),
+            "-ExecutionPolicy".to_string(),
+            "Bypass".to_string(),
+            "-File".to_string(),
+            native_path(&canary_script).to_string_lossy().into_owned(),
+            native_path(&runtime_marker).to_string_lossy().into_owned(),
         ],
     })
 }
 
+fn replace_setup_canary_runtime_generation(network: NetworkMode) -> Result<()> {
+    let generation = crate::setup::state_dir()
+        .join("canary")
+        .join("managed-runtime")
+        .join(match network {
+            NetworkMode::Deny => "offline-generation",
+            NetworkMode::Internet => "online-generation",
+        });
+    if generation.is_dir() {
+        std::fs::remove_dir_all(&generation).with_context(|| {
+            format!(
+                "remove managed-runtime canary generation {}",
+                generation.display()
+            )
+        })?;
+    }
+    std::fs::create_dir_all(&generation).with_context(|| {
+        format!(
+            "recreate managed-runtime canary generation {}",
+            generation.display()
+        )
+    })?;
+    std::fs::write(
+        generation.join("canary.txt"),
+        b"opentopia-managed-runtime-canary\r\n",
+    )
+    .context("rewrite managed-runtime canary marker after generation replacement")?;
+    Ok(())
+}
+
 fn provision_dedicated_user(request: &SandboxRequest) -> Result<()> {
+    crate::logging::event("apply_acl", "starting dedicated-user ACL provisioning");
     let credentials = crate::setup::load_credentials().map_err(|error| {
         anyhow::anyhow!("stage=prepare_sandbox dedicated-user backend unavailable: {error:#}")
     })?;
+    crate::logging::event("apply_acl", "loaded dedicated-user ACL credentials");
     let (username, password) = match request.network {
         NetworkMode::Deny => (
             credentials.offline_username.as_str(),
@@ -309,19 +399,34 @@ fn provision_dedicated_user(request: &SandboxRequest) -> Result<()> {
         ),
     };
     let mut user_sid = account_sid(username)?;
+    crate::logging::event("apply_acl", "resolved dedicated-user ACL SID");
     let logon_token = LoggedOnToken::new(username, password)
         .context("stage=prepare_sandbox log on dedicated-user identity")?;
+    crate::logging::event("apply_acl", "created dedicated-user ACL access token");
+    crate::logging::event("apply_acl", "preparing runtime registry ACL");
     provision_runtime_registry_as_user(username, password)?;
+    crate::logging::event("apply_acl", "preparing broker exchange ACL");
     ensure_broker_exchange_permissions(username, user_sid.as_ptr(), logon_token.handle)?;
+    crate::logging::event("apply_acl", "migrating legacy dedicated-user ACLs");
     migrate_legacy_dedicated_user_acls(request, username)?;
     let mut write_group = account_sid(crate::setup::SANDBOX_GROUP_NAME).context(
         "stage=prepare_sandbox resolve managed sandbox filesystem group; rerun `opentopia-sandbox setup`",
     )?;
+    crate::logging::event("apply_acl", "migrating dedicated write ACLs to group");
     migrate_dedicated_user_write_acls_to_group(
         username,
         crate::setup::SANDBOX_GROUP_NAME,
         write_group.as_ptr(),
     )?;
+    crate::logging::event("apply_acl", "reconciling managed runtime ACLs");
+    ensure_managed_runtime_group_permissions(
+        request,
+        crate::setup::SANDBOX_GROUP_NAME,
+        write_group.as_ptr(),
+        logon_token.handle,
+    )
+    .context("stage=apply_acl provision managed runtime group permissions")?;
+    crate::logging::event("apply_acl", "reconciling normal-token filesystem ACLs");
     ensure_persistent_user_permissions(
         request,
         username,
@@ -332,6 +437,7 @@ fn provision_dedicated_user(request: &SandboxRequest) -> Result<()> {
     )?;
     let capability_principal = capability_principal(request);
     let mut capability = acl_principal_sid(&capability_principal)?;
+    crate::logging::event("apply_acl", "reconciling restricted capability ACLs");
     ensure_persistent_capability_permissions(request, &capability_principal, capability.as_ptr())
         .context("stage=apply_acl provision dedicated-user capability permissions")?;
     Ok(())
@@ -510,6 +616,11 @@ fn run_dedicated_user(request: SandboxRequest) -> Result<i32> {
     );
     let logon_token = LoggedOnToken::new(username, password)
         .context("stage=prepare_sandbox log on dedicated-user identity")?;
+    verify_managed_runtime_group_permissions(
+        &request,
+        crate::setup::SANDBOX_GROUP_NAME,
+        logon_token.handle,
+    )?;
     verify_persistent_user_permissions(&request, username, logon_token.handle)?;
     let capability_principal = capability_principal(&request);
     let mut capability = acl_principal_sid(&capability_principal)?;
