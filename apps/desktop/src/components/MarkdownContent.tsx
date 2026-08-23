@@ -40,6 +40,7 @@ import {
 } from "../filePathLinks";
 import {
   markdownFileActionPath,
+  markdownFileLinkLabelIsPath,
   markdownFileLinkDisplayState,
   markdownStreamInterval,
   resolveMarkdownFileLink,
@@ -248,6 +249,10 @@ function MarkdownAnchor({
     linkInfo?.kind === "workspace" ? linkInfo.path : null;
   const workspacePathStatus = useWorkspacePathStatus(workspaceLinkPath);
   const pathStatus = linkInfo?.kind === "local" ? "known" : workspacePathStatus;
+  const authoredLinkText = markdownPlainText(children);
+  const compactFileLabel =
+    detectedLinkInfo !== null ||
+    markdownFileLinkLabelIsPath(authoredLinkText, linkInfo);
   const fileLinkDisplayState = markdownFileLinkDisplayState(
     detectedLinkInfo !== null,
     pathStatus,
@@ -327,9 +332,9 @@ function MarkdownAnchor({
     );
   }
 
-  // Keep the visible label stable while the workspace index verifies whether
-  // the target exists. Verification controls interactivity, not presentation,
-  // so an asynchronous directory lookup never flashes the raw full path.
+  // Automatically detected paths keep a stable filename while the workspace
+  // index verifies whether the target exists. Verification controls their
+  // interactivity without changing their presentation.
   if (linkInfo && fileLinkDisplayState !== "fallback") {
     const targetTitle = linkInfo.fragment
       ? `${linkInfo.path}#${linkInfo.fragment}`
@@ -373,7 +378,9 @@ function MarkdownAnchor({
   // path is missing. Explicit Markdown links retain their original behavior.
   if (detectedLinkInfo) return <>{children}</>;
 
-  // Normal markdown link
+  // Explicit links keep their authored interaction while a workspace lookup
+  // is pending. If the authored label is itself a path, compact only its text
+  // synchronously so returning to a task cannot flash the full path.
   return (
     <>
       <a
@@ -393,7 +400,7 @@ function MarkdownAnchor({
           fileActionPath ? handleFileContextMenu : props.onContextMenu
         }
       >
-        {children}
+        {compactFileLabel && linkInfo ? linkInfo.fileName : children}
       </a>
       {fileContextMenu}
     </>
@@ -405,6 +412,22 @@ function markdownLineNumber(fragment: string | null): number | null {
   if (!value) return null;
   const line = Number.parseInt(value, 10);
   return Number.isSafeInteger(line) && line > 0 ? line : null;
+}
+
+function markdownPlainText(value: ReactNode): string | null {
+  if (typeof value === "string" || typeof value === "number") {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    const parts = value.map(markdownPlainText);
+    return parts.every((part): part is string => part !== null)
+      ? parts.join("")
+      : null;
+  }
+  if (isValidElement<{ children?: ReactNode }>(value)) {
+    return markdownPlainText(value.props.children);
+  }
+  return null;
 }
 
 function MarkdownImage({

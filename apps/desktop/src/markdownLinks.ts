@@ -138,6 +138,48 @@ export function markdownFileLinkDisplayState(
 }
 
 /**
+ * Identifies explicit file links whose authored label is another spelling of
+ * the target path. Those labels can be shortened synchronously without
+ * replacing meaningful prose such as `[setup guide](docs/setup.md)`.
+ */
+export function markdownFileLinkLabelIsPath(
+  label: string | null,
+  target: MarkdownFileLinkTarget | null,
+): boolean {
+  if (!label || !target) return false;
+
+  const { path } = splitRelativeReference(label.trim());
+  let decodedPath = path;
+  try {
+    decodedPath = decodeURIComponent(path);
+  } catch {
+    // A literal percent sign is valid in a displayed filename even though it
+    // is not a complete URI escape. Compare that authored spelling as-is.
+  }
+
+  const normalizedLabel = decodedPath
+    .replaceAll("\\", "/")
+    .replace(/^\.\//, "")
+    .replace(/^\/+|\/+$/g, "");
+  const normalizedTarget = target.path
+    .replaceAll("\\", "/")
+    .replace(/^\/+|\/+$/g, "");
+  if (!normalizedLabel || !normalizedTarget) return false;
+
+  const caseInsensitive = /^[A-Za-z]:\//.test(normalizedTarget);
+  const comparableLabel = caseInsensitive
+    ? normalizedLabel.toLowerCase()
+    : normalizedLabel;
+  const comparableTarget = caseInsensitive
+    ? normalizedTarget.toLowerCase()
+    : normalizedTarget;
+  return (
+    comparableLabel === comparableTarget ||
+    comparableTarget.endsWith(`/${comparableLabel}`)
+  );
+}
+
+/**
  * Resolves a path that was written as a filesystem path rather than as a
  * markdown-relative link: `docs/guide.md`, `/srv/app/main.rs` or `D:\repo\a.md`.
  * Absolute paths stay absolute so the server can validate them against the

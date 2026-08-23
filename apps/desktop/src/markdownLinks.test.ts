@@ -9,6 +9,7 @@ const markdownLinks: typeof MarkdownLinksModule = await import(
 
 const {
   markdownFileActionPath,
+  markdownFileLinkLabelIsPath,
   markdownFileLinkDisplayState,
   markdownStreamInterval,
   resolveMarkdownFileLink,
@@ -152,6 +153,39 @@ test("keeps detected file labels stable while workspace lookup settles", () => {
   assert.equal(markdownFileLinkDisplayState(true, "missing"), "label");
   assert.equal(markdownFileLinkDisplayState(true, "known"), "link");
   assert.equal(markdownFileLinkDisplayState(false, "unknown"), "fallback");
+});
+
+test("recognizes explicit path labels that can stay compact during lookup", () => {
+  const target = resolveMarkdownFileLink(
+    "J:/Project/OpenTopia/apps/desktop/src/App.tsx:42",
+  );
+
+  assert.equal(
+    markdownFileLinkLabelIsPath(
+      "J:\\Project\\OpenTopia\\apps\\desktop\\src\\App.tsx:42",
+      target,
+    ),
+    true,
+  );
+  assert.equal(
+    markdownFileLinkLabelIsPath("apps/desktop/src/App.tsx", target),
+    true,
+  );
+  assert.equal(
+    markdownFileLinkLabelIsPath(
+      "j:/project/opentopia/apps/desktop/src/App.tsx",
+      target,
+    ),
+    true,
+  );
+  assert.equal(markdownFileLinkLabelIsPath("setup guide", target), false);
+  assert.equal(markdownFileLinkLabelIsPath(null, target), false);
+
+  const percentTarget = resolveMarkdownFileLink("reports/100%25-ready.md");
+  assert.equal(
+    markdownFileLinkLabelIsPath("reports/100%-ready.md", percentTarget),
+    true,
+  );
 });
 
 test("blocks unsafe protocols and workspace traversal", () => {
