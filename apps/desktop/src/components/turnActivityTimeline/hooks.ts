@@ -9,8 +9,8 @@ export function useTimelineClock(shouldTick: boolean) {
   const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
-    setNow(Date.now());
     if (!shouldTick) return;
+    setNow(Date.now());
     const timer = window.setInterval(() => setNow(Date.now()), 1_000);
     return () => window.clearInterval(timer);
   }, [shouldTick]);

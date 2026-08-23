@@ -41,6 +41,7 @@ button:disabled {
 
 .topbar {
   position: relative;
+  z-index: var(--z-sticky);
   min-height: 32px;
   border-bottom: 0;
   padding: 0;
@@ -52,21 +53,20 @@ button:disabled {
   background-size: 100vw 100vh;
   color: var(--text-secondary);
   user-select: none;
+  -webkit-app-region: no-drag;
 }
 
 /*
- * Electron only recognizes a no-drag region when it is not enclosed by a
- * larger draggable surface. Make the menu strip opt in to pointer handling
- * and reserve window dragging for the remaining caption-area space.
+ * Keep Electron's draggable caption area as a sibling of the controls rather
+ * than an overlay. An overlapping drag region can win hit testing before the
+ * menu's `no-drag` declaration is considered, which leaves every menu item
+ * inert. The flexible trailing region preserves window dragging everywhere
+ * outside the controls without covering them.
  */
-.topbar::after {
-  position: absolute;
-  z-index: var(--z-base);
-  top: 0;
-  right: 0;
-  bottom: 0;
-  left: 0;
-  content: "";
+.topbar-drag-region {
+  min-width: 0;
+  flex: 1 1 auto;
+  align-self: stretch;
   -webkit-app-region: drag;
 }
 

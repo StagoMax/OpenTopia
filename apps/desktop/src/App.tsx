@@ -1,7 +1,6 @@
 import {
   useCallback,
   useEffect,
-  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -30,16 +29,11 @@ import type {
   DiffReviewGitAction,
 } from "./components/DiffReviewPanel";
 import { LogViewer } from "./components/LogViewer";
-import {
-  ApprovalDialog,
-  type ApprovalRequest,
-} from "./components/ApprovalDialog";
+import { ApprovalDialog } from "./components/ApprovalDialog";
 import { PlanChoiceCard } from "./components/PlanChoiceCard";
 import type { ImagePreviewSource } from "./components/PreviewHost";
 import { ConnectionSidebarCollection } from "./components/connections";
-import {
-  WorkflowDeploymentSidebarCollection,
-} from "./components/workflowDeployments";
+import { WorkflowDeploymentSidebarCollection } from "./components/workflowDeployments";
 import {
   EnterpriseSidebarCollection,
   FlowEnterpriseWorkspace,
@@ -63,7 +57,6 @@ import {
   threadComposerDraftKey,
 } from "./composerDrafts";
 import { useComposerDraft } from "./useComposerDraft";
-import { resolveComposerWorkForm } from "./conversationWorkForm";
 import {
   conversationStreamEventTrace,
   rendererTraceTime,
@@ -72,8 +65,6 @@ import {
 
 import { closeToolTabState } from "./toolTabState";
 import { resolveMarkdownLink } from "./markdownLinks";
-import { conversationMetrics as deriveConversationMetrics } from "./conversationMetrics";
-import { resolveThreadModelContextWindow } from "./modelCapabilities";
 import {
   useWorkspacePathIndex,
   WorkspacePathIndexContext,
@@ -100,22 +91,20 @@ import {
   showSystemNotification,
 } from "./platform";
 import {
+  formatTaskCompletionNotificationBody,
+  formatTaskCompletionNotificationTitle,
   playCompletionChime,
   readTaskNotificationPreferences,
+  resolveTaskCompletionNotificationContent,
   shouldDeliverTaskNotification,
   writeTaskNotificationPreferences,
 } from "./taskNotifications";
 import {
-  isThreadActivityUnread,
-  readThreadActivityReadAt,
-  writeThreadActivityReadAt,
-  type ThreadActivityReadAt,
-} from "./threadActivityRead";
-import {
   isThreadActivityProcessing,
-  resolveThreadActivityStatus,
-  type ThreadActivityStatus,
+  resolveThreadActivityEventStatus,
 } from "./threadActivityStatus";
+import { ThreadActivityStore } from "./threadActivityStore";
+import { useThreadActivityStatus } from "./useThreadActivityStore";
 import { errorMessage, isAbortError } from "./errorMessage";
 import { threadTitleFromPrompt } from "./threadTitle";
 import { workspaceRootKey } from "./workspaceRootKey";
@@ -157,6 +146,7 @@ import type {
   CollaborationMode,
   CodexAccountStatus,
   CodexLoginStart,
+  ContextSourceFile,
   ContextStatus,
   ExperienceMode,
   GoalSnapshot,
@@ -188,6 +178,7 @@ import type {
   Thread,
   ThreadMcpServerView,
   ThreadModelSelection,
+  TurnStatus,
   TurnFileChange,
   UserInputResponse,
   WorkspaceDiff,
@@ -201,7 +192,11 @@ import type {
 import { reuseUnchangedAgentList } from "./agentListState";
 import { PreviewSessionStore } from "./previewSessionStore";
 import { ConversationSessionRegistry } from "./conversationSessionController";
-import { useConversationSession } from "./useConversationSession";
+import { useConversationSessionSelector } from "./useConversationSession";
+import {
+  appConversationStateEqual,
+  selectAppConversationState,
+} from "./appConversationState";
 import { Sidebar } from "./features/sidebar/Sidebar";
 import { toolTabTitle, type ToolTab, type ToolTabKind } from "./toolTabs";
 import {
@@ -215,7 +210,7 @@ import {
   GoalStrip,
   ThreadHeader,
 } from "./features/conversation/ConversationHeader";
-import { MessageList } from "./features/conversation/MessageList";
+import { LiveConversationMessageList } from "./features/conversation/LiveConversationMessageList";
 import { TopBar } from "./features/shell/TopBar";
 import {
   AboutDialog,
@@ -227,12 +222,12 @@ import {
   type TurnUndoDialogState,
 } from "./features/shell/AppDialogs";
 import {
-  Composer,
   ConversationFileDropTarget,
   useConversationFileDrop,
   type ComposerFileDropHandle,
   type NewTaskLaunchMode,
 } from "./features/composer/Composer";
+import { LiveConversationComposer } from "./features/composer/LiveConversationComposer";
 import { workspaceName } from "./workspaceName";
 import { RightPanel } from "./features/workbench/RightPanel";
 import {
@@ -245,42 +240,21 @@ type ServerStatus = "checking" | "online" | "offline";
 const emptyConversationMessages: Message[] = [];
 const emptyConversationEvents: AgentEvent[] = [];
 
-type LoadedThreadActivityStatus = {
-  status: ThreadActivityStatus;
-  updatedAt: string | null;
-};
-
-async function loadThreadActivityStatuses(
+async function loadThreadActivityTurnStatuses(
   client: ApiClient,
   threadList: Thread[],
-  activityReadAt: ThreadActivityReadAt,
-): Promise<Record<string, LoadedThreadActivityStatus>> {
-  const entries = await Promise.all(
+): Promise<TurnStatus[]> {
+  const turnStatuses = await Promise.all(
     threadList.map(async (thread) => {
       try {
-        const turnStatus = await client.getTurnStatus(thread.id);
-        const status = resolveThreadActivityStatus(turnStatus);
-        if (!status) return null;
-
-        const updatedAt = turnStatus?.updatedAt ?? null;
-        if (
-          !isThreadActivityProcessing(status) &&
-          !isThreadActivityUnread(activityReadAt, thread.id, updatedAt)
-        ) {
-          return null;
-        }
-        return [thread.id, { status, updatedAt }] as const;
+        return await client.getTurnStatus(thread.id);
       } catch {
         return null;
       }
     }),
   );
-
-  return Object.fromEntries(
-    entries.filter(
-      (entry): entry is readonly [string, LoadedThreadActivityStatus] =>
-        entry !== null,
-    ),
+  return turnStatuses.filter(
+    (turnStatus): turnStatus is TurnStatus => turnStatus !== null,
   );
 }
 
@@ -490,9 +464,13 @@ function emptyContextUsage(): ContextStatus["usage"] {
 export function App() {
   const [platform, setPlatform] = useState<PlatformInfo | null>(null);
   const [client, setClient] = useState<ApiClient | null>(null);
+  const threadActivityStore = useMemo(() => new ThreadActivityStore(), []);
   const conversationRegistry = useMemo(
-    () => (client ? new ConversationSessionRegistry(client) : null),
-    [client],
+    () =>
+      client
+        ? new ConversationSessionRegistry(client, 8, threadActivityStore)
+        : null,
+    [client, threadActivityStore],
   );
   useEffect(
     () => () => {
@@ -535,13 +513,18 @@ export function App() {
   const forwardConversationEvent = useCallback((event: AgentEvent) => {
     conversationEventEffectRef.current(event);
   }, []);
+  useEffect(
+    () => conversationRegistry?.subscribeToEvents(forwardConversationEvent),
+    [conversationRegistry, forwardConversationEvent],
+  );
   const {
     controller: activeConversationController,
     state: activeConversationState,
-  } = useConversationSession(
+  } = useConversationSessionSelector(
     conversationRegistry,
     activeThreadId,
-    forwardConversationEvent,
+    selectAppConversationState,
+    appConversationStateEqual,
   );
   const [draftProjectId, setDraftProjectId] = useState<string | null>(null);
   // Model picked on the new-task screen, before a thread exists to pin it to.
@@ -567,9 +550,6 @@ export function App() {
   >(null);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [isPickingWorkspace, setIsPickingWorkspace] = useState(false);
-  const messages =
-    activeConversationState?.messages ?? emptyConversationMessages;
-  const events = activeConversationState?.events ?? emptyConversationEvents;
   const conversationLoadState = activeConversationState?.loadState ?? {
     threadId: null,
     status: "idle" as const,
@@ -601,10 +581,10 @@ export function App() {
   const [skillsRevision, setSkillsRevision] = useState(0);
   const [isCreatingThread, setIsCreatingThread] = useState(false);
   const activeTurnId = activeConversationState?.activeTurnId ?? null;
-
-  const [threadActivityStatuses, setThreadActivityStatuses] = useState<
-    Record<string, ThreadActivityStatus>
-  >({});
+  const activeThreadActivityStatus = useThreadActivityStatus(
+    threadActivityStore,
+    activeThreadId,
+  );
   const queuedMessageCount = activeConversationState?.queuedMessageCount ?? 0;
   const pendingApprovalIds = activeConversationState?.pendingApprovalIds ?? [];
   const decidingApprovalId =
@@ -834,6 +814,7 @@ export function App() {
   const workspaceResizeFrameRef = useRef<number | null>(null);
   const markdownNavigationIdRef = useRef(0);
   const taskNotificationPreferencesRef = useRef(taskNotificationPreferences);
+  const pendingTaskNotificationEventsRef = useRef<AgentEvent[]>([]);
   const pendingEventCommitTraceRef = useRef(
     new Map<
       string,
@@ -846,113 +827,12 @@ export function App() {
   );
   const activeThreadIdRef = useRef<string | null>(null);
   const agentRefreshRequestRef = useRef<(() => void) | null>(null);
-  const threadActivityStatusesRef = useRef(threadActivityStatuses);
-  const threadActivityReadAtRef = useRef<ThreadActivityReadAt>(
-    readThreadActivityReadAt(),
-  );
 
   activeThreadIdRef.current = activeThreadId;
-  threadActivityStatusesRef.current = threadActivityStatuses;
-
-  const setThreadActivityStatus = useCallback(
-    (threadId: string, status: ThreadActivityStatus | null) => {
-      setThreadActivityStatuses((current) => {
-        if (!status) {
-          if (!(threadId in current)) return current;
-          const next = { ...current };
-          delete next[threadId];
-          return next;
-        }
-        if (current[threadId] === status) return current;
-        return { ...current, [threadId]: status };
-      });
-    },
-    [],
+  const markThreadActivityRead = useCallback(
+    (threadId: string) => threadActivityStore.markRead(threadId),
+    [threadActivityStore],
   );
-
-  const markThreadActivityRead = useCallback((threadId: string) => {
-    const nextReadAt = {
-      ...threadActivityReadAtRef.current,
-      [threadId]: new Date().toISOString(),
-    };
-    threadActivityReadAtRef.current = nextReadAt;
-    writeThreadActivityReadAt(nextReadAt);
-    setThreadActivityStatuses((current) => {
-      if (
-        !(threadId in current) ||
-        isThreadActivityProcessing(current[threadId])
-      ) {
-        return current;
-      }
-      const next = { ...current };
-      delete next[threadId];
-      return next;
-    });
-  }, []);
-
-  const processingThreadIds = useMemo(
-    () =>
-      Object.keys(threadActivityStatuses).filter((threadId) =>
-        isThreadActivityProcessing(threadActivityStatuses[threadId]),
-      ),
-    [threadActivityStatuses],
-  );
-
-  useEffect(() => {
-    if (!client || processingThreadIds.length === 0) return;
-
-    const controller = new AbortController();
-    const refreshProcessingStatuses = () => {
-      void Promise.all(
-        processingThreadIds.map(async (threadId) => {
-          try {
-            const turnStatus = await client.getTurnStatus(
-              threadId,
-              controller.signal,
-            );
-            return turnStatus
-              ? {
-                  threadId,
-                  status: resolveThreadActivityStatus(turnStatus),
-                  updatedAt: turnStatus.updatedAt,
-                }
-              : null;
-          } catch {
-            return null;
-          }
-        }),
-      ).then((statusUpdates) => {
-        if (controller.signal.aborted) return;
-        setThreadActivityStatuses((current) => {
-          let next = current;
-          for (const update of statusUpdates) {
-            if (!update || isThreadActivityProcessing(update.status)) continue;
-            const nextStatus =
-              update.status &&
-              isThreadActivityUnread(
-                threadActivityReadAtRef.current,
-                update.threadId,
-                update.updatedAt,
-              )
-                ? update.status
-                : null;
-            if (next[update.threadId] === nextStatus) continue;
-            if (next === current) next = { ...current };
-            if (nextStatus) next[update.threadId] = nextStatus;
-            else delete next[update.threadId];
-          }
-          return next;
-        });
-      });
-    };
-
-    refreshProcessingStatuses();
-    const timer = window.setInterval(refreshProcessingStatuses, 2_000);
-    return () => {
-      controller.abort();
-      window.clearInterval(timer);
-    };
-  }, [client, processingThreadIds]);
 
   const activeThread = useMemo(
     () => threads.find((thread) => thread.id === activeThreadId) ?? null,
@@ -1009,36 +889,12 @@ export function App() {
     activeThreadId !== null &&
     !isConversationReady &&
     conversationLoadError === null;
-  const conversationMessages = isConversationReady ? messages : [];
-  const conversationEvents = isConversationReady ? events : [];
-  const conversationActivityMetrics = useMemo(() => {
-    const contextWindow = resolveThreadModelContextWindow(
-      settings?.providers ?? [],
-      settings?.activeProviderId,
-      activeThread?.modelSelection,
-    );
-    return deriveConversationMetrics(
-      conversationEvents,
-      activeThread?.modelSelection,
-      contextWindow?.contextWindowTokens,
-    );
-  }, [
-    activeThread?.modelSelection,
-    conversationEvents,
-    settings?.activeProviderId,
-    settings?.providers,
-  ]);
   const conversationGoalSnapshot = isConversationReady ? goalSnapshot : null;
   const conversationActiveTurnId = isConversationReady ? activeTurnId : null;
-  const conversationPendingTurnFeedback =
-    isConversationReady && pendingTurnFeedback?.threadId === activeThreadId
-      ? pendingTurnFeedback
-      : null;
   const conversationTurnCanBeCancelled = canCancelTurn(
     conversationActiveTurnId,
     isSending || pendingTurnFeedback?.threadId === activeThreadId,
-    activeThreadId !== null &&
-      isThreadActivityProcessing(threadActivityStatuses[activeThreadId]),
+    isThreadActivityProcessing(activeThreadActivityStatus),
   );
   const conversationTurnIsCancelling =
     activeConversationState?.cancelling ?? false;
@@ -1077,29 +933,16 @@ export function App() {
     toolStageOpen && (conversationCollapsed || activeToolRequiresFullWorkspace);
   const terminalToolActive =
     toolStageOpen && activeToolTab?.kind === "terminal";
-  const pendingApprovalQueue = useMemo(
-    () =>
-      conversationEvents
-        .filter(
-          (event): event is AgentEvent & { payload: ApprovalRequest } =>
-            event.payload.type === "approval_requested" &&
-            pendingApprovalIds.includes(event.payload.approval_id),
-        )
-        .sort((a, b) => a.seq - b.seq),
-    [conversationEvents, pendingApprovalIds],
-  );
+  const pendingApprovalQueue =
+    activeConversationState?.pendingApprovalQueue ?? [];
   const activeApproval = pendingApprovalQueue[0]?.payload ?? null;
   const activeUserInput = isConversationReady
     ? (pendingUserInput[0] ?? null)
     : null;
-  const composerWorkForm = useMemo(
-    () => resolveComposerWorkForm(conversationEvents, conversationGoalSnapshot),
-    [conversationEvents, conversationGoalSnapshot],
-  );
-
   useEffect(() => {
     setTurnUndoDialog(null);
     pendingEventCommitTraceRef.current.clear();
+    pendingTaskNotificationEventsRef.current = [];
   }, [activeThreadId]);
 
   useEffect(() => {
@@ -1341,7 +1184,7 @@ export function App() {
   }, [activeThreadId, client, currentWorkspaceRoot]);
 
   const deliverTaskCompletionNotification = useCallback(
-    (summary: string, force = false) => {
+    (content: { userMessage: string; reply: string }, force = false) => {
       const preferences = taskNotificationPreferencesRef.current;
       if (!preferences.enabled) return;
       if (
@@ -1353,12 +1196,9 @@ export function App() {
 
       if (preferences.completionSound) playCompletionChime();
       if (preferences.systemNotification) {
-        const body =
-          summary.replace(/\s+/g, " ").trim().slice(0, 260) ||
-          "OpenTopia 已完成当前任务。";
         void showSystemNotification({
-          title: "任务已完成",
-          body,
+          title: formatTaskCompletionNotificationTitle(content),
+          body: formatTaskCompletionNotificationBody(content),
           silent: true,
         }).catch(() => {
           // Notification delivery is best-effort and must not affect the turn.
@@ -1370,7 +1210,23 @@ export function App() {
 
   const ingestEvent = useCallback(
     (event: AgentEvent) => {
-      if (event.threadId !== activeThreadIdRef.current) return;
+      const isActiveThread = event.threadId === activeThreadIdRef.current;
+      const activityStatus = resolveThreadActivityEventStatus(event);
+      if (
+        isActiveThread &&
+        activityStatus !== undefined &&
+        activityStatus !== null
+      ) {
+        markThreadActivityRead(event.threadId);
+      }
+      if (!isActiveThread) return;
+
+      if (
+        event.payload.type === "turn_started" ||
+        event.payload.type === "assistant_message"
+      ) {
+        pendingTaskNotificationEventsRef.current.push(event);
+      }
 
       const eventTrace = conversationStreamEventTrace(event);
       if (eventTrace) {
@@ -1394,8 +1250,6 @@ export function App() {
       }
 
       if (event.payload.type === "approval_requested") {
-        setThreadActivityStatus(event.threadId, "approval");
-        markThreadActivityRead(event.threadId);
         setConversationCollapsed(false);
       }
 
@@ -1407,48 +1261,50 @@ export function App() {
       }
 
       if (event.payload.type === "browser_handoff_required") {
-        setThreadActivityStatus(event.threadId, "user_action");
-        markThreadActivityRead(event.threadId);
         setConversationCollapsed(false);
       }
 
       if (event.payload.type === "user_input_requested") {
-        setThreadActivityStatus(event.threadId, "user_action");
         setConversationCollapsed(false);
       }
 
       if (event.payload.type === "error") {
-        setThreadActivityStatus(event.threadId, "failed");
-        markThreadActivityRead(event.threadId);
         setActionError(
           `Agent 请求失败：${friendlyProviderError(event.payload.message)}`,
         );
       }
 
       if (event.payload.type === "turn_started" && event.turnId) {
-        setThreadActivityStatus(event.threadId, "processing");
-        markThreadActivityRead(event.threadId);
         agentRefreshRequestRef.current?.();
-      } else if (event.payload.type === "turn_finished") {
-        // This task is already open, so its completion has been seen.
-        setThreadActivityStatus(event.threadId, "succeeded");
-        markThreadActivityRead(event.threadId);
-      } else if (event.payload.type === "turn_suspended") {
-        setThreadActivityStatus(event.threadId, "approval");
-        markThreadActivityRead(event.threadId);
-      } else if (event.payload.type === "turn_cancelled") {
-        setThreadActivityStatus(event.threadId, null);
-      } else if (
-        event.payload.type === "turn_awaiting_input" ||
-        event.payload.type === "error"
-      ) {
-        if (event.payload.type === "turn_awaiting_input") {
-          setThreadActivityStatus(event.threadId, "user_action");
-        }
       }
 
       if (event.payload.type === "turn_finished") {
-        deliverTaskCompletionNotification(event.payload.summary);
+        const notificationSession = conversationRegistry
+          ?.get(event.threadId)
+          .getSnapshot();
+        deliverTaskCompletionNotification(
+          resolveTaskCompletionNotificationContent(
+            notificationSession?.messages ?? emptyConversationMessages,
+            [
+              ...(notificationSession?.events ?? emptyConversationEvents),
+              ...pendingTaskNotificationEventsRef.current,
+            ],
+            event,
+          ),
+        );
+        pendingTaskNotificationEventsRef.current =
+          event.turnId === null || event.turnId === undefined
+            ? []
+            : pendingTaskNotificationEventsRef.current.filter(
+                (pendingEvent) => pendingEvent.turnId !== event.turnId,
+              );
+      } else if (event.payload.type === "turn_cancelled") {
+        pendingTaskNotificationEventsRef.current =
+          event.turnId === null || event.turnId === undefined
+            ? []
+            : pendingTaskNotificationEventsRef.current.filter(
+                (pendingEvent) => pendingEvent.turnId !== event.turnId,
+              );
       }
 
       if (event.payload.type === "tool_call_finished") {
@@ -1535,34 +1391,28 @@ export function App() {
       }
     },
     [
+      conversationRegistry,
       deliverTaskCompletionNotification,
       markThreadActivityRead,
-      setThreadActivityStatus,
     ],
   );
   conversationEventEffectRef.current = ingestEvent;
 
-  useLayoutEffect(() => {
-    const committedEventIds = new Set(events.map((event) => event.id));
-    const latestStreamSeq = events.reduce(
-      (latest, event) =>
-        event.seq === Number.MAX_SAFE_INTEGER
-          ? latest
-          : Math.max(latest, event.seq),
-      -1,
-    );
-    for (const [eventId, pendingTrace] of pendingEventCommitTraceRef.current) {
-      if (
-        !committedEventIds.has(eventId) &&
-        pendingTrace.eventSeq <= latestStreamSeq
-      ) {
-        pendingEventCommitTraceRef.current.delete(eventId);
-      }
+  const commitConversationEventTraces = useCallback((events: AgentEvent[]) => {
+    const pendingTraces = pendingEventCommitTraceRef.current;
+    let oldestPendingSeq = Number.POSITIVE_INFINITY;
+    for (const pendingTrace of pendingTraces.values()) {
+      oldestPendingSeq = Math.min(oldestPendingSeq, pendingTrace.eventSeq);
     }
-    for (const event of events) {
-      const pendingTrace = pendingEventCommitTraceRef.current.get(event.id);
+    let latestStreamSeq = -1;
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index];
+      if (!event || event.seq === Number.MAX_SAFE_INTEGER) continue;
+      if (latestStreamSeq < 0) latestStreamSeq = event.seq;
+      if (event.seq < oldestPendingSeq) break;
+      const pendingTrace = pendingTraces.get(event.id);
       if (!pendingTrace) continue;
-      pendingEventCommitTraceRef.current.delete(event.id);
+      pendingTraces.delete(event.id);
       const traceTime = rendererTraceTime();
       recordConversationRenderTrace({
         stage: "committed",
@@ -1576,7 +1426,12 @@ export function App() {
         textLength: pendingTrace.eventTrace.text.length,
       });
     }
-  }, [events]);
+    for (const [eventId, pendingTrace] of pendingTraces) {
+      if (pendingTrace.eventSeq <= latestStreamSeq) {
+        pendingTraces.delete(eventId);
+      }
+    }
+  }, []);
 
   const ingestTerminalEvent = useCallback((event: TerminalEvent) => {
     setTerminalEvents((current) => {
@@ -1611,6 +1466,7 @@ export function App() {
       // once every probe; only a reassigned backend port swaps the instance.
       const sameEndpoint = clientEndpointRef.current === info.backendUrl;
       clientEndpointRef.current = info.backendUrl;
+      if (!sameEndpoint) threadActivityStore.reset();
       setClient((current) => (current && sameEndpoint ? current : nextClient));
 
       try {
@@ -1669,40 +1525,15 @@ export function App() {
         if (cancelled) return;
         setProjects(sortProjects(loadedProjects));
         setThreads(loadedThreads);
-        void loadThreadActivityStatuses(
-          nextClient,
-          loadedThreads,
-          threadActivityReadAtRef.current,
-        ).then((statuses) => {
-          if (cancelled) return;
-          const loadedThreadIds = new Set(
-            loadedThreads.map((thread) => thread.id),
-          );
-          const latestStatuses = Object.fromEntries(
-            Object.entries(statuses)
-              .filter(
-                ([threadId, activity]) =>
-                  isThreadActivityProcessing(activity.status) ||
-                  isThreadActivityUnread(
-                    threadActivityReadAtRef.current,
-                    threadId,
-                    activity.updatedAt,
-                  ),
-              )
-              .map(([threadId, activity]) => [threadId, activity.status]),
-          );
-          setThreadActivityStatuses((current) => {
-            const currentStatuses = Object.fromEntries(
-              Object.entries(current).filter(
-                ([threadId, status]) =>
-                  loadedThreadIds.has(threadId) &&
-                  (isThreadActivityProcessing(status) ||
-                    !threadActivityReadAtRef.current[threadId]),
-              ),
+        void loadThreadActivityTurnStatuses(nextClient, loadedThreads).then(
+          (turnStatuses) => {
+            if (cancelled) return;
+            threadActivityStore.retainKnownThreads(
+              new Set(loadedThreads.map((thread) => thread.id)),
             );
-            return { ...latestStatuses, ...currentStatuses };
-          });
-        });
+            threadActivityStore.reconcileTurnStatuses(turnStatuses);
+          },
+        );
         setSettings(loadedSettings);
         setProviderHealth(loadedHealth);
         setMcpServers(loadedMcp);
@@ -1756,7 +1587,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [bootstrapAttempt]);
+  }, [bootstrapAttempt, threadActivityStore]);
 
   useEffect(() => {
     const hasCodexProvider = Boolean(
@@ -1896,26 +1727,6 @@ export function App() {
       }
     };
   }, [activeThreadId, client]);
-
-  useEffect(() => {
-    if (!activeThreadId || !activeConversationState) return;
-    const activityStatus =
-      activeConversationState.pendingApprovalIds.length > 0
-        ? "approval"
-        : activeConversationState.pendingUserInput.length > 0
-          ? "user_action"
-          : resolveThreadActivityStatus(activeConversationState.turnStatus);
-    if (!activityStatus) return;
-    setThreadActivityStatus(activeThreadId, activityStatus);
-    markThreadActivityRead(activeThreadId);
-  }, [
-    activeConversationState?.pendingApprovalIds.length,
-    activeConversationState?.pendingUserInput.length,
-    activeConversationState?.turnStatus,
-    activeThreadId,
-    markThreadActivityRead,
-    setThreadActivityStatus,
-  ]);
 
   useEffect(() => {
     if (!client || !activeThreadId || !terminalToolActive) {
@@ -2778,7 +2589,9 @@ export function App() {
     });
   }
 
-  async function addContextSources(files?: File[]): Promise<void> {
+  async function addContextSources(
+    files?: File[],
+  ): Promise<ContextSourceFile[]> {
     setActionError(null);
     try {
       const result = files
@@ -2786,7 +2599,7 @@ export function App() {
         : await selectContextFiles({
             defaultPath: currentWorkspaceRoot ?? undefined,
           });
-      if (result.canceled) return;
+      if (result.canceled) return [];
       setContextSources((current) => {
         const byPath = new Map(
           current.map((source) => [workspaceRootKey(source.path), source]),
@@ -2796,8 +2609,10 @@ export function App() {
         }
         return [...byPath.values()].slice(0, 20);
       });
+      return result.files;
     } catch (error) {
       setActionError(`添加来源失败：${errorMessage(error)}`);
+      return [];
     }
   }
 
@@ -2933,7 +2748,7 @@ export function App() {
         await runDirectToolCommand(thread.id, directCommand);
         if (activeThreadIdRef.current === thread.id) setComposer("");
       } else if (shouldSendInitialPrompt) {
-        setThreadActivityStatus(thread.id, "processing");
+        markThreadActivityRead(thread.id);
         const sessionController = conversationRegistry?.get(thread.id);
         if (!sessionController) throw new Error("会话服务尚未就绪。");
         const result = await sessionController.send({
@@ -2959,9 +2774,6 @@ export function App() {
       }
       return activeThreadIdRef.current === thread.id;
     } catch (error) {
-      if (createdThreadId) {
-        setThreadActivityStatus(createdThreadId, null);
-      }
       if (
         createdThreadId === null ||
         activeThreadIdRef.current === createdThreadId
@@ -3084,7 +2896,7 @@ export function App() {
         if (activeThreadIdRef.current === threadId) setComposer("");
         return activeThreadIdRef.current === threadId;
       }
-      setThreadActivityStatus(threadId, "processing");
+      markThreadActivityRead(threadId);
       if (!activeConversationController) throw new Error("会话服务尚未就绪。");
       const result = await activeConversationController.send({
         content: messageText,
@@ -3113,7 +2925,6 @@ export function App() {
       }
       return activeThreadIdRef.current === threadId;
     } catch (error) {
-      setThreadActivityStatus(threadId, null);
       if (activeThreadIdRef.current === threadId) {
         setActionError(errorMessage(error));
       }
@@ -3976,7 +3787,7 @@ export function App() {
           <Sidebar
             projects={projects}
             threads={threads}
-            threadActivityStatuses={threadActivityStatuses}
+            threadActivityStore={threadActivityStore}
             activeThreadId={
               sidebarDestination === "conversation" ? activeThreadId : null
             }
@@ -3992,12 +3803,10 @@ export function App() {
             newTaskOpen={
               sidebarDestination === "conversation" && activeThreadId === null
             }
-            activeFlowPrimaryView={
-              resolveActiveFlowPrimaryView({
-                flowPrimaryView,
-                sidebarDestination,
-              })
-            }
+            activeFlowPrimaryView={resolveActiveFlowPrimaryView({
+              flowPrimaryView,
+              sidebarDestination,
+            })}
             pluginsOpen={sidebarDestination === "plugins"}
             contextualCollection={
               sidebarDestination === "flow-deployments" && client ? (
@@ -4156,7 +3965,9 @@ export function App() {
                     ? activeThread.id
                     : null
                 }
-                view={flowPrimaryView as Exclude<FlowPrimaryView, "conversation">}
+                view={
+                  flowPrimaryView as Exclude<FlowPrimaryView, "conversation">
+                }
                 workspaceRoot={currentWorkspaceRoot}
               />
             ) : serverStatus === "offline" ? (
@@ -4188,12 +3999,10 @@ export function App() {
                 ) : isConversationLoading ? (
                   <ConversationLoadingState />
                 ) : (
-                  <MessageList
+                  <LiveConversationMessageList
                     key={activeThread.id}
-                    messages={conversationMessages}
-                    events={conversationEvents}
-                    activeTurnId={conversationActiveTurnId}
-                    pendingTurnFeedback={conversationPendingTurnFeedback}
+                    conversationRegistry={conversationRegistry!}
+                    onEventsCommitted={commitConversationEventTraces}
                     undoingTurnId={
                       turnUndoDialog?.loading || turnUndoDialog?.applying
                         ? turnUndoDialog.turnId
@@ -4277,19 +4086,20 @@ export function App() {
                     }
                   />
                 ) : (
-                  <Composer
+                  <LiveConversationComposer
+                    conversationRegistry={conversationRegistry!}
+                    threadId={activeThread.id}
+                    goalSnapshot={conversationGoalSnapshot}
                     fileDropHandleRef={conversationComposerFileDropHandle}
                     fileDropScope="conversation"
                     value={composer}
                     sendShortcut={editorPreferences.sendShortcut}
-                    workForm={composerWorkForm}
                     isSending={isSending}
                     isRunning={conversationTurnCanBeCancelled}
                     isCancelling={conversationTurnIsCancelling}
                     queuedMessageCount={
                       isConversationReady ? queuedMessageCount : 0
                     }
-                    metrics={conversationActivityMetrics}
                     showContextWindowUsage={
                       editorPreferences.showContextWindowUsage
                     }
@@ -4402,12 +4212,6 @@ export function App() {
             showContextWindowUsage={editorPreferences.showContextWindowUsage}
             libraryProvider={activeFlowLibraryProvider}
             workspaceRoot={currentWorkspaceRoot}
-            messages={conversationMessages}
-            events={conversationEvents.filter(
-              (event) =>
-                event.payload.type !== "approval_requested" ||
-                pendingApprovalIds.includes(event.payload.approval_id),
-            )}
             conversationLoading={isConversationLoading}
             agentItems={isConversationReady ? agentItems : []}
             terminalEvents={terminalEvents}
@@ -4483,8 +4287,6 @@ export function App() {
                 ),
               )
             }
-            onSetThreadActivity={setThreadActivityStatus}
-            onMarkThreadActivityRead={markThreadActivityRead}
             onChangePermissionMode={changeExecutionPreset}
             onChangeSandboxMode={changeSandboxMode}
             onChangeLibraryProvider={changeFlowLibraryProvider}
@@ -4555,7 +4357,10 @@ export function App() {
             onNotificationPreferencesChange={setTaskNotificationPreferences}
             onTestNotification={() =>
               deliverTaskCompletionNotification(
-                "测试成功：OpenTopia 可以在任务完成时提醒你。",
+                {
+                  userMessage: "测试任务完成通知",
+                  reply: "测试成功：OpenTopia 可以在任务完成时提醒你。",
+                },
                 true,
               )
             }
@@ -4589,7 +4394,7 @@ export function App() {
         {taskSearchOpen ? (
           <TaskSearchDialog
             activeThreadId={activeThreadId}
-            activityStatuses={threadActivityStatuses}
+            activityStore={threadActivityStore}
             projects={projects}
             threads={threads}
             onClose={closeTaskSearch}
@@ -4915,9 +4720,11 @@ function mergeArtifactDescriptors(
 }
 
 function flowPrimaryHeadingIcon(view: FlowPrimaryView) {
-  if (view === "overview") return <LayoutDashboard aria-hidden="true" size={15} />;
+  if (view === "overview")
+    return <LayoutDashboard aria-hidden="true" size={15} />;
   if (view === "agents") return <Bot aria-hidden="true" size={15} />;
-  if (view === "workflow-templates") return <Workflow aria-hidden="true" size={15} />;
+  if (view === "workflow-templates")
+    return <Workflow aria-hidden="true" size={15} />;
   if (view === "inbox") return <Inbox aria-hidden="true" size={15} />;
   if (view === "deployments") return <Rocket aria-hidden="true" size={15} />;
   if (view === "automation") return <RadioTower aria-hidden="true" size={15} />;

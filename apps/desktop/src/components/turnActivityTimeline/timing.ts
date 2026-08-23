@@ -3,12 +3,16 @@ import { asRecord } from "../../toolActivity";
 import { toolExecutionDurationMs } from "../../toolExecutionTiming";
 import type { ToolExecution, WorkItemTiming } from "./model";
 
-export function formatTurnTiming(
+export type TurnTimingRange = {
+  startedAt: number;
+  finishedAt: number | null;
+};
+
+export function resolveTurnTimingRange(
   events: AgentEvent[],
   isActive: boolean,
-  now: number,
   mountedAt: number,
-) {
+): TurnTimingRange | null {
   const validEvents = [...events]
     .sort((left, right) => left.seq - right.seq)
     .map((event) => ({ event, time: parseTimestamp(event.createdAt) }))
@@ -20,7 +24,7 @@ export function formatTurnTiming(
   );
   const startedAt =
     turnStarted?.time ?? validEvents[0]?.time ?? (isActive ? mountedAt : null);
-  if (startedAt === null || startedAt === undefined) return "";
+  if (startedAt === null || startedAt === undefined) return null;
 
   const terminal = [...validEvents]
     .reverse()
@@ -30,10 +34,17 @@ export function formatTurnTiming(
       ),
     );
   const finishedAt = isActive
-    ? now
+    ? null
     : (terminal?.time ?? validEvents[validEvents.length - 1]?.time ?? null);
-  if (finishedAt === null || finishedAt < startedAt) return "";
-  return formatTurnElapsed(finishedAt - startedAt);
+  if (finishedAt !== null && finishedAt < startedAt) return null;
+  return { startedAt, finishedAt };
+}
+
+export function formatTurnTiming(range: TurnTimingRange | null, now: number) {
+  if (!range) return "";
+  const finishedAt = range.finishedAt ?? now;
+  if (finishedAt < range.startedAt) return "";
+  return formatTurnElapsed(finishedAt - range.startedAt);
 }
 
 export function formatActivityTiming(

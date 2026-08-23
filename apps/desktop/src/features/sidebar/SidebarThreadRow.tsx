@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { memo, useEffect, useRef, useState, type CSSProperties } from "react";
 import {
   Activity,
   Circle,
@@ -16,8 +16,10 @@ import {
   threadActivityStatusLabel,
   type ThreadActivityStatus,
 } from "../../threadActivityStatus";
+import type { ThreadActivityStore } from "../../threadActivityStore";
 import { threadTitleScrollDurationMs } from "../../threadTitleScroll";
 import type { Project, Thread } from "../../types";
+import { useThreadActivityStatus } from "../../useThreadActivityStore";
 
 function ThreadStatusIndicator({ status }: { status?: ThreadActivityStatus }) {
   if (!status) return null;
@@ -45,11 +47,11 @@ function ThreadStatusIndicator({ status }: { status?: ThreadActivityStatus }) {
   );
 }
 
-export function SidebarThreadRow({
+export const SidebarThreadRow = memo(function SidebarThreadRow({
   thread,
   project,
   active,
-  activityStatus,
+  activityStore,
   archived = false,
   onSelect,
   onRename,
@@ -61,15 +63,16 @@ export function SidebarThreadRow({
   thread: Thread;
   project: Project | null;
   active: boolean;
-  activityStatus?: ThreadActivityStatus;
+  activityStore: ThreadActivityStore;
   archived?: boolean;
-  onSelect(): void;
-  onRename(): void;
-  onOpenUsage(): void;
+  onSelect(thread: Thread): void;
+  onRename(thread: Thread): void;
+  onOpenUsage(thread: Thread): void;
   onRemoveProject(project: Project): void;
   onToggleProjectPinned(project: Project): void;
-  onRestore?(): void;
+  onRestore?(thread: Thread): void;
 }) {
+  const activityStatus = useThreadActivityStatus(activityStore, thread.id);
   const [menuOpen, setMenuOpen] = useState(false);
   const [titleOverflow, setTitleOverflow] = useState({
     distance: 0,
@@ -124,10 +127,10 @@ export function SidebarThreadRow({
         className={`thread-row ${active ? "active" : ""}`}
         aria-current={active ? "page" : undefined}
         onPointerDown={(event) => {
-          if (event.button === 0) onSelect();
+          if (event.button === 0) onSelect(thread);
         }}
         onClick={(event) => {
-          if (event.detail === 0) onSelect();
+          if (event.detail === 0) onSelect(thread);
         }}
         onContextMenu={(event) => {
           event.preventDefault();
@@ -165,7 +168,7 @@ export function SidebarThreadRow({
             <button
               role="menuitem"
               onClick={() => {
-                onRename();
+                onRename(thread);
                 setMenuOpen(false);
               }}
             >
@@ -175,7 +178,7 @@ export function SidebarThreadRow({
             <button
               role="menuitem"
               onClick={() => {
-                onOpenUsage();
+                onOpenUsage(thread);
                 setMenuOpen(false);
               }}
             >
@@ -223,7 +226,7 @@ export function SidebarThreadRow({
               <button
                 role="menuitem"
                 onClick={() => {
-                  onRestore();
+                  onRestore(thread);
                   setMenuOpen(false);
                 }}
               >
@@ -236,4 +239,4 @@ export function SidebarThreadRow({
       </div>
     </div>
   );
-}
+});

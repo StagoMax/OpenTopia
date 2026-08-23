@@ -1,6 +1,14 @@
 import type { InlineImageAttachment, InlineMessageContentPart } from "./types";
 
-const caretMarker = "\u200b";
+export const COMPOSER_CARET_MARKER = "\u200b";
+
+export function composerImageDisplayId(imageId: string): string {
+  return imageId.slice(0, 8);
+}
+
+export function composerAttachmentReferenceText(name: string): string {
+  return `[${name}]`;
+}
 
 export type ComposerHistorySnapshot = {
   parts: InlineMessageContentPart[];
@@ -8,6 +16,8 @@ export type ComposerHistorySnapshot = {
 };
 
 export type ComposerExternalValueSyncAction = "ignore" | "defer" | "apply";
+
+const composerOrderedListMarkerPattern = /^( {0,3})(\d+)\.[ \t]+/;
 
 export function composerExternalValueSyncAction({
   value,
@@ -44,22 +54,57 @@ export function composerInputCommitPending({
   return isComposing || compositionSnapshotPending || nativeIsComposing;
 }
 
+export function composerLineBreakText(
+  snapshot: ComposerHistorySnapshot,
+  continueOrderedList: boolean,
+): string {
+  return continueOrderedList
+    ? (composerOrderedListContinuation(snapshot) ?? "\n")
+    : "\n";
+}
+
 /**
  * Builds the text inserted by a line break inside a plain-text ordered-list
- * item. The composer stores caret offsets as grapheme counts, so slice through
- * the same representation instead of using UTF-16 offsets.
+ * item. Image references on earlier lines do not affect the current line, but
+ * an image on the current line keeps that line from being treated as a list.
+ * The composer stores caret offsets as grapheme counts, so slice through the
+ * same representation instead of using UTF-16 offsets.
  */
 export function composerOrderedListContinuation(
   snapshot: ComposerHistorySnapshot,
 ): string | null {
-  const text = composerPlainText(snapshot.parts);
-  if (text === null) return null;
+  const currentLine = composerLineBeforeCaret(snapshot);
+  if (currentLine === null) return null;
+  return orderedListContinuation(currentLine);
+}
 
-  const beforeCaret = splitComposerText(text)
-    .slice(0, Math.max(0, snapshot.caretOffset))
-    .join("");
-  const currentLine = beforeCaret.slice(beforeCaret.lastIndexOf("\n") + 1);
-  const match = /^(\s*)(\d+)\.\s+/.exec(currentLine);
+function composerLineBeforeCaret(
+  snapshot: ComposerHistorySnapshot,
+): string | null {
+  const beforeCaret = composerContentTokens(snapshot.parts).slice(
+    0,
+    Math.max(0, snapshot.caretOffset),
+  );
+  let currentLine: string | null = "";
+  for (const token of beforeCaret) {
+    if (token.type !== "text") {
+      currentLine = null;
+      continue;
+    }
+    const lastLineBreak = token.text.lastIndexOf("\n");
+    if (lastLineBreak >= 0) {
+      currentLine = token.text.slice(lastLineBreak + 1);
+    } else if (currentLine !== null) {
+      currentLine += token.text;
+    }
+  }
+  return currentLine;
+}
+
+function orderedListContinuation(currentLine: string): string | null {
+  // CommonMark allows up to three leading spaces. Requiring the marker at the
+  // beginning also keeps prose such as "说明 1. 内容" from becoming a list.
+  const match = composerOrderedListMarkerPattern.exec(currentLine);
   if (!match) return null;
 
   return `\n${match[1]}${BigInt(match[2]) + 1n}. `;
@@ -71,16 +116,15 @@ export function composerOrderedListContinuation(
  * indentation visual so the submitted text remains portable Markdown.
  */
 export function composerUsesOrderedListIndentation(text: string): boolean {
-  const firstContentLine = text
+  return text
     .split(/\r?\n/)
-    .find((line) => line.trim().length > 0);
-  return Boolean(
-    firstContentLine && /^[ \t]{0,3}\d+\.[ \t]+/.test(firstContentLine),
-  );
+    .some((line) => composerOrderedListMarkerPattern.test(line));
 }
 
 type ComposerContentToken =
-  { type: "text"; text: string } | { type: "image_ref"; imageId: string };
+  | { type: "text"; text: string }
+  | { type: "image_ref"; imageId: string }
+  | { type: "attachment_ref"; path: string; name: string };
 
 const graphemeSegmenter = new Intl.Segmenter(undefined, {
   granularity: "grapheme",
@@ -102,7 +146,7 @@ function composerContentTokens(
 ): ComposerContentToken[] {
   const tokens: ComposerContentToken[] = [];
   for (const part of normalizeComposerContentParts(parts)) {
-    if (part.type === "image_ref") {
+    if (part.type === "image_ref" || part.type === "attachment_ref") {
       tokens.push(part);
       continue;
     }
@@ -121,7 +165,7 @@ function composerPartsFromTokens(
 ): InlineMessageContentPart[] {
   const parts: InlineMessageContentPart[] = [];
   for (const token of tokens) {
-    if (token.type === "image_ref") {
+    if (token.type === "image_ref" || token.type === "attachment_ref") {
       parts.push(token);
       continue;
     }
@@ -140,7 +184,9 @@ function composerTokensEqual(
     ? left.text === right.text
     : left.type === "image_ref" && right.type === "image_ref"
       ? left.imageId === right.imageId
-      : false;
+      : left.type === "attachment_ref" && right.type === "attachment_ref"
+        ? left.path === right.path
+        : false;
 }
 
 function cloneComposerSnapshot(
@@ -157,7 +203,7 @@ function cloneComposerSnapshot(
  * or more line breaks. Those breaks are browser caret scaffolding, not user
  * input, and become an apparently undeletable blank line once the composer is
  * read back. Remove them only when the same mutation actually deleted an image
- * reference and inserted nothing except line breaks.
+ * or attachment reference and inserted nothing except line breaks.
  */
 export function normalizeComposerImageDeletionSnapshot(
   before: ComposerHistorySnapshot,
@@ -165,7 +211,12 @@ export function normalizeComposerImageDeletionSnapshot(
 ): ComposerHistorySnapshot {
   // Plain-text deletion cannot produce the Chromium artifact handled below.
   // Avoid segmenting the entire draft on the overwhelmingly common path.
-  if (!before.parts.some((part) => part.type === "image_ref")) return after;
+  if (
+    !before.parts.some(
+      (part) => part.type === "image_ref" || part.type === "attachment_ref",
+    )
+  )
+    return after;
 
   const beforeTokens = composerContentTokens(before.parts);
   const afterTokens = composerContentTokens(after.parts);
@@ -198,15 +249,16 @@ export function normalizeComposerImageDeletionSnapshot(
     prefixLength,
     afterTokens.length - suffixLength,
   );
-  const deletedImage = removedTokens.some(
-    (token) => token.type === "image_ref",
+  const deletedReference = removedTokens.some(
+    (token) =>
+      token.type === "image_ref" || token.type === "attachment_ref",
   );
   const insertedOnlyLineBreaks =
     insertedTokens.length > 0 &&
     insertedTokens.every(
       (token) => token.type === "text" && /^\r?\n$/.test(token.text),
     );
-  if (!deletedImage || !insertedOnlyLineBreaks) return after;
+  if (!deletedReference || !insertedOnlyLineBreaks) return after;
 
   return {
     parts: composerPartsFromTokens([
@@ -332,7 +384,7 @@ export function composerUndoEntries(
 function composerPlainText(parts: InlineMessageContentPart[]): string | null {
   let text = "";
   for (const part of normalizeComposerContentParts(parts)) {
-    if (part.type === "image_ref") return null;
+    if (part.type !== "text") return null;
     text += part.text;
   }
   return text;
@@ -343,11 +395,11 @@ export function normalizeComposerContentParts(
 ): InlineMessageContentPart[] {
   const normalized: InlineMessageContentPart[] = [];
   for (const part of parts) {
-    if (part.type === "image_ref") {
+    if (part.type === "image_ref" || part.type === "attachment_ref") {
       normalized.push(part);
       continue;
     }
-    const text = part.text.replaceAll(caretMarker, "");
+    const text = part.text.replaceAll(COMPOSER_CARET_MARKER, "");
     if (!text) continue;
     const previous = normalized.at(-1);
     if (previous?.type === "text") previous.text += text;
@@ -371,28 +423,70 @@ export function referencedImageIds(
   );
 }
 
+export function referencedAttachmentPaths(
+  parts: InlineMessageContentPart[],
+): Set<string> {
+  return new Set(
+    parts
+      .filter(
+        (
+          part,
+        ): part is Extract<
+          InlineMessageContentPart,
+          { type: "attachment_ref" }
+        > => part.type === "attachment_ref",
+      )
+      .map((part) => part.path),
+  );
+}
+
 export function composerContentText(
   parts: InlineMessageContentPart[],
   attachments: InlineImageAttachment[],
 ): string {
-  const names = new Map(
-    attachments.map((attachment) => [attachment.id, attachment.name || "图片"]),
+  const displayIds = new Map(
+    attachments.map((attachment) => [
+      attachment.id,
+      composerImageDisplayId(attachment.id),
+    ]),
   );
   return normalizeComposerContentParts(parts)
-    .map((part) =>
-      part.type === "text"
-        ? part.text
-        : `[图片：${names.get(part.imageId) ?? "图片"}]`,
-    )
+    .map((part) => {
+      if (part.type === "text") return part.text;
+      if (part.type === "image_ref") {
+        return `[图片：${displayIds.get(part.imageId) ?? composerImageDisplayId(part.imageId)}]`;
+      }
+      return composerAttachmentReferenceText(part.name);
+    })
     .join("");
 }
 
 export function composerVisibleText(parts: InlineMessageContentPart[]): string {
   return normalizeComposerContentParts(parts)
-    .filter(
-      (part): part is Extract<InlineMessageContentPart, { type: "text" }> =>
-        part.type === "text",
-    )
-    .map((part) => part.text)
+    .map((part) => {
+      if (part.type === "text") return part.text;
+      if (part.type === "attachment_ref") {
+        return composerAttachmentReferenceText(part.name);
+      }
+      return "";
+    })
     .join("");
+}
+
+/**
+ * The wire accepts only text and image reference parts. Attachment references
+ * are flattened to their `[文件名]` text for submission; the actual file
+ * linkage still flows through the separate `sourcePaths` channel.
+ */
+export function composerWireContentParts(
+  parts: InlineMessageContentPart[],
+): InlineMessageContentPart[] {
+  return normalizeComposerContentParts(parts).map((part) =>
+    part.type === "attachment_ref"
+      ? {
+          type: "text" as const,
+          text: composerAttachmentReferenceText(part.name),
+        }
+      : part,
+  );
 }

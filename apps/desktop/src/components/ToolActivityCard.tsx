@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { memo, useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   Bot,
   ChevronDown,
@@ -30,6 +30,7 @@ import {
   type ToolActivityView,
 } from "../toolActivity";
 import { FileTypeIcon } from "./FileTypeIcon";
+import { ShimmerText } from "./ui";
 import "./ToolActivityCard.css";
 
 export type ToolSandboxState = {
@@ -81,12 +82,21 @@ export function ActivityCallCard({
         <span className="tool-activity-icon" aria-hidden="true">
           {icon}
         </span>
-        <span
-          className={`tool-activity-title${running ? " conversation-status-shimmer" : ""}`}
-          title={detail ? `${title} · ${detail}` : title}
-        >
-          {title}
-        </span>
+        {running ? (
+          <ShimmerText
+            className="tool-activity-title"
+            title={detail ? `${title} · ${detail}` : title}
+          >
+            {title}
+          </ShimmerText>
+        ) : (
+          <span
+            className="tool-activity-title"
+            title={detail ? `${title} · ${detail}` : title}
+          >
+            {title}
+          </span>
+        )}
         <span className="tool-activity-meta">
           {detail && <span className="tool-activity-detail">{detail}</span>}
           {chips.map((chip) => (
@@ -116,33 +126,39 @@ export function ActivityCallCard({
  * and the panel shows the call and its output together instead of splitting
  * "arguments" and "result" into two boxes.
  */
-export function ToolActivityCard({
-  call,
-  result,
-  timing,
-  sandbox,
-  streaming = false,
-  defaultExpanded = false,
-}: {
+type ToolActivityCardProps = {
   call: ToolCall;
   result?: ToolResult;
   timing?: string;
   sandbox?: ToolSandboxState | null;
   streaming?: boolean;
   defaultExpanded?: boolean;
-}) {
-  const view = buildToolActivity(call, result);
+};
+
+export const ToolActivityCard = memo(function ToolActivityCard({
+  call,
+  result,
+  timing,
+  sandbox,
+  streaming = false,
+  defaultExpanded = false,
+}: ToolActivityCardProps) {
+  const view = useMemo(() => buildToolActivity(call, result), [call, result]);
   const running = !result;
-  const chips: ToolActivityChip[] = sandbox
-    ? [
-        ...view.chips,
-        {
-          label: sandbox.label,
-          tone: sandbox.unsafe ? "warning" : "neutral",
-          title: sandbox.detail,
-        },
-      ]
-    : view.chips;
+  const chips = useMemo<ToolActivityChip[]>(
+    () =>
+      sandbox
+        ? [
+            ...view.chips,
+            {
+              label: sandbox.label,
+              tone: sandbox.unsafe ? "warning" : "neutral",
+              title: sandbox.detail,
+            },
+          ]
+        : view.chips,
+    [sandbox, view.chips],
+  );
 
   return (
     <ActivityCallCard
@@ -166,6 +182,32 @@ export function ToolActivityCard({
     >
       <ToolActivityBodyView body={view.body} view={view} />
     </ActivityCallCard>
+  );
+}, toolActivityCardPropsEqual);
+
+function toolActivityCardPropsEqual(
+  previous: ToolActivityCardProps,
+  next: ToolActivityCardProps,
+): boolean {
+  return (
+    previous.call === next.call &&
+    previous.result === next.result &&
+    previous.timing === next.timing &&
+    previous.streaming === next.streaming &&
+    previous.defaultExpanded === next.defaultExpanded &&
+    toolSandboxEqual(previous.sandbox, next.sandbox)
+  );
+}
+
+function toolSandboxEqual(
+  previous: ToolSandboxState | null | undefined,
+  next: ToolSandboxState | null | undefined,
+): boolean {
+  return (
+    previous === next ||
+    (previous?.label === next?.label &&
+      previous?.detail === next?.detail &&
+      previous?.unsafe === next?.unsafe)
   );
 }
 

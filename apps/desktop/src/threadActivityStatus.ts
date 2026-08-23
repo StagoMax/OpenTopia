@@ -1,4 +1,4 @@
-import type { TurnStatus } from "./types";
+import type { AgentEvent, TurnStatus } from "./types";
 
 export type ThreadActivityStatus =
   "processing" | "succeeded" | "failed" | "approval" | "user_action";
@@ -52,5 +52,33 @@ export function resolveThreadActivityStatus(
       return "failed";
     default:
       return null;
+  }
+}
+
+/**
+ * Projects lifecycle events into the sidebar status model. `undefined` means
+ * the event does not change task activity, while `null` explicitly clears it.
+ */
+export function resolveThreadActivityEventStatus(
+  event: AgentEvent,
+): ThreadActivityStatus | null | undefined {
+  switch (event.payload.type) {
+    case "turn_started":
+      return event.turnId ? "processing" : undefined;
+    case "approval_requested":
+    case "turn_suspended":
+      return "approval";
+    case "browser_handoff_required":
+    case "user_input_requested":
+    case "turn_awaiting_input":
+      return "user_action";
+    case "turn_finished":
+      return "succeeded";
+    case "error":
+      return "failed";
+    case "turn_cancelled":
+      return null;
+    default:
+      return undefined;
   }
 }

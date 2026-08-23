@@ -18,6 +18,7 @@ import type {
   Message,
   UserInputResponse,
 } from "./types";
+import { ThreadActivityStore } from "./threadActivityStore.ts";
 
 export type ConversationSendRequest = {
   content: string;
@@ -53,10 +54,16 @@ export class ConversationSessionController {
   private retainCount = 0;
   private loadGeneration = 0;
   private cancelRequestInFlight = false;
+  private readonly activityStore?: ThreadActivityStore;
 
-  constructor(client: ApiClient, threadId: string) {
+  constructor(
+    client: ApiClient,
+    threadId: string,
+    activityStore?: ThreadActivityStore,
+  ) {
     this.client = client;
     this.threadId = threadId;
+    this.activityStore = activityStore;
     this.state = createConversationSessionState(threadId);
   }
 
@@ -104,6 +111,7 @@ export class ConversationSessionController {
     }
 
     const startedAt = new Date().toISOString();
+    this.activityStore?.startOptimistic(this.threadId);
     this.dispatch({ type: "sendStarted", startedAt });
     try {
       const result = await this.client.sendMessage(
@@ -122,11 +130,13 @@ export class ConversationSessionController {
         ...result,
         startedAt,
       });
+      this.activityStore?.confirmTurn(this.threadId, result.turnId);
       if (this.state.cancellationRequested && result.turnId) {
         await this.issueCancel(result.turnId);
       }
       return result;
     } catch (error) {
+      this.activityStore?.clearOptimistic(this.threadId);
       this.dispatch({
         type: "sendFailed",
         error: errorMessage(error),
@@ -242,6 +252,7 @@ export class ConversationSessionController {
       .then(([messages, events]) => {
         if (!this.isCurrentLoad(generation, controller)) return;
         events.forEach((event) => this.rememberEventId(event.id));
+        this.activityStore?.applyEvents(events);
         this.dispatch({ type: "historyLoaded", messages, events });
         this.stream = this.client.openEventStream(
           this.threadId,
@@ -265,6 +276,9 @@ export class ConversationSessionController {
       this.client.listPendingUserInput(this.threadId, controller.signal),
     ]).then(([turnStatus, approvals, userInput]) => {
       if (!this.isCurrentLoad(generation, controller)) return;
+      if (turnStatus.status === "fulfilled") {
+        this.activityStore?.reconcileTurnStatus(turnStatus.value);
+      }
       this.dispatch({
         type: "auxiliaryLoaded",
         turnStatus:
@@ -290,6 +304,7 @@ export class ConversationSessionController {
 
   private hasLiveActivity(): boolean {
     return (
+      this.activityStore?.isLive(this.threadId) === true ||
       this.state.sending ||
       this.state.pendingTurnFeedback !== null ||
       this.state.activeTurnId !== null ||
@@ -312,6 +327,7 @@ export class ConversationSessionController {
   private receiveEvent(event: AgentEvent): void {
     if (event.threadId !== this.threadId || this.eventIds.has(event.id)) return;
     this.rememberEventId(event.id);
+    this.activityStore?.applyEvent(event);
     this.eventListeners.forEach((listener) => listener(event));
     this.pendingEvents.push(event);
     if (!this.eventBatchTimer) {
@@ -387,14 +403,30 @@ export class ConversationSessionController {
 export class ConversationSessionRegistry {
   private readonly client: ApiClient;
   private readonly cacheLimit: number;
+  private readonly eventListeners = new Set<EventListener>();
+  readonly activityStore: ThreadActivityStore;
   private readonly controllers = new Map<
     string,
     ConversationSessionController
   >();
+  private readonly controllerEventReleases = new Map<string, () => void>();
+  private readonly activityRetentionReleases = new Map<string, () => void>();
+  private readonly activityStoreRelease: () => void;
 
-  constructor(client: ApiClient, cacheLimit = 8) {
+  constructor(
+    client: ApiClient,
+    cacheLimit = 8,
+    activityStore = new ThreadActivityStore(),
+  ) {
     this.client = client;
     this.cacheLimit = cacheLimit;
+    this.activityStore = activityStore;
+    this.activityStoreRelease = activityStore.subscribeToChanges((threadId) =>
+      this.syncActivityRetention(threadId),
+    );
+    activityStore
+      .liveThreadIds()
+      .forEach((threadId) => this.syncActivityRetention(threadId));
   }
 
   get(threadId: string): ConversationSessionController {
@@ -404,15 +436,47 @@ export class ConversationSessionRegistry {
       this.controllers.set(threadId, existing);
       return existing;
     }
-    const controller = new ConversationSessionController(this.client, threadId);
+    const controller = new ConversationSessionController(
+      this.client,
+      threadId,
+      this.activityStore,
+    );
+    const releaseEvents = controller.subscribeToEvents((event) => {
+      this.eventListeners.forEach((listener) => listener(event));
+    });
     this.controllers.set(threadId, controller);
+    this.controllerEventReleases.set(threadId, releaseEvents);
     this.prune(threadId);
     return controller;
   }
 
+  subscribeToEvents(listener: EventListener): () => void {
+    this.eventListeners.add(listener);
+    return () => this.eventListeners.delete(listener);
+  }
+
   dispose(): void {
+    this.activityStoreRelease();
+    this.activityRetentionReleases.forEach((release) => release());
+    this.activityRetentionReleases.clear();
+    this.controllerEventReleases.forEach((release) => release());
+    this.controllerEventReleases.clear();
     this.controllers.forEach((controller) => controller.dispose());
     this.controllers.clear();
+    this.eventListeners.clear();
+  }
+
+  private syncActivityRetention(threadId: string): void {
+    const retained = this.activityRetentionReleases.get(threadId);
+    if (this.activityStore.isLive(threadId)) {
+      if (retained) return;
+      const release = this.get(threadId).retain();
+      this.activityRetentionReleases.set(threadId, release);
+      return;
+    }
+    if (!retained) return;
+    this.activityRetentionReleases.delete(threadId);
+    retained();
   }
 
   private prune(protectedThreadId: string): void {
@@ -420,6 +484,8 @@ export class ConversationSessionRegistry {
     for (const [threadId, controller] of this.controllers) {
       if (this.controllers.size <= this.cacheLimit) break;
       if (threadId === protectedThreadId || controller.isRetained()) continue;
+      this.controllerEventReleases.get(threadId)?.();
+      this.controllerEventReleases.delete(threadId);
       controller.dispose();
       this.controllers.delete(threadId);
     }

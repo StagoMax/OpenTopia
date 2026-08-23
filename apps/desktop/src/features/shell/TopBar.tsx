@@ -362,6 +362,7 @@ export function TopBar({
           ) : null}
         </div>
       </div>
+      <div className="topbar-drag-region" aria-hidden="true" />
     </header>
   );
 }

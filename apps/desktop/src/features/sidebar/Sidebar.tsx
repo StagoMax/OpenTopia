@@ -1,4 +1,11 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { createPortal } from "react-dom";
 import {
   Archive,
@@ -41,7 +48,7 @@ import {
   readSidebarNavigationState,
   updateSidebarNavigationState,
 } from "../../workbenchPreferences";
-import { type ThreadActivityStatus } from "../../threadActivityStatus";
+import type { ThreadActivityStore } from "../../threadActivityStore";
 import type { ExperienceMode, Project, Thread } from "../../types";
 import type { FlowPrimaryView } from "../../workspaceNavigation";
 import { useDismissiblePopover } from "../../hooks/useDismissiblePopover";
@@ -131,7 +138,7 @@ const FLOW_NAVIGATION_ITEMS = [
 export function Sidebar({
   projects,
   threads,
-  threadActivityStatuses,
+  threadActivityStore,
   activeThreadId,
   activeProjectId,
   workspaceError,
@@ -163,7 +170,7 @@ export function Sidebar({
 }: {
   projects: Project[];
   threads: Thread[];
-  threadActivityStatuses: Record<string, ThreadActivityStatus>;
+  threadActivityStore: ThreadActivityStore;
   activeThreadId: string | null;
   activeProjectId: string | null;
   workspaceError: string | null;
@@ -225,6 +232,47 @@ export function Sidebar({
   const experienceMenuRef = useDismissiblePopover(experienceMenuOpen, () =>
     setExperienceMenuOpen(false),
   );
+  const threadRowActionsRef = useRef({
+    onSelect,
+    onRenameThread,
+    onOpenThreadUsage,
+    onRemoveProject,
+    onToggleProjectPinned,
+    onRestoreThread,
+  });
+  threadRowActionsRef.current = {
+    onSelect,
+    onRenameThread,
+    onOpenThreadUsage,
+    onRemoveProject,
+    onToggleProjectPinned,
+    onRestoreThread,
+  };
+  const selectThreadRow = useCallback(
+    (thread: Thread) => threadRowActionsRef.current.onSelect(thread.id),
+    [],
+  );
+  const renameThreadRow = useCallback(
+    (thread: Thread) => threadRowActionsRef.current.onRenameThread(thread),
+    [],
+  );
+  const openThreadUsage = useCallback(
+    (thread: Thread) => threadRowActionsRef.current.onOpenThreadUsage(thread),
+    [],
+  );
+  const removeThreadProject = useCallback(
+    (project: Project) => threadRowActionsRef.current.onRemoveProject(project),
+    [],
+  );
+  const toggleThreadProjectPinned = useCallback(
+    (project: Project) =>
+      threadRowActionsRef.current.onToggleProjectPinned(project),
+    [],
+  );
+  const restoreThreadRow = useCallback(
+    (thread: Thread) => threadRowActionsRef.current.onRestoreThread(thread),
+    [],
+  );
   const modeThreads = threads.filter(
     (thread) => thread.experienceMode === experienceMode,
   );
@@ -243,9 +291,6 @@ export function Sidebar({
     experienceModeOptions.find((option) => option.id === experienceMode) ??
     experienceModeOptions.find((option) => option.id === "code")!;
   const ActiveExperienceModeIcon = activeExperienceMode.icon;
-  const activityStatusForThread = (threadId: string) =>
-    threadActivityStatuses[threadId];
-
   function toggleExpandedProject(projectId: string) {
     setExpandedProjects((prev) => {
       const next = new Set(prev);
@@ -602,15 +647,15 @@ export function Sidebar({
                         {visibleProjectThreads.map((thread) => (
                           <SidebarThreadRow
                             active={thread.id === activeThreadId}
-                            activityStatus={activityStatusForThread(thread.id)}
+                            activityStore={threadActivityStore}
                             key={thread.id}
                             project={project}
                             thread={thread}
-                            onSelect={() => onSelect(thread.id)}
-                            onRename={() => onRenameThread(thread)}
-                            onOpenUsage={() => onOpenThreadUsage(thread)}
-                            onRemoveProject={onRemoveProject}
-                            onToggleProjectPinned={onToggleProjectPinned}
+                            onSelect={selectThreadRow}
+                            onRename={renameThreadRow}
+                            onOpenUsage={openThreadUsage}
+                            onRemoveProject={removeThreadProject}
+                            onToggleProjectPinned={toggleThreadProjectPinned}
                           />
                         ))}
                         {projectThreads.length > threadDisplayLimit && (
@@ -665,15 +710,15 @@ export function Sidebar({
                       {unassignedThreads.map((thread) => (
                         <SidebarThreadRow
                           active={thread.id === activeThreadId}
-                          activityStatus={activityStatusForThread(thread.id)}
+                          activityStore={threadActivityStore}
                           key={thread.id}
                           project={null}
                           thread={thread}
-                          onSelect={() => onSelect(thread.id)}
-                          onRename={() => onRenameThread(thread)}
-                          onOpenUsage={() => onOpenThreadUsage(thread)}
-                          onRemoveProject={onRemoveProject}
-                          onToggleProjectPinned={onToggleProjectPinned}
+                          onSelect={selectThreadRow}
+                          onRename={renameThreadRow}
+                          onOpenUsage={openThreadUsage}
+                          onRemoveProject={removeThreadProject}
+                          onToggleProjectPinned={toggleThreadProjectPinned}
                         />
                       ))}
                     </div>
@@ -698,7 +743,7 @@ export function Sidebar({
                         <SidebarThreadRow
                           archived
                           active={false}
-                          activityStatus={activityStatusForThread(thread.id)}
+                          activityStore={threadActivityStore}
                           key={thread.id}
                           project={
                             projects.find(
@@ -706,12 +751,12 @@ export function Sidebar({
                             ) ?? null
                           }
                           thread={thread}
-                          onSelect={() => onRestoreThread(thread)}
-                          onRename={() => onRenameThread(thread)}
-                          onOpenUsage={() => onOpenThreadUsage(thread)}
-                          onRemoveProject={onRemoveProject}
-                          onToggleProjectPinned={onToggleProjectPinned}
-                          onRestore={() => onRestoreThread(thread)}
+                          onSelect={restoreThreadRow}
+                          onRename={renameThreadRow}
+                          onOpenUsage={openThreadUsage}
+                          onRemoveProject={removeThreadProject}
+                          onToggleProjectPinned={toggleThreadProjectPinned}
+                          onRestore={restoreThreadRow}
                         />
                       ))}
                     </div>

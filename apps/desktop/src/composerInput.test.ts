@@ -4,6 +4,55 @@ import {
   composerExternalValueSyncAction,
   composerInputCommitPending,
 } from "./composerContent.ts";
+import { composerEnterCommand } from "./composerInput.ts";
+
+type EnterKey = Parameters<typeof composerEnterCommand>[0];
+
+function enterKey(overrides: Partial<EnterKey> = {}): EnterKey {
+  return {
+    altKey: false,
+    ctrlKey: false,
+    key: "Enter",
+    metaKey: false,
+    shiftKey: false,
+    ...overrides,
+  };
+}
+
+test("resolves default Enter as submit and Shift+Enter as list-aware newline", () => {
+  assert.equal(composerEnterCommand(enterKey(), "enter"), "submit");
+  assert.equal(
+    composerEnterCommand(enterKey({ shiftKey: true }), "enter"),
+    "insert-list-line-break",
+  );
+});
+
+test("does not reinterpret Alt+Enter or non-Enter keys", () => {
+  assert.equal(composerEnterCommand(enterKey({ altKey: true }), "enter"), null);
+  assert.equal(composerEnterCommand(enterKey({ key: "a" }), "enter"), null);
+  assert.equal(
+    composerEnterCommand(
+      enterKey({ ctrlKey: true, shiftKey: true }),
+      "enter",
+    ),
+    null,
+  );
+});
+
+test("keeps modifier-send compatibility without changing Shift+Enter", () => {
+  assert.equal(
+    composerEnterCommand(enterKey(), "mod-enter"),
+    "insert-line-break",
+  );
+  assert.equal(
+    composerEnterCommand(enterKey({ ctrlKey: true }), "mod-enter"),
+    "submit",
+  );
+  assert.equal(
+    composerEnterCommand(enterKey({ shiftKey: true }), "mod-enter"),
+    "insert-list-line-break",
+  );
+});
 
 test("keeps IME preedit and final input events inside one composition transaction", () => {
   assert.equal(

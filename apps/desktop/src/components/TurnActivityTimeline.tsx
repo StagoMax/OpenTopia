@@ -3,6 +3,7 @@ import { ChevronDown, ChevronRight } from "lucide-react";
 import type { AgentEvent } from "../types";
 import { shouldShowRecordedTurnChanges } from "../turnChangeOwnership";
 import type { ActiveTurnPhase } from "../turnActivityStatus";
+import { ShimmerText } from "./ui";
 import { ActivityEntryView } from "./turnActivityTimeline/activityGroups";
 import {
   activityEntryIsRunning,
@@ -15,7 +16,11 @@ import {
   useStatusPaintTrace,
   useTimelineClock,
 } from "./turnActivityTimeline/hooks";
-import { formatTurnTiming } from "./turnActivityTimeline/timing";
+import {
+  formatTurnTiming,
+  resolveTurnTimingRange,
+  type TurnTimingRange,
+} from "./turnActivityTimeline/timing";
 export { TurnChangeCard } from "./turnActivityTimeline/TurnChangeCard";
 import "./TurnActivityTimeline.css";
 
@@ -39,15 +44,19 @@ export function TurnActivityTimeline({
       ),
     [events],
   );
-  const state = activityState(events, isActive);
+  const state = useMemo(
+    () => activityState(events, isActive),
+    [events, isActive],
+  );
   const [expanded, setExpanded] = useState(isActive);
   const bodyId = useId();
   const mountedAt = useMemo(() => Date.now(), []);
-  const hasRunningEntry = entries.some(activityEntryIsRunning);
-  const now = useTimelineClock(
-    isActive || (state === "running" && hasRunningEntry),
+  const shouldTick =
+    isActive || (state === "running" && entries.some(activityEntryIsRunning));
+  const turnTimingRange = useMemo(
+    () => resolveTurnTimingRange(events, isActive, mountedAt),
+    [events, isActive, mountedAt],
   );
-  const turnTiming = formatTurnTiming(events, isActive, now, mountedAt);
   const statusLabel = isActive ? "处理中" : activityStateLabel(state);
   const traceEvent = events.at(-1);
   useStatusPaintTrace(
@@ -64,24 +73,29 @@ export function TurnActivityTimeline({
     }
   }, [isActive, state]);
 
-  const changeSetEvent = [...events]
-    .reverse()
-    .find((event) => event.payload.type === "turn_changes_recorded");
-  const changeSet =
-    changeSetEvent?.payload.type === "turn_changes_recorded" &&
-    changeSetEvent.turnId &&
-    shouldShowRecordedTurnChanges(events, changeSetEvent.turnId)
-      ? changeSetEvent.payload.change_set
-      : null;
-  const hasTurnLifecycle = events.some((event) =>
-    [
-      "turn_started",
-      "turn_finished",
-      "turn_cancelled",
-      "turn_suspended",
-      "error",
-    ].includes(event.payload.type),
-  );
+  const { changeSet, hasTurnLifecycle } = useMemo(() => {
+    const changeSetEvent = [...events]
+      .reverse()
+      .find((event) => event.payload.type === "turn_changes_recorded");
+    const resolvedChangeSet =
+      changeSetEvent?.payload.type === "turn_changes_recorded" &&
+      changeSetEvent.turnId &&
+      shouldShowRecordedTurnChanges(events, changeSetEvent.turnId)
+        ? changeSetEvent.payload.change_set
+        : null;
+    return {
+      changeSet: resolvedChangeSet,
+      hasTurnLifecycle: events.some((event) =>
+        [
+          "turn_started",
+          "turn_finished",
+          "turn_cancelled",
+          "turn_suspended",
+          "error",
+        ].includes(event.payload.type),
+      ),
+    };
+  }, [events]);
   if (!isActive && entries.length === 0 && !changeSet && !hasTurnLifecycle) {
     return null;
   }
@@ -90,7 +104,6 @@ export function TurnActivityTimeline({
       key={activityEntryKey(entry)}
       entry={entry}
       isActive={isActive}
-      now={now}
       traceThreadId={traceEvent?.threadId}
       traceTurnId={traceEvent?.turnId}
       formatError={formatError}
@@ -128,12 +141,14 @@ export function TurnActivityTimeline({
           className="turn-activity-heading"
           aria-live={isActive ? "polite" : undefined}
         >
-          <strong
-            className={isActive ? "conversation-status-shimmer" : undefined}
-          >
-            {statusLabel}
-          </strong>
-          {turnTiming && <small>{turnTiming}</small>}
+          {isActive ? (
+            <strong>
+              <ShimmerText>{statusLabel}</ShimmerText>
+            </strong>
+          ) : (
+            <strong>{statusLabel}</strong>
+          )}
+          <TurnTimingText range={turnTimingRange} shouldTick={shouldTick} />
         </span>
         <span className="turn-activity-chevron" aria-hidden="true">
           {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
@@ -151,6 +166,18 @@ export function TurnActivityTimeline({
       )}
     </section>
   );
+}
+
+function TurnTimingText({
+  range,
+  shouldTick,
+}: {
+  range: TurnTimingRange | null;
+  shouldTick: boolean;
+}) {
+  const now = useTimelineClock(shouldTick);
+  const timing = formatTurnTiming(range, now);
+  return timing ? <small>{timing}</small> : null;
 }
 
 export function PendingTurnStatus({
@@ -172,7 +199,9 @@ export function PendingTurnStatus({
         aria-live="polite"
       >
         <span className="turn-activity-heading">
-          <strong className="conversation-status-shimmer">{label}</strong>
+          <strong>
+            <ShimmerText>{label}</ShimmerText>
+          </strong>
         </span>
       </div>
     </section>

@@ -28,16 +28,14 @@ import type { SendShortcut } from "../../editorPreferences";
 import { getDroppedContextFiles, selectContextFiles } from "../../platform";
 import { friendlyProviderError } from "../../providerErrors";
 import { resolveThreadModelContextWindow } from "../../modelCapabilities";
-import {
-  resolveThreadActivityStatus,
-  type ThreadActivityStatus,
-} from "../../threadActivityStatus";
+import { resolveThreadActivityEventStatus } from "../../threadActivityStatus";
 import { threadTitleFromPrompt } from "../../threadTitle";
 import type { ToolTabKind } from "../../toolTabs";
 import type {
   AgentEvent,
   AppSettings,
   CollaborationMode,
+  ContextSourceFile,
   InlineImageAttachment,
   InlineMessageContentPart,
   PreviewTarget,
@@ -62,8 +60,6 @@ export function SideTaskConversation({
   sendShortcut,
   showContextWindowUsage,
   onThreadUpdated,
-  onSetThreadActivity,
-  onMarkThreadActivityRead,
   onChangePermissionMode,
   onChangeSandboxMode,
   onOpenSettings,
@@ -84,11 +80,6 @@ export function SideTaskConversation({
   sendShortcut: SendShortcut;
   showContextWindowUsage: boolean;
   onThreadUpdated(thread: Thread): void;
-  onSetThreadActivity(
-    threadId: string,
-    status: ThreadActivityStatus | null,
-  ): void;
-  onMarkThreadActivityRead(threadId: string): void;
   onChangePermissionMode(mode: ExecutionPermissionMode): void;
   onChangeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]): void;
   onOpenSettings(): void;
@@ -129,40 +120,14 @@ export function SideTaskConversation({
   const handleSideTaskEvent = useCallback(
     (event: AgentEvent) => {
       if (!threadId || event.threadId !== threadId) return;
-      if (event.payload.type === "approval_requested") {
-        onSetThreadActivity(threadId, "approval");
-        onMarkThreadActivityRead(threadId);
-      }
-      if (event.payload.type === "browser_handoff_required") {
-        onSetThreadActivity(threadId, "user_action");
-        onMarkThreadActivityRead(threadId);
-      }
-      if (event.payload.type === "user_input_requested") {
-        onSetThreadActivity(threadId, "user_action");
-      }
-
-      if (event.payload.type === "turn_started" && event.turnId) {
-        onSetThreadActivity(threadId, "processing");
-        onMarkThreadActivityRead(threadId);
-      } else if (event.payload.type === "turn_finished") {
-        onSetThreadActivity(threadId, "succeeded");
-        onMarkThreadActivityRead(threadId);
-      } else if (event.payload.type === "turn_suspended") {
-        onSetThreadActivity(threadId, "approval");
-        onMarkThreadActivityRead(threadId);
-      } else if (event.payload.type === "turn_cancelled") {
-        onSetThreadActivity(threadId, null);
-      } else if (event.payload.type === "turn_awaiting_input") {
-        onSetThreadActivity(threadId, "user_action");
-      }
-
       if (event.payload.type === "error") {
-        onSetThreadActivity(threadId, "failed");
         setActionError(friendlyProviderError(event.payload.message));
-        onMarkThreadActivityRead(threadId);
+      }
+      if (resolveThreadActivityEventStatus(event) !== undefined) {
+        conversationRegistry?.activityStore.markRead(threadId);
       }
     },
-    [onMarkThreadActivityRead, onSetThreadActivity, threadId],
+    [conversationRegistry, threadId],
   );
 
   const { controller: sessionController, state: sessionState } =
@@ -199,22 +164,8 @@ export function SideTaskConversation({
   }, [events, modelSelection, settings?.activeProviderId, settings?.providers]);
 
   useEffect(() => {
-    if (!threadId || sessionState?.loadState.status !== "ready") return;
-    const activityStatus =
-      sessionState.pendingApprovalIds.length > 0
-        ? "approval"
-        : resolveThreadActivityStatus(sessionState.turnStatus);
-    if (!activityStatus) return;
-    onSetThreadActivity(threadId, activityStatus);
-    onMarkThreadActivityRead(threadId);
-  }, [
-    onMarkThreadActivityRead,
-    onSetThreadActivity,
-    sessionState?.loadState.status,
-    sessionState?.pendingApprovalIds.length,
-    sessionState?.turnStatus,
-    threadId,
-  ]);
+    if (threadId) conversationRegistry?.activityStore.markRead(threadId);
+  }, [conversationRegistry, threadId]);
 
   const pendingApprovalQueue = useMemo(
     () =>
@@ -271,7 +222,6 @@ export function SideTaskConversation({
     const isFirstPrompt = !messages.some((message) => message.role === "user");
     setActionError(null);
     sessionController.clearCommandError();
-    onSetThreadActivity(thread.id, "processing");
     const result = await sessionController.send({
       content: messageText,
       sourcePaths: contextSources.map((source) => source.path),
@@ -280,15 +230,10 @@ export function SideTaskConversation({
       imageAttachments,
       contentParts,
     });
-    if (!result) {
-      onSetThreadActivity(thread.id, "failed");
-      onMarkThreadActivityRead(thread.id);
-      return false;
-    }
+    if (!result) return false;
     setComposer("");
     setContextSources([]);
     setSelectedSkillIds([]);
-    onMarkThreadActivityRead(thread.id);
     if (isFirstPrompt && messageText) void updateThreadTitle(messageText);
     return true;
   }
@@ -299,14 +244,16 @@ export function SideTaskConversation({
     await sessionController.cancel();
   }
 
-  async function addSideTaskContextSources(files?: File[]) {
-    if (!thread) return;
+  async function addSideTaskContextSources(
+    files?: File[],
+  ): Promise<ContextSourceFile[]> {
+    if (!thread) return [];
     setActionError(null);
     try {
       const result = files
         ? await getDroppedContextFiles(files)
         : await selectContextFiles({ defaultPath: thread.workspaceRoot });
-      if (result.canceled) return;
+      if (result.canceled) return [];
       setContextSources((current) => {
         const byPath = new Map(
           current.map((source) => [workspaceRootKey(source.path), source]),
@@ -316,8 +263,10 @@ export function SideTaskConversation({
         );
         return [...byPath.values()].slice(0, 20);
       });
+      return result.files;
     } catch (error) {
       setActionError(`添加来源失败：${errorMessage(error)}`);
+      return [];
     }
   }
 

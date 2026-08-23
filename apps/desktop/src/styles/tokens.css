@@ -158,6 +158,8 @@
   --permission-full-access: #c2410c;
   --danger: #c23d42;
   --danger-subtle: #fff0f1;
+  --overlay-control-bg: rgb(0 0 0 / 55%);
+  --overlay-control-fg: #ffffff;
   --file-type-pdf: #c53d4b;
   --file-type-word: #3268b2;
   --file-type-spreadsheet: #20815a;

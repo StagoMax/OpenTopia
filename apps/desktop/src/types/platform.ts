@@ -141,7 +141,9 @@ export type InlineImageAttachment = {
 };
 
 export type InlineMessageContentPart =
-  { type: "text"; text: string } | { type: "image_ref"; imageId: string };
+  | { type: "text"; text: string }
+  | { type: "image_ref"; imageId: string }
+  | { type: "attachment_ref"; path: string; name: string };
 
 export type PluginDirectoryPickResult =
   { canceled: true } | { canceled: false; path: string };

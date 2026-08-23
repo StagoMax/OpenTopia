@@ -13,7 +13,9 @@ import {
   threadActivityStatusLabel,
   type ThreadActivityStatus,
 } from "../threadActivityStatus";
+import type { ThreadActivityStore } from "../threadActivityStore";
 import type { Project, Thread } from "../types";
+import { useThreadActivityStatuses } from "../useThreadActivityStore";
 import { IconButton } from "./ui";
 import "./TaskSearchDialog.css";
 
@@ -21,7 +23,7 @@ const resultLimit = 50;
 
 type TaskSearchDialogProps = {
   activeThreadId: string | null;
-  activityStatuses: Record<string, ThreadActivityStatus>;
+  activityStore: ThreadActivityStore;
   projects: Project[];
   threads: Thread[];
   onClose(): void;
@@ -49,12 +51,13 @@ function StatusIcon({ status }: { status?: ThreadActivityStatus }) {
 
 export function TaskSearchDialog({
   activeThreadId,
-  activityStatuses,
+  activityStore,
   projects,
   threads,
   onClose,
   onSelectThread,
 }: TaskSearchDialogProps) {
+  const activityStatuses = useThreadActivityStatuses(activityStore);
   const [query, setQuery] = useState("");
   const dialogRef = useRef<HTMLElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -179,11 +182,11 @@ export function TaskSearchDialog({
         >
           <StatusIcon status={result.status} />
         </span>
-    <span className="task-search-result-title">{result.thread.title}</span>
-    <span className="task-search-result-context">
-      {current ? <small>当前</small> : null}
-      <span>{result.projectName}</span>
-    </span>
+        <span className="task-search-result-title">{result.thread.title}</span>
+        <span className="task-search-result-context">
+          {current ? <small>当前</small> : null}
+          <span>{result.projectName}</span>
+        </span>
         <span className="ot-sr-only">结果 {resultIndex + 1}</span>
       </button>
     );

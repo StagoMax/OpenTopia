@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type * as ThreadActivityStatusModule from "./threadActivityStatus";
-import type { TurnStatus } from "./types";
+import type { AgentEvent, TurnStatus } from "./types";
 
 const {
   isThreadActivityProcessing,
+  resolveThreadActivityEventStatus,
   resolveThreadActivityStatus,
   threadActivityStatusLabel,
   threadActivityStatusPriority,
@@ -55,4 +56,41 @@ test("projects backend turn statuses into sidebar activity", () => {
   );
   assert.equal(resolveThreadActivityStatus(turnStatus("failed")), "failed");
   assert.equal(resolveThreadActivityStatus(turnStatus("cancelled")), null);
+});
+
+test("projects background lifecycle events without depending on active navigation", () => {
+  const event = (payload: AgentEvent["payload"], turnId = "turn-1") =>
+    ({
+      id: crypto.randomUUID(),
+      threadId: "thread-1",
+      turnId,
+      seq: 1,
+      createdAt: "2026-08-23T00:00:00Z",
+      payload,
+    }) satisfies AgentEvent;
+
+  assert.equal(
+    resolveThreadActivityEventStatus(
+      event({ type: "turn_started", user_message_id: "message-1" }),
+    ),
+    "processing",
+  );
+  assert.equal(
+    resolveThreadActivityEventStatus(
+      event({ type: "turn_finished", summary: "done" }),
+    ),
+    "succeeded",
+  );
+  assert.equal(
+    resolveThreadActivityEventStatus(
+      event({ type: "turn_cancelled", reason: "cancelled" }),
+    ),
+    null,
+  );
+  assert.equal(
+    resolveThreadActivityEventStatus(
+      event({ type: "model_delta", text: "working" }),
+    ),
+    undefined,
+  );
 });

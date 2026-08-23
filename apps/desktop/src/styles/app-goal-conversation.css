@@ -267,39 +267,35 @@
 }
 
 .composer-inline-image-reference {
-  display: inline-flex;
+  display: inline;
   width: auto;
-  height: var(--control-height-md);
-  margin: 0 var(--space-1);
-  vertical-align: middle;
+  height: auto;
+  margin: 0;
+  vertical-align: baseline;
 }
 
 .composer-inline-image-button {
-  display: block;
-  width: 100%;
-  height: 100%;
-  overflow: hidden;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-md);
-  background: var(--surface-subtle);
+  display: inline;
+  width: auto;
+  height: auto;
+  min-width: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
   color: var(--accent);
-  padding: var(--space-1);
+  padding: 0;
+  font: inherit;
+  text-decoration: none;
 }
 
 .composer-inline-image-button:hover {
-  border-color: var(--accent);
-  background: var(--surface-hover);
+  background: transparent;
+  color: var(--accent-hover);
 }
 
 .composer-inline-image-button:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: var(--space-1);
-}
-
-.composer-inline-image-button {
-  min-width: calc(var(--space-12) * 2);
-  font-family: var(--font-mono);
-  font-size: var(--font-size-sm);
 }
 
 .composer-attachment-reference {
@@ -1071,25 +1067,9 @@
   font-size: var(--font-size-sm);
 }
 
-.conversation-loading__wordmark,
-.conversation-status-shimmer {
-  display: inline-flex;
-  align-items: baseline;
-  color: var(--loading-wordmark-ink);
-  will-change: opacity;
-  animation: conversation-loading-shimmer calc(var(--motion-standard) * 8)
-    var(--ease-standard) infinite;
-}
-
 .conversation-loading__wordmark {
   font-size: var(--font-size-xl);
   font-weight: var(--font-weight-semibold);
-}
-
-.turn-activity[data-state="running"]
-  .turn-activity-heading
-  .conversation-status-shimmer {
-  color: var(--loading-wordmark-ink);
 }
 
 .turn-activity-header.is-static {
@@ -1098,11 +1078,6 @@
 
 .turn-activity-header.is-static:hover {
   color: inherit;
-}
-
-.conversation-loading__brand-open {
-  color: inherit;
-  font-weight: inherit;
 }
 
 .sandbox-setup-dialog {
@@ -1122,26 +1097,4 @@
   display: flex;
   justify-content: flex-end;
   gap: var(--space-4);
-}
-
-@keyframes conversation-loading-shimmer {
-  50% {
-    opacity: 0.62;
-  }
-
-  to {
-    opacity: 1;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .conversation-loading__wordmark,
-  .conversation-status-shimmer {
-    animation: none;
-  }
-}
-
-[data-reduce-motion="on"] .conversation-loading__wordmark,
-[data-reduce-motion="on"] .conversation-status-shimmer {
-  animation: none;
 }

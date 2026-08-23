@@ -1,4 +1,7 @@
 import {
+  COMPOSER_CARET_MARKER,
+  composerAttachmentReferenceText,
+  composerImageDisplayId,
   composerTextLength,
   normalizeComposerContentParts,
   splitComposerText,
@@ -66,7 +69,7 @@ export function readComposerContent(
   let contentOffset = 0;
   let caretOffset: number | null = null;
   const appendText = (text: string) => {
-    const normalized = text.replaceAll("\u200b", "");
+    const normalized = text.replaceAll(COMPOSER_CARET_MARKER, "");
     pushComposerText(parts, normalized);
     contentOffset += composerTextLength(normalized);
   };
@@ -80,7 +83,12 @@ export function readComposerContent(
       const text = node.textContent ?? "";
       if (caretPoint?.node === node) {
         caretOffset =
-          contentOffset + composerTextLength(text.slice(0, caretPoint.offset));
+          contentOffset +
+          composerTextLength(
+            text
+              .slice(0, caretPoint.offset)
+              .replaceAll(COMPOSER_CARET_MARKER, ""),
+          );
       }
       appendText(text);
       return;
@@ -90,6 +98,18 @@ export function readComposerContent(
     if (imageId) {
       captureElementOffset(node, 0);
       parts.push({ type: "image_ref", imageId });
+      contentOffset += 1;
+      captureElementOffset(node, node.childNodes.length);
+      return;
+    }
+    const attachmentPath = node.dataset.composerAttachmentPath;
+    if (attachmentPath) {
+      captureElementOffset(node, 0);
+      parts.push({
+        type: "attachment_ref",
+        path: attachmentPath,
+        name: node.dataset.composerAttachmentName ?? "",
+      });
       contentOffset += 1;
       captureElementOffset(node, node.childNodes.length);
       return;
@@ -167,7 +187,11 @@ export function renderComposerSnapshot(
   editor.replaceChildren();
   for (const part of normalizeComposerContentParts(snapshot.parts)) {
     if (part.type === "text") {
-      editor.append(document.createTextNode(part.text));
+      editor.append(document.createTextNode(composerTextInsertionValue(part.text)));
+      continue;
+    }
+    if (part.type === "attachment_ref") {
+      editor.append(createComposerAttachmentReferenceNode(part.path, part.name));
       continue;
     }
     const attachment = attachmentsById.get(part.imageId);
@@ -181,26 +205,37 @@ export function renderComposerSnapshot(
   for (const node of editor.childNodes) {
     if (node.nodeType === Node.TEXT_NODE) {
       const text = node.textContent ?? "";
-      const graphemes = splitComposerText(text);
+      const visibleText = text.replaceAll(COMPOSER_CARET_MARKER, "");
+      const graphemes = splitComposerText(visibleText);
       if (remaining <= graphemes.length) {
-        range.setStart(node, graphemes.slice(0, remaining).join("").length);
+        const visibleOffset = graphemes.slice(0, remaining).join("").length;
+        const domOffset =
+          remaining === graphemes.length && text.endsWith(COMPOSER_CARET_MARKER)
+            ? text.length
+            : visibleOffset;
+        range.setStart(node, domOffset);
         range.collapse(true);
         return range;
       }
       remaining -= graphemes.length;
       continue;
     }
-    if (node instanceof HTMLElement && node.dataset.composerImageId) {
-      if (remaining === 0) {
-        range.setStartBefore(node);
-        range.collapse(true);
-        return range;
-      }
-      remaining -= 1;
-      if (remaining === 0) {
-        range.setStartAfter(node);
-        range.collapse(true);
-        return range;
+    if (node instanceof HTMLElement) {
+      const isInlineReference = Boolean(
+        node.dataset.composerImageId || node.dataset.composerAttachmentPath,
+      );
+      if (isInlineReference) {
+        if (remaining === 0) {
+          range.setStartBefore(node);
+          range.collapse(true);
+          return range;
+        }
+        remaining -= 1;
+        if (remaining === 0) {
+          range.setStartAfter(node);
+          range.collapse(true);
+          return range;
+        }
       }
     }
   }
@@ -221,37 +256,26 @@ export function createComposerImageReferenceNode(
   button.type = "button";
   button.className = "composer-inline-image-button";
   button.dataset.composerImageId = attachment.id;
-  const shortId = attachment.id.slice(0, 8);
-  button.title = `${attachment.name || "图片"}（ID: ${attachment.id}）`;
-  button.setAttribute("aria-label", `预览图片 ${shortId}`);
-  button.textContent = `[图片 · ${shortId}]`;
+  const name = attachment.name || "图片";
+  const displayId = composerImageDisplayId(attachment.id);
+  button.title = `预览 ${name}（图片 ID：${attachment.id}）`;
+  button.setAttribute("aria-label", `预览图片 ${displayId}`);
+  button.textContent = `ID · ${displayId}`;
   wrapper.append(button);
   return wrapper;
 }
 
-export function composerAttachmentReferenceId(
-  name: string,
-  size = 0,
-  contentType = "",
-): string {
-  let hash = 2166136261;
-  for (const character of `${name}\u0000${size}\u0000${contentType}`) {
-    hash ^= character.charCodeAt(0);
-    hash = Math.imul(hash, 16777619);
-  }
-  return `att-${(hash >>> 0).toString(16).padStart(8, "0")}`;
-}
-
 export function createComposerAttachmentReferenceNode(
-  id: string,
-  label: string,
+  path: string,
+  name: string,
 ): HTMLElement {
   const reference = document.createElement("span");
   reference.className = "composer-attachment-reference";
-  reference.dataset.composerAttachmentId = id;
+  reference.dataset.composerAttachmentPath = path;
+  reference.dataset.composerAttachmentName = name;
   reference.contentEditable = "false";
-  reference.textContent = `[附件 · ${label} · ${id}]`;
-  reference.title = `附件 ID：${id}`;
+  reference.textContent = composerAttachmentReferenceText(name);
+  reference.title = name;
   return reference;
 }
 
@@ -294,13 +318,20 @@ export function insertComposerTextAtSelection(
   if (!rangeBelongsToEditor(editor, range)) return false;
 
   range!.deleteContents();
-  const textNode = document.createTextNode(text);
+  const textNode = document.createTextNode(composerTextInsertionValue(text));
   range!.insertNode(textNode);
   range!.setStartAfter(textNode);
   range!.collapse(true);
   selection!.removeAllRanges();
   selection!.addRange(range!);
   return true;
+}
+
+export function composerTextInsertionValue(text: string): string {
+  const normalized = text.replaceAll(COMPOSER_CARET_MARKER, "");
+  return normalized.endsWith("\n")
+    ? `${normalized}${COMPOSER_CARET_MARKER}`
+    : normalized;
 }
 
 export function composerRangeAtPoint(x: number, y: number): Range | null {

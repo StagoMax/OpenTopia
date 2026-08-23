@@ -1,5 +1,6 @@
 import { Plug, X } from "lucide-react";
 import { FileTypeIcon } from "../../components/FileTypeIcon";
+import { composerImageDisplayId } from "../../composerContent";
 import { formatBytes } from "../../formatBytes";
 import type { ContextSourceFile, SkillDescriptor } from "../../types";
 import type { ComposerImageAttachment } from "./composerDom";
@@ -11,6 +12,7 @@ export function ComposerSources({
   imageAttachments = [],
   onRemoveContextSource,
   onPreviewImage,
+  onImageContextMenu,
   onRemoveImage,
   onToggleSkill,
 }: {
@@ -20,6 +22,7 @@ export function ComposerSources({
   imageAttachments?: ComposerImageAttachment[];
   onRemoveContextSource(path: string): void;
   onPreviewImage?(id: string): void;
+  onImageContextMenu?(id: string, x: number, y: number): void;
   onRemoveImage?(id: string): void;
   onToggleSkill(skillId: string): void;
 }) {
@@ -36,25 +39,40 @@ export function ComposerSources({
         <span
           className="composer-source composer-media-source"
           key={attachment.id}
-          title={`${attachment.name || "图片"}（ID: ${attachment.id}）`}
+          title={`图片 ID：${attachment.id}`}
+          onContextMenu={(event) => {
+            event.preventDefault();
+            const bounds = event.currentTarget.getBoundingClientRect();
+            const openedFromKeyboard =
+              event.clientX === 0 && event.clientY === 0;
+            onImageContextMenu?.(
+              attachment.id,
+              openedFromKeyboard ? bounds.left : event.clientX,
+              openedFromKeyboard ? bounds.bottom : event.clientY,
+            );
+          }}
         >
           <button
             className="composer-media-preview"
             type="button"
-            aria-label={`预览图片 ${attachment.id.slice(0, 8)}`}
+            aria-haspopup="menu"
+            aria-label={`预览图片 ${composerImageDisplayId(attachment.id)}`}
+            title={`预览 ${attachment.name || "图片"}`}
             onClick={() => onPreviewImage?.(attachment.id)}
           >
             <img src={attachment.previewUrl} alt="" aria-hidden="true" />
           </button>
-          <span>{attachment.name || "图片"}</span>
-          <small>[图片 · {attachment.id.slice(0, 8)}]</small>
+          <span className="composer-media-id">
+            ID · {composerImageDisplayId(attachment.id)}
+          </span>
           <button
+            className="composer-media-remove"
             type="button"
-            title={`移除 ${attachment.name || "图片"}`}
-            aria-label={`移除 ${attachment.name || "图片"}`}
+            title={`移除图片 ${composerImageDisplayId(attachment.id)}`}
+            aria-label={`移除图片 ${composerImageDisplayId(attachment.id)}`}
             onClick={() => onRemoveImage?.(attachment.id)}
           >
-            <X size={12} />
+            <X size={12} aria-hidden="true" />
           </button>
         </span>
       ))}

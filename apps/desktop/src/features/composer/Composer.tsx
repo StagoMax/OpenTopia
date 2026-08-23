@@ -1,4 +1,5 @@
 import {
+  memo,
   useEffect,
   useImperativeHandle,
   useLayoutEffect,
@@ -12,18 +13,25 @@ import {
   composerContentText,
   composerExternalValueSyncAction,
   composerInputCommitPending,
-  composerOrderedListContinuation,
+  composerLineBreakText,
   composerUndoEntries,
   composerUsesOrderedListIndentation,
   composerVisibleText,
+  composerWireContentParts,
   normalizeComposerImageDeletionSnapshot,
+  referencedAttachmentPaths,
   referencedImageIds,
   type ComposerHistorySnapshot,
 } from "../../composerContent";
+import {
+  composerEnterCommand,
+  type ComposerEnterCommand,
+} from "../../composerInput";
 import type { ConversationMetrics } from "../../conversationMetrics";
 import { hasFileDragPayload } from "../../fileDrop";
 import { useDismissiblePopover } from "../../hooks/useDismissiblePopover";
-import { shouldSubmitOnKey, type SendShortcut } from "../../editorPreferences";
+import type { SendShortcut } from "../../editorPreferences";
+import { workspaceRootKey } from "../../workspaceRootKey";
 import { ComposerMetrics } from "./ComposerMetrics";
 import { ComposerContextBar } from "./ComposerContextBar";
 import { ComposerSources } from "./ComposerSources";
@@ -40,7 +48,6 @@ import {
   composerRangeAtPoint,
   composerRangesEqual,
   composerSnapshotAtSelection,
-  composerAttachmentReferenceId,
   createComposerAttachmentReferenceNode,
   createComposerImageReferenceNode,
   endOfComposerRange,
@@ -88,47 +95,8 @@ const MAX_COMPOSER_IMAGES = 10;
 const MAX_COMPOSER_IMAGE_BYTES = 25 * 1024 * 1024;
 const MAX_COMPOSER_HISTORY_ENTRIES = 200;
 const COMPOSER_DRAFT_PUBLISH_DELAY_MS = 300;
-export function Composer({
-  autoFocus = false,
-  sendShortcut,
-  fileDropHandleRef,
-  fileDropScope = "composer",
-  value,
-  workForm,
-  isSending,
-  isRunning,
-  isCancelling,
-  queuedMessageCount = 0,
-  metrics,
-  showContextWindowUsage = false,
-  providers,
-  activeProviderId,
-  modelSelection,
-  permissionMode,
-  collaborationMode,
-  sandboxMode,
-  contextSources,
-  skills,
-  selectedSkillIds,
-  workspaceRoot,
-  projectName,
-  projects,
-  launchMode,
-  onChange,
-  onSubmit,
-  onCancel,
-  onPickWorkspace,
-  onSelectProject,
-  onChangeLaunchMode,
-  onChangePermissionMode,
-  onChangeCollaborationMode,
-  onChangeSandboxMode,
-  onChangeModelSelection,
-  onOpenSettings,
-  onAddContextSources,
-  onRemoveContextSource,
-  onToggleSkill,
-}: {
+
+export type ComposerProps = {
   autoFocus?: boolean;
   sendShortcut: SendShortcut;
   fileDropHandleRef?: { current: ComposerFileDropHandle | null };
@@ -169,10 +137,56 @@ export function Composer({
   onChangeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]): void;
   onChangeModelSelection(selection: ThreadModelSelection): void;
   onOpenSettings(): void;
-  onAddContextSources(files?: File[]): Promise<void>;
+  onAddContextSources(files?: File[]): Promise<ContextSourceFile[]>;
   onRemoveContextSource(path: string): void;
   onToggleSkill(skillId: string): void;
-}) {
+};
+
+export function Composer(props: ComposerProps) {
+  return <MemoizedComposer {...props} />;
+}
+
+const MemoizedComposer = memo(function ComposerView({
+  autoFocus = false,
+  sendShortcut,
+  fileDropHandleRef,
+  fileDropScope = "composer",
+  value,
+  workForm,
+  isSending,
+  isRunning,
+  isCancelling,
+  queuedMessageCount = 0,
+  metrics,
+  showContextWindowUsage = false,
+  providers,
+  activeProviderId,
+  modelSelection,
+  permissionMode,
+  collaborationMode,
+  sandboxMode,
+  contextSources,
+  skills,
+  selectedSkillIds,
+  workspaceRoot,
+  projectName,
+  projects,
+  launchMode,
+  onChange,
+  onSubmit,
+  onCancel,
+  onPickWorkspace,
+  onSelectProject,
+  onChangeLaunchMode,
+  onChangePermissionMode,
+  onChangeCollaborationMode,
+  onChangeSandboxMode,
+  onChangeModelSelection,
+  onOpenSettings,
+  onAddContextSources,
+  onRemoveContextSource,
+  onToggleSkill,
+}: ComposerProps) {
   const [openMenu, setOpenMenu] = useState<ComposerOpenMenu>(null);
   const closeMenus = () => {
     setOpenMenu(null);
@@ -502,6 +516,37 @@ export function Composer({
     restoreComposerHistorySnapshot(target);
   }
 
+  function insertComposerLineBreak(
+    continueOrderedList: boolean,
+    requestedRange: Range | null = null,
+  ) {
+    const editor = editorRef.current;
+    const selection = window.getSelection();
+    if (!editor || !selection) return;
+    const selectedRange =
+      selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
+    const range = rangeBelongsToEditor(editor, requestedRange)
+      ? requestedRange!.cloneRange()
+      : rangeBelongsToEditor(editor, selectedRange)
+        ? selectedRange!.cloneRange()
+        : rangeBelongsToEditor(editor, savedComposerRangeRef.current)
+          ? savedComposerRangeRef.current!.cloneRange()
+          : null;
+    if (!range) return;
+
+    editor.focus();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    const before = composerSnapshotAtSelection(editor);
+    const text = composerLineBreakText(
+      before,
+      continueOrderedList && range.collapsed,
+    );
+    if (insertComposerTextAtSelection(editor, text)) {
+      commitComposerMutation(false, before);
+    }
+  }
+
   function insertImageReference(
     attachment: ComposerImageAttachment,
     requestedRange: Range | null = savedComposerRangeRef.current,
@@ -612,11 +657,40 @@ export function Composer({
     setImageAttachments(next);
   }
 
+  function removeContextSource(path: string) {
+    const editor = editorRef.current;
+    if (editor) {
+      const key = workspaceRootKey(path);
+      const references = Array.from(
+        editor.querySelectorAll<HTMLElement>(
+          "[data-composer-attachment-path]",
+        ),
+      ).filter(
+        (reference) =>
+          workspaceRootKey(reference.dataset.composerAttachmentPath ?? "") ===
+          key,
+      );
+      if (references.length > 0) {
+        const before = composerSnapshotAtSelection(editor);
+        references.forEach((reference) => reference.remove());
+        commitComposerMutation(false, before, true);
+      }
+    }
+    onRemoveContextSource(path);
+  }
+
   const submitDraft = async () => {
     if (isSending) return;
     flushPendingComposerPublish();
     const editor = editorRef.current;
-    const parts = editor ? readComposerContentParts(editor) : [];
+    const sourceKeys = new Set(
+      contextSources.map((source) => workspaceRootKey(source.path)),
+    );
+    const parts = (editor ? readComposerContentParts(editor) : []).filter(
+      (part) =>
+        part.type !== "attachment_ref" ||
+        sourceKeys.has(workspaceRootKey(part.path)),
+    );
     const usedIds = referencedImageIds(parts);
     const currentAttachments = imageAttachmentsRef.current;
     const submittedAttachments = currentAttachments
@@ -628,14 +702,18 @@ export function Composer({
           ...attachment
         }) => attachment,
       );
-    const submittedValue =
-      submittedAttachments.length > 0
-        ? composerContentText(parts, submittedAttachments)
-        : draftRef.current;
+    const hasInlineReferences =
+      submittedAttachments.length > 0 ||
+      referencedAttachmentPaths(parts).size > 0;
+    const submittedValue = hasInlineReferences
+      ? composerContentText(parts, submittedAttachments)
+      : draftRef.current;
+    const submittedContentParts =
+      submittedAttachments.length > 0 ? composerWireContentParts(parts) : [];
     const accepted = await onSubmit(
       submittedValue,
       submittedAttachments,
-      submittedAttachments.length > 0 ? parts : [],
+      submittedContentParts,
     );
     if (!accepted) return;
     currentAttachments.forEach((attachment) =>
@@ -662,6 +740,21 @@ export function Composer({
     onChange("");
   };
 
+  function executeComposerEnterCommand(
+    command: ComposerEnterCommand,
+    requestedRange: Range | null = null,
+    repeat = false,
+  ) {
+    if (command === "submit") {
+      if (!repeat) void submitDraft();
+      return;
+    }
+    insertComposerLineBreak(
+      command === "insert-list-line-break",
+      requestedRange,
+    );
+  }
+
   async function handlePaste(event: ReactClipboardEvent<HTMLDivElement>) {
     const items = Array.from(event.clipboardData.items).filter(
       (item) => item.kind === "file" && item.type.startsWith("image/"),
@@ -676,7 +769,7 @@ export function Composer({
     await addImageFiles(files, range);
   }
 
-  function addSelectedFiles(
+  async function addSelectedFiles(
     files: File[],
     requestedRange: Range | null = savedComposerRangeRef.current,
   ) {
@@ -686,19 +779,21 @@ export function Composer({
       void addImageFiles(images, requestedRange?.cloneRange() ?? null);
     }
     if (otherFiles.length > 0) {
-      void onAddContextSources(otherFiles);
+      const sources = await onAddContextSources(otherFiles);
+      if (sources.length === 0) return;
       const editor = editorRef.current;
       const before = editor ? composerSnapshotAtSelection(editor) : null;
       let range = requestedRange?.cloneRange() ?? null;
-      for (const file of otherFiles) {
+      for (const source of sources) {
         if (!editor) break;
         const insertionRange = rangeBelongsToEditor(editor, range)
           ? range!.cloneRange()
           : endOfComposerRange(editor);
         insertionRange.deleteContents();
-        const label = file.name || "附件";
-        const id = composerAttachmentReferenceId(label, file.size, file.type);
-        const node = createComposerAttachmentReferenceNode(id, label);
+        const node = createComposerAttachmentReferenceNode(
+          source.path,
+          source.name,
+        );
         insertionRange.insertNode(node);
         insertionRange.setStartAfter(node);
         insertionRange.collapse(true);
@@ -802,8 +897,15 @@ export function Composer({
             );
             if (index >= 0) setPreviewIndex(index);
           }}
+          onImageContextMenu={(imageId, x, y) => {
+            closeMenus();
+            contextMenuInsertionRangeRef.current =
+              savedComposerRangeRef.current?.cloneRange() ?? null;
+            contextMenuReferenceRef.current = null;
+            setImageContextMenu({ imageId, target: "attachment", x, y });
+          }}
           onRemoveImage={removeImageAttachment}
-          onRemoveContextSource={onRemoveContextSource}
+          onRemoveContextSource={removeContextSource}
           onToggleSkill={onToggleSkill}
         />
         {isDraggingFiles ? (
@@ -927,6 +1029,7 @@ export function Composer({
             contextMenuReferenceRef.current = reference;
             setImageContextMenu({
               imageId,
+              target: "reference",
               x: event.clientX,
               y: event.clientY,
             });
@@ -954,35 +1057,23 @@ export function Composer({
               redoComposerMutation();
               return;
             }
-            if (
-              (event.target as Element).closest(".composer-inline-image-button")
-            ) {
-              return;
+            const command = composerEnterCommand(event, sendShortcut);
+            if (!command) return;
+            const imageButton = (event.target as Element).closest(
+              ".composer-inline-image-button",
+            );
+            const reference = imageButton?.closest(
+              ".composer-inline-image-reference",
+            );
+            let requestedRange: Range | null = null;
+            if (reference && command !== "submit") {
+              const range = document.createRange();
+              range.setStartAfter(reference);
+              range.collapse(true);
+              requestedRange = range;
             }
-            if (!event.altKey && shouldSubmitOnKey(event, sendShortcut)) {
-              event.preventDefault();
-              if (!event.repeat) void submitDraft();
-              return;
-            }
-            if (event.key === "Enter" && !event.altKey) {
-              const editor = editorRef.current;
-              const selection = window.getSelection();
-              const range =
-                selection && selection.rangeCount > 0
-                  ? selection.getRangeAt(0)
-                  : null;
-              if (!editor || !range || !rangeBelongsToEditor(editor, range)) {
-                return;
-              }
-              const before = composerSnapshotAtSelection(editor);
-              const continuation = range.collapsed
-                ? composerOrderedListContinuation(before)
-                : null;
-              event.preventDefault();
-              if (insertComposerTextAtSelection(editor, continuation ?? "\n")) {
-                commitComposerMutation(false, before);
-              }
-            }
+            event.preventDefault();
+            executeComposerEnterCommand(command, requestedRange, event.repeat);
           }}
         />
         <input
@@ -1070,7 +1161,11 @@ export function Composer({
             setImageContextMenu(null);
           }}
           onRemove={() => {
-            removeImageReference(contextMenuReferenceRef.current);
+            if (imageContextMenu.target === "attachment") {
+              removeImageAttachment(imageContextMenu.imageId);
+            } else {
+              removeImageReference(contextMenuReferenceRef.current);
+            }
             contextMenuInsertionRangeRef.current = null;
             contextMenuReferenceRef.current = null;
             setImageContextMenu(null);
@@ -1079,4 +1174,4 @@ export function Composer({
       ) : null}
     </div>
   );
-}
+});

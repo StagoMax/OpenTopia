@@ -56,23 +56,7 @@ import { MessagePartView } from "./MessagePartView";
 const initialRenderedMessageCount = 12;
 const messageRenderBatchSize = 12;
 
-export function MessageList({
-  messages,
-  events: latestEvents,
-  activeTurnId,
-  pendingTurnFeedback,
-  undoingTurnId,
-  threadId,
-  artifacts,
-  onOpenArtifact,
-  onOpenImagePreview,
-  onOpenAttachmentPreview,
-  onOpenMarkdownLink,
-  onUndoTurn,
-  onReviewChanges,
-  onOpenFileReview,
-  onLoadTurnFilePreview,
-}: {
+export type MessageListProps = {
   messages: Message[];
   events: AgentEvent[];
   activeTurnId: string | null;
@@ -92,7 +76,25 @@ export function MessageList({
     path: string,
     offset?: number,
   ): Promise<TurnFileDiffPreview>;
-}) {
+};
+
+export function MessageList({
+  messages,
+  events: latestEvents,
+  activeTurnId,
+  pendingTurnFeedback,
+  undoingTurnId,
+  threadId,
+  artifacts,
+  onOpenArtifact,
+  onOpenImagePreview,
+  onOpenAttachmentPreview,
+  onOpenMarkdownLink,
+  onUndoTurn,
+  onReviewChanges,
+  onOpenFileReview,
+  onLoadTurnFilePreview,
+}: MessageListProps) {
   // Tool events originate in an external store, whose updates React must
   // process synchronously. Keep the previous timeline during that urgent pass
   // and let React build the event-heavy replacement in an interruptible render
@@ -217,7 +219,8 @@ export function MessageList({
         event.payload.type === "turn_started" &&
         (pendingTurnFeedback.turnId
           ? event.turnId === pendingTurnFeedback.turnId
-          : event.payload.user_message_id === pendingTurnFeedback.userMessageId),
+          : event.payload.user_message_id ===
+            pendingTurnFeedback.userMessageId),
     );
   const showPendingTurnStatus =
     pendingTurnFeedback !== null &&
@@ -228,11 +231,11 @@ export function MessageList({
   const activeTurnUserMessageId =
     activeTurnId === null
       ? null
-      : (pendingTurnFeedback?.turnId === activeTurnId
-          ? pendingTurnFeedback.userMessageId
-          : [...turnIdsByUserMessage.entries()].find(([, turnIds]) =>
-                turnIds.includes(activeTurnId),
-              )?.[0] ?? null);
+      : pendingTurnFeedback?.turnId === activeTurnId
+        ? pendingTurnFeedback.userMessageId
+        : ([...turnIdsByUserMessage.entries()].find(([, turnIds]) =>
+            turnIds.includes(activeTurnId),
+          )?.[0] ?? null);
   const showModelThinkingStatus =
     activeTurnIsAnchored && hasPendingProviderRequest(activeTurnEvents);
   const showActiveProcessingStatus =
@@ -289,21 +292,29 @@ export function MessageList({
       list.scrollTop = list.scrollHeight;
     }
     updateScrollToEndVisibility();
-  }, [events, messages, renderedMessageCount, updateScrollToEndVisibility]);
+  }, [messages, renderedMessageCount, updateScrollToEndVisibility]);
 
   useEffect(() => {
     const content = messageListContentRef.current;
     if (!content) return;
+    let frame: number | null = null;
     const observer = new ResizeObserver(() => {
-      const list = messageListRef.current;
-      if (!list) return;
-      if (conversationPinnedToEndRef.current) {
-        list.scrollTop = list.scrollHeight;
-      }
-      updateScrollToEndVisibility();
+      if (frame !== null) return;
+      frame = window.requestAnimationFrame(() => {
+        frame = null;
+        const list = messageListRef.current;
+        if (!list) return;
+        if (conversationPinnedToEndRef.current) {
+          list.scrollTop = list.scrollHeight;
+        }
+        updateScrollToEndVisibility();
+      });
     });
     observer.observe(content);
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      if (frame !== null) window.cancelAnimationFrame(frame);
+    };
   }, [updateScrollToEndVisibility]);
 
   const scrollToEnd = useCallback(() => {
@@ -415,7 +426,9 @@ export function MessageList({
                   (showModelThinkingStatus || showActiveProcessingStatus) ? (
                     <PendingTurnStatus
                       key={`active-${activeTurnId}`}
-                      phase={showModelThinkingStatus ? "thinking" : "processing"}
+                      phase={
+                        showModelThinkingStatus ? "thinking" : "processing"
+                      }
                       threadId={threadId}
                       turnId={activeTurnId}
                     />

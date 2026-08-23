@@ -92,7 +92,9 @@ export function writeEditorPreferences(preferences: EditorPreferences): void {
 
 /**
  * Whether a keydown in the composer should submit, given the send shortcut.
- * Shift+Enter always inserts a newline, matching every chat composer.
+ * Shift+Enter never submits. The composer owns the resulting line-break
+ * command so rich-text features such as ordered-list continuation stay
+ * consistent across plain text and attachment references.
  */
 export function shouldSubmitOnKey(
   event: Pick<KeyboardEvent, "key" | "shiftKey" | "ctrlKey" | "metaKey">,

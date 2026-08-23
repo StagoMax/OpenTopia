@@ -7,6 +7,7 @@ import {
   Plus,
   X,
 } from "lucide-react";
+import { useMemo } from "react";
 import { ApiClient } from "../../api/client";
 import type {
   DiffReviewFileContent,
@@ -30,9 +31,9 @@ import {
 } from "../../components/WorkbenchPanel";
 import { Button, IconButton, Popover } from "../../components/ui";
 import { ConversationSessionRegistry } from "../../conversationSessionController";
+import { useConversationSession } from "../../useConversationSession";
 import { PreviewSessionStore } from "../../previewSessionStore";
 import type { SendShortcut } from "../../editorPreferences";
-import type { ThreadActivityStatus } from "../../threadActivityStatus";
 import {
   toolStageLauncherKinds,
   toolTabIcon,
@@ -42,7 +43,6 @@ import {
   type ToolTabKind,
 } from "../../toolTabs";
 import type {
-  AgentEvent,
   AgentListItem,
   AppSettings,
   ArtifactContent,
@@ -53,7 +53,6 @@ import type {
   LibraryProviderId,
   McpServerInput,
   McpServerView,
-  Message,
   PluginView,
   PreviewTarget,
   Project,
@@ -97,8 +96,6 @@ export function RightPanel({
   libraryProvider,
   workspaceRoot,
   agentItems,
-  messages,
-  events,
   conversationLoading,
   terminalEvents,
   terminalSession,
@@ -153,8 +150,6 @@ export function RightPanel({
   onOpenToolTab,
   onOpenSideTask,
   onThreadUpdated,
-  onSetThreadActivity,
-  onMarkThreadActivityRead,
   onChangePermissionMode,
   onChangeSandboxMode,
   onChangeLibraryProvider,
@@ -187,9 +182,7 @@ export function RightPanel({
   showContextWindowUsage: boolean;
   libraryProvider: LibraryProviderId | null;
   workspaceRoot: string | null;
-  messages: Message[];
   agentItems: AgentListItem[];
-  events: AgentEvent[];
   conversationLoading: boolean;
   terminalEvents: TerminalEvent[];
   terminalSession: TerminalSession | null;
@@ -260,11 +253,6 @@ export function RightPanel({
   onOpenToolTab(kind: ToolTabKind): void;
   onOpenSideTask(): void;
   onThreadUpdated(thread: Thread): void;
-  onSetThreadActivity(
-    threadId: string,
-    status: ThreadActivityStatus | null,
-  ): void;
-  onMarkThreadActivityRead(threadId: string): void;
   onChangePermissionMode(mode: ExecutionPermissionMode): void;
   onChangeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]): void;
   onChangeLibraryProvider(provider: LibraryProviderId | null): void;
@@ -277,6 +265,25 @@ export function RightPanel({
   onAddContextSources(): void;
   onInterruptAgent(agentThreadId: string): void;
 }) {
+  const { state: conversationState } = useConversationSession(
+    conversationRegistry,
+    thread?.id ?? null,
+  );
+  const messages =
+    conversationState?.loadState.status === "ready"
+      ? conversationState.messages
+      : [];
+  const events = useMemo(
+    () =>
+      conversationState?.loadState.status === "ready"
+        ? conversationState.events.filter(
+            (event) =>
+              event.payload.type !== "approval_requested" ||
+              pendingApprovalIds.includes(event.payload.approval_id),
+          )
+        : [],
+    [conversationState, pendingApprovalIds],
+  );
   const renderWorkbench = (
     mode: "panel" | "stage",
     activeTab?: WorkbenchTab,
@@ -396,8 +403,6 @@ export function RightPanel({
                 sendShortcut={sendShortcut}
                 showContextWindowUsage={showContextWindowUsage}
                 onThreadUpdated={onThreadUpdated}
-                onSetThreadActivity={onSetThreadActivity}
-                onMarkThreadActivityRead={onMarkThreadActivityRead}
                 onChangePermissionMode={onChangePermissionMode}
                 onChangeSandboxMode={onChangeSandboxMode}
                 onOpenSettings={onOpenSettings}

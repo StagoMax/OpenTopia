@@ -37,11 +37,11 @@ import {
   formatFileGroupTiming,
   formatToolSandbox,
 } from "./timing";
+import { useTimelineClock } from "./hooks";
 
 export function ActivityEntryView({
   entry,
   isActive,
-  now,
   traceThreadId,
   traceTurnId,
   formatError,
@@ -49,7 +49,6 @@ export function ActivityEntryView({
 }: {
   entry: ActivityEntry;
   isActive: boolean;
-  now: number;
   traceThreadId?: string;
   traceTurnId?: string | null;
   formatError(message: string): string;
@@ -61,7 +60,6 @@ export function ActivityEntryView({
         group={entry.group}
         executions={entry.executions}
         defaultExpanded={isActive}
-        now={now}
       />
     );
   }
@@ -83,20 +81,10 @@ export function ActivityEntryView({
     );
   }
   if (entry.kind === "work-form") {
-    return (
-      <WorkFormActivity
-        form={entry.form}
-        itemTimings={entry.itemTimings}
-        startedAt={entry.startedAt}
-        finishedAt={entry.finishedAt}
-        defaultExpanded={isActive}
-        isActive={isActive}
-        now={now}
-      />
-    );
+    return <TimedWorkFormActivity entry={entry} isActive={isActive} />;
   }
   if (entry.kind === "context-compaction") {
-    return <ContextCompactionActivity entry={entry} now={now} />;
+    return <TimedContextCompactionActivity entry={entry} />;
   }
   if (entry.kind === "approval") {
     return (
@@ -109,7 +97,7 @@ export function ActivityEntryView({
     );
   }
   if (entry.kind === "guardian-review") {
-    return <GuardianReviewActivity entry={entry} now={now} />;
+    return <TimedGuardianReviewActivity entry={entry} />;
   }
   if (entry.kind === "browser-handoff") {
     const details = [entry.reason, entry.url, "完成后在对话中告诉我继续。"]
@@ -176,17 +164,16 @@ function ToolActivityGroup({
   group,
   executions,
   defaultExpanded,
-  now,
 }: {
   group: ToolGroupKey;
   executions: ToolExecution[];
   defaultExpanded: boolean;
-  now: number;
 }) {
   const state = toolActivityGroupStatus(
     executions.map((execution) => execution.result),
   );
   const running = state === "running";
+  const now = useTimelineClock(running);
   const commandBatch = group === "shell" && executions.length > 1;
   const runningCommand = [...executions]
     .reverse()
@@ -247,6 +234,47 @@ function ToolActivityGroup({
       )}
     </div>
   );
+}
+
+function TimedWorkFormActivity({
+  entry,
+  isActive,
+}: {
+  entry: Extract<ActivityEntry, { kind: "work-form" }>;
+  isActive: boolean;
+}) {
+  const running =
+    isActive && entry.form.items.some((item) => item.status === "in_progress");
+  const now = useTimelineClock(running);
+  return (
+    <WorkFormActivity
+      form={entry.form}
+      itemTimings={entry.itemTimings}
+      startedAt={entry.startedAt}
+      finishedAt={entry.finishedAt}
+      defaultExpanded={isActive}
+      isActive={isActive}
+      now={now}
+    />
+  );
+}
+
+function TimedGuardianReviewActivity({
+  entry,
+}: {
+  entry: Extract<ActivityEntry, { kind: "guardian-review" }>;
+}) {
+  const now = useTimelineClock(!entry.completed);
+  return <GuardianReviewActivity entry={entry} now={now} />;
+}
+
+function TimedContextCompactionActivity({
+  entry,
+}: {
+  entry: Extract<ActivityEntry, { kind: "context-compaction" }>;
+}) {
+  const now = useTimelineClock(!entry.finishedAt);
+  return <ContextCompactionActivity entry={entry} now={now} />;
 }
 
 function ToolExecutionItem({

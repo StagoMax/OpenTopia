@@ -643,13 +643,20 @@
 }
 
 .composer-media-source {
-  grid-template-columns: 28px minmax(0, auto) auto 20px;
-  min-width: min(100%, 280px);
+  position: relative;
+  max-width: none;
+  width: max-content;
+  min-width: 0;
+  grid-template-columns: calc(var(--space-12) * 3);
+  grid-template-rows: calc(var(--space-12) * 3) auto;
+  justify-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2);
 }
 
-.composer-media-preview {
-  width: 24px;
-  height: 24px;
+.composer-source .composer-media-preview {
+  width: calc(var(--space-12) * 3);
+  height: calc(var(--space-12) * 3);
   overflow: hidden;
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
@@ -657,7 +664,7 @@
   padding: 0;
 }
 
-.composer-media-preview:hover {
+.composer-source .composer-media-preview:hover {
   border-color: var(--accent);
 }
 
@@ -671,6 +678,37 @@
   width: 100%;
   height: 100%;
   object-fit: cover;
+}
+
+.composer-media-source .composer-media-id {
+  display: block;
+  width: 100%;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  line-height: var(--line-height-body);
+  text-align: center;
+}
+
+.composer-media-source > .composer-media-remove {
+  position: absolute;
+  inset-block-start: var(--space-2);
+  inset-inline-end: var(--space-2);
+  width: var(--control-height-sm);
+  height: var(--control-height-sm);
+  border: 1px solid color-mix(in srgb, var(--overlay-control-fg) 24%, transparent);
+  background: var(--overlay-control-bg);
+  color: var(--overlay-control-fg);
+}
+
+.composer-media-source > .composer-media-remove:hover {
+  background: color-mix(in srgb, var(--overlay-control-bg) 82%, var(--text));
+  color: var(--overlay-control-fg);
+}
+
+.composer-media-source > .composer-media-remove:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: var(--space-1);
 }
 
 .composer-context-button {

@@ -25,7 +25,7 @@ import type { ToolTabKind } from "../../toolTabs";
 import type { GoalSnapshot, GoalStatus, Thread } from "../../types";
 import { conversationHeaderTitle } from "../../threadTitle";
 import { useDismissiblePopover } from "../../hooks/useDismissiblePopover";
-import { Button, IconButton } from "../../components/ui";
+import { Button, IconButton, ShimmerText } from "../../components/ui";
 
 export function ThreadHeader({
   thread,
@@ -385,10 +385,12 @@ export function ConversationLoadingState() {
       aria-live="polite"
     >
       <div className="conversation-loading__content">
-        <span className="conversation-loading__wordmark" aria-hidden="true">
-          <span className="conversation-loading__brand-open">Open</span>
-          <span>Topia</span>
-        </span>
+        <ShimmerText
+          className="conversation-loading__wordmark"
+          aria-hidden="true"
+        >
+          OpenTopia
+        </ShimmerText>
       </div>
     </section>
   );

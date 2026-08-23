@@ -97,7 +97,7 @@ export function NewTaskState({
   onChangeSandboxMode(mode: AppSettings["sandbox"]["sandboxMode"]): void;
   onChangeModelSelection(selection: ThreadModelSelection): void;
   onOpenSettings(): void;
-  onAddContextSources(files?: File[]): Promise<void>;
+  onAddContextSources(files?: File[]): Promise<ContextSourceFile[]>;
   onRemoveContextSource(path: string): void;
   onToggleSkill(skillId: string): void;
   onSubmit(
