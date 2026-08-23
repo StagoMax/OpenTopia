@@ -8,6 +8,9 @@ function createAppLogger({ app, apiToken, getBackendUrl, isDev }) {
   let crashLogFilePath = null;
   let logsDirPath = null;
   let crashLogsDirPath = null;
+  let logFlushHandle = null;
+  let logWriteInFlight = false;
+  const pendingLogLines = [];
 
   function isSecretName(name) {
     return /api[_-]?key|token|secret|password|authorization|credential/i.test(
@@ -93,20 +96,72 @@ function createAppLogger({ app, apiToken, getBackendUrl, isDev }) {
     }
   }
 
-  function appendLogLine(targetPath, level, event, metadata) {
-    if (!targetPath) return;
+  function formatLogLine(level, event, metadata) {
     const record = {
       ts: new Date().toISOString(),
       level,
       event,
       metadata: sanitizeForLog(metadata || {}),
     };
-    fs.appendFileSync(targetPath, `${JSON.stringify(record)}\n`, "utf8");
+    return `${JSON.stringify(record)}\n`;
+  }
+
+  function appendLogLineSync(targetPath, level, event, metadata) {
+    if (!targetPath) return;
+    fs.appendFileSync(
+      targetPath,
+      formatLogLine(level, event, metadata),
+      "utf8",
+    );
+  }
+
+  function scheduleLogFlush() {
+    if (
+      logFlushHandle !== null ||
+      logWriteInFlight ||
+      pendingLogLines.length === 0
+    ) {
+      return;
+    }
+    logFlushHandle = setImmediate(() => {
+      logFlushHandle = null;
+      flushQueuedLogLines();
+    });
+  }
+
+  function flushQueuedLogLines() {
+    if (logWriteInFlight || pendingLogLines.length === 0 || !logFilePath) {
+      return;
+    }
+    const batch = pendingLogLines.splice(0).join("");
+    logWriteInFlight = true;
+    fs.appendFile(logFilePath, batch, "utf8", (error) => {
+      logWriteInFlight = false;
+      if (error) {
+        console.error(
+          "[opentopia] failed to write buffered log",
+          serializeError(error),
+        );
+      }
+      scheduleLogFlush();
+    });
+  }
+
+  function flushLogsSync() {
+    if (logFlushHandle !== null) {
+      clearImmediate(logFlushHandle);
+      logFlushHandle = null;
+    }
+    if (!logFilePath || pendingLogLines.length === 0) return;
+    const batch = pendingLogLines.splice(0).join("");
+    fs.appendFileSync(logFilePath, batch, "utf8");
   }
 
   function writeLog(level, event, metadata = {}) {
     try {
-      appendLogLine(logFilePath, level, event, metadata);
+      if (!logFilePath) return;
+      pendingLogLines.push(formatLogLine(level, event, metadata));
+      scheduleLogFlush();
     } catch (error) {
       console.error("[opentopia] failed to write log", serializeError(error));
     }
@@ -115,7 +170,7 @@ function createAppLogger({ app, apiToken, getBackendUrl, isDev }) {
   function writeCrashLog(level, event, metadata = {}) {
     writeLog(level, event, metadata);
     try {
-      appendLogLine(crashLogFilePath, level, event, metadata);
+      appendLogLineSync(crashLogFilePath, level, event, metadata);
     } catch (error) {
       console.error(
         "[opentopia] failed to write crash log",
@@ -165,10 +220,10 @@ function createAppLogger({ app, apiToken, getBackendUrl, isDev }) {
     });
 
     process.on("uncaughtExceptionMonitor", (error) => {
-      writeLog("error", "process.uncaughtException", { error });
+      writeCrashLog("error", "process.uncaughtException", { error });
     });
     process.on("unhandledRejection", (reason) => {
-      writeLog("error", "process.unhandledRejection", {
+      writeCrashLog("error", "process.unhandledRejection", {
         reason: reason instanceof Error ? serializeError(reason) : reason,
       });
     });
@@ -190,6 +245,7 @@ function createAppLogger({ app, apiToken, getBackendUrl, isDev }) {
   return {
     backendEndpointInfo,
     ensureLoggingInitialized,
+    flushLogsSync,
     getLogPaths,
     isSecretName,
     logConsole,

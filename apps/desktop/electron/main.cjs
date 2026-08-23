@@ -59,6 +59,7 @@ const openTopiaProtocol = "opentopia";
 const {
   backendEndpointInfo,
   ensureLoggingInitialized,
+  flushLogsSync,
   getLogPaths,
   isSecretName,
   logConsole,
@@ -2550,4 +2551,5 @@ app.on("before-quit", () => {
   sagServiceManager?.stopSync();
   graphRagServiceManager?.stopSync();
   killBackendProcessTree();
+  flushLogsSync();
 });
