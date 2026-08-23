@@ -1,5 +1,25 @@
 # Repository Instructions
 
+## Proportional Problem Solving
+
+- Investigate in proportion to the task's risk and complexity before changing
+  code.
+- For clearly isolated mechanical changes, copy changes, or simple defects,
+  implement directly and run targeted validation.
+- For bugs and behavior changes, first make a lightweight check of the likely
+  root cause, the module or abstraction that owns the behavior, and any obvious
+  callers or parallel implementations that may also be affected.
+- Keep the fix local when the evidence shows the problem is isolated. Expand to
+  a broader systemic investigation only when there are concrete signals such as
+  recurring failures, shared logic, duplicated implementations, patches needed
+  in multiple places, or concerns involving state, concurrency, caching,
+  lifecycle, performance, or data consistency.
+- When systemic signals exist, identify the correct abstraction boundary,
+  inspect the affected paths, and prefer fixing the root cause there.
+- Do not broaden the change merely for architectural completeness. Report the
+  tradeoff briefly only when the chosen approach materially changes scope or
+  risk.
+
 ## Performance Engineering
 
 - When designing architecture or implementing code, treat performance as a
