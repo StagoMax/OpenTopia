@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "id": "ai.opentopia.agent-tools-runtime.lock",
+  "runtimeVersion": "rg-15.2.0-git-2.55.0.3-r1",
+  "tools": {
+    "rg": {
+      "version": "15.2.0",
+      "provider": "BurntSushi/ripgrep"
+    },
+    "git": {
+      "version": "2.55.0.windows.3",
+      "provider": "git-for-windows/MinGit"
+    }
+  },
+  "targets": {
+    "windows-x86_64": {
+      "ripgrep": {
+        "fileName": "ripgrep-15.2.0-x86_64-pc-windows-msvc.zip",
+        "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-pc-windows-msvc.zip",
+        "sha256": "71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5",
+        "maxBytes": 10485760,
+        "executablePath": "ripgrep-15.2.0-x86_64-pc-windows-msvc/rg.exe"
+      },
+      "git": {
+        "fileName": "MinGit-2.55.0.3-64-bit.zip",
+        "url": "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.3/MinGit-2.55.0.3-64-bit.zip",
+        "sha256": "f48e2d2dc74a24454adc6d8fd0ac25bf9c2386f19cfb06202b9465aaad4f9f05",
+        "maxBytes": 134217728,
+        "executablePath": "cmd/git.exe"
+      }
+    },
+    "windows-aarch64": {
+      "ripgrep": {
+        "fileName": "ripgrep-15.2.0-aarch64-pc-windows-msvc.zip",
+        "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-pc-windows-msvc.zip",
+        "sha256": "e4abca10c3a64ebea742667dd7009449d49403db5460dd6873e389fa2945360f",
+        "maxBytes": 10485760,
+        "executablePath": "ripgrep-15.2.0-aarch64-pc-windows-msvc/rg.exe"
+      },
+      "git": {
+        "fileName": "MinGit-2.55.0.3-arm64.zip",
+        "url": "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.3/MinGit-2.55.0.3-arm64.zip",
+        "sha256": "f7748965d5068e81ad93ca1923650db6742d6e22332b1ae7567a841c59f6bde5",
+        "maxBytes": 134217728,
+        "executablePath": "cmd/git.exe"
+      }
+    }
+  }
+}

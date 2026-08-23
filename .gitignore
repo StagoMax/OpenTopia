@@ -19,6 +19,9 @@ apps/desktop/.runtime-stage/
 apps/desktop/.runtime-stage.tmp-*/
 /runtime/office/cache/
 /runtime/office/.prepared-*/
+/runtime/agent-tools/cache/
+/runtime/agent-tools/dist/
+/runtime/agent-tools/.prepared-*/
 apps/desktop/resources/opentopia-server*
 apps/desktop/resources/codex-sandbox/
 apps/desktop/resources/opentopia-sandbox/

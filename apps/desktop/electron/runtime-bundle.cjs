@@ -2,6 +2,7 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
+const { loadAgentToolsRuntime } = require("./agent-tools-runtime.cjs");
 
 const protocolSchema = "ai.opentopia.sandbox.protocol";
 const runtimeManifestName = "opentopia-runtime-manifest.json";
@@ -88,7 +89,9 @@ function resolveArtifact(bundleRoot, descriptor, label) {
   }
   const actualHash = sha256File(resolved);
   if (actualHash.toLowerCase() !== descriptor.sha256.toLowerCase()) {
-    throw new Error(`Runtime bundle ${label} hash does not match its manifest.`);
+    throw new Error(
+      `Runtime bundle ${label} hash does not match its manifest.`,
+    );
   }
   return resolved;
 }
@@ -101,12 +104,25 @@ function loadRuntimeBundle(resourcesPath, platform = process.platform) {
       `Unsupported OpenTopia runtime manifest version ${manifest.schemaVersion}.`,
     );
   }
-  const server = resolveArtifact(resourcesPath, manifest.artifacts?.server, "server");
+  const server = resolveArtifact(
+    resourcesPath,
+    manifest.artifacts?.server,
+    "server",
+  );
   const officeRuntimeManifest = resolveArtifact(
     resourcesPath,
     manifest.artifacts?.officeRuntime,
     "Office runtime manifest",
   );
+  let agentToolsRuntime = null;
+  if (platform === "win32" || manifest.artifacts?.agentTools) {
+    const agentToolsManifest = resolveArtifact(
+      resourcesPath,
+      manifest.artifacts?.agentTools,
+      "agent tools manifest",
+    );
+    agentToolsRuntime = loadAgentToolsRuntime(path.dirname(agentToolsManifest));
+  }
   let sandbox = null;
   let sandboxProtocol = null;
   if (platform === "win32") {
@@ -123,6 +139,7 @@ function loadRuntimeBundle(resourcesPath, platform = process.platform) {
     sandbox,
     sandboxProtocol,
     officeRuntimeRoot: path.dirname(officeRuntimeManifest),
+    agentToolsRuntime,
     manifest,
   };
 }

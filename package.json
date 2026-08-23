@@ -6,6 +6,7 @@
   "type": "module",
   "packageManager": "pnpm@10.30.0",
   "scripts": {
+    "runtime:agent-tools": "node scripts/ensure-agent-tools-runtime.cjs",
     "dev": "pnpm --filter @opentopia/desktop dev",
     "dev:desktop": "pnpm --filter @opentopia/desktop dev",
     "dev:server": "cargo run -p opentopia-server",

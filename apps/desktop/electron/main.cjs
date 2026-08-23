@@ -34,6 +34,10 @@ const {
   loadRuntimeBundle,
   runtimeManifestName,
 } = require("./runtime-bundle.cjs");
+const {
+  applyAgentToolsEnvironment,
+  resolveDevelopmentAgentToolsRuntime,
+} = require("./agent-tools-runtime.cjs");
 
 const isDev = !app.isPackaged;
 if (isDev) {
@@ -87,6 +91,12 @@ function titleBarOverlayFor(theme) {
 let mainWindow = null;
 const appWindows = new Set();
 let backendProcess = null;
+let backendStartupStatus = {
+  phase: "checking",
+  detail: null,
+  startedAt: new Date().toISOString(),
+  updatedAt: new Date().toISOString(),
+};
 let protocolClientRegistered = false;
 let nextOpenRequestId = 1;
 let desktopBrowserHost = null;
@@ -97,6 +107,36 @@ let sagServiceManager = null;
 let graphRagServiceManager = null;
 let packagedRuntimeBundle = null;
 let packagedRuntimeBundleError = null;
+
+function backendStartupStatusSnapshot() {
+  return { ...backendStartupStatus };
+}
+
+function publishBackendStartupStatus() {
+  for (const appWindow of appWindows) {
+    if (appWindow.isDestroyed() || appWindow.webContents.isDestroyed()) {
+      continue;
+    }
+    appWindow.webContents.send(
+      "backend:startup-status",
+      backendStartupStatusSnapshot(),
+    );
+  }
+}
+
+function updateBackendStartupStatus(
+  phase,
+  { detail = null, resetElapsed = false } = {},
+) {
+  const now = new Date().toISOString();
+  backendStartupStatus = {
+    phase,
+    detail,
+    startedAt: resetElapsed ? now : backendStartupStatus.startedAt,
+    updatedAt: now,
+  };
+  publishBackendStartupStatus();
+}
 
 const secretsFilePath = "secrets.json";
 const providerSecretStorageKey = "provider-api-key";
@@ -685,11 +725,13 @@ function createBackendEnv(repoRoot, options = {}) {
       path.join(repoRoot, "target", "desktop-dev");
   }
 
+  let agentToolsRuntime = null;
   if (!isDev) {
     const bundle = resolvePackagedRuntimeBundle();
     if (bundle?.officeRuntimeRoot) {
       env.OPENTOPIA_OFFICE_RUNTIME_ROOT = bundle.officeRuntimeRoot;
     }
+    agentToolsRuntime = bundle?.agentToolsRuntime || null;
   }
 
   if (desktopBrowserBroker) {
@@ -711,6 +753,9 @@ function createBackendEnv(repoRoot, options = {}) {
   importEnvFile(env, selectedEnvFile);
   importProviderCredentialFallback(env, repoRoot, selectedEnvFile);
   applyProviderAliases(env);
+  if (isDev) {
+    agentToolsRuntime = resolveDevelopmentAgentToolsRuntime(repoRoot, env);
+  }
   if (options.includeKeyring !== false) {
     injectKeyringProviderApiKey(env);
     if (process.platform === "win32") {
@@ -744,6 +789,8 @@ function createBackendEnv(repoRoot, options = {}) {
       prependPath(env, path.join(process.env.USERPROFILE, ".cargo", "bin"));
     prependPath(env, resolveMingwBin());
   }
+
+  applyAgentToolsEnvironment(env, agentToolsRuntime);
 
   return env;
 }
@@ -1418,10 +1465,12 @@ function resolveOpenTopiaWindowsSandboxBinary(repoRoot) {
 const backendHealthAttempts = isDev ? 60 : 30;
 
 async function waitForBackendHealth(attempts) {
+  updateBackendStartupStatus("waiting_for_health");
   for (let i = 0; i < attempts; i += 1) {
     await new Promise((resolve) => setTimeout(resolve, 500));
     if (!backendProcess) {
       writeLog("warn", "backend.spawn.gone", { attempts: i + 1 });
+      updateBackendStartupStatus("failed");
       return false;
     }
     if (await isBackendHealthy()) {
@@ -1429,6 +1478,7 @@ async function waitForBackendHealth(attempts) {
         attempts: i + 1,
         backend: backendEndpointInfo(),
       });
+      updateBackendStartupStatus("ready");
       return true;
     }
   }
@@ -1436,6 +1486,7 @@ async function waitForBackendHealth(attempts) {
     backend: backendEndpointInfo(),
     attempts,
   });
+  updateBackendStartupStatus("failed");
   return false;
 }
 
@@ -1447,6 +1498,7 @@ function devServerBinaryPath(repoRoot) {
 
 async function ensureBackendBuilt(repoRoot) {
   writeLog("info", "backend.build.starting", { repoRoot });
+  updateBackendStartupStatus("compiling");
   const env = createBackendEnv(repoRoot);
   return new Promise((resolve, reject) => {
     const packages = ["build", "-p", "opentopia-server"];
@@ -1459,20 +1511,33 @@ async function ensureBackendBuilt(repoRoot) {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
-    const stderrChunks = [];
-    child.stderr?.on("data", (chunk) => stderrChunks.push(chunk.toString()));
+    let stderrTail = "";
+    child.stderr?.on("data", (chunk) => {
+      const output = chunk.toString();
+      stderrTail = `${stderrTail}${output}`.slice(-2000);
+      for (const rawLine of output.split(/\r?\n/)) {
+        const line = rawLine.replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, "");
+        const compiling = line.match(/^\s*(?:Compiling|Checking)\s+([^\s]+)/);
+        if (compiling) {
+          updateBackendStartupStatus("compiling", {
+            detail: compiling[1],
+          });
+        }
+      }
+    });
     child.on("exit", (code) => {
       if (code === 0) {
         writeLog("info", "backend.build.completed");
         resolve();
       } else {
-        const stderr = stderrChunks.join("").slice(-2000);
-        writeLog("error", "backend.build.failed", { code, stderr });
+        writeLog("error", "backend.build.failed", { code, stderr: stderrTail });
+        updateBackendStartupStatus("failed", { detail: "编译未能完成" });
         reject(new Error(`cargo build exited with code ${code}`));
       }
     });
     child.on("error", (error) => {
       writeLog("error", "backend.build.error", { error: error.message });
+      updateBackendStartupStatus("failed", { detail: "编译未能开始" });
       reject(error);
     });
   });
@@ -1482,7 +1547,9 @@ async function startBackendIfNeeded({
   waitForHealth = true,
   attempts = backendHealthAttempts,
 } = {}) {
+  updateBackendStartupStatus("checking", { resetElapsed: true });
   if (await isBackendHealthy()) {
+    updateBackendStartupStatus("ready");
     return;
   }
 
@@ -1500,6 +1567,7 @@ async function startBackendIfNeeded({
       packagedServer: packagedServer.path,
       packagedServerCandidates: packagedServer.candidates,
     });
+    updateBackendStartupStatus("failed", { detail: "本地服务文件缺失" });
     return;
   }
 
@@ -1509,6 +1577,7 @@ async function startBackendIfNeeded({
     endpoint.protocol !== "http:" ||
     !["127.0.0.1", "::1", "localhost"].includes(endpointHost)
   ) {
+    updateBackendStartupStatus("failed", { detail: "本地服务地址无效" });
     throw new Error(
       "OPENTOPIA_SERVER_URL must use HTTP on a loopback host for the local desktop server.",
     );
@@ -1533,6 +1602,7 @@ async function startBackendIfNeeded({
   }
 
   try {
+    updateBackendStartupStatus("starting");
     writeLog("info", "backend.spawn.starting", {
       backend: backendEndpointInfo(),
       command,
@@ -1572,6 +1642,7 @@ async function startBackendIfNeeded({
     spawnedBackend.on("exit", (code) => {
       writeLog("info", "backend.spawn.exited", { code });
       if (backendProcess === spawnedBackend) backendProcess = null;
+      updateBackendStartupStatus("failed", { detail: "本地服务已退出" });
     });
 
     // The renderer keeps probing /health on its own, so the window does not have
@@ -1583,6 +1654,7 @@ async function startBackendIfNeeded({
     if (waitForHealth) await readiness;
   } catch (error) {
     logConsole("error", "backend.spawn.failed", { error });
+    updateBackendStartupStatus("failed", { detail: "本地服务未能启动" });
   }
 }
 
@@ -1731,6 +1803,7 @@ function createMainWindow() {
       url: createdWindow.webContents.getURL(),
       pendingOpenRequests: openRequestHistory.length,
     });
+    publishBackendStartupStatus();
     flushOpenRequestsToRenderer();
   });
 
@@ -1992,6 +2065,11 @@ function registerIpc() {
       registered: protocolClientRegistered,
     },
   }));
+
+  ipcMain.handle("backend:get-startup-status", (event) => {
+    assertMainRenderer(event);
+    return backendStartupStatusSnapshot();
+  });
 
   ipcMain.handle("library:sag:ensure-ready", (event) => {
     assertMainRenderer(event);

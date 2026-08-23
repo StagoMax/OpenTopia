@@ -2,7 +2,10 @@ param(
   [switch]$StageOnly,
   [string]$OfficeRuntimeSource,
   [string]$OfficePythonArchive,
-  [string]$OfficePython
+  [string]$OfficePython,
+  [string]$AgentToolsRuntimeSource,
+  [string]$AgentToolsRipgrepArchive,
+  [string]$AgentToolsGitArchive
 )
 
 $ErrorActionPreference = "Stop"
@@ -45,6 +48,7 @@ $sandboxStageDir = Join-Path $runtimeTempDir "opentopia-sandbox"
 $stagedSandboxBinary = Join-Path $sandboxStageDir $sandboxBinaryName
 $runtimeManifestPath = Join-Path $runtimeTempDir "opentopia-runtime-manifest.json"
 $officeRuntimeStageDir = Join-Path $runtimeTempDir "office-runtime"
+$agentToolsRuntimeStageDir = Join-Path $runtimeTempDir "agent-tools"
 
 function Assert-RuntimeStagePath {
   param([Parameter(Mandatory = $true)][string]$Path)
@@ -126,6 +130,98 @@ function Assert-OfficeRuntimeSource {
   }
 }
 
+function Get-AgentToolsTargetId {
+  $architecture = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant()
+  $arch = if ($architecture -eq "x64") {
+    "x86_64"
+  } elseif ($architecture -eq "arm64") {
+    "aarch64"
+  } else {
+    throw "Agent tools runtime is unsupported on architecture $architecture"
+  }
+  return "windows-$arch"
+}
+
+function Resolve-AgentToolsRuntimeSource {
+  if (-not $isWindowsHost) { return $null }
+  if ($AgentToolsRuntimeSource) {
+    return (Resolve-Path -LiteralPath $AgentToolsRuntimeSource).Path
+  }
+  if ($env:OPENTOPIA_AGENT_TOOLS_SOURCE) {
+    return (Resolve-Path -LiteralPath $env:OPENTOPIA_AGENT_TOOLS_SOURCE).Path
+  }
+
+  $default = Join-Path $repoRoot "runtime\agent-tools\dist"
+  if (Test-Path -LiteralPath (Join-Path $default "agent-tools-runtime.json")) {
+    return (Resolve-Path -LiteralPath $default).Path
+  }
+
+  $lock = Get-Content -LiteralPath (Join-Path $repoRoot "runtime\agent-tools\runtime-lock.json") -Raw | ConvertFrom-Json
+  $targetId = Get-AgentToolsTargetId
+  $prepared = Join-Path $repoRoot "runtime\agent-tools\cache\$($lock.runtimeVersion)\$targetId"
+  $prepareArgs = @("-Output", $prepared)
+  $ripgrepArchive = if ($AgentToolsRipgrepArchive) {
+    $AgentToolsRipgrepArchive
+  } elseif ($env:OPENTOPIA_AGENT_TOOLS_RG_ARCHIVE) {
+    $env:OPENTOPIA_AGENT_TOOLS_RG_ARCHIVE
+  } else {
+    $null
+  }
+  $gitArchive = if ($AgentToolsGitArchive) {
+    $AgentToolsGitArchive
+  } elseif ($env:OPENTOPIA_AGENT_TOOLS_GIT_ARCHIVE) {
+    $env:OPENTOPIA_AGENT_TOOLS_GIT_ARCHIVE
+  } else {
+    $null
+  }
+  if ($ripgrepArchive) { $prepareArgs += @("-RipgrepArchive", $ripgrepArchive) }
+  if ($gitArchive) { $prepareArgs += @("-GitArchive", $gitArchive) }
+  & (Join-Path $PSScriptRoot "prepare-agent-tools-runtime.ps1") @prepareArgs
+  return (Resolve-Path -LiteralPath $prepared).Path
+}
+
+function Assert-AgentToolsRuntimeSource {
+  param([Parameter(Mandatory = $true)][string]$Path)
+
+  $manifestPath = Join-Path $Path "agent-tools-runtime.json"
+  if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+    throw "Agent tools runtime manifest not found: $manifestPath"
+  }
+  $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+  if ($manifest.schemaVersion -ne 1 -or $manifest.id -ne "ai.opentopia.agent-tools-runtime") {
+    throw "Agent tools runtime manifest has an unsupported identity: $manifestPath"
+  }
+  if ($manifest.target -ne (Get-AgentToolsTargetId)) {
+    throw "Agent tools runtime target $($manifest.target) does not match this build host"
+  }
+
+  $runtimeRoot = [System.IO.Path]::GetFullPath($Path)
+  $runtimePrefix = $runtimeRoot + [System.IO.Path]::DirectorySeparatorChar
+  foreach ($name in @("rg", "git")) {
+    $tool = $manifest.tools.$name
+    if (-not $tool.executable -or -not $tool.sha256 -or -not $tool.version) {
+      throw "Agent tools runtime manifest has no valid $name artifact"
+    }
+    $executable = [System.IO.Path]::GetFullPath((Join-Path $runtimeRoot $tool.executable))
+    if (-not $executable.StartsWith($runtimePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+      throw "Agent tools runtime $name path escapes its runtime root"
+    }
+    if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
+      throw "Agent tools runtime $name executable not found: $executable"
+    }
+    $actualHash = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash
+    if (-not $actualHash.Equals($tool.sha256, [System.StringComparison]::OrdinalIgnoreCase)) {
+      throw "Agent tools runtime $name hash does not match its manifest"
+    }
+    $rawVersionOutput = & $executable --version
+    $versionExitCode = $LASTEXITCODE
+    $versionOutput = ($rawVersionOutput | Select-Object -First 1 | Out-String).Trim()
+    if ($versionExitCode -ne 0 -or -not $versionOutput.Contains($tool.version)) {
+      throw "Agent tools runtime $name version probe failed with exit code $versionExitCode; expected $($tool.version), got '$versionOutput'"
+    }
+  }
+}
+
 Push-Location $repoRoot
 try {
   & (Join-Path $PSScriptRoot "test-provider-tool-cache-release.ps1")
@@ -162,6 +258,14 @@ try {
   Copy-Item -LiteralPath $resolvedOfficeRuntime -Destination $officeRuntimeStageDir -Recurse -Force
   Write-Host "Staged managed Office runtime: $officeRuntimeStageDir"
 
+  $resolvedAgentToolsRuntime = Resolve-AgentToolsRuntimeSource
+  if ($resolvedAgentToolsRuntime) {
+    Assert-AgentToolsRuntimeSource -Path $resolvedAgentToolsRuntime
+    Copy-Item -LiteralPath $resolvedAgentToolsRuntime -Destination $agentToolsRuntimeStageDir -Recurse -Force
+    Assert-AgentToolsRuntimeSource -Path $agentToolsRuntimeStageDir
+    Write-Host "Staged managed agent tools runtime: $agentToolsRuntimeStageDir"
+  }
+
   $sandboxProtocol = $null
   if ($isWindowsHost) {
     if (-not (Test-Path -LiteralPath $releaseSandboxBinary)) {
@@ -191,6 +295,12 @@ try {
   $artifacts.officeRuntime = [ordered]@{
     path = "office-runtime/office-runtime.json"
     sha256 = (Get-FileHash -LiteralPath (Join-Path $officeRuntimeStageDir "office-runtime.json") -Algorithm SHA256).Hash.ToLowerInvariant()
+  }
+  if ($resolvedAgentToolsRuntime) {
+    $artifacts.agentTools = [ordered]@{
+      path = "agent-tools/agent-tools-runtime.json"
+      sha256 = (Get-FileHash -LiteralPath (Join-Path $agentToolsRuntimeStageDir "agent-tools-runtime.json") -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
   }
   if ($isWindowsHost) {
     $artifacts.sandbox = [ordered]@{

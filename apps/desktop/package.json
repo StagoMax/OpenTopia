@@ -7,8 +7,10 @@
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
+    "predev": "node ../../scripts/ensure-agent-tools-runtime.cjs",
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron .\"",
     "dev:renderer": "vite --host 127.0.0.1",
+    "prestart": "node ../../scripts/ensure-agent-tools-runtime.cjs",
     "start": "electron .",
     "build": "tsc --noEmit && vite build",
     "contracts:check": "cargo run -q -p opentopia-core --example generate_desktop_contracts -- --output src/api/generated --check && cargo run -q -p opentopia-server -- --desktop-contracts-output src/api/generated --check-desktop-contracts && node scripts/generate-contract-types.mjs --check && node scripts/check-http-contract-coverage.mjs",
@@ -41,6 +43,7 @@
           "opentopia-server",
           "opentopia-server.exe",
           "opentopia-sandbox/opentopia-sandbox.exe",
+          "agent-tools/**/*",
           "office-runtime/**/*",
           "sag/enterprise-sag-panel",
           "sag/enterprise-sag-panel.exe",

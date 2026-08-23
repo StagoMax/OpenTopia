@@ -61,6 +61,18 @@ contextBridge.exposeInMainWorld("opentopia", {
   closeWindow: () => ipcRenderer.invoke("platform:close-window"),
   quit: () => ipcRenderer.invoke("platform:quit"),
   getPlatformInfo: () => ipcRenderer.invoke("platform:get-info"),
+  getBackendStartupStatus: () =>
+    ipcRenderer.invoke("backend:get-startup-status"),
+  onBackendStartupStatus: (listener) => {
+    if (typeof listener !== "function") {
+      throw new TypeError(
+        "Backend startup status listener must be a function.",
+      );
+    }
+    const wrapped = (_event, status) => listener(status);
+    ipcRenderer.on("backend:startup-status", wrapped);
+    return () => ipcRenderer.removeListener("backend:startup-status", wrapped);
+  },
   ensureSagLibraryService: () => ipcRenderer.invoke("library:sag:ensure-ready"),
   ensureLibraryProviderService: (provider) =>
     ipcRenderer.invoke("library:provider:ensure-ready", provider),

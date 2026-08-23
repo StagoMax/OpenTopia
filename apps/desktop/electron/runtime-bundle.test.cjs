@@ -40,7 +40,9 @@ test("rejects a helper missing a required bundle feature", () => {
 });
 
 test("binds the verified Office runtime directory for the backend", () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "opentopia-runtime-bundle-"));
+  const root = fs.mkdtempSync(
+    path.join(os.tmpdir(), "opentopia-runtime-bundle-"),
+  );
   try {
     const server = path.join(root, "opentopia-server");
     const officeDirectory = path.join(root, "office-runtime");
@@ -66,6 +68,72 @@ test("binds the verified Office runtime directory for the backend", () => {
 
     const bundle = loadRuntimeBundle(root, "linux");
     assert.equal(bundle.officeRuntimeRoot, officeDirectory);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("binds and validates a packaged agent tools runtime", () => {
+  const root = fs.mkdtempSync(
+    path.join(os.tmpdir(), "opentopia-runtime-bundle-"),
+  );
+  try {
+    const server = path.join(root, "opentopia-server");
+    const officeDirectory = path.join(root, "office-runtime");
+    const officeManifest = path.join(officeDirectory, "office-runtime.json");
+    const agentToolsDirectory = path.join(root, "agent-tools");
+    const agentToolsManifest = path.join(
+      agentToolsDirectory,
+      "agent-tools-runtime.json",
+    );
+    const rg = path.join(agentToolsDirectory, "bin", "rg");
+    const git = path.join(agentToolsDirectory, "git", "cmd", "git");
+    fs.mkdirSync(officeDirectory);
+    fs.mkdirSync(path.dirname(rg), { recursive: true });
+    fs.mkdirSync(path.dirname(git), { recursive: true });
+    fs.writeFileSync(server, "server");
+    fs.writeFileSync(officeManifest, "office runtime");
+    fs.writeFileSync(rg, "ripgrep");
+    fs.writeFileSync(git, "git");
+    const sha256 = (file) =>
+      crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+    fs.writeFileSync(
+      agentToolsManifest,
+      JSON.stringify({
+        schemaVersion: 1,
+        id: "ai.opentopia.agent-tools-runtime",
+        pathEntries: ["bin", "git/cmd"],
+        tools: {
+          rg: { version: "test", executable: "bin/rg", sha256: sha256(rg) },
+          git: {
+            version: "test",
+            executable: "git/cmd/git",
+            sha256: sha256(git),
+          },
+        },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(root, "opentopia-runtime-manifest.json"),
+      JSON.stringify({
+        schemaVersion: 1,
+        artifacts: {
+          server: { path: "opentopia-server", sha256: sha256(server) },
+          officeRuntime: {
+            path: "office-runtime/office-runtime.json",
+            sha256: sha256(officeManifest),
+          },
+          agentTools: {
+            path: "agent-tools/agent-tools-runtime.json",
+            sha256: sha256(agentToolsManifest),
+          },
+        },
+      }),
+    );
+
+    const bundle = loadRuntimeBundle(root, "linux");
+    assert.equal(bundle.agentToolsRuntime.root, agentToolsDirectory);
+    assert.equal(bundle.agentToolsRuntime.tools.rg.executable, rg);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

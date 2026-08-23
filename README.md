@@ -179,6 +179,9 @@ docs/                         Architecture notes and implementation decisions
 ### Useful commands
 
 ```powershell
+# Prepare pinned rg and Git tools once (dev startup and release builds also do this)
+pnpm runtime:agent-tools
+
 # Start the desktop development environment
 pnpm dev:desktop
 

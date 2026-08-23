@@ -6,6 +6,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+. "$PSScriptRoot\runtime-download.ps1"
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $lockPath = Join-Path $repoRoot "runtime\office\runtime-lock.json"
 $lock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
@@ -52,84 +54,6 @@ function Get-CurrentTargetId {
   return "$os-$arch"
 }
 
-function Test-Sha256 {
-  param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Expected)
-  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
-  $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
-  return $actual.Equals($Expected, [System.StringComparison]::OrdinalIgnoreCase)
-}
-
-function Get-RetryAfterSeconds {
-  param($ErrorRecord)
-  try {
-    $value = $ErrorRecord.Exception.Response.Headers["Retry-After"]
-    $seconds = 0
-    if ([int]::TryParse([string]$value, [ref]$seconds)) { return [Math]::Min($seconds, 8) }
-  } catch {}
-  return $null
-}
-
-function Test-RetryableDownloadError {
-  param($ErrorRecord)
-  try {
-    $status = [int]$ErrorRecord.Exception.Response.StatusCode
-    return $status -in @(429, 502, 503, 504)
-  } catch {
-    # No HTTP response means connection establishment, DNS, TLS, or timeout.
-    return $true
-  }
-}
-
-function Invoke-VerifiedDownload {
-  param(
-    [Parameter(Mandatory = $true)][string]$Uri,
-    [Parameter(Mandatory = $true)][string]$Destination,
-    [Parameter(Mandatory = $true)][string]$Sha256,
-    [Parameter(Mandatory = $true)][long]$MaxBytes
-  )
-  if (Test-Sha256 -Path $Destination -Expected $Sha256) { return $Destination }
-  if (Test-Path -LiteralPath $Destination) {
-    throw "Cached artifact failed SHA-256 verification: $Destination"
-  }
-  $parent = Split-Path -Parent $Destination
-  New-Item -ItemType Directory -Force -Path $parent | Out-Null
-
-  for ($attempt = 1; $attempt -le 3; $attempt++) {
-    $temporary = "$Destination.download-$PID-$([Guid]::NewGuid().ToString('N'))"
-    try {
-      Invoke-WebRequest -Uri $Uri -OutFile $temporary -TimeoutSec 900 -MaximumRedirection 10 -Headers @{
-        "User-Agent" = "OpenTopia Office runtime preparer"
-      }
-      $length = (Get-Item -LiteralPath $temporary).Length
-      if ($length -gt $MaxBytes) {
-        throw "Downloaded artifact exceeds the configured $MaxBytes byte limit"
-      }
-      if (-not (Test-Sha256 -Path $temporary -Expected $Sha256)) {
-        throw "Downloaded artifact failed SHA-256 verification: $Uri"
-      }
-      try {
-        Move-Item -LiteralPath $temporary -Destination $Destination
-      } catch {
-        if (-not (Test-Sha256 -Path $Destination -Expected $Sha256)) { throw }
-        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
-      }
-      return $Destination
-    } catch {
-      Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
-      $message = $_.Exception.Message
-      $integrityFailure = $message -match "SHA-256|exceeds the configured"
-      if ($integrityFailure -or $attempt -ge 3 -or -not (Test-RetryableDownloadError -ErrorRecord $_)) {
-        throw
-      }
-      $backoff = [Math]::Min([Math]::Pow(2, $attempt - 1), 8)
-      $retryAfter = Get-RetryAfterSeconds -ErrorRecord $_
-      if ($null -ne $retryAfter) { $backoff = [Math]::Max($backoff, $retryAfter) }
-      Write-Warning "Runtime download attempt $attempt failed; retrying in $backoff seconds: $message"
-      Start-Sleep -Seconds $backoff
-    }
-  }
-}
-
 function Invoke-PythonProbe {
   param([Parameter(Mandatory = $true)][string]$Python)
   $script = "import importlib.metadata,json,sys; print(json.dumps({'python': '.'.join(map(str, sys.version_info[:3])), 'openpyxl': importlib.metadata.version('openpyxl'), 'et_xmlfile': importlib.metadata.version('et_xmlfile')}))"
@@ -151,7 +75,7 @@ function Test-PreparedRuntime {
         $manifest.version -ne $lock.runtimeVersion -or
         $manifest.target -ne $TargetId) { return $false }
     $python = Join-Path $Root $manifest.python.path
-    if (-not (Test-Sha256 -Path $python -Expected $manifest.python.sha256)) { return $false }
+    if (-not (Test-RuntimeArtifactSha256 -Path $python -Expected $manifest.python.sha256)) { return $false }
     $probe = Invoke-PythonProbe -Python $python
     return $probe.python -eq $lock.pythonVersion -and
       $probe.openpyxl -eq (($lock.packages | Where-Object name -eq "openpyxl").version) -and
@@ -186,12 +110,12 @@ try {
   New-Item -ItemType Directory -Force -Path $temporaryPath | Out-Null
   $archivePath = if ($PythonArchive) {
     $resolved = (Resolve-Path -LiteralPath $PythonArchive).Path
-    if (-not (Test-Sha256 -Path $resolved -Expected $pythonAsset.sha256)) {
+    if (-not (Test-RuntimeArtifactSha256 -Path $resolved -Expected $pythonAsset.sha256)) {
       throw "Offline standalone Python archive failed SHA-256 verification: $resolved"
     }
     $resolved
   } else {
-    Invoke-VerifiedDownload `
+    Invoke-VerifiedRuntimeDownload `
       -Uri $pythonAsset.url `
       -Destination (Join-Path $artifactCachePath $pythonAsset.fileName) `
       -Sha256 $pythonAsset.sha256 `
@@ -207,7 +131,7 @@ try {
 
   $wheelPaths = @()
   foreach ($package in $lock.packages) {
-    $wheelPaths += Invoke-VerifiedDownload `
+    $wheelPaths += Invoke-VerifiedRuntimeDownload `
       -Uri $package.url `
       -Destination (Join-Path $artifactCachePath $package.fileName) `
       -Sha256 $package.sha256 `
