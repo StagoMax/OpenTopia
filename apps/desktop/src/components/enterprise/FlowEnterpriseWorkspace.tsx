@@ -2,11 +2,11 @@ import type { ApiClient } from "../../api/client";
 import type { AppSettings } from "../../types";
 import type { FlowPrimaryView } from "../../workspaceNavigation";
 import { FlowLibraryPanel } from "../FlowLibraryPanel";
-import { HumanTaskInboxPanel } from "../HumanTaskInboxPanel";
 import { LibraryPanel } from "../LibraryPanel";
 import { WorkflowDeploymentsPanel } from "../workflowDeployments";
 import { AgentsPage } from "./AgentsPage";
 import { AutomationPage } from "./automation/AutomationPage";
+import { FlowInboxPage } from "./FlowInboxPage";
 import { OverviewPage } from "./OverviewPage";
 import { RunsPage } from "./RunsPage";
 import { TrustPage } from "./TrustPage";
@@ -51,7 +51,7 @@ export function FlowEnterpriseWorkspace({
         threadId={threadId}
       />
     );
-  if (view === "inbox") return <HumanTaskInboxPanel client={client} />;
+  if (view === "inbox") return <FlowInboxPage client={client} />;
   if (view === "deployments")
     return (
       <WorkflowDeploymentsPanel

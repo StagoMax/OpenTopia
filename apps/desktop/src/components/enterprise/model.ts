@@ -99,26 +99,26 @@ export function guidedWorkflowSpec(input: {
   name: string;
   owner: string;
   outcome: string;
-  template: AgentTemplateVersionView;
+  templates: AgentTemplateVersionView[];
   requireApproval: boolean;
 }): FlowSpec {
   const objectSchema = { type: "object" };
-  const agentId = "agent";
   const approvalId = "review";
   const outputId = "output";
-  const nodes: FlowSpec["graph"]["nodes"] = [
-    {
-      id: agentId,
-      label: input.template.template.name,
+  const agentIds = input.templates.map((_, index) => `agent-${index + 1}`);
+  const nodes: FlowSpec["graph"]["nodes"] = input.templates.map(
+    (template, index) => ({
+      id: agentIds[index]!,
+      label: template.template.name,
       kind: "agent",
       config: {
-        reference: input.template.template.templateId,
-        templateVersion: input.template.template.version,
+        reference: template.template.templateId,
+        templateVersion: template.template.version,
       },
       inputSchema: objectSchema,
       outputSchema: objectSchema,
-    },
-  ];
+    }),
+  );
   if (input.requireApproval) {
     nodes.push({
       id: approvalId,
@@ -138,8 +138,8 @@ export function guidedWorkflowSpec(input: {
     outputSchema: objectSchema,
   });
   const path = input.requireApproval
-    ? [agentId, approvalId, outputId]
-    : [agentId, outputId];
+    ? [...agentIds, approvalId, outputId]
+    : [...agentIds, outputId];
   return {
     flowId: input.flowId,
     name: input.name,
@@ -151,7 +151,7 @@ export function guidedWorkflowSpec(input: {
     outputSchema: objectSchema,
     graph: {
       schemaVersion: 1,
-      entryNodeId: agentId,
+      entryNodeId: agentIds[0] ?? outputId,
       nodes,
       edges: path.slice(0, -1).map((from, index) => ({
         from,

@@ -8,6 +8,7 @@ import type {
   FlowRun,
   HumanTask,
   WorkflowDeployment,
+  WorkflowTriggerInvocation,
 } from "../../types";
 
 export type EnterpriseSnapshot = {
@@ -18,6 +19,7 @@ export type EnterpriseSnapshot = {
   deployments: readonly WorkflowDeployment[];
   runs: readonly FlowRun[];
   tasks: readonly HumanTask[];
+  invocations: readonly WorkflowTriggerInvocation[];
   connections: readonly Connection[];
   error: string | null;
   refreshedAt: string | null;
@@ -31,6 +33,7 @@ const INITIAL_SNAPSHOT: EnterpriseSnapshot = {
   deployments: [],
   runs: [],
   tasks: [],
+  invocations: [],
   connections: [],
   error: null,
   refreshedAt: null,
@@ -64,10 +67,20 @@ export class EnterpriseStore {
       this.client.listWorkflowDeployments(),
       this.client.listAllFlowRuns({ limit: 200 }),
       this.client.listHumanTasks({ status: "pending" }),
+      this.client.listWorkflowTriggerInvocations(),
       this.client.listConnections(),
     ])
       .then(
-        ([templates, agents, workflows, deployments, runs, tasks, connections]) => {
+        ([
+          templates,
+          agents,
+          workflows,
+          deployments,
+          runs,
+          tasks,
+          invocations,
+          connections,
+        ]) => {
           this.update({
             status: "ready",
             templates,
@@ -76,6 +89,7 @@ export class EnterpriseStore {
             deployments,
             runs,
             tasks,
+            invocations,
             connections,
             error: null,
             refreshedAt: new Date().toISOString(),

@@ -38,8 +38,10 @@ import type {
   WorkflowDeliveryStatus,
   WorkflowEvaluation,
   WorkflowEvaluationSummary,
+  WorkflowIngressPolicy,
   WorkflowInvocationResult,
   WorkflowOutput,
+  WorkflowOutputReviewPolicy,
   WorkflowRelease,
   WorkflowTrigger,
   WorkflowTriggerInvocation,
@@ -383,6 +385,7 @@ export class ExtensionsApi extends ConfigurationApi {
     createdBy: string;
     trigger?: WorkflowTrigger;
     output?: WorkflowOutput;
+    outputReviewPolicy?: WorkflowOutputReviewPolicy;
   }): Promise<WorkflowDeployment> {
     return this.post(
       "createWorkflowDeployment",
@@ -415,6 +418,7 @@ export class ExtensionsApi extends ConfigurationApi {
     threadId: string;
     deploymentId: string;
     trigger: WorkflowTrigger;
+    ingressPolicy?: WorkflowIngressPolicy;
     createdBy: string;
   }): Promise<WorkflowRelease> {
     return this.post("createWorkflowRelease", "/api/workflow-releases", input);
@@ -492,6 +496,16 @@ export class ExtensionsApi extends ConfigurationApi {
     return this.get(
       "listWorkflowTriggerInvocations",
       `/api/workflow-trigger-invocations${queryString({ releaseId: filters.releaseId })}`,
+    );
+  }
+
+  async startPendingWorkflowInvocation(
+    invocationId: string,
+  ): Promise<WorkflowInvocationResult> {
+    return this.post(
+      "startPendingWorkflowInvocation",
+      `/api/workflow-trigger-invocations/${encodeURIComponent(invocationId)}/start`,
+      {},
     );
   }
 
@@ -635,6 +649,18 @@ export class ExtensionsApi extends ConfigurationApi {
       "simulateFlowDraft",
       `/api/flow-drafts/${encodeURIComponent(draftId)}/simulate`,
       { input },
+    );
+  }
+
+  async startFlowTestRun(
+    draftId: string,
+    input: unknown = {},
+    startedBy = "local-user",
+  ): Promise<FlowRun> {
+    return this.post(
+      "startFlowTestRun",
+      `/api/flow-drafts/${encodeURIComponent(draftId)}/test-run`,
+      { input, startedBy },
     );
   }
 

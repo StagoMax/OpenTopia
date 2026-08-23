@@ -2523,6 +2523,31 @@ mod tests {
         assert!(!restored.output_reviewed);
     }
 
+    #[test]
+    fn deployment_can_limit_review_to_explicit_approval_nodes() {
+        let definition = definition(
+            vec![runtime_node("output", GraphNodeKindV1::Output, json!({}))],
+            Vec::new(),
+        );
+        let compiled =
+            crate::CompiledWorkflowV1::compile(&definition, Vec::new()).expect("compile workflow");
+        let deployment = crate::WorkflowDeploymentV1::new_with_options(
+            "Unattended runtime",
+            "production",
+            compiled,
+            crate::WorkflowTriggerSpecV1::Manual,
+            crate::WorkflowOutputSpecV1::Inbox,
+            crate::WorkflowOutputReviewPolicyV1::ExplicitNodesOnly,
+            "release-manager",
+        )
+        .expect("deployment");
+
+        let run = FlowRunV1::new_from_deployment(Uuid::new_v4(), &deployment, json!({}))
+            .expect("deployed run");
+
+        assert!(!run.output_review_required);
+    }
+
     #[tokio::test]
     async fn deployed_agent_node_executes_only_its_frozen_workflow_agent_spec() {
         let store = Arc::new(SqliteSessionStore::open(":memory:").expect("open store"));

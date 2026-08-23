@@ -21,6 +21,9 @@ export function OverviewPage({
   onNavigate(view: Exclude<FlowPrimaryView, "conversation">): void;
 }) {
   const { snapshot, store } = useEnterpriseStore(client);
+  const pendingEvents = snapshot.invocations.filter(
+    (item) => item.status === "accepted" && !item.flowRunId,
+  );
   const metrics = [
     {
       label: "Published Agents",
@@ -45,8 +48,8 @@ export function OverviewPage({
     },
     {
       label: "Inbox",
-      value: snapshot.tasks.length,
-      detail: "待人工处理",
+      value: snapshot.tasks.length + pendingEvents.length,
+      detail: `${pendingEvents.length} 个事件待确认`,
       icon: Inbox,
       view: "inbox" as const,
     },
@@ -124,7 +127,9 @@ export function OverviewPage({
                   <Activity aria-hidden="true" size={15} />
                   <span>
                     <strong>{run.flowId}</strong>
-                    <small>{shortId(run.id)} · {formatTime(run.updatedAt)}</small>
+                    <small>
+                      {shortId(run.id)} · {formatTime(run.updatedAt)}
+                    </small>
                   </span>
                   <Badge variant={runVariant(run.status)}>{run.status}</Badge>
                 </button>
@@ -149,8 +154,22 @@ export function OverviewPage({
                 </button>
               </li>
             ))}
-            {snapshot.tasks.length === 0 ? (
-              <li className="enterprise-list__empty">当前没有待处理 HumanTask。</li>
+            {pendingEvents
+              .slice(0, Math.max(0, 8 - snapshot.tasks.length))
+              .map((event) => (
+                <li key={event.id}>
+                  <button onClick={() => onNavigate("inbox")} type="button">
+                    <Inbox aria-hidden="true" size={15} />
+                    <span>
+                      <strong>Workflow event / 工作流事件</strong>
+                      <small>{event.idempotencyKey}</small>
+                    </span>
+                    <Badge variant="warning">review</Badge>
+                  </button>
+                </li>
+              ))}
+            {snapshot.tasks.length === 0 && pendingEvents.length === 0 ? (
+              <li className="enterprise-list__empty">当前没有待处理事项。</li>
             ) : null}
           </ol>
         </Panel>
@@ -159,7 +178,9 @@ export function OverviewPage({
   );
 }
 
-function runVariant(status: string): "success" | "danger" | "warning" | "info" | "neutral" {
+function runVariant(
+  status: string,
+): "success" | "danger" | "warning" | "info" | "neutral" {
   if (status === "succeeded") return "success";
   if (status === "failed" || status === "cancelled") return "danger";
   if (status.includes("waiting") || status === "paused") return "warning";

@@ -1,5 +1,9 @@
 import type { ExecutionConnectionOperation, FlowRun } from "./flow";
 
+export type WorkflowIngressPolicy = "immediate" | "require_review";
+export type WorkflowOutputReviewPolicy =
+  "explicit_nodes_only" | "always_review_output";
+
 export type WorkflowTrigger =
   | { kind: "manual" }
   | { kind: "webhook"; triggerId: string; tokenRef: string }
@@ -36,6 +40,7 @@ export type WorkflowRelease = {
   threadId: string;
   status: "active" | "disabled";
   trigger: WorkflowTrigger;
+  ingressPolicy: WorkflowIngressPolicy;
   primaryDeploymentId: string;
   canaryDeploymentId?: string | null;
   canaryPercent: number;
@@ -55,6 +60,7 @@ export type WorkflowTriggerInvocation = {
   flowRunId?: string | null;
   status: "accepted" | "started" | "failed";
   inputHash: string;
+  input: unknown;
   error?: string | null;
   createdAt: string;
   updatedAt: string;
@@ -96,7 +102,7 @@ export type WorkflowEvaluation = {
 
 export type WorkflowInvocationResult = {
   invocation: WorkflowTriggerInvocation;
-  run: FlowRun;
+  run?: FlowRun | null;
   reused: boolean;
 };
 

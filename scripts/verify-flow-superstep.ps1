@@ -152,6 +152,20 @@ try {
   if ($trial.status -ne "passed") {
     throw "Flow simulation failed: $($trial | ConvertTo-Json -Depth 12 -Compress)"
   }
+  $testStarted = Invoke-TopiaApi POST "/api/flow-drafts/$($draftView.draft.id)/test-run" @{
+    input = @{ requestId = $runId; ready = $true }
+    startedBy = "opentopia-e2e"
+  }
+  $testDeadline = [DateTime]::UtcNow.AddSeconds(30)
+  $testRun = $testStarted
+  do {
+    $testRun = Invoke-TopiaApi GET "/api/flow-runs/$($testStarted.id)"
+    if ($testRun.status -in @("succeeded", "failed", "cancelled")) { break }
+    Start-Sleep -Milliseconds 100
+  } while ([DateTime]::UtcNow -lt $testDeadline)
+  if ($testRun.status -ne "succeeded") {
+    throw "Workflow Test Run did not succeed: status=$($testRun.status), error=$($testRun.error)"
+  }
   $definition = Invoke-TopiaApi POST "/api/flow-drafts/$($draftView.draft.id)/publish" @{ publishedBy = "opentopia-e2e" }
   $deployment = Invoke-TopiaApi POST "/api/workflow-deployments" @{
     flowId = $definition.flowId
@@ -159,28 +173,45 @@ try {
     name = "Phase 2B background deployment"
     environment = "e2e"
     createdBy = "opentopia-e2e"
+    outputReviewPolicy = "explicit_nodes_only"
   }
-  $started = Invoke-TopiaApi POST "/api/threads/$($thread.id)/workflow-deployments/$($deployment.id)/runs" @{
-    input = @{ requestId = $runId; ready = $true }
+  $release = Invoke-TopiaApi POST "/api/workflow-releases" @{
+    releaseKey = "phase2b-$runId"
+    environment = "e2e"
+    threadId = $thread.id
+    deploymentId = $deployment.id
+    trigger = @{
+      kind = "event_subscription"
+      triggerId = [guid]::NewGuid().ToString()
+      source = "opentopia-e2e"
+      eventType = "flow.requested"
+    }
+    ingressPolicy = "require_review"
+    createdBy = "opentopia-e2e"
   }
+  $pendingResults = @(Invoke-TopiaApi POST "/api/workflow-events" @{
+    source = "opentopia-e2e"
+    eventType = "flow.requested"
+    idempotencyKey = $runId
+    payload = @{ requestId = $runId; ready = $true }
+  })
+  if ($pendingResults.Count -ne 1 -or $pendingResults[0].invocation.status -ne "accepted" -or $pendingResults[0].run) {
+    throw "Reviewed event did not stop in the pending invocation queue"
+  }
+  $pendingInvocations = @(Invoke-TopiaApi GET "/api/workflow-trigger-invocations?releaseId=$($release.id)")
+  if ($pendingInvocations.Count -ne 1 -or $pendingInvocations[0].input.requestId -ne $runId) {
+    throw "Pending event input was not durably queryable"
+  }
+  $approved = Invoke-TopiaApi POST "/api/workflow-trigger-invocations/$($pendingInvocations[0].id)/start" @{}
+  if (-not $approved.run -or $approved.invocation.status -ne "started") {
+    throw "Approved event did not create a Flow Run"
+  }
+  $started = $approved.run
 
   $deadline = [DateTime]::UtcNow.AddSeconds(30)
   $run = $started
   do {
     $run = Invoke-TopiaApi GET "/api/flow-runs/$($started.id)"
-    if ($run.status -eq "waiting_human") {
-      $reviewTasks = @(Invoke-TopiaApi GET "/api/human-tasks?status=pending&flowRunId=$($started.id)")
-      if ($reviewTasks.Count -ne 1 -or $reviewTasks[0].taskType -ne "output_review") {
-        throw "Production Flow did not expose exactly one output review task"
-      }
-      $review = Invoke-TopiaApi POST "/api/human-tasks/$($reviewTasks[0].id)/resolve" @{
-        expectedRevision = $reviewTasks[0].revision
-        action = "approve"
-        note = "Phase 2B checkpoint output verified by background Topia test"
-        idempotencyKey = "phase2b-output-review-$runId"
-      }
-      $run = $review.run
-    }
     if ($run.status -in @("succeeded", "failed", "cancelled")) { break }
     Start-Sleep -Milliseconds 100
   } while ([DateTime]::UtcNow -lt $deadline)
@@ -211,6 +242,9 @@ try {
     threadId = $thread.id
     definitionId = $definition.id
     deploymentId = $deployment.id
+    releaseId = $release.id
+    invocationId = $approved.invocation.id
+    testRunId = $testRun.id
     runId = $run.id
     status = $run.status
     superstep = $run.superstep

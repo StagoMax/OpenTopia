@@ -18,7 +18,6 @@ import type {
   Message,
   UserInputResponse,
 } from "./types";
-import { ThreadActivityMonitor } from "./threadActivityMonitor.ts";
 import { ThreadActivityStore } from "./threadActivityStore.ts";
 
 export type ConversationSendRequest = {
@@ -85,12 +84,14 @@ export class ConversationSessionController {
     if (this.retainCount === 1) this.connect();
     return () => {
       this.retainCount = Math.max(0, this.retainCount - 1);
-      if (this.retainCount === 0) this.disconnect();
+      if (this.retainCount === 0 && !this.hasLiveActivity()) {
+        this.disconnect();
+      }
     };
   }
 
   isRetained(): boolean {
-    return this.retainCount > 0;
+    return this.retainCount > 0 || this.hasLiveActivity();
   }
 
   retry(): void {
@@ -309,6 +310,17 @@ export class ConversationSessionController {
     this.flushPendingEvents();
   }
 
+  private hasLiveActivity(): boolean {
+    return (
+      this.activityStore?.isLive(this.threadId) === true ||
+      this.state.sending ||
+      this.state.pendingTurnFeedback !== null ||
+      this.state.activeTurnId !== null ||
+      this.state.turnStatus?.status === "running" ||
+      this.state.turnStatus?.status === "cancelling"
+    );
+  }
+
   private isCurrentLoad(
     generation: number,
     controller: AbortController,
@@ -390,7 +402,9 @@ export class ConversationSessionController {
     if (next === this.state) return;
     this.state = next;
     this.stateListeners.forEach((listener) => listener());
-    if (this.retainCount === 0 && this.stream) this.disconnect();
+    if (this.retainCount === 0 && !this.hasLiveActivity() && this.stream) {
+      this.disconnect();
+    }
   }
 }
 
@@ -404,7 +418,8 @@ export class ConversationSessionRegistry {
     ConversationSessionController
   >();
   private readonly controllerEventReleases = new Map<string, () => void>();
-  private readonly activityMonitor: ThreadActivityMonitor;
+  private readonly activityRetentionReleases = new Map<string, () => void>();
+  private readonly activityStoreRelease: () => void;
 
   constructor(
     client: ApiClient,
@@ -414,7 +429,12 @@ export class ConversationSessionRegistry {
     this.client = client;
     this.cacheLimit = cacheLimit;
     this.activityStore = activityStore;
-    this.activityMonitor = new ThreadActivityMonitor(client, activityStore);
+    this.activityStoreRelease = activityStore.subscribeToChanges((threadId) =>
+      this.syncActivityRetention(threadId),
+    );
+    activityStore
+      .liveThreadIds()
+      .forEach((threadId) => this.syncActivityRetention(threadId));
   }
 
   get(threadId: string): ConversationSessionController {
@@ -444,12 +464,27 @@ export class ConversationSessionRegistry {
   }
 
   dispose(): void {
-    this.activityMonitor.dispose();
+    this.activityStoreRelease();
+    this.activityRetentionReleases.forEach((release) => release());
+    this.activityRetentionReleases.clear();
     this.controllerEventReleases.forEach((release) => release());
     this.controllerEventReleases.clear();
     this.controllers.forEach((controller) => controller.dispose());
     this.controllers.clear();
     this.eventListeners.clear();
+  }
+
+  private syncActivityRetention(threadId: string): void {
+    const retained = this.activityRetentionReleases.get(threadId);
+    if (this.activityStore.isLive(threadId)) {
+      if (retained) return;
+      const release = this.get(threadId).retain();
+      this.activityRetentionReleases.set(threadId, release);
+      return;
+    }
+    if (!retained) return;
+    this.activityRetentionReleases.delete(threadId);
+    retained();
   }
 
   private prune(protectedThreadId: string): void {

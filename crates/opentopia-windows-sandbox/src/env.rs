@@ -8,8 +8,15 @@ const SINGLE_PATH_ENV_KEYS: &[&str] = &[
     "USERPROFILE",
     "HOME",
     "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
     "APPDATA",
     "LOCALAPPDATA",
+    "NPM_CONFIG_USERCONFIG",
+    "NPM_CONFIG_GLOBALCONFIG",
+    "NPM_CONFIG_CACHE",
+    "PNPM_HOME",
     "TEMP",
     "TMP",
 ];
@@ -24,8 +31,15 @@ const DEFAULT_ENV_KEYS: &[&str] = &[
     "USERPROFILE",
     "HOME",
     "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
     "APPDATA",
     "LOCALAPPDATA",
+    "NPM_CONFIG_USERCONFIG",
+    "NPM_CONFIG_GLOBALCONFIG",
+    "NPM_CONFIG_CACHE",
+    "PNPM_HOME",
     "TEMP",
     "TMP",
     "HOMEDRIVE",
@@ -102,6 +116,44 @@ pub(crate) fn current_environment_block(
             "XDG_CONFIG_HOME",
             home.join(".config").as_os_str(),
         );
+        insert_value(
+            &mut values,
+            "XDG_CACHE_HOME",
+            home.join(".cache").as_os_str(),
+        );
+        insert_value(
+            &mut values,
+            "XDG_DATA_HOME",
+            home.join(".local").join("share").as_os_str(),
+        );
+        insert_value(
+            &mut values,
+            "XDG_STATE_HOME",
+            home.join(".local").join("state").as_os_str(),
+        );
+        insert_value(
+            &mut values,
+            "NPM_CONFIG_USERCONFIG",
+            home.join(".config").join("npm").join("npmrc").as_os_str(),
+        );
+        insert_value(
+            &mut values,
+            "NPM_CONFIG_GLOBALCONFIG",
+            home.join(".config")
+                .join("npm")
+                .join("global-npmrc")
+                .as_os_str(),
+        );
+        insert_value(
+            &mut values,
+            "NPM_CONFIG_CACHE",
+            home.join(".cache").join("npm").as_os_str(),
+        );
+        insert_value(
+            &mut values,
+            "PNPM_HOME",
+            home.join(".local").join("share").join("pnpm").as_os_str(),
+        );
         let roaming = home.join("AppData").join("Roaming");
         let local = home.join("AppData").join("Local");
         let temporary = home.join("tmp");
@@ -169,6 +221,9 @@ mod tests {
         );
         let decoded = String::from_utf16_lossy(&block);
         assert!(decoded.contains("USERPROFILE=C:\\sandbox-home\0"));
+        assert!(decoded.contains("XDG_CONFIG_HOME=C:\\sandbox-home\\.config\0"));
+        assert!(decoded.contains("NPM_CONFIG_USERCONFIG=C:\\sandbox-home\\.config\\npm\\npmrc\0"));
+        assert!(decoded.contains("PNPM_HOME=C:\\sandbox-home\\.local\\share\\pnpm\0"));
         assert!(decoded.contains("TEMP=C:\\sandbox-home\\tmp\0"));
         assert!(decoded.contains("=J:=J:\\workspace\0"));
         assert!(!decoded.contains(r"\\?\"));

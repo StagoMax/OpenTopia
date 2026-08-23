@@ -713,4 +713,38 @@ mod tests {
         };
         assert!(next_fire_at > now);
     }
+
+    #[test]
+    fn reviewed_ingress_preserves_event_input_before_a_run_exists() {
+        let deployment = deployment("production");
+        let release = WorkflowReleaseV1::new_with_ingress_policy(
+            "reviewed-orders",
+            "production",
+            Uuid::new_v4(),
+            &deployment,
+            WorkflowTriggerSpecV1::EventSubscription {
+                trigger_id: Uuid::new_v4(),
+                source: "crm".to_string(),
+                event_type: "record.updated".to_string(),
+            },
+            WorkflowIngressPolicyV1::RequireReview,
+            "tester",
+        )
+        .expect("reviewed release");
+        let input = serde_json::json!({"recordId": "customer-42"});
+        let invocation =
+            WorkflowTriggerInvocationV1::accepted(&release, "event-42", deployment.id, &input)
+                .expect("accepted event");
+
+        assert_eq!(
+            release.ingress_policy,
+            WorkflowIngressPolicyV1::RequireReview
+        );
+        assert_eq!(
+            invocation.status,
+            WorkflowTriggerInvocationStatusV1::Accepted
+        );
+        assert_eq!(invocation.flow_run_id, None);
+        assert_eq!(invocation.input, input);
+    }
 }

@@ -4,7 +4,7 @@ use crate::workflow_delivery::{deliver_run_output, reconcile_interrupted_deliver
 use chrono::Utc;
 use opentopia_core::{
     content_fingerprint, spawn_flow_run, FlowRunStatusV1, FlowRunV1, SessionStore,
-    WorkflowDeliveryStatusV1, WorkflowReleaseStatusV1, WorkflowReleaseV1,
+    WorkflowDeliveryStatusV1, WorkflowIngressPolicyV1, WorkflowReleaseStatusV1, WorkflowReleaseV1,
     WorkflowTriggerInvocationStatusV1, WorkflowTriggerInvocationV1,
 };
 use schemars::JsonSchema;
@@ -19,7 +19,8 @@ use uuid::Uuid;
 #[serde(rename_all = "camelCase")]
 pub(crate) struct WorkflowInvocationResult {
     pub invocation: WorkflowTriggerInvocationV1,
-    pub run: FlowRunV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run: Option<FlowRunV1>,
     pub reused: bool,
 }
 
@@ -43,19 +44,7 @@ pub(crate) async fn start_release_invocation(
                 "idempotencyKey was already used with different input",
             ));
         }
-        let run_id = existing
-            .flow_run_id
-            .ok_or_else(|| ApiError::conflict("invocation has not produced a Flow run"))?;
-        let run = state
-            .store
-            .get_flow_run(run_id)
-            .map_err(flow_error)?
-            .ok_or_else(|| ApiError::not_found("Flow run not found"))?;
-        return Ok(WorkflowInvocationResult {
-            invocation: existing,
-            run,
-            reused: true,
-        });
+        return resume_or_reuse_invocation(state, release, existing).await;
     }
 
     let deployment_id = release
@@ -71,8 +60,8 @@ pub(crate) async fn start_release_invocation(
             "selected deployment is outside the release environment",
         ));
     }
-    let thread = ensure_flow_thread(state, release.thread_id)?;
-    let mut invocation = WorkflowTriggerInvocationV1::accepted(
+    ensure_flow_thread(state, release.thread_id)?;
+    let invocation = WorkflowTriggerInvocationV1::accepted(
         release,
         idempotency_key.clone(),
         deployment_id,
@@ -91,24 +80,105 @@ pub(crate) async fn start_release_invocation(
                     "idempotencyKey was already used with different input",
                 ));
             }
-            let run_id = existing
-                .flow_run_id
-                .ok_or_else(|| ApiError::conflict("invocation is already being started"))?;
-            let run = state
-                .store
-                .get_flow_run(run_id)
-                .map_err(flow_error)?
-                .ok_or_else(|| ApiError::not_found("Flow run not found"))?;
-            return Ok(WorkflowInvocationResult {
-                invocation: existing,
-                run,
-                reused: true,
-            });
+            return resume_or_reuse_invocation(state, release, existing).await;
         }
         return Err(workflow_automation_error(error));
     }
 
-    let run = match FlowRunV1::new_from_deployment(release.thread_id, &deployment, input) {
+    if release.ingress_policy == WorkflowIngressPolicyV1::RequireReview {
+        return Ok(WorkflowInvocationResult {
+            invocation,
+            run: None,
+            reused: false,
+        });
+    }
+
+    start_accepted_invocation(state, release, invocation, false).await
+}
+
+pub(crate) async fn start_pending_release_invocation(
+    state: &AppState,
+    invocation_id: Uuid,
+) -> Result<WorkflowInvocationResult, ApiError> {
+    let invocation = state
+        .store
+        .get_workflow_trigger_invocation_by_id(invocation_id)
+        .map_err(workflow_automation_error)?
+        .ok_or_else(|| ApiError::not_found("Workflow trigger invocation not found"))?;
+    let release = state
+        .store
+        .get_workflow_release(invocation.release_id)
+        .map_err(workflow_automation_error)?
+        .ok_or_else(|| ApiError::not_found("Workflow release not found"))?;
+    if release.status != WorkflowReleaseStatusV1::Active {
+        return Err(ApiError::conflict(
+            "Workflow release is disabled; the pending event cannot start",
+        ));
+    }
+    start_accepted_invocation(state, &release, invocation, false).await
+}
+
+async fn resume_or_reuse_invocation(
+    state: &AppState,
+    release: &WorkflowReleaseV1,
+    invocation: WorkflowTriggerInvocationV1,
+) -> Result<WorkflowInvocationResult, ApiError> {
+    if invocation.status == WorkflowTriggerInvocationStatusV1::Accepted
+        && release.ingress_policy == WorkflowIngressPolicyV1::Immediate
+    {
+        return start_accepted_invocation(state, release, invocation, true).await;
+    }
+    reuse_invocation_result(state, invocation).await
+}
+
+async fn reuse_invocation_result(
+    state: &AppState,
+    invocation: WorkflowTriggerInvocationV1,
+) -> Result<WorkflowInvocationResult, ApiError> {
+    let run = match invocation.flow_run_id {
+        Some(run_id) => Some(
+            state
+                .store
+                .get_flow_run(run_id)
+                .map_err(flow_error)?
+                .ok_or_else(|| ApiError::not_found("Flow run not found"))?,
+        ),
+        None => None,
+    };
+    Ok(WorkflowInvocationResult {
+        invocation,
+        run,
+        reused: true,
+    })
+}
+
+async fn start_accepted_invocation(
+    state: &AppState,
+    release: &WorkflowReleaseV1,
+    mut invocation: WorkflowTriggerInvocationV1,
+    reused: bool,
+) -> Result<WorkflowInvocationResult, ApiError> {
+    if invocation.status != WorkflowTriggerInvocationStatusV1::Accepted {
+        return reuse_invocation_result(state, invocation).await;
+    }
+
+    let deployment = state
+        .store
+        .get_workflow_deployment(invocation.deployment_id)
+        .map_err(flow_error)?
+        .ok_or_else(|| ApiError::not_found("Workflow deployment not found"))?;
+    if deployment.environment != release.environment {
+        return Err(ApiError::conflict(
+            "selected deployment is outside the release environment",
+        ));
+    }
+    let thread = ensure_flow_thread(state, release.thread_id)?;
+
+    let mut run = match FlowRunV1::new_from_deployment(
+        release.thread_id,
+        &deployment,
+        invocation.input.clone(),
+    ) {
         Ok(run) => run,
         Err(error) => {
             invocation.status = WorkflowTriggerInvocationStatusV1::Failed;
@@ -118,6 +188,7 @@ pub(crate) async fn start_release_invocation(
             return Err(ApiError::conflict(error.to_string()));
         }
     };
+    run.id = Uuid::new_v5(&invocation.id, b"flow-run");
     let context = match flow_runtime_context(state, &thread, &run).await {
         Ok(context) => context,
         Err(error) => {
@@ -128,15 +199,18 @@ pub(crate) async fn start_release_invocation(
             return Err(error);
         }
     };
-    let run = match state.store.insert_flow_run(&run) {
-        Ok(run) => run,
-        Err(error) => {
-            invocation.status = WorkflowTriggerInvocationStatusV1::Failed;
-            invocation.error = Some(error.to_string());
-            invocation.updated_at = Utc::now();
-            let _ = state.store.update_workflow_trigger_invocation(&invocation);
-            return Err(flow_error(error));
-        }
+    let (run, should_spawn) = match state.store.insert_flow_run(&run) {
+        Ok(run) => (run, true),
+        Err(error) => match state.store.get_flow_run(run.id).map_err(flow_error)? {
+            Some(existing) => (existing, false),
+            None => {
+                invocation.status = WorkflowTriggerInvocationStatusV1::Failed;
+                invocation.error = Some(error.to_string());
+                invocation.updated_at = Utc::now();
+                let _ = state.store.update_workflow_trigger_invocation(&invocation);
+                return Err(flow_error(error));
+            }
+        },
     };
     invocation.flow_run_id = Some(run.id);
     invocation.status = WorkflowTriggerInvocationStatusV1::Started;
@@ -146,11 +220,13 @@ pub(crate) async fn start_release_invocation(
         .update_workflow_trigger_invocation(&invocation)
         .map_err(workflow_automation_error)?;
 
-    spawn_flow_run(run.id, context).map_err(ApiError::from)?;
+    if should_spawn {
+        spawn_flow_run(run.id, context).map_err(ApiError::from)?;
+    }
     Ok(WorkflowInvocationResult {
         invocation,
-        run,
-        reused: false,
+        run: Some(run),
+        reused,
     })
 }
 

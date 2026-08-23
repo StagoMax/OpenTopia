@@ -66,7 +66,9 @@
   padding: var(--space-4);
   color: var(--text);
   text-align: start;
-  transition: background var(--motion-fast) var(--ease-standard), border-color var(--motion-fast) var(--ease-standard);
+  transition:
+    background var(--motion-fast) var(--ease-standard),
+    border-color var(--motion-fast) var(--ease-standard);
 }
 
 .enterprise-metric:hover {
@@ -245,9 +247,143 @@
   margin-top: var(--space-5);
 }
 
+.enterprise-inbox-page {
+  gap: var(--space-6);
+}
+
+.enterprise-pending-events {
+  display: grid;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.enterprise-pending-events > li:not(.enterprise-list__empty) {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: var(--space-4);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: var(--space-4);
+}
+
+.enterprise-pending-events__icon {
+  display: grid;
+  place-items: center;
+  inline-size: var(--control-height-md);
+  block-size: var(--control-height-md);
+  border-radius: var(--radius-sm);
+  background: var(--warning-subtle);
+  color: var(--warning);
+}
+
+.enterprise-pending-events__content,
+.enterprise-pending-events__content > span {
+  display: grid;
+  gap: var(--space-2);
+  min-inline-size: 0;
+}
+
+.enterprise-pending-events__content > span {
+  grid-template-columns: minmax(0, max-content) auto;
+  align-items: center;
+  justify-content: start;
+}
+
+.enterprise-pending-events__content small {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.enterprise-pending-events details {
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.enterprise-pending-events summary {
+  cursor: pointer;
+}
+
+.enterprise-pending-events pre {
+  max-block-size: calc(var(--control-height-lg) * 6);
+  overflow: auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface-subtle);
+  padding: var(--space-3);
+  color: var(--text);
+  font: var(--font-size-xs) / var(--line-height-body) var(--font-mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .enterprise-progress {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   margin-top: var(--space-5);
+}
+
+.enterprise-agent-sequence {
+  display: grid;
+  gap: var(--space-3);
+  min-inline-size: 0;
+  margin: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: var(--space-4);
+}
+
+.enterprise-agent-sequence legend {
+  padding: 0 var(--space-2);
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+}
+
+.enterprise-agent-sequence > p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.enterprise-agent-sequence ol {
+  display: grid;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.enterprise-agent-sequence li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: end;
+  gap: var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+  padding-bottom: var(--space-3);
+}
+
+.enterprise-agent-sequence__index {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  min-inline-size: var(--control-height-md);
+  min-block-size: var(--control-height-md);
+  border-radius: var(--radius-sm);
+  background: var(--surface-subtle);
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.enterprise-agent-sequence__actions {
+  display: flex;
+  gap: var(--space-2);
+  min-block-size: var(--control-height-md);
 }
 
 .enterprise-progress li {
@@ -359,9 +495,15 @@
   font-size: var(--font-size-xs);
 }
 
-.enterprise-trust-signals li.is-healthy { border-color: var(--success); }
-.enterprise-trust-signals li.is-warning { border-color: var(--danger); }
-.enterprise-trust-signals li.is-attention { border-color: var(--warning); }
+.enterprise-trust-signals li.is-healthy {
+  border-color: var(--success);
+}
+.enterprise-trust-signals li.is-warning {
+  border-color: var(--danger);
+}
+.enterprise-trust-signals li.is-attention {
+  border-color: var(--warning);
+}
 
 .enterprise-sidebar-collection {
   display: grid;
@@ -393,18 +535,48 @@
   font-size: var(--font-size-xs);
 }
 
-.enterprise-sidebar-collection li:hover { background: var(--sidebar-item-hover); }
-.enterprise-sidebar-collection strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.enterprise-sidebar-collection small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.enterprise-sidebar-collection li:hover {
+  background: var(--sidebar-item-hover);
+}
+.enterprise-sidebar-collection strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.enterprise-sidebar-collection small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 @media (max-width: 56rem) {
   .enterprise-page__columns,
-  .enterprise-master-detail { grid-template-columns: 1fr; }
-  .enterprise-form-grid { grid-template-columns: 1fr; }
-  .enterprise-field--wide { grid-column: auto; }
-  .enterprise-run-list { max-block-size: none; border-right: 0; border-bottom: 1px solid var(--border-subtle); padding: 0 0 var(--space-4); }
+  .enterprise-master-detail {
+    grid-template-columns: 1fr;
+  }
+  .enterprise-form-grid {
+    grid-template-columns: 1fr;
+  }
+  .enterprise-field--wide {
+    grid-column: auto;
+  }
+  .enterprise-pending-events > li:not(.enterprise-list__empty) {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+  .enterprise-pending-events > li > button {
+    grid-column: 2;
+    justify-self: start;
+  }
+  .enterprise-run-list {
+    max-block-size: none;
+    border-right: 0;
+    border-bottom: 1px solid var(--border-subtle);
+    padding: 0 0 var(--space-4);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .enterprise-metric { transition: none; }
+  .enterprise-metric {
+    transition: none;
+  }
 }

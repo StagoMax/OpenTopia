@@ -128,8 +128,13 @@ export function WorkflowDeploymentDetails({
             </span>
             <span>
               <ShieldCheck aria-hidden="true" size={16} />
-              <strong>Frozen Authority</strong>
-              <small>冻结权限</small>
+              <strong>
+                {deployment.snapshot.outputReviewPolicy ===
+                "always_review_output"
+                  ? "Always review output"
+                  : "Explicit approvals only"}
+              </strong>
+              <small>最终输出复核策略</small>
             </span>
           </div>
         </Panel>

@@ -17,6 +17,7 @@ function snapshot(): EnterpriseSnapshot {
     deployments: [],
     runs: [],
     tasks: [],
+    invocations: [],
     connections: [],
     error: null,
     refreshedAt: "2026-08-21T00:00:00.000Z",
@@ -55,16 +56,19 @@ test("trust signals fail closed for degraded connections", () => {
   assert.equal(trustSignals(value)[0]?.level, "warning");
 });
 
-test("guided workflow pins the selected Agent template without exposing JSON", () => {
-  const template = {
+test("guided workflow pins an ordered Agent template sequence without exposing JSON", () => {
+  const reviewer = {
     template: { templateId: "reviewer", version: 3, name: "Reviewer" },
+  } as unknown as EnterpriseSnapshot["templates"][number];
+  const writer = {
+    template: { templateId: "writer", version: 2, name: "Writer" },
   } as unknown as EnterpriseSnapshot["templates"][number];
   const spec = guidedWorkflowSpec({
     flowId: "review-flow",
     name: "Review flow",
     owner: "ops",
     outcome: "Review incoming records",
-    template,
+    templates: [reviewer, writer],
     requireApproval: true,
   });
   assert.deepEqual(spec.graph.nodes[0]?.config, {
@@ -73,6 +77,14 @@ test("guided workflow pins the selected Agent template without exposing JSON", (
   });
   assert.deepEqual(
     spec.graph.nodes.map((node) => node.kind),
-    ["agent", "approval", "output"],
+    ["agent", "agent", "approval", "output"],
+  );
+  assert.deepEqual(
+    spec.graph.edges.map((edge) => [edge.from, edge.to]),
+    [
+      ["agent-1", "agent-2"],
+      ["agent-2", "review"],
+      ["review", "output"],
+    ],
   );
 });

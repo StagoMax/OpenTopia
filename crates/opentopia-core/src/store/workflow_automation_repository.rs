@@ -182,6 +182,20 @@ impl SqliteSessionStore {
             .optional()?)
     }
 
+    pub fn get_workflow_trigger_invocation_by_id(
+        &self,
+        invocation_id: Uuid,
+    ) -> anyhow::Result<Option<WorkflowTriggerInvocationV1>> {
+        let conn = self.read_connection();
+        Ok(conn
+            .query_row(
+                "SELECT document_json FROM workflow_trigger_invocations WHERE id = ?1",
+                params![invocation_id.to_string()],
+                deserialize_json_column::<WorkflowTriggerInvocationV1>,
+            )
+            .optional()?)
+    }
+
     pub fn list_workflow_trigger_invocations(
         &self,
         release_id: Option<Uuid>,

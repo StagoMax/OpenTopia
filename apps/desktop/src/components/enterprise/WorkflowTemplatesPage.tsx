@@ -1,22 +1,28 @@
 import {
   CheckCircle2,
   FileJson2,
+  FlaskConical,
   Play,
   Plus,
+  RefreshCw,
   Send,
   ShieldCheck,
   Workflow,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import type { ApiClient } from "../../api/client";
-import type { FlowDraftView } from "../../types";
-import { Badge, Button, Panel, SelectField, Switch, TextField } from "../ui";
+import type { AgentTemplateVersionView, FlowDraftView } from "../../types";
+import { Badge, Button, Panel, Switch, TextField } from "../ui";
 import { guidedWorkflowSpec } from "./model";
 import {
   useEnterpriseSubpageHeader,
   type EnterprisePageHeaderChange,
 } from "./pageHeader";
 import { useEnterpriseStore } from "./store";
+import {
+  WorkflowAgentSequenceEditor,
+  type WorkflowAgentSelection,
+} from "./WorkflowAgentSequenceEditor";
 
 export function WorkflowTemplatesPage({
   client,
@@ -37,7 +43,9 @@ export function WorkflowTemplatesPage({
   const [name, setName] = useState("Guided workflow");
   const [owner, setOwner] = useState("local_operator");
   const [outcome, setOutcome] = useState("");
-  const [templateKey, setTemplateKey] = useState("");
+  const [agentSelections, setAgentSelections] = useState<
+    WorkflowAgentSelection[]
+  >([]);
   const [requireApproval, setRequireApproval] = useState(true);
   const [draft, setDraft] = useState<FlowDraftView | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -52,19 +60,66 @@ export function WorkflowTemplatesPage({
   });
 
   useEffect(() => {
-    if (publishedTemplates.some((item) => keyOf(item) === templateKey)) return;
-    setTemplateKey(publishedTemplates[0] ? keyOf(publishedTemplates[0]) : "");
-  }, [publishedTemplates, templateKey]);
+    const available = new Set(publishedTemplates.map(keyOf));
+    setAgentSelections((current) => {
+      const valid = current.filter((item) => available.has(item.templateKey));
+      if (valid.length > 0) return valid;
+      const first = publishedTemplates[0];
+      return first
+        ? [{ id: crypto.randomUUID(), templateKey: keyOf(first) }]
+        : [];
+    });
+  }, [publishedTemplates]);
 
-  const selectedTemplate =
-    publishedTemplates.find((item) => keyOf(item) === templateKey) ?? null;
-  const passedTrial = Boolean(
+  const selectedTemplates = agentSelections
+    .map((selection) =>
+      publishedTemplates.find((item) => keyOf(item) === selection.templateKey),
+    )
+    .filter((item): item is AgentTemplateVersionView => Boolean(item));
+  const passedDryRun = Boolean(
     draft?.trials.some(
       (trial) =>
         trial.draftRevision === draft.draft.revision &&
         trial.status === "passed",
     ),
   );
+  const successfulTestRun = Boolean(
+    draft?.testRuns.some(
+      (run) =>
+        run.testDraftRevision === draft.draft.revision &&
+        run.definitionContentHash === draft.draft.contentHash &&
+        run.status === "succeeded",
+    ),
+  );
+  const activeTestRun = draft?.testRuns.find(
+    (run) =>
+      run.testDraftRevision === draft.draft.revision && !isTerminal(run.status),
+  );
+
+  useEffect(() => {
+    if (!activeTestRun) return;
+    const timer = window.setInterval(() => {
+      void client
+        .getFlowRun(activeTestRun.id)
+        .then((run) => {
+          setDraft((current) =>
+            current
+              ? {
+                  ...current,
+                  testRuns: [
+                    run,
+                    ...current.testRuns.filter((item) => item.id !== run.id),
+                  ],
+                }
+              : current,
+          );
+        })
+        .catch((pollError: unknown) => {
+          setError(readableError(pollError));
+        });
+    }, 1_000);
+    return () => window.clearInterval(timer);
+  }, [activeTestRun, client]);
 
   if (!creating) {
     return (
@@ -130,7 +185,13 @@ export function WorkflowTemplatesPage({
   }
 
   function createDraft() {
-    if (!threadId || !selectedTemplate || !outcome.trim()) return;
+    if (
+      !threadId ||
+      selectedTemplates.length === 0 ||
+      selectedTemplates.length !== agentSelections.length ||
+      !outcome.trim()
+    )
+      return;
     void execute("create", async () => {
       const created = await client.createFlowDraft(
         threadId,
@@ -139,7 +200,7 @@ export function WorkflowTemplatesPage({
           name: name.trim(),
           owner: owner.trim(),
           outcome: outcome.trim(),
-          template: selectedTemplate,
+          templates: selectedTemplates,
           requireApproval,
         }),
       );
@@ -152,8 +213,8 @@ export function WorkflowTemplatesPage({
     <div className="enterprise-page enterprise-workflow-templates">
       <Panel title="Guided workflow builder / 引导式工作流创建">
         <p className="enterprise-page__lede">
-          用业务结果、Agent 模板和人工审查策略创建标准 Agent → Review → Output
-          流程；常规路径不需要编辑 JSON。
+          按顺序组合多个 Agent Template，并通过 Dry Run 与真实 Test Run
+          后发布为不可变工作流版本。
         </p>
         {!threadId ? (
           <p className="enterprise-page__message is-warning" role="status">
@@ -185,28 +246,16 @@ export function WorkflowTemplatesPage({
               value={outcome}
             />
           </label>
-          <SelectField
-            fieldClassName="enterprise-field--wide"
+          <WorkflowAgentSequenceEditor
             disabled={publishedTemplates.length === 0}
-            label="执行 Agent 模板"
-            onChange={setTemplateKey}
-            options={publishedTemplates.map((item) => ({
-              value: keyOf(item),
-              label: `${item.template.name} · ${item.template.templateId}@${item.template.version}`,
-            }))}
-            value={templateKey}
-            hint={
-              publishedTemplates.length === 0
-                ? "请先在 Agents 发布一个模板版本。"
-                : undefined
-            }
+            onChange={setAgentSelections}
+            selections={agentSelections}
+            templates={publishedTemplates}
           />
           <label className="enterprise-switch enterprise-field--wide">
             <span>
               <strong>执行后人工审查</strong>
-              <small>
-                在 Agent 输出与 Inbox Output 之间增加 Approval 节点。
-              </small>
+              <small>在最后一个 Agent 与 Output 之间增加 Approval 节点。</small>
             </span>
             <Switch checked={requireApproval} onChange={setRequireApproval} />
           </label>
@@ -214,7 +263,11 @@ export function WorkflowTemplatesPage({
         <div className="enterprise-actions">
           <Button
             disabled={
-              !threadId || !selectedTemplate || !outcome.trim() || Boolean(busy)
+              !threadId ||
+              selectedTemplates.length === 0 ||
+              selectedTemplates.length !== agentSelections.length ||
+              !outcome.trim() ||
+              Boolean(busy)
             }
             onClick={createDraft}
             variant="primary"
@@ -227,7 +280,7 @@ export function WorkflowTemplatesPage({
             onClick={() =>
               void execute("validate", async () => {
                 setDraft(await client.validateFlowDraft(draft!.draft.id));
-                setNotice("静态验证完成。 ");
+                setNotice("静态验证完成，可以进行执行计划 Dry Run。 ");
               })
             }
           >
@@ -243,16 +296,60 @@ export function WorkflowTemplatesPage({
                     (item) => item.draft.id === draft!.draft.id,
                   ) ?? draft,
                 );
-                setNotice("确定性 Trial 已通过。 ");
+                setNotice("Dry Run 已通过；下一步执行真实 Test Run。 ");
               })
             }
           >
-            <Play aria-hidden="true" size={14} /> Trial
+            <Play aria-hidden="true" size={14} /> Dry Run
           </Button>
           <Button
             disabled={
               !draft?.draft.lastValidation?.valid ||
-              !passedTrial ||
+              !passedDryRun ||
+              Boolean(busy) ||
+              Boolean(activeTestRun)
+            }
+            onClick={() =>
+              void execute("test-run", async () => {
+                const run = await client.startFlowTestRun(
+                  draft!.draft.id,
+                  {},
+                  owner.trim(),
+                );
+                setDraft((current) =>
+                  current
+                    ? { ...current, testRuns: [run, ...current.testRuns] }
+                    : current,
+                );
+                setNotice(
+                  "真实 Test Run 已启动；Agent、工具和 Connection 会按冻结权限执行。 ",
+                );
+              })
+            }
+          >
+            <FlaskConical aria-hidden="true" size={14} />
+            {activeTestRun ? "测试运行中…" : "Test Run"}
+          </Button>
+          <Button
+            disabled={!draft || Boolean(busy)}
+            onClick={() =>
+              void execute("refresh-test", async () => {
+                setDraft(
+                  (await client.listFlowDrafts(threadId!)).find(
+                    (item) => item.draft.id === draft!.draft.id,
+                  ) ?? draft,
+                );
+              })
+            }
+            variant="quiet"
+          >
+            <RefreshCw aria-hidden="true" size={14} /> 刷新测试状态
+          </Button>
+          <Button
+            disabled={
+              !draft?.draft.lastValidation?.valid ||
+              !passedDryRun ||
+              !successfulTestRun ||
               Boolean(busy)
             }
             onClick={() =>
@@ -271,7 +368,11 @@ export function WorkflowTemplatesPage({
           </Button>
         </div>
         {draft ? (
-          <WorkflowProgress draft={draft} passedTrial={passedTrial} />
+          <WorkflowProgress
+            draft={draft}
+            passedDryRun={passedDryRun}
+            successfulTestRun={successfulTestRun}
+          />
         ) : null}
         {error ? (
           <p className="enterprise-page__message is-error" role="alert">
@@ -299,15 +400,18 @@ export function WorkflowTemplatesPage({
 
 function WorkflowProgress({
   draft,
-  passedTrial,
+  passedDryRun,
+  successfulTestRun,
 }: {
   draft: FlowDraftView;
-  passedTrial: boolean;
+  passedDryRun: boolean;
+  successfulTestRun: boolean;
 }) {
   const steps = [
     ["Draft", true],
     ["Validated", Boolean(draft.draft.lastValidation?.valid)],
-    ["Trial", passedTrial],
+    ["Dry Run", passedDryRun],
+    ["Test Run", successfulTestRun],
     ["Published", draft.draft.status === "published"],
   ] as const;
   return (
@@ -330,4 +434,8 @@ function keyOf(item: {
 
 function readableError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isTerminal(status: string): boolean {
+  return ["succeeded", "failed", "cancelled"].includes(status);
 }

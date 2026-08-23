@@ -59,6 +59,14 @@ fn workflow_deployment_store_is_queryable_and_cas_protected() {
         .expect("validate Flow draft");
     let trial = simulate_flow(&draft, json!({}), &capabilities);
     store.insert_flow_trial(&trial).expect("persist Flow trial");
+    let candidate = crate::definition_from_draft(&draft, draft.revision, "test-runner");
+    let mut test_run = crate::FlowRunV1::new(thread.id, &candidate, json!({}), &capabilities)
+        .expect("create Test Run");
+    test_run.test_draft_id = Some(draft.id);
+    test_run.test_draft_revision = Some(draft.revision);
+    test_run.status = crate::FlowRunStatusV1::Succeeded;
+    test_run.completed_at = Some(chrono::Utc::now());
+    store.insert_flow_run(&test_run).expect("persist Test Run");
     let definition = store
         .publish_flow_draft(draft.id, "publisher")
         .expect("publish Flow definition");
@@ -112,6 +120,13 @@ fn workflow_deployment_store_is_queryable_and_cas_protected() {
     store
         .insert_workflow_trigger_invocation(&invocation)
         .expect("insert invocation");
+    assert_eq!(invocation.input, json!({"orderId": 42}));
+    assert_eq!(
+        store
+            .get_workflow_trigger_invocation_by_id(invocation.id)
+            .expect("load invocation by id"),
+        Some(invocation.clone())
+    );
     let run = crate::FlowRunV1::new_from_deployment(thread.id, &inserted, json!({}))
         .expect("deployed run");
     store.insert_flow_run(&run).expect("insert deployed run");

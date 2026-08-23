@@ -223,6 +223,12 @@ fn prepare_sandbox_home(home: &Path) -> Result<(), ExecutionFailure> {
         home.join("AppData").join("Roaming"),
         home.join("AppData").join("Local"),
         home.join(".config"),
+        home.join(".config").join("npm"),
+        home.join(".config").join("pnpm"),
+        home.join(".cache"),
+        home.join(".cache").join("npm"),
+        home.join(".local").join("share").join("pnpm"),
+        home.join(".local").join("state").join("pnpm"),
         home.join("tmp"),
     ] {
         std::fs::create_dir_all(&path).map_err(|error| {
@@ -395,9 +401,31 @@ pub(crate) fn configure_command_environment(
         if let Some(home) = runtime.sandbox_home.as_deref() {
             let roaming = home.join("AppData").join("Roaming");
             let local = home.join("AppData").join("Local");
+            let config_home = home.join(".config");
+            let cache = home.join(".cache");
+            let data = home.join(".local").join("share");
+            let state = home.join(".local").join("state");
             let temp = home.join("tmp");
             command.env("HOME", home);
-            command.env("XDG_CONFIG_HOME", home.join(".config"));
+            command.env("XDG_CONFIG_HOME", &config_home);
+            command.env("XDG_CACHE_HOME", &cache);
+            command.env("XDG_DATA_HOME", &data);
+            command.env("XDG_STATE_HOME", &state);
+            // Package managers must never discover configuration through the
+            // interactive user's profile. Besides preventing credential and
+            // policy leakage, explicit sandbox-owned paths avoid noisy EPERM
+            // warnings when the dedicated account probes an unreadable host
+            // pnpm configuration.
+            command.env(
+                "NPM_CONFIG_USERCONFIG",
+                config_home.join("npm").join("npmrc"),
+            );
+            command.env(
+                "NPM_CONFIG_GLOBALCONFIG",
+                config_home.join("npm").join("global-npmrc"),
+            );
+            command.env("NPM_CONFIG_CACHE", cache.join("npm"));
+            command.env("PNPM_HOME", data.join("pnpm"));
             if !cfg!(windows)
                 || config.effective_windows_backend()
                     == crate::sandbox::WindowsSandboxBackend::DedicatedUser

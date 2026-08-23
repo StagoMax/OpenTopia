@@ -2,8 +2,8 @@ use super::{ApiError, AppState};
 use crate::auth::constant_time_eq;
 use crate::flows_api::{ensure_enterprise, ensure_flow_thread, flow_error};
 use crate::workflow_automation_service::{
-    evaluation_summary, start_release_invocation, workflow_automation_error,
-    WorkflowEvaluationSummary, WorkflowInvocationResult,
+    evaluation_summary, start_pending_release_invocation, start_release_invocation,
+    workflow_automation_error, WorkflowEvaluationSummary, WorkflowInvocationResult,
 };
 use crate::workflow_delivery::deliver_run_output;
 use axum::extract::{Path, Query, State};
@@ -13,8 +13,8 @@ use axum::{Json, Router};
 use chrono::{Duration, Utc};
 use opentopia_core::{
     SessionStore, WorkflowDeliveryReceiptV1, WorkflowDeliveryStatusV1, WorkflowDeploymentStatusV1,
-    WorkflowEvaluationV1, WorkflowReleaseStatusV1, WorkflowReleaseV1, WorkflowTriggerInvocationV1,
-    WorkflowTriggerSpecV1,
+    WorkflowEvaluationV1, WorkflowIngressPolicyV1, WorkflowReleaseStatusV1, WorkflowReleaseV1,
+    WorkflowTriggerInvocationV1, WorkflowTriggerSpecV1,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -55,6 +55,10 @@ pub(crate) fn router() -> Router<AppState> {
         .route(
             "/api/workflow-trigger-invocations",
             get(list_workflow_trigger_invocations),
+        )
+        .route(
+            "/api/workflow-trigger-invocations/:invocation_id/start",
+            post(start_pending_workflow_invocation),
         )
         .route(
             "/api/workflow-delivery-receipts",
@@ -110,12 +114,13 @@ async fn create_workflow_release(
         .get_workflow_deployment(request.deployment_id)
         .map_err(flow_error)?
         .ok_or_else(|| ApiError::not_found("Workflow deployment not found"))?;
-    let release = WorkflowReleaseV1::new(
+    let release = WorkflowReleaseV1::new_with_ingress_policy(
         request.release_key,
         request.environment,
         request.thread_id,
         &deployment,
         request.trigger,
+        request.ingress_policy,
         request.created_by,
     )
     .map_err(|error| ApiError::bad_request(error.to_string()))?;
@@ -337,6 +342,16 @@ async fn list_workflow_trigger_invocations(
     ))
 }
 
+async fn start_pending_workflow_invocation(
+    State(state): State<AppState>,
+    Path(invocation_id): Path<Uuid>,
+) -> Result<Json<WorkflowInvocationResult>, ApiError> {
+    ensure_enterprise(&state)?;
+    Ok(Json(
+        start_pending_release_invocation(&state, invocation_id).await?,
+    ))
+}
+
 async fn list_workflow_delivery_receipts(
     State(state): State<AppState>,
     Query(query): Query<ListWorkflowDeliveryReceiptsQuery>,
@@ -520,6 +535,8 @@ struct CreateWorkflowReleaseRequest {
     thread_id: Uuid,
     deployment_id: Uuid,
     trigger: WorkflowTriggerSpecV1,
+    #[serde(default)]
+    ingress_policy: WorkflowIngressPolicyV1,
     created_by: String,
 }
 

@@ -5,6 +5,7 @@ import type {
   FlowRun,
   WorkflowDeployment,
   WorkflowOutput,
+  WorkflowOutputReviewPolicy,
 } from "../../types";
 import { sortFlowDefinitions, sortWorkflowDeployments } from "./model";
 
@@ -112,6 +113,7 @@ export class WorkflowDeploymentsStore {
     environment: string;
     createdBy: string;
     output?: WorkflowOutput;
+    outputReviewPolicy?: WorkflowOutputReviewPolicy;
   }): Promise<boolean> {
     this.update({ busyAction: "create", error: null, notice: null });
     try {

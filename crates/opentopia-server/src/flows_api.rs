@@ -6,14 +6,15 @@ use crate::connection_operation_runtime::{
     connection_authority_for_context, ConnectionOperationUnavailable,
 };
 use crate::thread_runtime::sync_runtime_connection_tools;
+use crate::workflow_compiler::compile_published_workflow;
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use opentopia_core::{
-    agent_model_context_with_runtime, experience_mode_module, prepare_flow_resume,
-    resolve_flow_approval, simulate_flow, spawn_flow_run, validate_flow_spec, AgentRunConfig,
-    AgentRunIdentity, CapabilityProjection, ExecutionAuthority, ExperienceMode,
+    agent_model_context_with_runtime, definition_from_draft, experience_mode_module,
+    prepare_flow_resume, resolve_flow_approval, simulate_flow, spawn_flow_run, validate_flow_spec,
+    AgentRunConfig, AgentRunIdentity, CapabilityProjection, ExecutionAuthority, ExperienceMode,
     ExperienceSurfaceProfile, FlowDefinitionV1, FlowDraftStatusV1, FlowDraftV1, FlowRunStatusV1,
     FlowRunV1, FlowSourceV1, FlowSpecV1, FlowStoreError, FlowTrialV1, HumanTaskActionV1,
     HumanTaskStoreError, RuntimeConnectionAuthorityV1, RuntimeSurface, SessionStore,
@@ -48,6 +49,10 @@ pub(crate) fn router() -> Router<AppState> {
         .route(
             "/api/flow-drafts/:draft_id/simulate",
             post(simulate_flow_draft),
+        )
+        .route(
+            "/api/flow-drafts/:draft_id/test-run",
+            post(start_flow_test_run),
         )
         .route(
             "/api/flow-drafts/:draft_id/publish",
@@ -245,6 +250,47 @@ async fn simulate_flow_draft(
     Ok(Json(
         state.store.insert_flow_trial(&trial).map_err(flow_error)?,
     ))
+}
+
+async fn start_flow_test_run(
+    State(state): State<AppState>,
+    Path(draft_id): Path<Uuid>,
+    Json(request): Json<StartFlowTestRunRequest>,
+) -> Result<Json<FlowRunV1>, ApiError> {
+    ensure_enterprise(&state)?;
+    let draft = state
+        .store
+        .get_flow_draft(draft_id)
+        .map_err(flow_error)?
+        .ok_or_else(|| ApiError::not_found("Flow draft not found"))?;
+    let thread = ensure_flow_thread(&state, draft.thread_id)?;
+    if !draft
+        .last_validation
+        .as_ref()
+        .is_some_and(|report| report.valid)
+    {
+        return Err(ApiError::conflict(
+            "Flow draft must pass validation before a Test Run",
+        ));
+    }
+    if request.started_by.trim().is_empty() {
+        return Err(ApiError::bad_request("startedBy is required"));
+    }
+    let candidate = definition_from_draft(&draft, draft.revision, request.started_by.trim());
+    let compiled = compile_published_workflow(&state.store, &candidate)
+        .map_err(|error| ApiError::conflict(error.to_string()))?;
+    let run = FlowRunV1::new_for_test_run(
+        draft.thread_id,
+        draft.id,
+        draft.revision,
+        compiled,
+        request.input,
+    )
+    .map_err(ApiError::from)?;
+    let context = flow_runtime_context(&state, &thread, &run).await?;
+    let run = state.store.insert_flow_run(&run).map_err(flow_error)?;
+    spawn_flow_run(run.id, context).map_err(ApiError::from)?;
+    Ok(Json(run))
 }
 
 async fn publish_flow_draft(
@@ -604,7 +650,18 @@ fn validate_workflow_agent_model_policies(
 
 fn draft_view(state: &AppState, draft: FlowDraftV1) -> Result<FlowDraftView, ApiError> {
     let trials = state.store.list_flow_trials(draft.id).map_err(flow_error)?;
-    Ok(FlowDraftView { draft, trials })
+    let test_runs = state
+        .store
+        .list_flow_runs(draft.thread_id)
+        .map_err(flow_error)?
+        .into_iter()
+        .filter(|run| run.test_draft_id == Some(draft.id))
+        .collect();
+    Ok(FlowDraftView {
+        draft,
+        trials,
+        test_runs,
+    })
 }
 
 pub(crate) fn ensure_enterprise(state: &AppState) -> Result<(), ApiError> {
@@ -670,6 +727,7 @@ pub(crate) fn flow_error(error: anyhow::Error) -> ApiError {
             | FlowStoreError::RunRevisionConflict(_)
             | FlowStoreError::ValidationRequired
             | FlowStoreError::PassedTrialRequired
+            | FlowStoreError::SuccessfulTestRunRequired
             | FlowStoreError::IndependentApproverRequired => ApiError::conflict(error.to_string()),
         };
     }
@@ -710,6 +768,14 @@ struct SimulateFlowDraftRequest {
     input: Value,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StartFlowTestRunRequest {
+    #[serde(default)]
+    input: Value,
+    started_by: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PublishFlowDraftRequest {
@@ -742,6 +808,7 @@ struct ResumeFlowRunRequest {
 pub(super) struct FlowDraftView {
     draft: FlowDraftV1,
     trials: Vec<FlowTrialV1>,
+    test_runs: Vec<FlowRunV1>,
 }
 
 #[cfg(test)]

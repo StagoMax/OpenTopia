@@ -2,6 +2,7 @@ import type { ExperienceMode } from "./base";
 import type {
   WorkflowDeliveryReceipt,
   WorkflowOutput,
+  WorkflowOutputReviewPolicy,
   WorkflowTrigger,
 } from "./workflowAutomation";
 import type {
@@ -264,6 +265,7 @@ export type FlowTrial = {
 export type FlowDraftView = {
   draft: FlowDraft;
   trials: FlowTrial[];
+  testRuns: FlowRun[];
 };
 
 export type FlowDefinition = {
@@ -328,6 +330,7 @@ export type DeploymentSnapshot = {
   compiledWorkflow: CompiledWorkflow;
   trigger: WorkflowTrigger;
   output: WorkflowOutput;
+  outputReviewPolicy: WorkflowOutputReviewPolicy;
   contentHash: string;
   createdAt: string;
   createdBy: string;
@@ -443,6 +446,8 @@ export type FlowRun = {
   definitionContentHash: string;
   deploymentId?: string | null;
   deploymentSnapshot?: DeploymentSnapshot | null;
+  testDraftId?: string | null;
+  testDraftRevision?: number | null;
   revision: number;
   status: FlowRunStatus;
   input: unknown;

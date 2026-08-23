@@ -116,8 +116,12 @@ pub enum FlowStoreError {
     RevisionConflict(u32),
     #[error("Flow draft cannot be published until validation passes")]
     ValidationRequired,
-    #[error("Flow draft cannot be published without a passed simulation for its current revision")]
+    #[error("Flow draft cannot be published without a passed Dry Run for its current revision")]
     PassedTrialRequired,
+    #[error(
+        "Flow draft cannot be published without a successful Test Run for its current revision"
+    )]
+    SuccessfulTestRunRequired,
     #[error("high-risk Flow publication requires an independent approver")]
     IndependentApproverRequired,
     #[error("Flow run not found: {0}")]
@@ -504,6 +508,24 @@ impl SessionStore for SqliteSessionStore {
         )?;
         if passed_trials == 0 {
             return Err(FlowStoreError::PassedTrialRequired.into());
+        }
+        let successful_test_runs: i64 = tx.query_row(
+            r#"
+            SELECT COUNT(*) FROM flow_runs
+            WHERE status = 'succeeded'
+              AND json_extract(document_json, '$.testDraftId') = ?1
+              AND json_extract(document_json, '$.testDraftRevision') = ?2
+              AND json_extract(document_json, '$.definitionContentHash') = ?3
+            "#,
+            params![
+                draft_id.to_string(),
+                i64::from(draft.revision),
+                &draft.content_hash,
+            ],
+            |row| row.get(0),
+        )?;
+        if successful_test_runs == 0 {
+            return Err(FlowStoreError::SuccessfulTestRunRequired.into());
         }
         if matches!(
             draft.spec.risk_class,

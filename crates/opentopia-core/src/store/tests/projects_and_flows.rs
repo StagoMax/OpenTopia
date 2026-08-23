@@ -570,6 +570,26 @@ fn flow_drafts_require_current_validation_and_trial_before_immutable_publish() {
         .expect("persist validation");
     let trial = simulate_flow(&draft, serde_json::json!({}), &capabilities);
     store.insert_flow_trial(&trial).expect("persist trial");
+    assert!(matches!(
+        store
+            .publish_flow_draft(draft.id, "reviewer")
+            .unwrap_err()
+            .downcast_ref::<FlowStoreError>(),
+        Some(FlowStoreError::SuccessfulTestRunRequired)
+    ));
+    let candidate = crate::definition_from_draft(&draft, draft.revision, "test-runner");
+    let mut test_run = crate::FlowRunV1::new(
+        thread.id,
+        &candidate,
+        serde_json::json!({}),
+        &capabilities,
+    )
+    .expect("create Test Run");
+    test_run.test_draft_id = Some(draft.id);
+    test_run.test_draft_revision = Some(draft.revision);
+    test_run.status = crate::FlowRunStatusV1::Succeeded;
+    test_run.completed_at = Some(Utc::now());
+    store.insert_flow_run(&test_run).expect("persist Test Run");
 
     let definition = store
         .publish_flow_draft(draft.id, "reviewer")

@@ -6,8 +6,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use opentopia_core::{
     spawn_flow_run, FlowRunV1, SessionStore, WorkflowCompileError, WorkflowDeploymentStatusV1,
-    WorkflowDeploymentStoreError, WorkflowDeploymentV1, WorkflowOutputSpecV1,
-    WorkflowTriggerSpecV1,
+    WorkflowDeploymentStoreError, WorkflowDeploymentV1, WorkflowOutputReviewPolicyV1,
+    WorkflowOutputSpecV1, WorkflowTriggerSpecV1,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -78,12 +78,15 @@ async fn create_workflow_deployment(
     output
         .validate()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let deployment = WorkflowDeploymentV1::new_with_io(
+    let deployment = WorkflowDeploymentV1::new_with_options(
         request.name,
         request.environment,
         compiled,
         trigger,
         output,
+        request
+            .output_review_policy
+            .unwrap_or(WorkflowOutputReviewPolicyV1::ExplicitNodesOnly),
         request.created_by,
     )
     .map_err(workflow_compile_error)?;
@@ -188,6 +191,8 @@ struct CreateWorkflowDeploymentRequest {
     trigger: Option<WorkflowTriggerSpecV1>,
     #[serde(default)]
     output: Option<WorkflowOutputSpecV1>,
+    #[serde(default)]
+    output_review_policy: Option<WorkflowOutputReviewPolicyV1>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

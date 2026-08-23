@@ -4,6 +4,7 @@ import type {
   WorkflowDeliveryReceipt,
   WorkflowDeployment,
   WorkflowEvaluationSummary,
+  WorkflowIngressPolicy,
   WorkflowRelease,
   WorkflowTrigger,
   WorkflowTriggerInvocation,
@@ -114,6 +115,7 @@ export class WorkflowAutomationStore {
     threadId: string;
     deploymentId: string;
     trigger: WorkflowTrigger;
+    ingressPolicy: WorkflowIngressPolicy;
     createdBy: string;
   }): Promise<boolean> {
     return this.perform("create", async () => {
@@ -196,6 +198,26 @@ export class WorkflowAutomationStore {
           updated.status === "delivered"
             ? "输出已重新投递"
             : "重试完成，请检查最新 DeliveryReceipt",
+      });
+      await this.loadSummary();
+    });
+  }
+
+  async startPending(invocation: WorkflowTriggerInvocation): Promise<boolean> {
+    return this.perform(`start:${invocation.id}`, async () => {
+      const result = await this.client.startPendingWorkflowInvocation(
+        invocation.id,
+      );
+      this.update({
+        invocations: sortUpdated([
+          result.invocation,
+          ...this.snapshot.invocations.filter(
+            (item) => item.id !== result.invocation.id,
+          ),
+        ]),
+        notice: result.run
+          ? `事件已批准并启动 Flow Run：${result.run.id}`
+          : "事件仍在等待处理",
       });
       await this.loadSummary();
     });

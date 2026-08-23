@@ -1,10 +1,7 @@
 import { Boxes, LoaderCircle } from "lucide-react";
 import { useMemo, useState, type FormEvent } from "react";
 import { Button, Panel, SelectField, TextField } from "../ui";
-import type {
-  WorkflowOutput,
-  WorkflowOutputReviewPolicy,
-} from "../../types";
+import type { WorkflowOutput, WorkflowOutputReviewPolicy } from "../../types";
 import type {
   WorkflowDeploymentsSnapshot,
   WorkflowDeploymentsStore,

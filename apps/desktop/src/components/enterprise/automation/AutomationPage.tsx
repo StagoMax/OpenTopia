@@ -13,7 +13,11 @@ import {
 } from "lucide-react";
 import { useMemo, useState, type FormEvent } from "react";
 import type { ApiClient } from "../../../api/client";
-import type { WorkflowRelease, WorkflowTrigger } from "../../../types";
+import type {
+  WorkflowIngressPolicy,
+  WorkflowRelease,
+  WorkflowTrigger,
+} from "../../../types";
 import {
   Badge,
   Button,
@@ -145,8 +149,12 @@ export function AutomationPage({
           />
           <Metric
             icon={Send}
-            label="Invocations"
-            value={snapshot.invocations.length}
+            label="Pending events"
+            value={
+              snapshot.invocations.filter(
+                (item) => item.status === "accepted" && !item.flowRunId,
+              ).length
+            }
           />
           <Metric
             icon={CheckCircle2}
@@ -256,6 +264,7 @@ function CreateReleaseForm({
     threadId: string;
     deploymentId: string;
     trigger: WorkflowTrigger;
+    ingressPolicy: WorkflowIngressPolicy;
     createdBy: string;
   }): Promise<boolean>;
   threadId: string | null;
@@ -273,6 +282,8 @@ function CreateReleaseForm({
   );
   const [eventSource, setEventSource] = useState("crm");
   const [eventType, setEventType] = useState("record.updated");
+  const [ingressPolicy, setIngressPolicy] =
+    useState<WorkflowIngressPolicy>("require_review");
   const [createdBy, setCreatedBy] = useState("local-user");
 
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -301,6 +312,7 @@ function CreateReleaseForm({
       threadId,
       deploymentId: deployment.id,
       trigger,
+      ingressPolicy,
       createdBy: createdBy.trim(),
     });
   }
@@ -339,6 +351,21 @@ function CreateReleaseForm({
               },
             ]}
             value={kind}
+          />
+          <SelectField
+            hint="人工确认会先进入 Inbox；自动执行会在事件通过认证和幂等检查后立即创建 Run。"
+            label="Event handling / 事件接入策略"
+            onChange={(value) =>
+              setIngressPolicy(value as WorkflowIngressPolicy)
+            }
+            options={[
+              {
+                value: "require_review",
+                label: "人工确认后执行（推荐）",
+              },
+              { value: "immediate", label: "通过检查后自动执行" },
+            ]}
+            value={ingressPolicy}
           />
           {kind === "webhook" ? (
             <TextField
@@ -444,6 +471,14 @@ function ReleaseDetails({
             <dt>Primary Deployment</dt>
             <dd>
               <code>{shortId(release.primaryDeploymentId)}</code>
+            </dd>
+          </div>
+          <div>
+            <dt>Event handling / 事件策略</dt>
+            <dd>
+              {release.ingressPolicy === "require_review"
+                ? "人工确认后执行"
+                : "自动执行"}
             </dd>
           </div>
           <div>

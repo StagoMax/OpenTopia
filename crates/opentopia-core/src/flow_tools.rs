@@ -277,7 +277,7 @@ impl Tool for FlowTool {
             FlowToolAction::Inspect => "Inspect a FlowDraft with its validation and simulation history, or inspect an immutable published Flow version.",
             FlowToolAction::Validate => "Statically validate graph topology, schemas, references, capability boundaries, risk gates, budgets, and bounded termination without calling another model.",
             FlowToolAction::Simulate => "Compile and dry-run a valid FlowDraft against the existing Agent Harness, showing which AgentCore, AgentRunScheduler, SkillRuntime, ToolRegistry, and runtime-control primitives each node will use. No business side effects are executed.",
-            FlowToolAction::Publish => "Publish an immutable Flow version after current-revision validation and simulation pass. High-risk Flows require an independent approver.",
+            FlowToolAction::Publish => "Publish an immutable Flow version after current-revision validation and a successful real Test Run. High-risk Flows require an independent approver.",
             FlowToolAction::Run => "Start an immutable published Flow in the durable Flow Runtime. The runtime schedules graph dependencies and control nodes, while Agent, Skill, and Tool nodes execute through the currently restricted Agent Harness.",
             FlowToolAction::Status => "Inspect one durable Flow run or list recent runs for the current Flow session, including node attempts, outputs, budgets, and pending control state.",
             FlowToolAction::Pause => "Request a Flow run pause. The request takes effect at the next node boundary so an in-flight side effect is not interrupted into an unknown state.",

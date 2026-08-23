@@ -950,6 +950,23 @@ OPENTOPIA_SANDBOX_ERROR {"version":1,"stage":"broker","nonce":"abc123","message"
             String::from_utf8_lossy(&managed_pnpm.stdout),
             String::from_utf8_lossy(&managed_pnpm.stderr)
         );
+        let managed_pnpm_stderr = String::from_utf8_lossy(&managed_pnpm.stderr);
+        assert!(
+            !managed_pnpm_stderr.contains("Issue while reading"),
+            "managed pnpm must not probe an inaccessible host-user configuration: {managed_pnpm_stderr}"
+        );
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            let host_config = PathBuf::from(local_app_data)
+                .join("pnpm")
+                .join("config")
+                .join("rc")
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            assert!(
+                !managed_pnpm_stderr.to_ascii_lowercase().contains(&host_config),
+                "managed pnpm leaked the interactive user's configuration path: {managed_pnpm_stderr}"
+            );
+        }
 
         // Node-based tools normally launch compilers, workers, or another Node
         // process. A top-level `node --version` cannot detect a sandbox/job

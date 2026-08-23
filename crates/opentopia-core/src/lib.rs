@@ -434,12 +434,14 @@ pub use turn_inbox::{BufferedTurnInbox, TurnInbox, TurnInboxItem};
 pub use work_form::{WorkForm, WorkFormStatus, WorkItem, WorkItemStatus, WorkScope};
 pub use workflow::{
     CompiledWorkflowV1, DeploymentSnapshotV1, WorkflowAgentSpecV1, WorkflowCompileError,
-    WorkflowDeploymentStatusV1, WorkflowDeploymentV1, WorkflowOutputSpecV1, WorkflowTriggerSpecV1,
+    WorkflowDeploymentStatusV1, WorkflowDeploymentV1, WorkflowOutputReviewPolicyV1,
+    WorkflowOutputSpecV1, WorkflowTriggerSpecV1,
 };
 pub use workflow_automation::{
     WorkflowDeliveryReceiptV1, WorkflowDeliveryStatusV1, WorkflowEvaluationV1,
-    WorkflowReleaseStatusV1, WorkflowReleaseV1, WorkflowTriggerInvocationStatusV1,
-    WorkflowTriggerInvocationV1, WORKFLOW_AUTOMATION_SCHEMA_VERSION_V1,
+    WorkflowIngressPolicyV1, WorkflowReleaseStatusV1, WorkflowReleaseV1,
+    WorkflowTriggerInvocationStatusV1, WorkflowTriggerInvocationV1,
+    WORKFLOW_AUTOMATION_SCHEMA_VERSION_V1,
 };
 pub use workflow_interrupt::{
     AgentContinuationEnvelopeV1, FlowNodeInterruptV1, FlowResumeCommandV1, FlowResumeSignalV1,
