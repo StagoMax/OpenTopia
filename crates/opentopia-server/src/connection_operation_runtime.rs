@@ -1,4 +1,3 @@
-use anyhow::Context;
 use async_trait::async_trait;
 use opentopia_core::collaboration::RuntimeConnectionAuthorityV1;
 use opentopia_core::{
@@ -8,6 +7,40 @@ use opentopia_core::{
     ConnectionStatusV1, ExecutionConnectionOperationV1, ExperienceMode, SqliteSessionStore,
 };
 use std::sync::Arc;
+
+/// A frozen Connection operation can become unavailable while its Agent or
+/// Workflow snapshot remains otherwise valid. This is a mutable business
+/// precondition (revocation, reauthentication, capability review), not an
+/// internal server failure. Keeping it typed lets API surfaces return a
+/// recoverable conflict without hiding unexpected store/runtime errors.
+#[derive(Debug)]
+pub(crate) struct ConnectionOperationUnavailable {
+    message: String,
+}
+
+impl ConnectionOperationUnavailable {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ConnectionOperationUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ConnectionOperationUnavailable {}
+
+fn require_available(condition: bool, message: impl Into<String>) -> anyhow::Result<()> {
+    if condition {
+        Ok(())
+    } else {
+        Err(ConnectionOperationUnavailable::new(message).into())
+    }
+}
 
 /// Store-backed, per-invocation guard for a frozen Connection operation.
 ///
@@ -66,26 +99,35 @@ impl ConnectionOperationInvocationGate for StoreConnectionOperationInvocationGat
         let connection = self
             .store
             .get_connection(operation.connection_id)?
-            .with_context(|| format!("Connection {} no longer exists", operation.connection_id))?;
-        anyhow::ensure!(connection.enabled, "Connection is disabled");
-        anyhow::ensure!(
+            .ok_or_else(|| {
+                ConnectionOperationUnavailable::new(format!(
+                    "Connection {} no longer exists",
+                    operation.connection_id
+                ))
+            })?;
+        require_available(connection.enabled, "Connection is disabled")?;
+        require_available(
             connection.status == ConnectionStatusV1::Ready,
-            "Connection is not ready"
-        );
-        anyhow::ensure!(
+            "Connection is not ready",
+        )?;
+        require_available(
             connection.runtime_binding.mcp_server_id() == operation.mcp_server_id,
-            "Connection runtime no longer matches the frozen operation"
-        );
+            "Connection runtime no longer matches the frozen operation",
+        )?;
 
         let definition = self
             .store
             .get_integration_definition(connection.integration_definition_id)?
-            .context("Connection Integration definition no longer exists")?;
-        anyhow::ensure!(definition.enabled, "Connection Integration is disabled");
-        anyhow::ensure!(
+            .ok_or_else(|| {
+                ConnectionOperationUnavailable::new(
+                    "Connection Integration definition no longer exists",
+                )
+            })?;
+        require_available(definition.enabled, "Connection Integration is disabled")?;
+        require_available(
             connection_auth_is_runtime_ready(&definition, &connection, chrono::Utc::now()),
-            "Connection account requires reauthentication"
-        );
+            "Connection account requires reauthentication",
+        )?;
 
         let pinned = self
             .store
@@ -93,52 +135,68 @@ impl ConnectionOperationInvocationGate for StoreConnectionOperationInvocationGat
                 operation.connection_id,
                 operation.capability_revision,
             )?
-            .context("reviewed Connection capability revision no longer exists")?;
-        let active_revision = connection
-            .active_capability_revision
-            .context("Connection has no active capability revision")?;
+            .ok_or_else(|| {
+                ConnectionOperationUnavailable::new(
+                    "reviewed Connection capability revision no longer exists",
+                )
+            })?;
+        let active_revision = connection.active_capability_revision.ok_or_else(|| {
+            ConnectionOperationUnavailable::new("Connection has no active capability revision")
+        })?;
         let active = self
             .store
             .get_connection_capability_revision(operation.connection_id, active_revision)?
-            .context("active Connection capability revision no longer exists")?;
+            .ok_or_else(|| {
+                ConnectionOperationUnavailable::new(
+                    "active Connection capability revision no longer exists",
+                )
+            })?;
 
         let pinned_capability = pinned
             .capabilities
             .iter()
             .find(|capability| capability.capability_id == operation.operation_id)
-            .context("granted operation was removed from its reviewed revision")?;
+            .ok_or_else(|| {
+                ConnectionOperationUnavailable::new(
+                    "granted operation was removed from its reviewed revision",
+                )
+            })?;
         let active_capability = active
             .capabilities
             .iter()
             .find(|capability| capability.capability_id == operation.operation_id)
-            .context("granted operation is no longer available")?;
+            .ok_or_else(|| {
+                ConnectionOperationUnavailable::new("granted operation is no longer available")
+            })?;
         for capability in [pinned_capability, active_capability] {
-            anyhow::ensure!(
+            require_available(
                 capability.kind == ConnectionCapabilityKindV1::Tool,
-                "granted capability is not an invocable tool"
-            );
-            anyhow::ensure!(
+                "granted capability is not an invocable tool",
+            )?;
+            require_available(
                 capability.provider_metadata.server_id == operation.mcp_server_id
                     && capability.provider_metadata.tool_name == operation.provider_tool_name,
-                "Connection operation route changed after review"
-            );
-            anyhow::ensure!(
+                "Connection operation route changed after review",
+            )?;
+            require_available(
                 mcp_operation_fingerprint_from_capability(capability)
                     == operation.pinned_operation_fingerprint,
-                "Connection operation descriptor changed after review"
-            );
+                "Connection operation descriptor changed after review",
+            )?;
         }
-        anyhow::ensure!(
+        require_available(
             connection_model_tool_name(operation.connection_id, &operation.provider_tool_name)
                 == operation.model_tool_name,
-            "Connection model tool alias does not match the frozen operation"
-        );
+            "Connection model tool alias does not match the frozen operation",
+        )?;
 
         let runtime = self
             .store
             .get_mcp_server(operation.mcp_server_id)?
-            .context("Connection MCP runtime no longer exists")?;
-        anyhow::ensure!(runtime.enabled, "Connection MCP runtime is disabled");
+            .ok_or_else(|| {
+                ConnectionOperationUnavailable::new("Connection MCP runtime no longer exists")
+            })?;
+        require_available(runtime.enabled, "Connection MCP runtime is disabled")?;
         Ok(())
     }
 }
@@ -286,6 +344,9 @@ mod tests {
             .await
             .expect_err("live disable must revoke an in-flight snapshot");
         assert!(err.to_string().contains("disabled"));
+        assert!(err
+            .downcast_ref::<ConnectionOperationUnavailable>()
+            .is_some());
     }
 
     #[tokio::test]

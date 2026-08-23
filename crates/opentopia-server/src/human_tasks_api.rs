@@ -282,6 +282,17 @@ async fn resolve_human_task(
         request.response.clone(),
     )
     .map_err(ApiError::from)?;
+    // Keep the Human task pending when its Flow runtime cannot be rebuilt.
+    // Operators can restore the Connection and retry the same idempotent
+    // action instead of losing the approval into a stuck Resuming run.
+    let context = if matches!(
+        run.status,
+        FlowRunStatusV1::Running | FlowRunStatusV1::Resuming
+    ) {
+        Some(flows_api::flow_runtime_context(&state, &thread, &run).await?)
+    } else {
+        None
+    };
     let expected_task_revision = request.expected_revision;
     let updated = state.store.update_flow_run_and_human_task(
         &run,
@@ -314,19 +325,7 @@ async fn resolve_human_task(
         }
         Err(error) => return Err(human_task_error(error)),
     };
-    if matches!(
-        run.status,
-        FlowRunStatusV1::Running | FlowRunStatusV1::Resuming
-    ) {
-        let context = flows_api::flow_runtime_context(
-            &state,
-            &thread,
-            run.id,
-            run.harness_capabilities(),
-            run.harness_connection_authority(),
-            run.workflow_agent_specs(),
-        )
-        .await?;
+    if let Some(context) = context {
         spawn_flow_run(run.id, context).map_err(ApiError::from)?;
     }
     let delivery_receipt = if run.status == FlowRunStatusV1::Succeeded {

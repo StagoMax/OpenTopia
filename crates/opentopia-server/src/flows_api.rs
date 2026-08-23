@@ -2,7 +2,9 @@ use super::{
     current_settings, ensure_experience_mode_enabled, ensure_thread, load_bound_agent_context,
     provider_settings_for_thread, sync_thread_bundled_plugin_activations, ApiError, AppState,
 };
-use crate::connection_operation_runtime::connection_authority_for_context;
+use crate::connection_operation_runtime::{
+    connection_authority_for_context, ConnectionOperationUnavailable,
+};
 use crate::thread_runtime::sync_runtime_connection_tools;
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
@@ -329,16 +331,11 @@ async fn start_flow_run(
         connection_authority,
     )
     .map_err(ApiError::from)?;
+    // Validate every mutable runtime dependency before publishing a durable
+    // Queued run. A revoked Connection is a recoverable precondition failure,
+    // not a FlowRun that the engine can ever start.
+    let context = flow_runtime_context(&state, &thread, &run).await?;
     let run = state.store.insert_flow_run(&run).map_err(flow_error)?;
-    let context = flow_runtime_context(
-        &state,
-        &thread,
-        run.id,
-        run.harness_capabilities(),
-        run.harness_connection_authority(),
-        run.workflow_agent_specs(),
-    )
-    .await?;
     spawn_flow_run(run.id, context).map_err(ApiError::from)?;
     Ok(Json(run))
 }
@@ -415,6 +412,13 @@ async fn resume_flow_run(
             ))
         }
     }
+    // Prepare the resume runtime before committing the run/task transition so
+    // a revoked Connection leaves both durable records pending and retryable.
+    let context = if run.status.is_terminal() {
+        None
+    } else {
+        Some(flow_runtime_context(&state, &thread, &run).await?)
+    };
     let run = if let (Some(mut task), Some(action), Some(task_revision)) = (
         human_task.take(),
         human_task_action,
@@ -433,16 +437,7 @@ async fn resume_flow_run(
             .update_flow_run(&run, expected)
             .map_err(flow_error)?
     };
-    if !run.status.is_terminal() {
-        let context = flow_runtime_context(
-            &state,
-            &thread,
-            run.id,
-            run.harness_capabilities(),
-            run.harness_connection_authority(),
-            run.workflow_agent_specs(),
-        )
-        .await?;
+    if let Some(context) = context {
         spawn_flow_run(run.id, context).map_err(ApiError::from)?;
     }
     Ok(Json(run))
@@ -503,11 +498,12 @@ fn flow_run_for_request(state: &AppState, run_id: Uuid) -> Result<FlowRunV1, Api
 pub(crate) async fn flow_runtime_context(
     state: &AppState,
     thread: &opentopia_core::Thread,
-    parent_run_id: Uuid,
-    capabilities: CapabilityProjection,
-    connection_authority: RuntimeConnectionAuthorityV1,
-    workflow_agent_specs: Vec<WorkflowAgentSpecV1>,
+    run: &FlowRunV1,
 ) -> Result<ToolInvocationContext, ApiError> {
+    let parent_run_id = run.id;
+    let capabilities = run.harness_capabilities();
+    let connection_authority = run.harness_connection_authority();
+    let workflow_agent_specs = run.workflow_agent_specs();
     let settings = current_settings(state);
     let selected_provider =
         provider_settings_for_thread(&settings, thread.model_selection.as_ref());
@@ -555,7 +551,7 @@ pub(crate) async fn flow_runtime_context(
         &mut agent,
     )
     .await
-    .map_err(ApiError::from)?;
+    .map_err(flow_runtime_context_error)?;
     let agent = agent.finalize().map_err(ApiError::from)?;
     let sandbox = authority.sandbox_config().clone();
     let mut context = authority.local_tool_context();
@@ -578,6 +574,16 @@ pub(crate) async fn flow_runtime_context(
     context.fork_model_context = Some(model_context);
     context.flow_harness = Some(Arc::new(agent));
     Ok(context)
+}
+
+fn flow_runtime_context_error(error: anyhow::Error) -> ApiError {
+    if error
+        .downcast_ref::<ConnectionOperationUnavailable>()
+        .is_some()
+    {
+        return ApiError::conflict(error.to_string());
+    }
+    ApiError::from(error)
 }
 
 fn validate_workflow_agent_model_policies(
@@ -736,4 +742,27 @@ struct ResumeFlowRunRequest {
 pub(super) struct FlowDraftView {
     draft: FlowDraftV1,
     trials: Vec<FlowTrialV1>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn unavailable_connection_is_a_recoverable_flow_conflict() {
+        let error = flow_runtime_context_error(
+            ConnectionOperationUnavailable::new("Connection is disabled").into(),
+        );
+
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.message, "Connection is disabled");
+    }
+
+    #[test]
+    fn unexpected_runtime_failure_remains_internal() {
+        let error = flow_runtime_context_error(anyhow::anyhow!("unexpected runtime failure"));
+
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }

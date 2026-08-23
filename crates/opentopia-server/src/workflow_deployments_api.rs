@@ -134,16 +134,8 @@ async fn start_deployed_workflow_run(
     }
     let run = FlowRunV1::new_from_deployment(thread_id, &deployment, request.input)
         .map_err(ApiError::from)?;
+    let context = flow_runtime_context(&state, &thread, &run).await?;
     let run = state.store.insert_flow_run(&run).map_err(flow_error)?;
-    let context = flow_runtime_context(
-        &state,
-        &thread,
-        run.id,
-        run.harness_capabilities(),
-        run.harness_connection_authority(),
-        run.workflow_agent_specs(),
-    )
-    .await?;
     spawn_flow_run(run.id, context).map_err(ApiError::from)?;
     Ok(Json(run))
 }

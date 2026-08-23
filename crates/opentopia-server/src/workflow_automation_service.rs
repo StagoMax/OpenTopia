@@ -118,6 +118,16 @@ pub(crate) async fn start_release_invocation(
             return Err(ApiError::conflict(error.to_string()));
         }
     };
+    let context = match flow_runtime_context(state, &thread, &run).await {
+        Ok(context) => context,
+        Err(error) => {
+            invocation.status = WorkflowTriggerInvocationStatusV1::Failed;
+            invocation.error = Some(error.message.clone());
+            invocation.updated_at = Utc::now();
+            let _ = state.store.update_workflow_trigger_invocation(&invocation);
+            return Err(error);
+        }
+    };
     let run = match state.store.insert_flow_run(&run) {
         Ok(run) => run,
         Err(error) => {
@@ -136,15 +146,6 @@ pub(crate) async fn start_release_invocation(
         .update_workflow_trigger_invocation(&invocation)
         .map_err(workflow_automation_error)?;
 
-    let context = flow_runtime_context(
-        state,
-        &thread,
-        run.id,
-        run.harness_capabilities(),
-        run.harness_connection_authority(),
-        run.workflow_agent_specs(),
-    )
-    .await?;
     spawn_flow_run(run.id, context).map_err(ApiError::from)?;
     Ok(WorkflowInvocationResult {
         invocation,

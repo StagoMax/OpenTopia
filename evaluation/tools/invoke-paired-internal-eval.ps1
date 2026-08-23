@@ -275,6 +275,16 @@ foreach ($repetition in 1..$Repetitions) {
       }
       & node $usageSummaryScript --input $usageLog --output $usageSummary --input-price-per-million $InputPricePerMillion --cache-hit-price-per-million $CacheHitPricePerMillion --output-price-per-million $OutputPricePerMillion
       if ($LASTEXITCODE -ne 0) { throw "could not summarize provider usage for $runId" }
+      if (-not (Test-Path -LiteralPath $summaryPath -PathType Leaf)) {
+        throw "evaluation runner did not write a summary for $runId"
+      }
+      $runnerSummary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json
+      if ($runnerSummary.status -eq "infra_error") {
+        # An infrastructure result is not a product measurement. Stop the
+        # experiment instead of allowing a depleted quota, broken proxy, or
+        # unavailable server to generate empty results for every later suite.
+        throw "evaluation infrastructure error for ${runId}: $($runnerSummary.error)"
+      }
       $manifest.runs += [ordered]@{
         runId = $runId
         repetition = $repetition
