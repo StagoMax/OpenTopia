@@ -607,6 +607,60 @@ async fn openai_provider_honors_rate_limit_retry_after() {
 }
 
 #[tokio::test]
+async fn openai_provider_does_not_retry_a_permanent_quota_rate_limit() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = read_http_request(&mut socket).await;
+        let body = r#"{"error":{"code":"insufficient_user_quota"}}"#;
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        socket.shutdown().await.unwrap();
+    });
+
+    let provider =
+        OpenAiCompatibleProvider::new(format!("http://{address}/v1"), "test-key", "test-model");
+    let mut transport = Vec::new();
+    let error = provider
+        .stream_prepared(
+            provider.prepare(Uuid::new_v4(), model_request()).unwrap(),
+            &mut |_| Ok(()),
+            &mut |event| {
+                transport.push(event);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+    server.await.unwrap();
+
+    assert!(error
+        .downcast_ref::<ProviderAdapterError>()
+        .is_some_and(|error| matches!(error, ProviderAdapterError::QuotaExhausted { .. })));
+    assert!(!transport
+        .iter()
+        .any(|event| matches!(event, ProviderTransportEvent::Retry { .. })));
+    assert!(transport.iter().any(|event| matches!(
+        event,
+        ProviderTransportEvent::Response {
+            attempt: 1,
+            status: Some(429),
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
 async fn chat_provider_retries_sse_rate_limit_without_changing_transport() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

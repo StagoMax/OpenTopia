@@ -1228,6 +1228,9 @@ mod tests {
             app_views: Arc::new(Mutex::new(opentopia_core::AppViewHost::default())),
             library_providers: Arc::new(crate::library_api::LibraryProviderRegistry::for_tests()),
             resources: crate::resource_registry::ResourceRegistry::default(),
+            provider_runtime_health: crate::provider_runtime_health::ProviderRuntimeHealth::default(
+            ),
+            shutdown: crate::runtime_shutdown::RuntimeShutdown::default(),
         }
     }
 

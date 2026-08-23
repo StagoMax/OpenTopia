@@ -685,7 +685,15 @@ fn startup_recovery_interrupts_only_active_turns() {
         .update_turn_status(waiting.turn_id, TurnStatus::WaitingApproval, None)
         .expect("mark waiting");
 
-    assert_eq!(store.interrupt_active_turns().expect("recover turns"), 2);
+    let interrupted = store.interrupt_active_turns().expect("recover turns");
+    assert_eq!(interrupted.len(), 2);
+    assert_eq!(
+        interrupted
+            .iter()
+            .map(|turn| turn.turn_id)
+            .collect::<Vec<_>>(),
+        vec![running.turn_id, cancelling.turn_id]
+    );
     for turn_id in [running.turn_id, cancelling.turn_id] {
         let recovered = store
             .get_turn(turn_id)

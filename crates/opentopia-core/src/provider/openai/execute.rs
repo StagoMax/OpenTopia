@@ -1,9 +1,9 @@
 use super::super::{
-    apply_provider_auth, provider_rejected_image_input, provider_transcript_candidate_item,
-    rejected_chat_profile_capability, request_image_part_count, truncate_observation_text,
-    ModelFinishReason, ModelResponse, ModelStreamCallback, PreparedProviderRequest,
-    ProviderAdapterError, ProviderResponseCommitMode, ProviderTransportCallback,
-    ProviderTransportEvent,
+    apply_provider_auth, provider_error_is_quota_exhausted, provider_rejected_image_input,
+    provider_transcript_candidate_item, rejected_chat_profile_capability, request_image_part_count,
+    truncate_observation_text, ModelFinishReason, ModelResponse, ModelStreamCallback,
+    PreparedProviderRequest, ProviderAdapterError, ProviderResponseCommitMode,
+    ProviderTransportCallback, ProviderTransportEvent,
 };
 use super::recovery::{
     recover_streamed_tool_call_non_streaming, schedule_rate_limited_stream_retry,
@@ -54,6 +54,9 @@ impl OpenAiCompatibleProvider {
                     response_id: None,
                     body: json!({ "error": truncate_observation_text(&body) }),
                 })?;
+                if provider_error_is_quota_exhausted(&body) {
+                    return Err(ProviderAdapterError::QuotaExhausted { detail: body }.into());
+                }
                 if status.as_u16() == 400 {
                     let image_parts = request_image_part_count(&prepared.logical_request);
                     if image_parts > 0 && provider_rejected_image_input(&body) {
@@ -231,6 +234,9 @@ impl OpenAiResponsesProvider {
                     response_id: None,
                     body: json!({ "error": truncate_observation_text(&body) }),
                 })?;
+                if provider_error_is_quota_exhausted(&body) {
+                    return Err(ProviderAdapterError::QuotaExhausted { detail: body }.into());
+                }
                 return Err(ResponsesRequestError { status, body }.into());
             }
 

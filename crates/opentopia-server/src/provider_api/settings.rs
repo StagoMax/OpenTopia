@@ -65,6 +65,12 @@ async fn update_settings(
     State(state): State<AppState>,
     Json(request): Json<SettingsPatchRequest>,
 ) -> Result<Json<AppSettings>, ApiError> {
+    let provider_configuration_changed = request.providers.is_some()
+        || request.active_provider_id.is_some()
+        || request.provider_kind.is_some()
+        || request.base_url.is_some()
+        || request.model.is_some()
+        || request.api_key_source.is_some();
     let mut settings = current_settings(&state);
     if let Some(providers) = request.providers {
         validate_provider_settings(&providers)?;
@@ -125,6 +131,9 @@ async fn update_settings(
         ));
     }
     let settings = save_settings_and_refresh_runtime(&state, settings)?;
+    if provider_configuration_changed {
+        state.provider_runtime_health.clear_all();
+    }
     Ok(Json(settings))
 }
 
@@ -239,6 +248,7 @@ async fn test_provider_connection(
             }
             save_settings_and_refresh_runtime(&state, latest)?;
         }
+        state.provider_runtime_health.clear(&provider_settings.id);
     }
     Ok(Json(result))
 }

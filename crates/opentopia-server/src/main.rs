@@ -101,10 +101,12 @@ mod mcp_api;
 mod message_api;
 mod plugins_api;
 mod provider_api;
+mod provider_runtime_health;
 mod resource_api;
 mod resource_registry;
 mod routes;
 mod runtime_api;
+mod runtime_shutdown;
 mod scm_api;
 mod terminal_api;
 mod thread_runtime;
@@ -165,6 +167,7 @@ use provider_api::{
     extract_model_catalog, provider_model_catalog_rate_limit_delay, provider_model_catalog_url,
     validate_provider_settings,
 };
+use provider_runtime_health::{provider_failure_is_quota_exhausted, QUOTA_EXHAUSTED_MESSAGE};
 use resource_api::ResourceReleaseResponse;
 #[cfg(test)]
 use resource_api::{
@@ -689,17 +692,24 @@ async fn cancel_user_turn(
     Path(thread_id): Path<Uuid>,
     Json(request): Json<CancelAgentTurnRequest>,
 ) -> Result<Json<TurnCancelResult>, ApiError> {
-    ensure_thread(&state, thread_id)?;
+    Ok(Json(
+        cancel_thread_turn(&state, thread_id, request.turn_id).await?,
+    ))
+}
+
+pub(crate) async fn cancel_thread_turn(
+    state: &AppState,
+    thread_id: Uuid,
+    requested_turn_id: Option<Uuid>,
+) -> Result<TurnCancelResult, ApiError> {
+    ensure_thread(state, thread_id)?;
     let latest = state.turns.status(thread_id)?;
-    let parent_turn_id = request
-        .turn_id
-        .or_else(|| latest.as_ref().map(|turn| turn.turn_id));
+    let parent_turn_id = requested_turn_id.or_else(|| latest.as_ref().map(|turn| turn.turn_id));
     let mut cancelled_waiting = false;
-    let mut result = state.turns.cancel(thread_id, request.turn_id)?;
+    let mut result = state.turns.cancel(thread_id, requested_turn_id)?;
     if !result.cancelled {
         if let Some(waiting) = latest.as_ref().filter(|turn| {
-            request
-                .turn_id
+            requested_turn_id
                 .map(|requested| requested == turn.turn_id)
                 .unwrap_or(true)
                 && matches!(
@@ -709,7 +719,7 @@ async fn cancel_user_turn(
                         | TurnStatus::WaitingUserAction
                 )
         }) {
-            result = cancel_waiting_agent_turn(&state, thread_id, waiting).await?;
+            result = cancel_waiting_agent_turn(state, thread_id, waiting).await?;
             cancelled_waiting = result.cancelled;
         }
     }
@@ -722,10 +732,10 @@ async fn cancel_user_turn(
             }
         }
         if let Some(parent_turn_id) = parent_turn_id {
-            cancel_collaboration_descendants(&state, thread_id, parent_turn_id).await;
+            cancel_collaboration_descendants(state, thread_id, parent_turn_id).await;
         }
     }
-    Ok(Json(result))
+    Ok(result)
 }
 
 async fn cancel_collaboration_descendants(state: &AppState, thread_id: Uuid, _root_turn_id: Uuid) {
@@ -1276,6 +1286,35 @@ async fn run_new_agent_turn(
     }
     let selected_provider =
         provider_settings_for_thread(&settings, thread.model_selection.as_ref());
+    if let Some(message) = state
+        .provider_runtime_health
+        .blocked_message(&selected_provider.id)
+    {
+        let message = message.to_string();
+        publish_payload(
+            &state,
+            thread_id,
+            Some(turn_id),
+            AgentEventPayload::Error {
+                message: message.clone(),
+            },
+        );
+        finalize_goal_after_turn(
+            &state,
+            thread_id,
+            collaboration_mode,
+            goal.as_ref().map(|goal| goal.id),
+            TurnStatus::Failed,
+        );
+        finish_turn(
+            &state,
+            thread_id,
+            turn_id,
+            TurnStatus::Failed,
+            Some(message),
+        );
+        return;
+    }
     if selected_provider.effective_transport() == ProviderTransportKind::Http
         && selected_provider.active_adapter_profile().is_none()
     {
@@ -1846,8 +1885,14 @@ async fn run_new_agent_turn(
     } else {
         rollback_unpublished_wait_boundary(&state, thread_id, turn_id, &deferred_wait_events);
     }
-    let (mut status, mut turn_error) =
-        finish_agent_result(&state, thread_id, turn_id, result, None);
+    let (mut status, mut turn_error) = finish_agent_result(
+        &state,
+        thread_id,
+        turn_id,
+        &selected_provider.id,
+        result,
+        None,
+    );
     if let Some(error) = approval_persistence
         .err()
         .or_else(|| continuation_persistence.err())
@@ -2000,6 +2045,36 @@ async fn run_resumed_agent_turn(
             return;
         }
     };
+    if let Some(message) = state
+        .provider_runtime_health
+        .blocked_message(&selected_provider.id)
+    {
+        let message = message.to_string();
+        publish_payload(
+            &state,
+            thread_id,
+            Some(turn_id),
+            AgentEventPayload::Error {
+                message: message.clone(),
+            },
+        );
+        finalize_turn_change_capture(&state, thread_id, turn_id, TurnStatus::Failed).await;
+        finalize_goal_after_turn(
+            &state,
+            thread_id,
+            collaboration_mode,
+            goal.as_ref().map(|goal| goal.id),
+            TurnStatus::Failed,
+        );
+        finish_turn(
+            &state,
+            thread_id,
+            turn_id,
+            TurnStatus::Failed,
+            Some(message),
+        );
+        return;
+    }
     agent.set_mcp_host(state.mcp_host.clone());
     if agent.capability_projection().allow_all_plugins
         || !agent.capability_projection().plugins.is_empty()
@@ -2215,8 +2290,14 @@ async fn run_resumed_agent_turn(
     } else {
         rollback_unpublished_wait_boundary(&state, thread_id, turn_id, &deferred_wait_events);
     }
-    let (mut status, mut turn_error) =
-        finish_agent_result(&state, thread_id, turn_id, result, resolved_approval_id);
+    let (mut status, mut turn_error) = finish_agent_result(
+        &state,
+        thread_id,
+        turn_id,
+        &selected_provider.id,
+        result,
+        resolved_approval_id,
+    );
     if let Some(error) = approval_persistence
         .err()
         .or_else(|| continuation_persistence.err())
@@ -2249,6 +2330,7 @@ fn finish_agent_result(
     state: &AppState,
     thread_id: Uuid,
     turn_id: Uuid,
+    provider_id: &str,
     result: anyhow::Result<opentopia_core::AgentTurnResult>,
     resolved_approval_id: Option<Uuid>,
 ) -> (TurnStatus, Option<String>) {
@@ -2267,7 +2349,13 @@ fn finish_agent_result(
             AgentTurnOutcome::WaitingUserAction { .. } => (TurnStatus::WaitingUserAction, None),
         },
         Err(err) => {
-            let message = err.to_string();
+            let message = if provider_failure_is_quota_exhausted(&err) {
+                warn!(%provider_id, "blocking provider after permanent quota failure");
+                state.provider_runtime_health.block_for_quota(provider_id);
+                QUOTA_EXHAUSTED_MESSAGE.to_string()
+            } else {
+                err.to_string()
+            };
             publish_payload(
                 state,
                 thread_id,

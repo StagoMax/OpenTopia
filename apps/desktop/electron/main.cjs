@@ -108,6 +108,8 @@ let sagServiceManager = null;
 let graphRagServiceManager = null;
 let packagedRuntimeBundle = null;
 let packagedRuntimeBundleError = null;
+let appQuitPrepared = false;
+let appQuitPreparation = null;
 
 function backendStartupStatusSnapshot() {
   return { ...backendStartupStatus };
@@ -1681,9 +1683,60 @@ function killBackendProcessTree() {
   child.kill();
 }
 
+async function requestBackendShutdownPreparation() {
+  if (!backendProcess) return null;
+  const response = await fetch(
+    `${defaultBackendUrl}/api/runtime/prepare-shutdown`,
+    {
+      method: "POST",
+      headers: { authorization: `Bearer ${backendApiToken}` },
+      signal: AbortSignal.timeout(7_000),
+    },
+  );
+  if (!response.ok) {
+    throw new Error(
+      `Backend shutdown preparation failed with HTTP ${response.status}`,
+    );
+  }
+  const result = await response.json();
+  writeLog(
+    result.remaining > 0 ? "warn" : "info",
+    "backend.shutdown.prepared",
+    result,
+  );
+  return result;
+}
+
+async function allSettledWithin(promises, timeoutMs) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      Promise.allSettled(promises),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(null), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function stopManagedBackend() {
   const child = backendProcess;
   if (!child) return;
+
+  try {
+    await requestBackendShutdownPreparation();
+  } catch (error) {
+    logConsole("warn", "backend.shutdown.prepare.failed", { error });
+  }
+  if (
+    backendProcess !== child ||
+    child.exitCode !== null ||
+    child.signalCode !== null
+  ) {
+    return;
+  }
 
   await new Promise((resolve, reject) => {
     let settled = false;
@@ -2541,15 +2594,42 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
 
-app.on("before-quit", () => {
-  void desktopBrowserHost?.close().catch((error) => {
-    logConsole("warn", "browser.host.close.failed", { error });
+app.on("before-quit", (event) => {
+  if (appQuitPrepared) {
+    flushLogsSync();
+    return;
+  }
+  event.preventDefault();
+  if (appQuitPreparation) return;
+
+  appQuitPreparation = (async () => {
+    try {
+      await stopManagedBackend();
+    } catch (error) {
+      logConsole("warn", "backend.shutdown.failed", { error });
+      killBackendProcessTree();
+    }
+    const closingServices = [
+      desktopBrowserHost?.close(),
+      chromeBridge?.close(),
+    ].filter(Boolean);
+    const results = await allSettledWithin(closingServices, 3_000);
+    if (results === null) {
+      writeLog("warn", "desktop.service.close.timed-out");
+    } else {
+      for (const result of results) {
+        if (result.status === "rejected") {
+          logConsole("warn", "desktop.service.close.failed", {
+            error: result.reason,
+          });
+        }
+      }
+    }
+    sagServiceManager?.stopSync();
+    graphRagServiceManager?.stopSync();
+  })().finally(() => {
+    appQuitPrepared = true;
+    flushLogsSync();
+    app.quit();
   });
-  void chromeBridge?.close().catch((error) => {
-    logConsole("warn", "chrome.bridge.close.failed", { error });
-  });
-  sagServiceManager?.stopSync();
-  graphRagServiceManager?.stopSync();
-  killBackendProcessTree();
-  flushLogsSync();
 });

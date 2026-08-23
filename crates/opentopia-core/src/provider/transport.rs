@@ -1,6 +1,9 @@
-use super::{ProviderTransportCallback, ProviderTransportEvent};
+use super::{
+    provider_error_is_quota_exhausted, truncate_observation_text, ProviderAdapterError,
+    ProviderTransportCallback, ProviderTransportEvent,
+};
 use crate::model::{ProviderCacheTrace, ProviderRetryKind};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::time::Duration;
 pub(super) const PROVIDER_NETWORK_RETRY_LIMIT: usize = 5;
 pub(super) const PROVIDER_RATE_LIMIT_RETRY_LIMIT: usize = PROVIDER_NETWORK_RETRY_LIMIT;
@@ -72,10 +75,23 @@ where
                 if retryable_provider_status(response.status())
                     && retry_index < PROVIDER_NETWORK_RETRY_LIMIT =>
             {
+                let response_attempt = attempt;
                 retry_index += 1;
                 attempt += 1;
                 let status = response.status();
                 let delay = provider_retry_delay(&response, retry_index);
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    let body = response.text().await?;
+                    if provider_error_is_quota_exhausted(&body) {
+                        on_transport(ProviderTransportEvent::Response {
+                            attempt: response_attempt,
+                            status: Some(status.as_u16()),
+                            response_id: None,
+                            body: json!({ "error": truncate_observation_text(&body) }),
+                        })?;
+                        return Err(ProviderAdapterError::QuotaExhausted { detail: body }.into());
+                    }
+                }
                 let reason = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     format!(
                         "provider rate limited the request; retrying after {} second(s)",

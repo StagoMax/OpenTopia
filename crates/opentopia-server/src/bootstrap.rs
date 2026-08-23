@@ -5,8 +5,8 @@ use super::auth::ApiAuth;
 use super::turn_changes::TurnChangeManager;
 use super::turns::RootTurnLifecycle;
 use super::{
-    launch_next_queued_turn, library_api, plugins_api, routes, AppState, Args, EventBus,
-    PtyManager, TerminalBus,
+    launch_next_queued_turn, library_api, plugins_api, publish_payload, routes, AppState, Args,
+    EventBus, PtyManager, TerminalBus,
 };
 use opentopia_core::collaboration::{
     AgentCollaborationRuntime, AgentMailboxNotifier, AgentRunCommand, AgentRunScheduler,
@@ -17,11 +17,11 @@ use opentopia_core::mcp_host::McpExtensionHost;
 use opentopia_core::{
     bundled_plugins_path, compact_database_copy, ensure_bundled_plugins_installed,
     initialize_office_runtime, initialize_shell_runtime, start_managed_office_runtime_install,
-    start_managed_powershell_install, AppSettings, BackgroundProcessRegistry, BrowserRuntime,
-    BrowserRuntimeConfig, BrowserRuntimeRouter, BufferedTurnInbox, ChromeExtensionBrowserRuntime,
-    ChromeExtensionBrowserRuntimeConfig, CodexAccountManager, ComputerRuntime,
-    ComputerRuntimeConfig, DesktopBrowserRuntime, LocalBrowserRuntime, LocalComputerRuntime,
-    LocalExecutionEnvironment, SessionStore, SqliteSessionStore, TurnInbox,
+    start_managed_powershell_install, AgentEventPayload, AppSettings, BackgroundProcessRegistry,
+    BrowserRuntime, BrowserRuntimeConfig, BrowserRuntimeRouter, BufferedTurnInbox,
+    ChromeExtensionBrowserRuntime, ChromeExtensionBrowserRuntimeConfig, CodexAccountManager,
+    ComputerRuntime, ComputerRuntimeConfig, DesktopBrowserRuntime, LocalBrowserRuntime,
+    LocalComputerRuntime, LocalExecutionEnvironment, SessionStore, SqliteSessionStore, TurnInbox,
 };
 use serde_json::json;
 use std::net::SocketAddr;
@@ -232,6 +232,8 @@ async fn assemble_application(args: &Args) -> anyhow::Result<AppState> {
         app_views: Arc::new(Mutex::new(opentopia_core::AppViewHost::default())),
         library_providers: Arc::new(library_api::LibraryProviderRegistry::from_env()?),
         resources: crate::resource_registry::ResourceRegistry::default(),
+        provider_runtime_health: crate::provider_runtime_health::ProviderRuntimeHealth::default(),
+        shutdown: crate::runtime_shutdown::RuntimeShutdown::default(),
     };
     spawn_turn_queue_worker(state.clone(), queued_threads);
     crate::workflow_automation_service::start_workflow_automation_worker(state.clone());
@@ -295,9 +297,19 @@ async fn start_recovery_workers(state: &AppState) -> anyhow::Result<()> {
     )
     .await?;
     let interrupted_projections = state.store.interrupt_active_turns()?;
-    if interrupted_projections > 0 {
+    for turn in &interrupted_projections {
+        publish_payload(
+            state,
+            turn.thread_id,
+            Some(turn.turn_id),
+            AgentEventPayload::Error {
+                message: "OpenTopia 在任务完成前退出或重启，当前任务已中断。".to_string(),
+            },
+        );
+    }
+    if !interrupted_projections.is_empty() {
         info!(
-            interrupted_projections,
+            interrupted_projections = interrupted_projections.len(),
             "reconciled root product Turn projections after canonical AgentTurn recovery"
         );
     }

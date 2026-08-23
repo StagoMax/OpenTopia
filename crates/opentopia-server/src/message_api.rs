@@ -34,6 +34,11 @@ async fn send_message(
     Path(thread_id): Path<Uuid>,
     Json(request): Json<SendMessageRequest>,
 ) -> Result<(HeaderMap, Json<Message>), ApiError> {
+    if state.shutdown.is_preparing() {
+        return Err(ApiError::conflict(
+            "OpenTopia is shutting down and cannot start another Turn",
+        ));
+    }
     let thread = ensure_thread(&state, thread_id)?;
     let library_provider = request.library_provider;
     if library_provider.is_some() && thread.experience_mode != ExperienceMode::Flow {
@@ -331,6 +336,9 @@ pub(super) fn message_library_provider(
 }
 
 pub(super) fn launch_next_queued_turn(state: &AppState, thread_id: Uuid) {
+    if state.shutdown.is_preparing() {
+        return;
+    }
     match state
         .store
         .list_approvals(thread_id, Some(ApprovalStatus::Pending))

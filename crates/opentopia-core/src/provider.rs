@@ -482,6 +482,8 @@ pub struct CompiledToolContract {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderAdapterError {
+    #[error("provider account quota is exhausted: {detail}")]
+    QuotaExhausted { detail: String },
     #[error(
         "provider adapter capability profile is stale for {capability}; test this connection/model again: {detail}"
     )]
@@ -494,6 +496,32 @@ pub enum ProviderAdapterError {
         capability: &'static str,
         detail: String,
     },
+}
+
+fn provider_error_is_quota_exhausted(body: &str) -> bool {
+    let normalized = body.to_ascii_lowercase();
+    normalized.contains("insufficient_user_quota")
+        || normalized.contains("insufficient_quota")
+        || normalized.contains("quota_exhausted")
+        || normalized.contains("quota exceeded")
+        || body.contains("用户额度不足")
+        || body.contains("余额不足")
+}
+
+#[cfg(test)]
+mod provider_error_tests {
+    use super::provider_error_is_quota_exhausted;
+
+    #[test]
+    fn recognizes_permanent_quota_failures_without_matching_rate_limits() {
+        assert!(provider_error_is_quota_exhausted(
+            r#"{"error":{"code":"insufficient_user_quota"}}"#
+        ));
+        assert!(provider_error_is_quota_exhausted("用户额度不足，请充值"));
+        assert!(!provider_error_is_quota_exhausted(
+            r#"{"error":{"code":"rate_limit_exceeded"}}"#
+        ));
+    }
 }
 
 fn require_function_tools(

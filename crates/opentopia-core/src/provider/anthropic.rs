@@ -2,8 +2,9 @@ use super::{
     apply_provider_auth, chat_finish_reason, compatibility_probe_candidate, emit_response_deltas,
     ensure_visual_input_supported, is_tool_call_protocol_error, model_response_observation,
     next_stream_chunk, parse_model_usage, parse_required_tool_arguments, provider_api_key,
-    redact_transport_value, require_function_tools, send_provider_request_with_network_retries,
-    stream_idle_timeout, tool_call_protocol_error_observation, truncate_observation_text,
+    provider_error_is_quota_exhausted, redact_transport_value, require_function_tools,
+    send_provider_request_with_network_retries, stream_idle_timeout,
+    tool_call_protocol_error_observation, truncate_observation_text,
     validate_provider_response_protocol, validate_tool_probe_response, ModelFinishReason,
     ModelProvider, ModelRequest, ModelResponse, ModelStreamCallback, ModelStreamDelta, ModelUsage,
     OpenAiProbeOutcome, PreparedProviderRequest, ProviderAdapterError, ProviderResponseCommitMode,
@@ -300,6 +301,9 @@ impl AnthropicMessagesProvider {
                 response_id: None,
                 body: json!({ "error": truncate_observation_text(&body) }),
             })?;
+            if provider_error_is_quota_exhausted(&body) {
+                return Err(ProviderAdapterError::QuotaExhausted { detail: body }.into());
+            }
             anyhow::bail!("Anthropic Messages request failed ({status}): {body}");
         }
 

@@ -1783,6 +1783,21 @@ impl SessionStore for SqliteSessionStore {
         .map_err(Into::into)
     }
 
+    fn list_active_turns(&self) -> anyhow::Result<Vec<TurnRecord>> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let mut statement = conn.prepare(
+            r#"
+            SELECT turn_id, invocation_id, thread_id, user_message_id, status,
+                   started_at, updated_at, completed_at, error
+            FROM turns
+            WHERE status IN ('running', 'cancelling')
+            ORDER BY started_at ASC, rowid ASC
+            "#,
+        )?;
+        let rows = statement.query_map([], map_turn)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     fn get_latest_turn(&self, thread_id: Uuid) -> anyhow::Result<Option<TurnRecord>> {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         conn.query_row(
@@ -1872,19 +1887,44 @@ impl SessionStore for SqliteSessionStore {
         .map_err(Into::into)
     }
 
-    fn interrupt_active_turns(&self) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().expect("sqlite mutex poisoned");
-        let now = Utc::now().to_rfc3339();
-        let changed = conn.execute(
+    fn interrupt_active_turns(&self) -> anyhow::Result<Vec<TurnRecord>> {
+        let mut conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let transaction = conn.transaction()?;
+        let mut interrupted = {
+            let mut statement = transaction.prepare(
+                r#"
+                SELECT turn_id, invocation_id, thread_id, user_message_id, status,
+                       started_at, updated_at, completed_at, error
+                FROM turns
+                WHERE status IN ('running', 'cancelling')
+                ORDER BY started_at ASC, rowid ASC
+                "#,
+            )?;
+            let rows = statement.query_map([], map_turn)?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if interrupted.is_empty() {
+            return Ok(interrupted);
+        }
+        let now = Utc::now();
+        let reason = "server restarted before turn completed";
+        transaction.execute(
             r#"
             UPDATE turns
             SET status = 'interrupted', updated_at = ?1, completed_at = ?1,
-                error = 'server restarted before turn completed'
+                error = ?2
             WHERE status IN ('running', 'cancelling')
             "#,
-            params![now],
+            params![now.to_rfc3339(), reason],
         )?;
-        Ok(changed)
+        transaction.commit()?;
+        for turn in &mut interrupted {
+            turn.status = TurnStatus::Interrupted;
+            turn.updated_at = now;
+            turn.completed_at = Some(now);
+            turn.error = Some(reason.to_string());
+        }
+        Ok(interrupted)
     }
 
     fn upsert_turn_change_set(&self, change_set: &TurnChangeSet) -> anyhow::Result<()> {

@@ -144,6 +144,7 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
     fn insert_turn(&self, turn: TurnRecord) -> anyhow::Result<TurnRecord>;
     fn get_turn(&self, turn_id: Uuid) -> anyhow::Result<Option<TurnRecord>>;
     fn get_active_turn(&self, thread_id: Uuid) -> anyhow::Result<Option<TurnRecord>>;
+    fn list_active_turns(&self) -> anyhow::Result<Vec<TurnRecord>>;
     fn get_latest_turn(&self, thread_id: Uuid) -> anyhow::Result<Option<TurnRecord>>;
     fn update_turn_status(
         &self,
@@ -152,7 +153,7 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         error: Option<String>,
     ) -> anyhow::Result<Option<TurnRecord>>;
     fn resume_turn_invocation(&self, turn_id: Uuid) -> anyhow::Result<Option<TurnRecord>>;
-    fn interrupt_active_turns(&self) -> anyhow::Result<usize>;
+    fn interrupt_active_turns(&self) -> anyhow::Result<Vec<TurnRecord>>;
     fn upsert_turn_change_set(&self, change_set: &TurnChangeSet) -> anyhow::Result<()>;
     fn get_turn_change_set(&self, turn_id: Uuid) -> anyhow::Result<Option<TurnChangeSet>>;
     fn list_turn_change_sets(&self, thread_id: Uuid) -> anyhow::Result<Vec<TurnChangeSet>>;
