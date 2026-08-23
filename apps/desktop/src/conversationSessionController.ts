@@ -18,6 +18,7 @@ import type {
   Message,
   UserInputResponse,
 } from "./types";
+import { ThreadActivityMonitor } from "./threadActivityMonitor.ts";
 import { ThreadActivityStore } from "./threadActivityStore.ts";
 
 export type ConversationSendRequest = {
@@ -84,14 +85,12 @@ export class ConversationSessionController {
     if (this.retainCount === 1) this.connect();
     return () => {
       this.retainCount = Math.max(0, this.retainCount - 1);
-      if (this.retainCount === 0 && !this.hasLiveActivity()) {
-        this.disconnect();
-      }
+      if (this.retainCount === 0) this.disconnect();
     };
   }
 
   isRetained(): boolean {
-    return this.retainCount > 0 || this.hasLiveActivity();
+    return this.retainCount > 0;
   }
 
   retry(): void {
@@ -241,26 +240,33 @@ export class ConversationSessionController {
     this.dispatch({ type: "loadStarted" });
 
     const since = latestPersistedEventSeq(this.state.events);
-    void Promise.all([
-      this.client.listMessages(this.threadId, controller.signal),
-      this.client.listConversationEvents(
-        this.threadId,
-        since,
-        controller.signal,
-      ),
-    ])
-      .then(([messages, events]) => {
+    void (async () => {
+      try {
+        // Durable messages are the primary conversation content and are much
+        // cheaper to load than the diagnostic event history. Publish them
+        // first so a large trace cannot hold the whole conversation blank.
+        const messages = await this.client.listMessages(
+          this.threadId,
+          controller.signal,
+        );
+        if (!this.isCurrentLoad(generation, controller)) return;
+        this.dispatch({ type: "historyLoaded", messages, events: [] });
+
+        const events = await this.client.listConversationEvents(
+          this.threadId,
+          since,
+          controller.signal,
+        );
         if (!this.isCurrentLoad(generation, controller)) return;
         events.forEach((event) => this.rememberEventId(event.id));
         this.activityStore?.applyEvents(events);
-        this.dispatch({ type: "historyLoaded", messages, events });
+        this.dispatch({ type: "historyLoaded", messages: [], events });
         this.stream = this.client.openEventStream(
           this.threadId,
           latestPersistedEventSeq(this.state.events),
           (event) => this.receiveEvent(event),
         );
-      })
-      .catch((error) => {
+      } catch (error) {
         if (
           !this.isCurrentLoad(generation, controller) ||
           isAbortError(error)
@@ -268,7 +274,8 @@ export class ConversationSessionController {
           return;
         }
         this.dispatch({ type: "loadFailed", error: errorMessage(error) });
-      });
+      }
+    })();
 
     void Promise.allSettled([
       this.client.getTurnStatus(this.threadId, controller.signal),
@@ -300,17 +307,6 @@ export class ConversationSessionController {
     this.stream?.close();
     this.stream = null;
     this.flushPendingEvents();
-  }
-
-  private hasLiveActivity(): boolean {
-    return (
-      this.activityStore?.isLive(this.threadId) === true ||
-      this.state.sending ||
-      this.state.pendingTurnFeedback !== null ||
-      this.state.activeTurnId !== null ||
-      this.state.turnStatus?.status === "running" ||
-      this.state.turnStatus?.status === "cancelling"
-    );
   }
 
   private isCurrentLoad(
@@ -394,9 +390,7 @@ export class ConversationSessionController {
     if (next === this.state) return;
     this.state = next;
     this.stateListeners.forEach((listener) => listener());
-    if (this.retainCount === 0 && !this.hasLiveActivity() && this.stream) {
-      this.disconnect();
-    }
+    if (this.retainCount === 0 && this.stream) this.disconnect();
   }
 }
 
@@ -410,8 +404,7 @@ export class ConversationSessionRegistry {
     ConversationSessionController
   >();
   private readonly controllerEventReleases = new Map<string, () => void>();
-  private readonly activityRetentionReleases = new Map<string, () => void>();
-  private readonly activityStoreRelease: () => void;
+  private readonly activityMonitor: ThreadActivityMonitor;
 
   constructor(
     client: ApiClient,
@@ -421,12 +414,7 @@ export class ConversationSessionRegistry {
     this.client = client;
     this.cacheLimit = cacheLimit;
     this.activityStore = activityStore;
-    this.activityStoreRelease = activityStore.subscribeToChanges((threadId) =>
-      this.syncActivityRetention(threadId),
-    );
-    activityStore
-      .liveThreadIds()
-      .forEach((threadId) => this.syncActivityRetention(threadId));
+    this.activityMonitor = new ThreadActivityMonitor(client, activityStore);
   }
 
   get(threadId: string): ConversationSessionController {
@@ -456,27 +444,12 @@ export class ConversationSessionRegistry {
   }
 
   dispose(): void {
-    this.activityStoreRelease();
-    this.activityRetentionReleases.forEach((release) => release());
-    this.activityRetentionReleases.clear();
+    this.activityMonitor.dispose();
     this.controllerEventReleases.forEach((release) => release());
     this.controllerEventReleases.clear();
     this.controllers.forEach((controller) => controller.dispose());
     this.controllers.clear();
     this.eventListeners.clear();
-  }
-
-  private syncActivityRetention(threadId: string): void {
-    const retained = this.activityRetentionReleases.get(threadId);
-    if (this.activityStore.isLive(threadId)) {
-      if (retained) return;
-      const release = this.get(threadId).retain();
-      this.activityRetentionReleases.set(threadId, release);
-      return;
-    }
-    if (!retained) return;
-    this.activityRetentionReleases.delete(threadId);
-    retained();
   }
 
   private prune(protectedThreadId: string): void {

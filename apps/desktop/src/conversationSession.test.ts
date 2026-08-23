@@ -4,7 +4,7 @@ import test from "node:test";
 import type { ApiClient } from "./api/client";
 import type * as ConversationSessionModule from "./conversationSession";
 import type * as ControllerModule from "./conversationSessionController";
-import type { AgentEvent, Message } from "./types";
+import type { AgentEvent, Message, TurnStatus } from "./types";
 
 const { conversationSessionReducer, createConversationSessionState } =
   (await import(
@@ -40,6 +40,75 @@ function message(id: string, role: Message["role"] = "user"): Message {
     createdAt: "2026-08-17T00:00:00Z",
   };
 }
+
+function turnStatus(status: TurnStatus["status"]): TurnStatus {
+  return {
+    turnId: "turn-1",
+    threadId: "thread-1",
+    userMessageId: "user",
+    status,
+    startedAt: "2026-08-17T00:00:00Z",
+    updatedAt: "2026-08-17T00:00:01Z",
+  };
+}
+
+test("keeps a terminal Turn status authoritative when stale history loads later", () => {
+  let state = conversationSessionReducer(
+    createConversationSessionState("thread-1"),
+    { type: "loadStarted" },
+  );
+  state = conversationSessionReducer(state, {
+    type: "auxiliaryLoaded",
+    turnStatus: turnStatus("interrupted"),
+  });
+  state = conversationSessionReducer(state, {
+    type: "historyLoaded",
+    messages: [message("user")],
+    events: [
+      event("started", 1, {
+        type: "turn_started",
+        user_message_id: "user",
+      }),
+      event("request", 2, {
+        type: "provider_request_sent",
+        request_id: "request-1",
+        round: 1,
+        attempt: 1,
+        adapter: "openai_chat",
+        method: "POST",
+        endpoint: "https://provider.example/v1/chat/completions",
+        body: {},
+      }),
+    ],
+  });
+
+  assert.equal(state.activeTurnId, null);
+  assert.equal(state.turnStatus?.status, "interrupted");
+});
+
+test("clears a stale history-derived active Turn when terminal status loads later", () => {
+  let state = conversationSessionReducer(
+    createConversationSessionState("thread-1"),
+    { type: "loadStarted" },
+  );
+  state = conversationSessionReducer(state, {
+    type: "historyLoaded",
+    messages: [message("user")],
+    events: [
+      event("started", 1, {
+        type: "turn_started",
+        user_message_id: "user",
+      }),
+    ],
+  });
+  assert.equal(state.activeTurnId, "turn-1");
+
+  state = conversationSessionReducer(state, {
+    type: "auxiliaryLoaded",
+    turnStatus: turnStatus("interrupted"),
+  });
+  assert.equal(state.activeTurnId, null);
+});
 
 test("reduces history and streamed lifecycle events deterministically", () => {
   let state = createConversationSessionState("thread-1");
@@ -165,6 +234,50 @@ test("registry returns one controller per thread", () => {
   const registry = new ConversationSessionRegistry({} as ApiClient);
   assert.equal(registry.get("thread-1"), registry.get("thread-1"));
   registry.dispose();
+});
+
+test("publishes durable messages before event history finishes loading", async () => {
+  let resolveEvents!: (events: AgentEvent[]) => void;
+  let openCalls = 0;
+  const client = {
+    listMessages: () => Promise.resolve([message("user")]),
+    listConversationEvents: () =>
+      new Promise<AgentEvent[]>((resolve) => {
+        resolveEvents = resolve;
+      }),
+    getTurnStatus: () => Promise.resolve(null),
+    listPendingApprovals: () => Promise.resolve([]),
+    listPendingUserInput: () => Promise.resolve([]),
+    openEventStream: () => {
+      openCalls += 1;
+      return { close() {} };
+    },
+  } as unknown as ApiClient;
+  const controller = new ConversationSessionController(client, "thread-1");
+
+  const release = controller.retain();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(controller.getSnapshot().loadState.status, "ready");
+  assert.deepEqual(
+    controller.getSnapshot().messages.map((item) => item.id),
+    ["user"],
+  );
+  assert.deepEqual(controller.getSnapshot().events, []);
+  assert.equal(openCalls, 0);
+
+  resolveEvents([
+    event("finished", 1, { type: "turn_finished", summary: "done" }),
+  ]);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.deepEqual(
+    controller.getSnapshot().events.map((item) => item.id),
+    ["finished"],
+  );
+  assert.equal(openCalls, 1);
+  release();
+  controller.dispose();
 });
 
 test("registry forwards lifecycle events after the active view switches away", async () => {

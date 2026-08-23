@@ -181,8 +181,8 @@ export function SideTaskConversation({
   const activeApproval = pendingApprovalQueue[0]?.payload ?? null;
   const activeUserInput = pendingUserInput[0] ?? null;
   const workForm = useMemo(
-    () => resolveComposerWorkForm(events, null),
-    [events],
+    () => resolveComposerWorkForm(events, null, activeTurnId),
+    [activeTurnId, events],
   );
 
   async function updateThreadTitle(firstPrompt: string) {

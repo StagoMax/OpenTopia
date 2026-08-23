@@ -15,8 +15,8 @@ export function backendStartupLabel(
       return "本地服务已连接，正在加载工作区";
     case "failed":
       return status.detail
-        ? `本地服务启动未完成：${status.detail}`
-        : "本地服务启动未完成，正在继续重试";
+        ? `本地服务启动失败：${status.detail}`
+        : "本地服务启动失败";
     case "checking":
       return "正在检查本地服务";
     default:

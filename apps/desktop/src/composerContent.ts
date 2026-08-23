@@ -1,4 +1,5 @@
 import type { InlineImageAttachment, InlineMessageContentPart } from "./types";
+import { workspaceRootKey } from "./workspaceRootKey.ts";
 
 export const COMPOSER_CARET_MARKER = "\u200b";
 
@@ -250,8 +251,7 @@ export function normalizeComposerImageDeletionSnapshot(
     afterTokens.length - suffixLength,
   );
   const deletedReference = removedTokens.some(
-    (token) =>
-      token.type === "image_ref" || token.type === "attachment_ref",
+    (token) => token.type === "image_ref" || token.type === "attachment_ref",
   );
   const insertedOnlyLineBreaks =
     insertedTokens.length > 0 &&
@@ -378,6 +378,25 @@ export function composerUndoEntries(
           ]),
           caretOffset: prefixLength + index,
         },
+  );
+}
+
+/**
+ * Keeps inline file references aligned with the source chips currently owned
+ * by the composer. The visible chip text is intentionally not used as the
+ * identity: duplicate filenames are valid, while paths identify the source.
+ */
+export function filterComposerAttachmentReferences(
+  parts: InlineMessageContentPart[],
+  activePaths: Iterable<string>,
+): InlineMessageContentPart[] {
+  const activeKeys = new Set(
+    Array.from(activePaths, (path) => workspaceRootKey(path)),
+  );
+  return normalizeComposerContentParts(parts).filter(
+    (part) =>
+      part.type !== "attachment_ref" ||
+      activeKeys.has(workspaceRootKey(part.path)),
   );
 }
 

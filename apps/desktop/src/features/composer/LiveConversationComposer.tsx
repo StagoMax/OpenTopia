@@ -37,8 +37,13 @@ export function LiveConversationComposer({
     state?.loadState.status === "ready" ? state.events : emptyEvents;
   const deferredEvents = useDeferredValue(events);
   const workForm = useMemo(
-    () => resolveComposerWorkForm(deferredEvents, goalSnapshot),
-    [deferredEvents, goalSnapshot],
+    () =>
+      resolveComposerWorkForm(
+        deferredEvents,
+        goalSnapshot,
+        state?.activeTurnId ?? null,
+      ),
+    [deferredEvents, goalSnapshot, state?.activeTurnId],
   );
   const metrics = useMemo(() => {
     const contextWindow = resolveThreadModelContextWindow(

@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   composerAttachmentReferenceText,
   composerContentText,
+  filterComposerAttachmentReferences,
   composerImageDisplayId,
   composerLineBreakText,
   composerOrderedListContinuation,
@@ -25,6 +26,34 @@ test("counts composer graphemes without splitting common text into arrays", () =
   assert.equal(composerTextLength("plain text"), 10);
   assert.equal(composerTextLength("输入框"), 3);
   assert.equal(composerTextLength("👨‍👩‍👧‍👦"), 1);
+});
+
+test("filters inline file references by normalized source path, not filename", () => {
+  const parts: InlineMessageContentPart[] = [
+    { type: "text", text: "请看" },
+    {
+      type: "attachment_ref",
+      path: "C:\\Work\\需求说明.pdf",
+      name: "需求说明.pdf",
+    },
+    {
+      type: "attachment_ref",
+      path: "C:\\Other\\需求说明.pdf",
+      name: "需求说明.pdf",
+    },
+  ];
+
+  assert.deepEqual(
+    filterComposerAttachmentReferences(parts, ["c:/work/需求说明.pdf"]),
+    [
+      { type: "text", text: "请看" },
+      {
+        type: "attachment_ref",
+        path: "C:\\Work\\需求说明.pdf",
+        name: "需求说明.pdf",
+      },
+    ],
+  );
 });
 
 test("uses a list-aware line break for Shift+Enter", () => {

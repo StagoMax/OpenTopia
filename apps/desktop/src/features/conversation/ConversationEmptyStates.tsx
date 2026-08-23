@@ -261,14 +261,12 @@ export function NewTaskState({
 export function OfflineState({
   backendUrl,
   error,
-  attempt,
   isProbing,
   startupStatus,
   onRetry,
 }: {
   backendUrl?: string;
   error: string | null;
-  attempt: number;
   isProbing: boolean;
   startupStatus: BackendStartupStatus | null;
   onRetry: () => void;
@@ -285,6 +283,8 @@ export function OfflineState({
     startupStatus?.startedAt ?? openedAt,
     now,
   );
+  const canRetry =
+    !startupStatus || startupStatus.phase === "failed";
 
   return (
     <div className="empty-state offline">
@@ -299,7 +299,7 @@ export function OfflineState({
         ) : (
           "本地服务正在启动。"
         )}
-        此页面会自动重连，无需手动刷新。
+        本地服务准备完成后会自动继续，无需手动刷新。
       </p>
       <small>{backendUrl ?? "http://127.0.0.1:8787"}</small>
       <div
@@ -314,21 +314,20 @@ export function OfflineState({
           <span>{elapsedLabel}</span>
         </div>
       </div>
-      <div className="offline-actions">
-        <button
-          className="secondary-button"
-          type="button"
-          disabled={isProbing}
-          onClick={onRetry}
-        >
-          <RotateCcw size={14} className={isProbing ? "spin" : undefined} />
-          {isProbing ? "连接中…" : "立即重试"}
-        </button>
-        <small>已尝试 {attempt + 1} 次</small>
-      </div>
-      {/* Early failures are just the build still running, so the raw error only
-          matters once retrying has clearly stopped helping. */}
-      {error && attempt >= 10 && <pre>{error}</pre>}
+      {canRetry ? (
+        <div className="offline-actions">
+          <button
+            className="secondary-button"
+            type="button"
+            disabled={isProbing}
+            onClick={onRetry}
+          >
+            <RotateCcw size={14} className={isProbing ? "spin" : undefined} />
+            {isProbing ? "连接中…" : "重新连接"}
+          </button>
+        </div>
+      ) : null}
+      {error && startupStatus?.phase === "failed" ? <pre>{error}</pre> : null}
     </div>
   );
 }

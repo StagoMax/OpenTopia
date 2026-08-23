@@ -4,7 +4,7 @@ import test from "node:test";
 import type * as ConversationWorkFormModule from "./conversationWorkForm";
 import type { AgentEvent, WorkForm } from "./types";
 
-const { resolveRuntimeWorkForm } = (await import(
+const { resolveComposerWorkForm, resolveRuntimeWorkForm } = (await import(
   "./conversationWorkForm" + ".ts"
 )) as typeof ConversationWorkFormModule;
 
@@ -64,6 +64,55 @@ test("clears the WorkForm after its turn is cancelled", () => {
       event(2, { type: "turn_cancelled", reason: "Cancelled by user." }),
     ]),
     null,
+  );
+});
+
+test("clears the WorkForm as soon as the session reports no active turn", () => {
+  assert.equal(
+    resolveRuntimeWorkForm(
+      [event(1, { type: "work_form_updated", form })],
+      null,
+    ),
+    null,
+  );
+});
+
+test("does not show a previous turn form during a newer active turn", () => {
+  assert.equal(
+    resolveRuntimeWorkForm(
+      [event(1, { type: "work_form_updated", form }, "turn-1")],
+      "turn-2",
+    ),
+    null,
+  );
+});
+
+test("keeps a paused goal form available while hiding an inactive runtime form", () => {
+  const goalForm: WorkForm = {
+    ...form,
+    id: "goal-form-1",
+    scope: { kind: "goal", id: "goal-1" },
+    status: "paused",
+  };
+  assert.equal(
+    resolveComposerWorkForm(
+      [event(1, { type: "work_form_updated", form })],
+      {
+        goal: {
+          id: "goal-1",
+          threadId: "thread-1",
+          objective: "Edit",
+          tokensUsed: 0,
+          timeUsedSeconds: 0,
+          version: 1,
+          createdAt: "2026-08-04T00:00:00Z",
+          updatedAt: "2026-08-04T00:00:00Z",
+        },
+        workForm: goalForm,
+      },
+      null,
+    ),
+    goalForm,
   );
 });
 

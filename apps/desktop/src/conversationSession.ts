@@ -28,6 +28,7 @@ export type ConversationSessionState = {
   messages: Message[];
   events: AgentEvent[];
   turnStatus: TurnStatus | null;
+  turnStatusResolved: boolean;
   activeTurnId: string | null;
   pendingApprovalIds: string[];
   pendingUserInput: UserInputRecord[];
@@ -84,6 +85,7 @@ export function createConversationSessionState(
     messages: [],
     events: [],
     turnStatus: null,
+    turnStatusResolved: false,
     activeTurnId: null,
     pendingApprovalIds: [],
     pendingUserInput: [],
@@ -108,6 +110,7 @@ export function conversationSessionReducer(
     case "loadStarted":
       return {
         ...state,
+        turnStatusResolved: false,
         loadState: {
           threadId: state.threadId,
           status: state.loadState.status === "ready" ? "ready" : "loading",
@@ -122,21 +125,34 @@ export function conversationSessionReducer(
       const events = mergeConversationEvents(state.events, action.events);
       const inactiveTurnIds = inactiveTurnIdsFromEvents(events);
       const restoredActiveTurnId = activeTurnIdFromEvents(events);
+      // History can end at `turn_started` after a process crash. Once the
+      // projection endpoint has returned a concrete Turn, its terminal status
+      // is authoritative regardless of which concurrent load finished first.
+      const statusActiveTurnId =
+        state.turnStatusResolved && state.turnStatus !== null
+          ? resolveActiveTurnId(state.turnStatus, inactiveTurnIds)
+          : undefined;
       return {
         ...state,
         messages,
         events,
         activeTurnId:
-          restoredActiveTurnId ??
-          (state.activeTurnId && !inactiveTurnIds.has(state.activeTurnId)
-            ? state.activeTurnId
-            : null),
+          statusActiveTurnId !== undefined
+            ? statusActiveTurnId
+            : restoredActiveTurnId ??
+              (state.activeTurnId && !inactiveTurnIds.has(state.activeTurnId)
+                ? state.activeTurnId
+                : null),
         loadState: { threadId: state.threadId, status: "ready", error: null },
       };
     }
     case "auxiliaryLoaded":
       return {
         ...state,
+        turnStatusResolved:
+          action.turnStatus === undefined
+            ? state.turnStatusResolved
+            : true,
         activeTurnId:
           action.turnStatus === undefined ||
           (action.turnStatus === null && state.activeTurnId !== null)

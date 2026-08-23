@@ -12,6 +12,7 @@ import type { WorkForm } from "../../types";
 
 export function ComposerWorkForm({ form }: { form: WorkForm }) {
   const [expanded, setExpanded] = useState(false);
+  const active = form.status === "active";
   const completedIds = useMemo(
     () =>
       new Set(
@@ -22,6 +23,7 @@ export function ComposerWorkForm({ form }: { form: WorkForm }) {
     [form.items],
   );
   const currentStepIndex = useMemo(() => {
+    if (!active) return -1;
     const inProgressIndex = form.items.findIndex(
       (item) => item.status === "in_progress",
     );
@@ -31,15 +33,22 @@ export function ComposerWorkForm({ form }: { form: WorkForm }) {
         item.status === "pending" &&
         item.dependsOn.every((dependency) => completedIds.has(dependency)),
     );
-  }, [completedIds, form.items]);
+  }, [active, completedIds, form.items]);
   const resolvedCount = form.items.filter((item) =>
     ["completed", "deferred", "blocked", "cancelled"].includes(item.status),
   ).length;
   const currentStep =
     currentStepIndex >= 0 ? form.items[currentStepIndex] : undefined;
-  const progressLabel = currentStep
-    ? `第 ${currentStepIndex + 1}/${form.items.length} 步`
-    : `${resolvedCount}/${form.items.length} 已处理`;
+  const progressLabel =
+    form.status === "paused"
+      ? "已暂停"
+      : form.status === "blocked"
+        ? "受阻"
+        : form.status === "cancelled"
+          ? "已取消"
+          : currentStep
+            ? `第 ${currentStepIndex + 1}/${form.items.length} 步`
+            : `${resolvedCount}/${form.items.length} 已处理`;
 
   useEffect(() => {
     setExpanded(false);

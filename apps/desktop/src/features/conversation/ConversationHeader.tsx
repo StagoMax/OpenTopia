@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import {
   Archive,
+  ArrowLeft,
   ChevronDown,
   Cloud,
   FileCode2,
@@ -32,6 +33,8 @@ export function ThreadHeader({
   title,
   headingIcon,
   showThreadControls = true,
+  onBack,
+  backLabel = "返回",
   toolStageOpen,
   contextRailOpen,
   onOpenLocation,
@@ -45,6 +48,8 @@ export function ThreadHeader({
   title?: string;
   headingIcon?: ReactNode;
   showThreadControls?: boolean;
+  onBack?: () => void;
+  backLabel?: string;
   toolStageOpen: boolean;
   contextRailOpen: boolean;
   onOpenLocation(): void;
@@ -79,6 +84,17 @@ export function ThreadHeader({
   return (
     <div className="thread-header">
       <div className="thread-heading">
+        {onBack ? (
+          <IconButton
+            aria-label={backLabel}
+            onClick={onBack}
+            size="compact"
+            title={backLabel}
+            variant="quiet"
+          >
+            <ArrowLeft aria-hidden="true" size={15} />
+          </IconButton>
+        ) : null}
         {headingIcon ?? <Folder size={15} />}
         <h1>{headerTitle}</h1>
         {showThreadControls ? (

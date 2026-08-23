@@ -12,6 +12,7 @@ import { Paperclip } from "lucide-react";
 import {
   composerContentText,
   composerExternalValueSyncAction,
+  filterComposerAttachmentReferences,
   composerInputCommitPending,
   composerLineBreakText,
   composerUndoEntries,
@@ -343,6 +344,30 @@ const MemoizedComposer = memo(function ComposerView({
     applyExternalComposerValue(value);
   }, [value]);
 
+  // Source chips can also be removed by draft restoration or another parent
+  // action, not only by ComposerSources' button. Reconcile the DOM at the
+  // composer boundary so no orphaned path-backed reference remains visible.
+  useLayoutEffect(() => {
+    const editor = editorRef.current;
+    if (!editor) return;
+    const activeKeys = new Set(
+      contextSources.map((source) => workspaceRootKey(source.path)),
+    );
+    const references = Array.from(
+      editor.querySelectorAll<HTMLElement>("[data-composer-attachment-path]"),
+    ).filter(
+      (reference) =>
+        !activeKeys.has(
+          workspaceRootKey(reference.dataset.composerAttachmentPath ?? ""),
+        ),
+    );
+    if (references.length === 0) return;
+    const before = composerSnapshotAtSelection(editor);
+    references.forEach((reference) => reference.remove());
+    commitComposerMutation(false, before, true);
+    flushPendingComposerPublish();
+  }, [contextSources]);
+
   useEffect(() => {
     const rememberSelection = () => {
       const editor = editorRef.current;
@@ -662,9 +687,7 @@ const MemoizedComposer = memo(function ComposerView({
     if (editor) {
       const key = workspaceRootKey(path);
       const references = Array.from(
-        editor.querySelectorAll<HTMLElement>(
-          "[data-composer-attachment-path]",
-        ),
+        editor.querySelectorAll<HTMLElement>("[data-composer-attachment-path]"),
       ).filter(
         (reference) =>
           workspaceRootKey(reference.dataset.composerAttachmentPath ?? "") ===
@@ -674,6 +697,11 @@ const MemoizedComposer = memo(function ComposerView({
         const before = composerSnapshotAtSelection(editor);
         references.forEach((reference) => reference.remove());
         commitComposerMutation(false, before, true);
+        // Source removal is a structural edit, not ordinary typing. Publish it
+        // before the parent removes the source from the draft; otherwise the
+        // parent's re-render can briefly feed the previous controlled value
+        // back into the contenteditable and recreate the visible reference.
+        flushPendingComposerPublish();
       }
     }
     onRemoveContextSource(path);
@@ -686,10 +714,9 @@ const MemoizedComposer = memo(function ComposerView({
     const sourceKeys = new Set(
       contextSources.map((source) => workspaceRootKey(source.path)),
     );
-    const parts = (editor ? readComposerContentParts(editor) : []).filter(
-      (part) =>
-        part.type !== "attachment_ref" ||
-        sourceKeys.has(workspaceRootKey(part.path)),
+    const parts = filterComposerAttachmentReferences(
+      editor ? readComposerContentParts(editor) : [],
+      sourceKeys,
     );
     const usedIds = referencedImageIds(parts);
     const currentAttachments = imageAttachmentsRef.current;
@@ -799,7 +826,17 @@ const MemoizedComposer = memo(function ComposerView({
         insertionRange.collapse(true);
         range = insertionRange;
       }
-      if (editor && before) commitComposerMutation(true, before);
+      if (editor && before && rangeBelongsToEditor(editor, range)) {
+        // `insertNode` only updates this detached Range. Move the browser
+        // selection as well so the next typed character follows the newly
+        // inserted reference (and so commitComposerMutation records the same
+        // caret position in the history snapshot).
+        const selection = window.getSelection();
+        selection?.removeAllRanges();
+        selection?.addRange(range!);
+        savedComposerRangeRef.current = range!.cloneRange();
+        commitComposerMutation(true, before);
+      }
     }
   }
 
