@@ -3,9 +3,10 @@ import test from "node:test";
 
 import type * as WorkspaceNavigationModule from "./workspaceNavigation";
 
-const { resolveSidebarDestination } = (await import(
-  "./workspaceNavigation" + ".ts"
-)) as typeof WorkspaceNavigationModule;
+const { resolveActiveFlowPrimaryView, resolveSidebarDestination } =
+  (await import(
+    "./workspaceNavigation" + ".ts"
+  )) as typeof WorkspaceNavigationModule;
 
 test("maps fixed Flow navigation to one primary destination", () => {
   for (const [flowPrimaryView, destination] of [
@@ -65,14 +66,30 @@ test("maps fixed Flow navigation to one primary destination", () => {
 });
 
 test("lets the full-workspace Plugins page own the current state", () => {
+  const sidebarDestination = resolveSidebarDestination({
+    experienceMode: "flow",
+    flowPrimaryView: "trust",
+    toolStageOpen: true,
+    activeToolKind: "extensions",
+  });
+
+  assert.equal(sidebarDestination, "plugins");
   assert.equal(
-    resolveSidebarDestination({
-      experienceMode: "flow",
-      flowPrimaryView: "connections",
-      toolStageOpen: true,
-      activeToolKind: "extensions",
+    resolveActiveFlowPrimaryView({
+      flowPrimaryView: "trust",
+      sidebarDestination,
     }),
-    "plugins",
+    null,
+  );
+});
+
+test("marks the active Flow page when it owns the sidebar destination", () => {
+  assert.equal(
+    resolveActiveFlowPrimaryView({
+      flowPrimaryView: "trust",
+      sidebarDestination: "flow-trust",
+    }),
+    "trust",
   );
 });
 

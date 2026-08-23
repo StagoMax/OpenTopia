@@ -1,4 +1,5 @@
 import type { ToolCall, ToolResult } from "./types";
+import { toolResultIsError } from "./toolFailures.ts";
 
 // The activity timeline renders a tool call from the call input and the result
 // metadata alone — never from prose the model wrote. Codex does the same: the
@@ -1063,9 +1064,7 @@ export function patchTargets(patch: string): string[] {
 }
 
 export function toolResultFailed(result?: ToolResult) {
-  if (!result) return false;
-  const metadata = asRecord(result.metadata);
-  return metadata?.success === false || metadata?.isError === true;
+  return toolResultIsError(result);
 }
 
 export function toolActivityGroupStatus(

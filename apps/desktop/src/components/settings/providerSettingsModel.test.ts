@@ -4,12 +4,42 @@ import test from "node:test";
 import type * as ProviderSettingsModelModule from "./providerSettingsModel";
 
 const {
+  contextWindowInputConstraints,
+  contextWindowPresets,
   createProviderSettings,
   hasCachedProviderModelCatalog,
   providerChangeInvalidatesModelDiscovery,
 } = (await import(
   "./providerSettingsModel" + ".ts"
 )) as typeof ProviderSettingsModelModule;
+
+test("accepts every context-window preset in the manual input", () => {
+  const { min, step } = contextWindowInputConstraints;
+
+  for (const preset of contextWindowPresets) {
+    assert.ok(Number.isInteger(preset.tokens), preset.label);
+    assert.ok(preset.tokens >= min, preset.label);
+    assert.equal((preset.tokens - min) % step, 0, preset.label);
+  }
+});
+
+test("uses the binary token value for the 1M context preset", () => {
+  assert.equal(
+    contextWindowPresets.find(
+      (preset) => preset.label === "1M（1,048,576 tokens）",
+    )?.tokens,
+    1_048_576,
+  );
+});
+
+test("labels every context-window preset with its exact token count", () => {
+  for (const preset of contextWindowPresets) {
+    assert.ok(
+      preset.label.includes(preset.tokens.toLocaleString("en-US")),
+      preset.label,
+    );
+  }
+});
 
 test("reuses a persisted model catalog when reopening settings", () => {
   const provider = createProviderSettings("relay", {

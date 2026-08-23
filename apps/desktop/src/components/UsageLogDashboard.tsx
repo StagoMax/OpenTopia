@@ -9,6 +9,7 @@ import {
 } from "../usageLogs";
 import type { AgentEvent, Thread } from "../types";
 import { Badge, Panel, type BadgeVariant } from "./ui";
+import { ToolFailureDetails } from "./ToolFailureDetails";
 import { UsageTokenBreakdown } from "./UsageTokenBreakdown";
 import "./UsageLogDashboard.css";
 
@@ -163,6 +164,8 @@ export function UsageLogDashboard({
           </Panel>
         </div>
 
+        <ToolFailureDetails events={events} isLoading={isLoading} />
+
         <UsageTokenBreakdown calls={data.calls} summary={data.summary} />
 
         <Panel className="usage-waste-panel" title="可归因浪费与附加成本">
@@ -210,9 +213,9 @@ export function UsageLogDashboard({
           }
         >
           <p className="usage-cache-break-help">
-            API 只报告命中的缓存
-            Token；下列位置由相邻请求的缓存结果、配置与上下文 hash
-            推断，并标注置信度。
+            API 只报告命中的缓存 Token；OpenTopia 会比较相邻请求的脱敏 Provider
+            前缀指纹，指出首个变化段。若请求前缀完全相同，则明确归类为 Provider
+            运行性未命中。
           </p>
           {data.cacheBreaks.length === 0 ? (
             <div className="usage-table-state">
@@ -342,7 +345,7 @@ function CacheBreakRecord({ call }: { call: UsageCall }) {
         </div>
         <div>
           <dt>置信度</dt>
-          <dd>{cacheConfidenceLabel(diagnostic.confidence)}</dd>
+          <dd>{cacheConfidenceLabel(diagnostic)}</dd>
         </div>
       </dl>
     </article>
@@ -358,6 +361,10 @@ function cacheBreakBadgeVariant(
 function cacheBreakTitle(diagnostic: CacheReuseDiagnostic): string {
   const point = diagnostic.breakpoint;
   switch (diagnostic.reason) {
+    case "wire_prefix_changed":
+      return point
+        ? `${wireChangeLabel(point.change)}：${contextKindLabel(point.kind)}${point.name ? ` · ${point.name}` : ""}`
+        : "Provider 请求前缀发生变化";
     case "content_changed":
       return point
         ? `最早变化：${contextKindLabel(point.kind)} · ${point.source}`
@@ -368,6 +375,8 @@ function cacheBreakTitle(diagnostic: CacheReuseDiagnostic): string {
       return "系统提示发生变化";
     case "cache_key_changed":
       return "Prompt Cache Key 发生变化";
+    case "request_configuration_changed":
+      return point ? `请求配置变化：${point.source}` : "请求配置发生变化";
     case "model_changed":
       return "模型发生切换";
     case "provider_changed":
@@ -377,7 +386,9 @@ function cacheBreakTitle(diagnostic: CacheReuseDiagnostic): string {
     case "stateful_context":
       return "状态游标请求无法直接比较完整前缀";
     case "operational_miss":
-      return "未发现提前变化的输入前缀";
+      return "请求前缀相同，但 Provider 未复用";
+    case "diagnostic_data_missing":
+      return "请求缺少 Provider 前缀指纹";
     default:
       return "缓存读取下降";
   }
@@ -386,6 +397,10 @@ function cacheBreakTitle(diagnostic: CacheReuseDiagnostic): string {
 function cacheBreakExplanation(diagnostic: CacheReuseDiagnostic): string {
   const point = diagnostic.breakpoint;
   switch (diagnostic.reason) {
+    case "wire_prefix_changed":
+      return point
+        ? wireBreakpointExplanation(point)
+        : "相邻请求的 Provider 前缀指纹不同，但没有记录可比较的分段。";
     case "content_changed":
       return point
         ? `${contextChangeLabel(point.change)}；缓存范围为${cacheScopeLabel(point.cacheScope)}。该位置是 token_estimate 推断，不是 API 返回的逐 Token 断点。`
@@ -396,6 +411,10 @@ function cacheBreakExplanation(diagnostic: CacheReuseDiagnostic): string {
       return "系统或开发者指令位于提示词前部，变化通常会影响其后的整段缓存复用。";
     case "cache_key_changed":
       return "相邻请求没有使用相同的 prompt_cache_key，缓存路由与匹配不再可直接复用。";
+    case "request_configuration_changed":
+      return point
+        ? `Provider 请求字段 ${point.source} 的值发生变化；该字段只保留 hash，没有记录原值。`
+        : "Provider 请求配置指纹发生变化。";
     case "model_changed":
       return "不同模型的 KV Cache 不能作为同一条可比较缓存链处理。";
     case "provider_changed":
@@ -405,7 +424,9 @@ function cacheBreakExplanation(diagnostic: CacheReuseDiagnostic): string {
     case "stateful_context":
       return "请求使用 previous_response_id 复用服务端状态；若已记录内容没有变化，缓存下降也可能来自状态游标的计量差异。";
     case "operational_miss":
-      return "已记录的公共前缀未提前变化，更可能是缓存过期、服务端逐出、路由漂移或负载分片造成。";
+      return "相邻请求的 Provider 前缀、工具目录、缓存键和请求配置指纹均一致；原因位于 Provider 内部，可能是缓存过期、逐出、路由漂移或负载分片。标准 API 无法继续区分。";
+    case "diagnostic_data_missing":
+      return "该请求产生于 Provider 前缀指纹启用之前，或适配器没有提供可分析的请求结构；不能可靠归因。";
     default:
       return "现有事件不足以确定具体内容位置。";
   }
@@ -413,9 +434,24 @@ function cacheBreakExplanation(diagnostic: CacheReuseDiagnostic): string {
 
 function cacheBreakOffset(diagnostic: CacheReuseDiagnostic): string {
   const offset = diagnostic.breakpoint?.tokenOffsetEstimate;
-  return offset === null || offset === undefined
-    ? "无法定位"
-    : `约 ${formatInteger(offset)} Tokens 后`;
+  if (offset !== null && offset !== undefined) {
+    return `约 ${formatInteger(offset)} Tokens 后`;
+  }
+  if (
+    diagnostic.reason === "tool_catalog_changed" ||
+    diagnostic.reason === "system_prompt_changed" ||
+    diagnostic.reason === "cache_key_changed" ||
+    diagnostic.reason === "request_configuration_changed" ||
+    diagnostic.reason === "model_changed" ||
+    diagnostic.reason === "provider_changed" ||
+    diagnostic.reason === "input_below_minimum"
+  ) {
+    return "请求起始配置";
+  }
+  if (diagnostic.reason === "operational_miss") return "无本地断点";
+  if (diagnostic.reason === "stateful_context") return "Provider 状态链";
+  if (diagnostic.reason === "diagnostic_data_missing") return "未记录指纹";
+  return "无可用断点";
 }
 
 function contextKindLabel(kind: string): string {
@@ -434,6 +470,15 @@ function contextKindLabel(kind: string): string {
     user: "用户输入",
     tool_call: "工具调用",
     tool_result: "工具结果",
+    instructions: "指令",
+    system_message: "系统消息",
+    developer_message: "开发者消息",
+    user_message: "用户消息",
+    assistant_message: "助手消息",
+    tool_image: "工具图片伴随消息",
+    input_item: "输入项",
+    unknown: "未知输入段",
+    request_configuration: "请求配置",
   };
   return labels[kind] ?? kind;
 }
@@ -444,6 +489,30 @@ function contextChangeLabel(
   if (change === "inserted") return "该上下文项被插入到公共前缀中";
   if (change === "removed") return "该上下文项从公共前缀中移除";
   return "该上下文项的内容 hash 发生变化";
+}
+
+function wireChangeLabel(
+  change: NonNullable<CacheReuseDiagnostic["breakpoint"]>["change"],
+): string {
+  if (change === "inserted") return "前缀内插入";
+  if (change === "removed") return "前缀内移除";
+  return "前缀段变化";
+}
+
+function wireBreakpointExplanation(
+  point: NonNullable<CacheReuseDiagnostic["breakpoint"]>,
+): string {
+  const count = Math.max(1, point.affectedSegmentCount ?? 1);
+  if (point.change === "inserted") {
+    const anchor = point.anchorSource
+      ? `，原有后续段移到 ${point.anchorSource}`
+      : "";
+    return `从 ${point.source} 起在旧公共前缀内插入 ${formatInteger(count)} 个 Provider 消息${anchor}。位置由脱敏 wire hash 与本地 token 估算得到。`;
+  }
+  if (point.change === "removed") {
+    return `从 ${point.source} 起移除了旧公共前缀中的 ${formatInteger(count)} 个 Provider 消息。位置由脱敏 wire hash 与本地 token 估算得到。`;
+  }
+  return `${point.source} 的 Provider 消息内容 hash 发生变化。位置由脱敏 wire hash 与本地 token 估算得到。`;
 }
 
 function cacheScopeLabel(
@@ -459,11 +528,12 @@ function cacheScopeLabel(
   return scope ? labels[scope] : "未知级";
 }
 
-function cacheConfidenceLabel(
-  confidence: CacheReuseDiagnostic["confidence"],
-): string {
-  if (confidence === "high") return "高 · 配置/API 证据";
-  if (confidence === "medium") return "中 · 上下文 hash 推断";
+function cacheConfidenceLabel(diagnostic: CacheReuseDiagnostic): string {
+  if (diagnostic.confidence === "high") return "高 · Provider 请求指纹";
+  if (diagnostic.reason === "operational_miss") {
+    return "中 · 本地前缀一致";
+  }
+  if (diagnostic.confidence === "medium") return "中 · 上下文 hash 推断";
   return "低 · 服务端状态不可见";
 }
 

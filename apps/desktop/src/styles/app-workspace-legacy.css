@@ -1694,7 +1694,7 @@
 }
 
 .composer-plan-list li.is-completed .composer-plan-step-icon {
-  color: var(--text-muted);
+  color: var(--success);
 }
 
 .composer-plan-list li.is-in_progress .composer-plan-step-icon {

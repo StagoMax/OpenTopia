@@ -7,6 +7,7 @@ import type { AppSettings } from "../../types";
 const {
   approvalStrategyMode,
   permissionAccessMode,
+  permissionAccessModeOptions,
   selectPermissionAccessMode,
   selectPermissionMode,
   systemSandboxIsActive,
@@ -35,7 +36,34 @@ test("keeps the legacy full_access value as guarded host access", () => {
     permissionAccessMode(selected.permissionMode, selected.sandbox),
     "guarded-full-access",
   );
-  assert.equal(approvalStrategyMode(selected.permissionMode), "unrestricted");
+  assert.equal(approvalStrategyMode(selected.permissionMode), "approve");
+});
+
+test("keeps host-only access modes out of automatic approval", () => {
+  assert.deepEqual(permissionAccessModeOptions("auto", sandbox), [
+    "read-only",
+    "workspace-write",
+  ]);
+});
+
+test("shows guarded host access under user approval", () => {
+  const selected = selectPermissionAccessMode(
+    "guarded-full-access",
+    "auto",
+    sandbox,
+  );
+  assert.deepEqual(
+    permissionAccessModeOptions(selected.permissionMode, selected.sandbox),
+    ["read-only", "workspace-write", "guarded-full-access"],
+  );
+});
+
+test("shows unrestricted access only in the unrestricted preset", () => {
+  const selected = selectPermissionMode("unrestricted", sandbox);
+  assert.deepEqual(
+    permissionAccessModeOptions(selected.permissionMode, selected.sandbox),
+    ["read-only", "workspace-write", "unrestricted"],
+  );
 });
 
 test("maps complete system access to the no-approval unrestricted mode", () => {

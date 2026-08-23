@@ -50,6 +50,7 @@ import {
 } from "./components/SettingsPanel";
 import { TaskSearchDialog } from "./components/TaskSearchDialog";
 import {
+  resolveActiveFlowPrimaryView,
   resolveSidebarDestination,
   type FlowPrimaryView,
 } from "./workspaceNavigation";
@@ -68,7 +69,7 @@ import {
   rendererTraceTime,
   type ConversationStreamEventTrace,
 } from "./conversationRenderTrace";
-import { threadTitleRetryDelay } from "./threadTitleRetry";
+
 import { closeToolTabState } from "./toolTabState";
 import { resolveMarkdownLink } from "./markdownLinks";
 import { conversationMetrics as deriveConversationMetrics } from "./conversationMetrics";
@@ -82,11 +83,13 @@ import {
   deleteProviderApiKey,
   ensureLibraryProviderService,
   getDroppedContextFiles,
+  getBackendStartupStatus,
   getRecentWorkspaces,
   listSecretSources,
   loadPlatformInfo,
   newAppWindow,
   openExternal,
+  onBackendStartupStatus,
   openPath,
   quitApp,
   recordConversationRenderTrace,
@@ -114,7 +117,7 @@ import {
   type ThreadActivityStatus,
 } from "./threadActivityStatus";
 import { errorMessage, isAbortError } from "./errorMessage";
-import { threadTitleFromPrompt, threadTitleNeedsSummary } from "./threadTitle";
+import { threadTitleFromPrompt } from "./threadTitle";
 import { workspaceRootKey } from "./workspaceRootKey";
 import { isSpreadsheetFilePath } from "./spreadsheetFormats.ts";
 import { shouldPromptForWindowsSandboxSetup } from "./windowsSandboxSetup";
@@ -147,6 +150,7 @@ import {
 import type {
   AgentEvent,
   AppSettings,
+  BackendStartupStatus,
   ArtifactContent,
   ArtifactDescriptor,
   BrowserNavigationRequest,
@@ -244,14 +248,6 @@ const emptyConversationEvents: AgentEvent[] = [];
 type LoadedThreadActivityStatus = {
   status: ThreadActivityStatus;
   updatedAt: string | null;
-};
-
-type PendingThreadTitleRetry = {
-  threadId: string;
-  prompt: string;
-  expectedTitle: string;
-  failureCount: number;
-  retryAt: number;
 };
 
 async function loadThreadActivityStatuses(
@@ -508,8 +504,28 @@ export function App() {
   const [serverError, setServerError] = useState<string | null>(null);
   const [bootstrapAttempt, setBootstrapAttempt] = useState(0);
   const [serverProbing, setServerProbing] = useState(true);
+  const [backendStartupStatus, setBackendStartupStatus] =
+    useState<BackendStartupStatus | null>(null);
   const clientEndpointRef = useRef<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const applyStatus = (nextStatus: BackendStartupStatus) => {
+      setBackendStartupStatus((currentStatus) =>
+        !currentStatus ||
+        Date.parse(nextStatus.updatedAt) >= Date.parse(currentStatus.updatedAt)
+          ? nextStatus
+          : currentStatus,
+      );
+    };
+    const unsubscribe = onBackendStartupStatus(applyStatus);
+    void getBackendStartupStatus()
+      .then((status) => {
+        if (status) applyStatus(status);
+      })
+      .catch(() => undefined);
+    return unsubscribe;
+  }, []);
   const [projects, setProjects] = useState<Project[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
@@ -585,12 +601,7 @@ export function App() {
   const [skillsRevision, setSkillsRevision] = useState(0);
   const [isCreatingThread, setIsCreatingThread] = useState(false);
   const activeTurnId = activeConversationState?.activeTurnId ?? null;
-  const pendingThreadTitleRetriesRef = useRef(
-    new Map<string, PendingThreadTitleRetry>(),
-  );
-  const threadTitleRetryInFlightRef = useRef(new Set<string>());
-  const threadTitleRetryTimerRef = useRef<number | null>(null);
-  const [threadTitleRetryRevision, setThreadTitleRetryRevision] = useState(0);
+
   const [threadActivityStatuses, setThreadActivityStatuses] = useState<
     Record<string, ThreadActivityStatus>
   >({});
@@ -2832,83 +2843,6 @@ export function App() {
     setFilePreview(await client.readWorkspaceFile(threadId, command.path));
   }
 
-  function requestThreadTitleGeneration(retry: PendingThreadTitleRetry) {
-    if (!client || threadTitleRetryInFlightRef.current.has(retry.threadId)) {
-      return;
-    }
-
-    threadTitleRetryInFlightRef.current.add(retry.threadId);
-    void client
-      .generateThreadTitle(retry.threadId, retry.prompt, retry.expectedTitle)
-      .then(({ thread: titledThread, updated }) => {
-        pendingThreadTitleRetriesRef.current.delete(retry.threadId);
-        if (!updated) return;
-        setThreads((current) =>
-          current.map((item) =>
-            item.id === titledThread.id ? titledThread : item,
-          ),
-        );
-      })
-      .catch((error) => {
-        const failureCount = retry.failureCount + 1;
-        const delay = threadTitleRetryDelay(failureCount);
-        if (delay === null) {
-          pendingThreadTitleRetriesRef.current.delete(retry.threadId);
-          console.warn(
-            "OpenTopia could not generate the task title after retries",
-            error,
-          );
-          return;
-        }
-
-        pendingThreadTitleRetriesRef.current.set(retry.threadId, {
-          ...retry,
-          failureCount,
-          retryAt: Date.now() + delay,
-        });
-        console.warn(
-          "OpenTopia could not generate the task title; it will retry when idle",
-          error,
-        );
-      })
-      .finally(() => {
-        threadTitleRetryInFlightRef.current.delete(retry.threadId);
-        setThreadTitleRetryRevision((current) => current + 1);
-      });
-  }
-
-  useEffect(() => {
-    if (threadTitleRetryTimerRef.current !== null) {
-      window.clearTimeout(threadTitleRetryTimerRef.current);
-      threadTitleRetryTimerRef.current = null;
-    }
-    if (!client || activeTurnId || isSending) return;
-
-    const nextRetry = [...pendingThreadTitleRetriesRef.current.values()]
-      .filter(
-        (retry) => !threadTitleRetryInFlightRef.current.has(retry.threadId),
-      )
-      .sort((left, right) => left.retryAt - right.retryAt)[0];
-    if (!nextRetry) return;
-
-    const waitMs = Math.max(0, nextRetry.retryAt - Date.now());
-    if (waitMs === 0) {
-      requestThreadTitleGeneration(nextRetry);
-      return;
-    }
-
-    threadTitleRetryTimerRef.current = window.setTimeout(() => {
-      threadTitleRetryTimerRef.current = null;
-      setThreadTitleRetryRevision((current) => current + 1);
-    }, waitMs);
-    return () => {
-      if (threadTitleRetryTimerRef.current !== null) {
-        window.clearTimeout(threadTitleRetryTimerRef.current);
-        threadTitleRetryTimerRef.current = null;
-      }
-    };
-  }, [activeTurnId, client, isSending, threadTitleRetryRevision]);
-
   async function createThread(
     initialPrompt?: string,
     imageAttachments: InlineImageAttachment[] = [],
@@ -2995,15 +2929,6 @@ export function App() {
       setToolTabs([]);
       setActiveToolTabId(null);
       setToolStageOpen(false);
-      if (threadTitleNeedsSummary(prompt)) {
-        requestThreadTitleGeneration({
-          threadId: thread.id,
-          prompt,
-          expectedTitle: thread.title,
-          failureCount: 0,
-          retryAt: Date.now(),
-        });
-      }
       if (directCommand) {
         await runDirectToolCommand(thread.id, directCommand);
         if (activeThreadIdRef.current === thread.id) setComposer("");
@@ -4068,7 +3993,10 @@ export function App() {
               sidebarDestination === "conversation" && activeThreadId === null
             }
             activeFlowPrimaryView={
-              flowPrimarySurface ? flowPrimaryView : null
+              resolveActiveFlowPrimaryView({
+                flowPrimaryView,
+                sidebarDestination,
+              })
             }
             pluginsOpen={sidebarDestination === "plugins"}
             contextualCollection={
@@ -4237,6 +4165,7 @@ export function App() {
                 error={serverError}
                 attempt={bootstrapAttempt}
                 isProbing={serverProbing}
+                startupStatus={backendStartupStatus}
                 onRetry={() => setBootstrapAttempt((attempt) => attempt + 1)}
               />
             ) : activeThread ? (

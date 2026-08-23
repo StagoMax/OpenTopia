@@ -12,6 +12,7 @@ export const KIMI_K3_MODEL_GUIDE_URL =
   "https://www.kimi.com/code/docs/en/kimi-code/models.html";
 export const GLM_THINKING_GUIDE_URL =
   "https://docs.bigmodel.cn/cn/guide/capabilities/thinking";
+export const GLM_5_3_MODEL_GUIDE_URL = "https://z.ai/blog/glm-5.3";
 export const DEEPSEEK_THINKING_GUIDE_URL =
   "https://api-docs.deepseek.com/guides/thinking_mode";
 export const OPENAI_MODEL_CATALOG_VERIFIED_AT = "2026-08-02";
@@ -128,6 +129,11 @@ const DEEPSEEK_V4_EFFORTS = [
   "max",
 ] as const satisfies readonly ReasoningEffort[];
 const DEEPSEEK_REASONER_EFFORTS = [
+  "high",
+  "max",
+] as const satisfies readonly ReasoningEffort[];
+const GLM_5_3_EFFORTS = [
+  "low",
   "high",
   "max",
 ] as const satisfies readonly ReasoningEffort[];
@@ -252,6 +258,15 @@ const modelCapabilityRules: ReadonlyArray<{
       "max",
       GLM_THINKING_GUIDE_URL,
       true,
+    ),
+  },
+  {
+    // GLM-5.3 is thinking-only: its API rejects `thinking.type: disabled`.
+    pattern: /(?:^|[/\.])glm-5\.3(?:$|[-\[])/,
+    capability: officialCapability(
+      GLM_5_3_EFFORTS,
+      "max",
+      GLM_5_3_MODEL_GUIDE_URL,
     ),
   },
   {

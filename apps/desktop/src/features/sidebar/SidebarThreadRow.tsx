@@ -16,6 +16,7 @@ import {
   threadActivityStatusLabel,
   type ThreadActivityStatus,
 } from "../../threadActivityStatus";
+import { threadTitleScrollDurationMs } from "../../threadTitleScroll";
 import type { Project, Thread } from "../../types";
 
 function ThreadStatusIndicator({ status }: { status?: ThreadActivityStatus }) {
@@ -30,7 +31,11 @@ function ThreadStatusIndicator({ status }: { status?: ThreadActivityStatus }) {
       title={label}
     >
       {status === "processing" ? (
-        <Loader2 size={14} className="spin" aria-hidden="true" />
+        <Loader2
+          size={14}
+          className="thread-status-spinner"
+          aria-hidden="true"
+        />
       ) : status === "failed" ? (
         <CircleAlert size={14} aria-hidden="true" />
       ) : (
@@ -84,8 +89,7 @@ export function SidebarThreadRow({
         0,
         Math.ceil(text.scrollWidth - viewport.clientWidth),
       );
-      const durationMs =
-        distance > 0 ? Math.min(8_000, 1_800 + distance * 24) : 0;
+      const durationMs = threadTitleScrollDurationMs(distance);
       setTitleOverflow((current) =>
         current.distance === distance && current.durationMs === durationMs
           ? current
@@ -124,6 +128,10 @@ export function SidebarThreadRow({
         }}
         onClick={(event) => {
           if (event.detail === 0) onSelect();
+        }}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          setMenuOpen(true);
         }}
         aria-label={thread.title}
         title={thread.title}

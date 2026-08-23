@@ -2,6 +2,7 @@ import {
   Fragment,
   memo,
   useCallback,
+  useDeferredValue,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -57,7 +58,7 @@ const messageRenderBatchSize = 12;
 
 export function MessageList({
   messages,
-  events,
+  events: latestEvents,
   activeTurnId,
   pendingTurnFeedback,
   undoingTurnId,
@@ -92,6 +93,11 @@ export function MessageList({
     offset?: number,
   ): Promise<TurnFileDiffPreview>;
 }) {
+  // Tool events originate in an external store, whose updates React must
+  // process synchronously. Keep the previous timeline during that urgent pass
+  // and let React build the event-heavy replacement in an interruptible render
+  // so persistent chrome animations remain responsive.
+  const events = useDeferredValue(latestEvents);
   const visibleMessages = useMemo(
     () =>
       messages.filter(
@@ -193,29 +199,47 @@ export function MessageList({
       turnsWithAssistantCards,
     };
   }, [events]);
-  const pendingTurnIsAnchored = pendingTurnFeedback
-    ? events.some(
-        (event) =>
-          event.payload.type === "turn_started" &&
-          (pendingTurnFeedback.turnId
-            ? event.turnId === pendingTurnFeedback.turnId
-            : event.createdAt >= pendingTurnFeedback.startedAt),
-      )
-    : false;
+  const visibleMessageIds = useMemo(
+    () => new Set(visibleMessages.map((message) => message.id)),
+    [visibleMessages],
+  );
+  const activeTurnIsAnchored =
+    activeTurnId !== null &&
+    [...turnIdsByUserMessage.entries()].some(
+      ([userMessageId, turnIds]) =>
+        visibleMessageIds.has(userMessageId) && turnIds.includes(activeTurnId),
+    );
+  const pendingTurnIsAnchored =
+    pendingTurnFeedback !== null &&
+    visibleMessageIds.has(pendingTurnFeedback.userMessageId) &&
+    events.some(
+      (event) =>
+        event.payload.type === "turn_started" &&
+        (pendingTurnFeedback.turnId
+          ? event.turnId === pendingTurnFeedback.turnId
+          : event.payload.user_message_id === pendingTurnFeedback.userMessageId),
+    );
   const showPendingTurnStatus =
-    pendingTurnFeedback !== null && !pendingTurnIsAnchored;
+    pendingTurnFeedback !== null &&
+    visibleMessageIds.has(pendingTurnFeedback.userMessageId) &&
+    !pendingTurnIsAnchored;
   const activeTurnEvents =
     activeTurnId === null ? [] : (eventsByTurn.get(activeTurnId) ?? []);
+  const activeTurnUserMessageId =
+    activeTurnId === null
+      ? null
+      : (pendingTurnFeedback?.turnId === activeTurnId
+          ? pendingTurnFeedback.userMessageId
+          : [...turnIdsByUserMessage.entries()].find(([, turnIds]) =>
+                turnIds.includes(activeTurnId),
+              )?.[0] ?? null);
   const showModelThinkingStatus =
-    activeTurnId !== null && hasPendingProviderRequest(activeTurnEvents);
+    activeTurnIsAnchored && hasPendingProviderRequest(activeTurnEvents);
   const showActiveProcessingStatus =
-    activeTurnId !== null &&
+    activeTurnIsAnchored &&
     !showModelThinkingStatus &&
     !hasPendingToolCall(activeTurnEvents);
-  const showTrailingTurnStatus =
-    showPendingTurnStatus ||
-    showModelThinkingStatus ||
-    showActiveProcessingStatus;
+  const showTrailingTurnStatus = showPendingTurnStatus;
 
   useEffect(() => {
     if (!hasPendingMessages) return;
@@ -377,6 +401,25 @@ export function MessageList({
                     </Fragment>
                   ))}
                   {resultTurnIds.map(renderTurnChangeCard)}
+                  {showPendingTurnStatus &&
+                  pendingTurnFeedback?.userMessageId === message.id ? (
+                    <PendingTurnStatus
+                      key={`pending-${pendingTurnFeedback.startedAt}`}
+                      phase="processing"
+                      threadId={pendingTurnFeedback.threadId}
+                      turnId={pendingTurnFeedback.turnId}
+                    />
+                  ) : null}
+                  {activeTurnUserMessageId === message.id &&
+                  activeTurnId &&
+                  (showModelThinkingStatus || showActiveProcessingStatus) ? (
+                    <PendingTurnStatus
+                      key={`active-${activeTurnId}`}
+                      phase={showModelThinkingStatus ? "thinking" : "processing"}
+                      threadId={threadId}
+                      turnId={activeTurnId}
+                    />
+                  ) : null}
                 </Fragment>
               );
             })
@@ -409,28 +452,6 @@ export function MessageList({
               </div>
             </article>
           ))}
-          {showModelThinkingStatus && activeTurnId ? (
-            <PendingTurnStatus
-              key={`model-thinking-${activeTurnId}`}
-              phase="thinking"
-              threadId={threadId}
-              turnId={activeTurnId}
-            />
-          ) : showActiveProcessingStatus && activeTurnId ? (
-            <PendingTurnStatus
-              key={`model-processing-${activeTurnId}`}
-              phase="processing"
-              threadId={threadId}
-              turnId={activeTurnId}
-            />
-          ) : showPendingTurnStatus && pendingTurnFeedback ? (
-            <PendingTurnStatus
-              key={pendingTurnFeedback.startedAt}
-              phase="processing"
-              threadId={pendingTurnFeedback.threadId}
-              turnId={pendingTurnFeedback.turnId}
-            />
-          ) : null}
         </div>
       </div>
       {showScrollToEnd ? (

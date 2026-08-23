@@ -1,4 +1,20 @@
 /* Video-derived task and tool workspace interactions */
+.workspace {
+  /* The workspace chrome remains visible through the rounded conversation
+   * corner, keeping the top bar and sidebar visually continuous. */
+  background-color: var(--sidebar-bg);
+  background-image: var(--sidebar-gradient);
+  background-attachment: fixed;
+  background-position: left top;
+  background-repeat: no-repeat;
+  background-size: 100vw 100vh;
+}
+
+.workspace:not(.sidebar-collapsed) > .center-pane,
+.workspace:not(.sidebar-collapsed) > .center-pane > .thread-header {
+  border-start-start-radius: var(--radius-lg);
+}
+
 .workspace.with-tool-stage {
   grid-template-columns:
     var(--workspace-left-width, 264px) 0 minmax(360px, 1fr) 0
@@ -624,6 +640,37 @@
 .composer-source button:hover {
   background: var(--surface-active);
   color: var(--text);
+}
+
+.composer-media-source {
+  grid-template-columns: 28px minmax(0, auto) auto 20px;
+  min-width: min(100%, 280px);
+}
+
+.composer-media-preview {
+  width: 24px;
+  height: 24px;
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface-active);
+  padding: 0;
+}
+
+.composer-media-preview:hover {
+  border-color: var(--accent);
+}
+
+.composer-media-preview:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: var(--space-1);
+}
+
+.composer-media-preview img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }
 
 .composer-context-button {

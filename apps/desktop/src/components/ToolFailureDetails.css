@@ -1,0 +1,234 @@
+.usage-tool-failure-panel {
+  margin-top: var(--space-4);
+}
+
+.usage-tool-failure-panel .ot-panel__body {
+  padding: 0;
+}
+
+.usage-tool-failure-help {
+  margin: 0;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  line-height: var(--line-height-relaxed);
+  padding: var(--space-3) var(--space-4);
+}
+
+.usage-tool-failure-list {
+  display: grid;
+}
+
+.usage-tool-failure-item {
+  border-bottom: 1px solid var(--border-subtle);
+  border-inline-start: var(--space-1) solid var(--danger);
+}
+
+.usage-tool-failure-item:last-child {
+  border-bottom: 0;
+}
+
+.usage-tool-failure-item > summary {
+  display: grid;
+  min-width: 0;
+  min-height: var(--control-height-md);
+  align-items: start;
+  gap: var(--space-3);
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  cursor: pointer;
+  list-style: none;
+  padding: var(--space-3) var(--space-4);
+}
+
+.usage-tool-failure-item > summary::-webkit-details-marker {
+  display: none;
+}
+
+.usage-tool-failure-item > summary:hover {
+  background: var(--surface-hover);
+}
+
+.usage-tool-failure-item > summary:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: calc(var(--space-1) * -1);
+}
+
+.usage-tool-failure-icon {
+  display: inline-flex;
+  width: var(--control-height-sm);
+  height: var(--control-height-sm);
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  background: var(--danger-subtle);
+  color: var(--danger);
+}
+
+.usage-tool-failure-summary {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-2);
+}
+
+.usage-tool-failure-heading {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.usage-tool-failure-heading strong {
+  overflow: hidden;
+  max-width: 100%;
+  color: var(--text);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-tool-failure-heading small,
+.usage-tool-failure-heading time {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.usage-tool-failure-heading small {
+  overflow: hidden;
+  max-width: 100%;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-tool-failure-heading time {
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+
+.usage-tool-failure-preview {
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  line-height: var(--line-height-body);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-tool-failure-chevron {
+  margin-top: var(--space-3);
+  color: var(--text-muted);
+  transition: transform var(--motion-standard) var(--ease-standard);
+}
+
+.usage-tool-failure-item[open] .usage-tool-failure-chevron {
+  transform: rotate(180deg);
+}
+
+.usage-tool-failure-body {
+  display: grid;
+  gap: var(--space-4);
+  border-top: 1px solid var(--border-subtle);
+  background: var(--surface-subtle);
+  padding: var(--space-4);
+}
+
+.usage-tool-failure-meta,
+.usage-tool-failure-identifiers {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+  margin: 0;
+}
+
+.usage-tool-failure-meta > div,
+.usage-tool-failure-identifiers > div {
+  min-width: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  padding: var(--space-3);
+}
+
+.usage-tool-failure-meta dt,
+.usage-tool-failure-identifiers dt {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.usage-tool-failure-meta dd,
+.usage-tool-failure-identifiers dd {
+  overflow: hidden;
+  margin: var(--space-1) 0 0;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-tool-failure-reason,
+.usage-tool-failure-causes {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.usage-tool-failure-reason h3,
+.usage-tool-failure-causes h3 {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+}
+
+.usage-tool-failure-reason pre {
+  max-height: calc(var(--space-16) * 12);
+  overflow: auto;
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  line-height: var(--line-height-relaxed);
+  overflow-wrap: anywhere;
+  padding: var(--space-3);
+  white-space: pre-wrap;
+}
+
+.usage-tool-failure-causes ol {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  line-height: var(--line-height-relaxed);
+  overflow-wrap: anywhere;
+  padding-inline-start: var(--space-8);
+}
+
+.usage-tool-failure-more {
+  display: flex;
+  justify-content: center;
+  border-top: 1px solid var(--border-subtle);
+  padding: var(--space-3);
+}
+
+@container (min-width: 640px) {
+  .usage-tool-failure-meta {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .usage-tool-failure-chevron {
+    transition: none;
+  }
+}
+
+[data-reduce-motion="on"] .usage-tool-failure-chevron {
+  transition: none;
+}

@@ -5,6 +5,7 @@ import {
   Circle,
   Clock3,
   ListTodo,
+  Loader2,
   X,
 } from "lucide-react";
 import type { WorkForm } from "../../types";
@@ -76,7 +77,10 @@ export function ComposerWorkForm({ form }: { form: WorkForm }) {
                 key={item.id}
               >
                 <span className="composer-plan-step-icon" aria-hidden="true">
-                  <ComposerPlanStepIcon status={item.status} />
+                  <ComposerPlanStepIcon
+                    isCurrent={index === currentStepIndex}
+                    status={item.status}
+                  />
                 </span>
                 <span className="composer-plan-step-copy">
                   <span>{item.title || item.id}</span>
@@ -95,10 +99,15 @@ export function ComposerWorkForm({ form }: { form: WorkForm }) {
 }
 
 function ComposerPlanStepIcon({
+  isCurrent,
   status,
 }: {
+  isCurrent: boolean;
   status: WorkForm["items"][number]["status"];
 }) {
+  if (isCurrent) {
+    return <Loader2 className="spin" size={14} />;
+  }
   if (status === "completed") {
     return <span className="composer-plan-complete" />;
   }

@@ -17,6 +17,7 @@ import { SettingsGroup, SettingsPage, SettingsRow } from "../SettingsLayout";
 import {
   approvalStrategyMode,
   permissionAccessMode,
+  permissionAccessModeOptions,
   systemSandboxIsActive,
   type ApprovalStrategyMode,
   type PermissionAccessMode,
@@ -49,8 +50,20 @@ export function PermissionSettings({
   onRemoveWindowsSandbox(): Promise<WindowsSandboxSetupStatus>;
 }) {
   const accessMode = permissionAccessMode(permissionMode, sandbox);
+  const accessModeOptions = permissionAccessModeOptions(
+    permissionMode,
+    sandbox,
+  );
   const activeApprovalStrategy = approvalStrategyMode(permissionMode);
   const showWindowsSandboxStatus = isWindows && systemSandboxIsActive(sandbox);
+  const hostAccessEnabled = sandbox.sandboxMode === "danger-full-access";
+
+  const accessModeLabels: Record<PermissionAccessMode, string> = {
+    "read-only": "只读",
+    "workspace-write": "工作区可写",
+    "guarded-full-access": "破坏性操作仍需确认",
+    unrestricted: "完整系统访问",
+  };
 
   function confirmHostAccess(mode: "full_access" | "unrestricted"): boolean {
     if (mode === "full_access") {
@@ -254,10 +267,11 @@ export function PermissionSettings({
                 onAccessModeChange(next);
               }}
             >
-              <option value="read-only">只读</option>
-              <option value="workspace-write">工作区可写</option>
-              <option value="guarded-full-access">破坏性操作仍需确认</option>
-              <option value="unrestricted">完整系统访问</option>
+              {accessModeOptions.map((mode) => (
+                <option key={mode} value={mode}>
+                  {accessModeLabels[mode]}
+                </option>
+              ))}
             </select>
           </label>
           <label>
@@ -300,6 +314,7 @@ export function PermissionSettings({
             <span>额外可写目录</span>
             <textarea
               rows={3}
+              disabled={hostAccessEnabled}
               value={sandbox.writableRoots.join("\n")}
               placeholder="每行一个绝对路径"
               onChange={(event) =>
@@ -314,6 +329,7 @@ export function PermissionSettings({
             <span>额外可读路径</span>
             <textarea
               rows={3}
+              disabled={hostAccessEnabled}
               value={sandbox.readPaths.join("\n")}
               placeholder="每行一个绝对路径"
               onChange={(event) =>

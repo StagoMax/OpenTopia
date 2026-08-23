@@ -25,6 +25,27 @@ export type PlatformInfo = {
   };
 };
 
+/**
+ * Startup activity reported by the desktop main process while its managed
+ * local backend is being prepared. A build has no reliable total work count,
+ * so consumers should present this as indeterminate progress.
+ */
+export type BackendStartupPhase =
+  | "checking"
+  | "compiling"
+  | "starting"
+  | "waiting_for_health"
+  | "ready"
+  | "failed";
+
+export type BackendStartupStatus = {
+  phase: BackendStartupPhase;
+  /** The active Cargo package when compilation is in progress. */
+  detail: string | null;
+  startedAt: string;
+  updatedAt: string;
+};
+
 export type ManagedPowerShellStatus =
   "not_required" | "pending" | "downloading" | "ready" | "disabled" | "failed";
 
@@ -278,6 +299,10 @@ declare global {
       closeWindow(): Promise<boolean>;
       quit(): Promise<boolean>;
       getPlatformInfo(): Promise<PlatformInfo>;
+      getBackendStartupStatus(): Promise<BackendStartupStatus>;
+      onBackendStartupStatus(
+        listener: (status: BackendStartupStatus) => void,
+      ): () => void;
       ensureSagLibraryService(): Promise<SagServiceRuntimeStatus>;
       ensureLibraryProviderService(
         provider: LibraryProviderId,

@@ -3,7 +3,7 @@ import {
   normalizeComposerContentParts,
   splitComposerText,
   type ComposerHistorySnapshot,
-} from "../../composerContent";
+} from "../../composerContent.ts";
 import type {
   InlineImageAttachment,
   InlineMessageContentPart,
@@ -221,16 +221,38 @@ export function createComposerImageReferenceNode(
   button.type = "button";
   button.className = "composer-inline-image-button";
   button.dataset.composerImageId = attachment.id;
-  button.title = attachment.name || "预览图片";
-  button.setAttribute("aria-label", `预览 ${attachment.name || "图片"}`);
-
-  const image = document.createElement("img");
-  image.src = attachment.previewUrl;
-  image.alt = "";
-  image.setAttribute("aria-hidden", "true");
-  button.append(image);
+  const shortId = attachment.id.slice(0, 8);
+  button.title = `${attachment.name || "图片"}（ID: ${attachment.id}）`;
+  button.setAttribute("aria-label", `预览图片 ${shortId}`);
+  button.textContent = `[图片 · ${shortId}]`;
   wrapper.append(button);
   return wrapper;
+}
+
+export function composerAttachmentReferenceId(
+  name: string,
+  size = 0,
+  contentType = "",
+): string {
+  let hash = 2166136261;
+  for (const character of `${name}\u0000${size}\u0000${contentType}`) {
+    hash ^= character.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `att-${(hash >>> 0).toString(16).padStart(8, "0")}`;
+}
+
+export function createComposerAttachmentReferenceNode(
+  id: string,
+  label: string,
+): HTMLElement {
+  const reference = document.createElement("span");
+  reference.className = "composer-attachment-reference";
+  reference.dataset.composerAttachmentId = id;
+  reference.contentEditable = "false";
+  reference.textContent = `[附件 · ${label} · ${id}]`;
+  reference.title = `附件 ID：${id}`;
+  return reference;
 }
 
 export function rangeBelongsToEditor(

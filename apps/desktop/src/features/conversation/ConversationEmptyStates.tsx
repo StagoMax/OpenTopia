@@ -13,6 +13,7 @@ import {
   TerminalSquare,
   Workflow,
 } from "lucide-react";
+import { useEffect, useState } from "react";
 import {
   Composer,
   type ExecutionPermissionMode,
@@ -20,6 +21,7 @@ import {
 } from "../composer/Composer";
 import type {
   AppSettings,
+  BackendStartupStatus,
   CollaborationMode,
   ContextSourceFile,
   ExperienceMode,
@@ -32,6 +34,10 @@ import type {
 } from "../../types";
 import { workspaceName } from "../../workspaceName";
 import type { SendShortcut } from "../../editorPreferences";
+import {
+  backendStartupLabel,
+  formatBackendStartupElapsed,
+} from "./backendStartupProgress";
 
 export function NewTaskState({
   value,
@@ -257,14 +263,29 @@ export function OfflineState({
   error,
   attempt,
   isProbing,
+  startupStatus,
   onRetry,
 }: {
   backendUrl?: string;
   error: string | null;
   attempt: number;
   isProbing: boolean;
+  startupStatus: BackendStartupStatus | null;
   onRetry: () => void;
 }) {
+  const [openedAt] = useState(() => new Date().toISOString());
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const startupLabel = backendStartupLabel(startupStatus, isProbing);
+  const elapsedLabel = formatBackendStartupElapsed(
+    startupStatus?.startedAt ?? openedAt,
+    now,
+  );
+
   return (
     <div className="empty-state offline">
       <TerminalSquare size={48} />
@@ -272,9 +293,8 @@ export function OfflineState({
       <p>
         {import.meta.env.DEV ? (
           <>
-            开发模式下本地服务由 <code>cargo run</code> 启动，首次编译或改动
-            Rust 代码后可能需要几分钟；编译进度会打印在运行{" "}
-            <code>pnpm dev</code> 的终端里。
+            开发模式下桌面应用会编译并启动本地服务。首次编译或改动 Rust
+            代码后可能需要几分钟；下方会显示当前启动阶段。
           </>
         ) : (
           "本地服务正在启动。"
@@ -282,6 +302,18 @@ export function OfflineState({
         此页面会自动重连，无需手动刷新。
       </p>
       <small>{backendUrl ?? "http://127.0.0.1:8787"}</small>
+      <div
+        className="offline-progress"
+        role="progressbar"
+        aria-label="本地服务启动进度"
+        aria-valuetext={`${startupLabel}，${elapsedLabel}`}
+      >
+        <div className="offline-progress__bar" />
+        <div className="offline-progress__summary" aria-live="polite">
+          <strong>{startupLabel}</strong>
+          <span>{elapsedLabel}</span>
+        </div>
+      </div>
       <div className="offline-actions">
         <button
           className="secondary-button"

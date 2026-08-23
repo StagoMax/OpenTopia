@@ -40,6 +40,8 @@ import {
   composerRangeAtPoint,
   composerRangesEqual,
   composerSnapshotAtSelection,
+  composerAttachmentReferenceId,
+  createComposerAttachmentReferenceNode,
   createComposerImageReferenceNode,
   endOfComposerRange,
   imageFileFingerprint,
@@ -589,6 +591,27 @@ export function Composer({
     commitComposerMutation(false, before, true);
   }
 
+  function removeImageAttachment(id: string) {
+    const editor = editorRef.current;
+    if (!editor) return;
+    const references = Array.from(
+      editor.querySelectorAll<HTMLElement>("[data-composer-image-id]"),
+    ).filter((reference) => reference.dataset.composerImageId === id);
+    if (references.length > 0) {
+      const before = composerSnapshotAtSelection(editor);
+      references.forEach((reference) => reference.remove());
+      commitComposerMutation(false, before, true);
+    }
+    const attachment = imageAttachmentsRef.current.find(
+      (item) => item.id === id,
+    );
+    if (!attachment) return;
+    URL.revokeObjectURL(attachment.previewUrl);
+    const next = imageAttachmentsRef.current.filter((item) => item.id !== id);
+    imageAttachmentsRef.current = next;
+    setImageAttachments(next);
+  }
+
   const submitDraft = async () => {
     if (isSending) return;
     flushPendingComposerPublish();
@@ -662,7 +685,27 @@ export function Composer({
     if (images.length > 0) {
       void addImageFiles(images, requestedRange?.cloneRange() ?? null);
     }
-    if (otherFiles.length > 0) void onAddContextSources(otherFiles);
+    if (otherFiles.length > 0) {
+      void onAddContextSources(otherFiles);
+      const editor = editorRef.current;
+      const before = editor ? composerSnapshotAtSelection(editor) : null;
+      let range = requestedRange?.cloneRange() ?? null;
+      for (const file of otherFiles) {
+        if (!editor) break;
+        const insertionRange = rangeBelongsToEditor(editor, range)
+          ? range!.cloneRange()
+          : endOfComposerRange(editor);
+        insertionRange.deleteContents();
+        const label = file.name || "附件";
+        const id = composerAttachmentReferenceId(label, file.size, file.type);
+        const node = createComposerAttachmentReferenceNode(id, label);
+        insertionRange.insertNode(node);
+        insertionRange.setStartAfter(node);
+        insertionRange.collapse(true);
+        range = insertionRange;
+      }
+      if (editor && before) commitComposerMutation(true, before);
+    }
   }
 
   useImperativeHandle(fileDropHandleRef, () => ({
@@ -713,6 +756,10 @@ export function Composer({
     addSelectedFiles(files, range);
   }
 
+  const hasMediaOrSources =
+    imageAttachments.length > 0 ||
+    contextSources.length > 0 ||
+    selectedSkillIds.length > 0;
   const hasSendableContent = Boolean(
     hasDraftText ||
     hasInlineImageReferences ||
@@ -723,7 +770,7 @@ export function Composer({
     <div className={`composer-shell${metrics ? " has-metrics" : ""}`}>
       {workForm ? <ComposerWorkForm form={workForm} /> : null}
       <div
-        className={`composer ${workspaceRoot || projectName ? "has-context" : ""} ${contextSources.length || selectedSkillIds.length ? "has-sources" : ""} ${isDraggingFiles ? "is-dragging-files" : ""}`}
+        className={`composer ${workspaceRoot || projectName ? "has-context" : ""} ${hasMediaOrSources ? "has-sources" : ""} ${isDraggingFiles ? "is-dragging-files" : ""}`}
         ref={popoverRef}
         onDragEnter={fileDropScope === "composer" ? handleDragEnter : undefined}
         onDragOver={fileDropScope === "composer" ? handleDragOver : undefined}
@@ -746,8 +793,16 @@ export function Composer({
         />
         <ComposerSources
           contextSources={contextSources}
+          imageAttachments={imageAttachments}
           skills={skills}
           selectedSkillIds={selectedSkillIds}
+          onPreviewImage={(id) => {
+            const index = imageAttachmentsRef.current.findIndex(
+              (attachment) => attachment.id === id,
+            );
+            if (index >= 0) setPreviewIndex(index);
+          }}
+          onRemoveImage={removeImageAttachment}
           onRemoveContextSource={onRemoveContextSource}
           onToggleSkill={onToggleSkill}
         />

@@ -41,6 +41,7 @@ export type AgentEventPayload =
       adapter: string;
       attempt: number;
       body?: unknown;
+      cache_trace?: ProviderCacheTrace | null;
       endpoint: string;
       method: string;
       request_id: string;
@@ -51,6 +52,7 @@ export type AgentEventPayload =
   | {
       attempt: number;
       body?: unknown;
+      cache_trace?: ProviderCacheTrace | null;
       reason: string;
       request_id: string;
       retry_index?: number | null;
@@ -316,6 +318,17 @@ export type ContextRole = "system" | "developer" | "user" | "assistant" | "tool"
 export type ContextSensitivity = "public" | "workspace" | "sensitive";
 export type ModelCallPurpose =
   "agent_round" | "context_compaction" | "guardian_review" | "title_generation" | "other";
+export type ProviderCacheTraceSegmentKind =
+  | "instructions"
+  | "system_message"
+  | "developer_message"
+  | "user_message"
+  | "assistant_message"
+  | "tool_call"
+  | "tool_result"
+  | "tool_image"
+  | "input_item"
+  | "unknown";
 export type ProviderRetryKind = "network" | "state_recovery";
 export type CompletionDisposition = "blocking" | "advisory";
 export type WorkItemStatus =
@@ -578,6 +591,35 @@ export interface TokenEstimateDetail {
   id: string;
   label: string;
   tokens: number;
+  [k: string]: unknown;
+}
+/**
+ * Describes the exact structured input sent by a provider adapter using only hashes, safe field names, and local token estimates.
+ */
+export interface ProviderCacheTrace {
+  configuration?: ProviderCacheTraceProperty[];
+  prefixHash: string;
+  previousResponseIdPresent: boolean;
+  promptCacheKeyHash?: string | null;
+  schemaVersion: number;
+  segments: ProviderCacheTraceSegment[];
+  toolCatalogHash?: string | null;
+  [k: string]: unknown;
+}
+export interface ProviderCacheTraceProperty {
+  name: string;
+  valueHash: string;
+  [k: string]: unknown;
+}
+/**
+ * A content-free fingerprint of one provider-visible prompt segment. These records are safe to keep in the compact conversation projection: they retain enough structure to explain cache-prefix changes without persisting prompt text, tool output, or image bytes a second time.
+ */
+export interface ProviderCacheTraceSegment {
+  contentHash: string;
+  kind: ProviderCacheTraceSegmentKind;
+  name?: string | null;
+  source: string;
+  tokenEstimate: number;
   [k: string]: unknown;
 }
 export interface ToolCall {

@@ -1,4 +1,5 @@
 import type { ConversationRenderTrace } from "./conversationRenderTrace";
+import type { BackendStartupStatus } from "./types/platform";
 import type {
   ContextSourcePickResult,
   FileLinkActionRequest,
@@ -40,6 +41,17 @@ export async function loadPlatformInfo(): Promise<PlatformInfo> {
       };
   loadedApiToken = info.apiToken;
   return info as PlatformInfo;
+}
+
+export async function getBackendStartupStatus(): Promise<BackendStartupStatus | null> {
+  if (!window.opentopia?.getBackendStartupStatus) return null;
+  return window.opentopia.getBackendStartupStatus();
+}
+
+export function onBackendStartupStatus(
+  listener: (status: BackendStartupStatus) => void,
+): () => void {
+  return window.opentopia?.onBackendStartupStatus?.(listener) ?? (() => {});
 }
 
 export async function ensureSagLibraryService(): Promise<SagServiceRuntimeStatus | null> {

@@ -173,6 +173,17 @@ test("keeps Claude effort when its model supports Anthropic's effort parameter",
       .defaultEffort,
     "max",
   );
+  assert.deepEqual(
+    resolveModelReasoningCapability("openai_compatible", "glm-5.3"),
+    {
+      status: "supported",
+      supportedEfforts: ["low", "high", "max"],
+      defaultEffort: "max",
+      sourceUrl: "https://z.ai/blog/glm-5.3",
+      official: true,
+      thinkingToggle: false,
+    },
+  );
   assert.equal(
     resolveModelReasoningCapability("openai_responses", "gpt-4.1-mini").status,
     "unsupported",

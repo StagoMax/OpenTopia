@@ -16,6 +16,7 @@ import type { ProviderModelSettings, ProviderSettings } from "../../types";
 import { Button, InputDropdown, Select, Switch } from "../ui";
 import { SettingsRow } from "../SettingsLayout";
 import {
+  contextWindowInputConstraints,
   contextWindowPresetOptions,
   contextWindowPresets,
   type ModelDiscoveryState,
@@ -226,8 +227,7 @@ export function ModelConfigurationSection({
               selectedOptionValue={selectedContextWindowPreset}
               inputProps={{
                 type: "number",
-                min: 4096,
-                step: 1024,
+                ...contextWindowInputConstraints,
                 placeholder: "自动识别",
               }}
               label="选择常用上下文窗口"

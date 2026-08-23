@@ -1,63 +1,32 @@
 import type {
   AgentEvent,
   ModelCallPurpose,
-  ModelContextItem,
   ModelRequestSnapshot,
   ThreadModelSelection,
   TokenEstimateBreakdown,
 } from "./types";
+import { toolResultIsError } from "./toolFailures.ts";
 import { toolExecutionDurationMs } from "./toolExecutionTiming.ts";
 import {
   addTokenBreakdown,
   emptyTokenBreakdown,
   hydrateLegacyTokenBreakdown,
 } from "./usageTokenBreakdown.ts";
+import {
+  diagnoseCacheReuse,
+  emptyCacheDiagnostic,
+  type CacheRequestObservation,
+  type CacheReuseDiagnostic,
+} from "./usageCacheDiagnostics.ts";
+
+export type {
+  CacheBreakPoint,
+  CacheBreakReason,
+  CacheReuseDiagnostic,
+  CacheReuseState,
+} from "./usageCacheDiagnostics.ts";
 
 export type UsageCallStatus = "running" | "succeeded" | "failed";
-
-export type CacheReuseState = "reused" | "degraded" | "broken" | "unverified";
-
-export type CacheBreakReason =
-  | "content_changed"
-  | "tool_catalog_changed"
-  | "system_prompt_changed"
-  | "cache_key_changed"
-  | "model_changed"
-  | "provider_changed"
-  | "input_below_minimum"
-  | "stateful_context"
-  | "operational_miss"
-  | "cache_hit"
-  | "no_baseline"
-  | "usage_unreported";
-
-export type CacheBreakPoint = {
-  kind:
-    | ModelContextItem["kind"]
-    | "tool_catalog"
-    | "system_prompt"
-    | "cache_key"
-    | "model"
-    | "provider"
-    | "input";
-  source: string;
-  cacheScope: ModelContextItem["cacheScope"] | null;
-  change: "changed" | "inserted" | "removed" | "configuration";
-  tokenOffsetEstimate: number | null;
-  previousTokenEstimate: number | null;
-  currentTokenEstimate: number | null;
-};
-
-export type CacheReuseDiagnostic = {
-  state: CacheReuseState;
-  reason: CacheBreakReason;
-  confidence: "high" | "medium" | "low";
-  previousRequestId: string | null;
-  previousCachedInputTokens: number | null;
-  currentCachedInputTokens: number;
-  lostCachedTokens: number;
-  breakpoint: CacheBreakPoint | null;
-};
 
 export type UsageCall = {
   id: string;
@@ -154,15 +123,6 @@ export type UsageDashboardData = {
   calls: UsageCall[];
   cacheBreaks: UsageCall[];
   summary: UsageSummary;
-};
-
-type CacheRequestObservation = {
-  contextHash: string | null;
-  contextItems: ModelContextItem[];
-  promptCacheKey: string | null;
-  previousResponseId: string | null;
-  systemPrompt: string | null;
-  toolCatalogSignature: string | null;
 };
 
 type UsageWasteSignals = {
@@ -320,6 +280,13 @@ export function aggregateUsageEvents(
     switch (payload.type) {
       case "provider_request_sent": {
         if (event.turnId) includedTurns.add(event.turnId);
+        const cacheObservation = getCacheObservation(
+          cacheObservationByRequest,
+          payload.request_id,
+        );
+        if (payload.cache_trace) {
+          cacheObservation.providerCacheTrace = payload.cache_trace;
+        }
         const call: MutableUsageCall = {
           id: payload.request_id,
           turnId: event.turnId ?? null,
@@ -359,9 +326,7 @@ export function aggregateUsageEvents(
           responseReceived: false,
           usageReceived: false,
           errored: false,
-          cacheObservation:
-            cacheObservationByRequest.get(payload.request_id) ??
-            emptyCacheObservation(),
+          cacheObservation,
         };
         callsById.set(call.id, call);
         latestRequestByTurn.set(turnKey, call.id);
@@ -370,6 +335,9 @@ export function aggregateUsageEvents(
       case "provider_request_retried": {
         const call = callsById.get(payload.request_id);
         if (!call) break;
+        if (payload.cache_trace) {
+          call.cacheObservation.providerCacheTrace = payload.cache_trace;
+        }
         call.attemptCount = Math.max(call.attemptCount, payload.attempt);
         call.retryCount += 1;
         call.retryReasons.push(payload.reason);
@@ -470,7 +438,7 @@ export function aggregateUsageEvents(
         } else if (startedAt !== undefined && completedAt !== null) {
           toolDurations.push(Math.max(0, completedAt - startedAt));
         }
-        if (toolResultIsError(payload.result.metadata)) toolErrorCount += 1;
+        if (toolResultIsError(payload.result)) toolErrorCount += 1;
         break;
       }
     }
@@ -714,6 +682,7 @@ function emptyCacheObservation(): CacheRequestObservation {
     previousResponseId: null,
     systemPrompt: null,
     toolCatalogSignature: null,
+    providerCacheTrace: null,
   };
 }
 
@@ -727,303 +696,6 @@ function captureModelRequestObservation(
   observation.toolCatalogSignature = stableSerialize(
     request.toolCandidates ?? [],
   );
-}
-
-function emptyCacheDiagnostic(): CacheReuseDiagnostic {
-  return {
-    state: "unverified",
-    reason: "usage_unreported",
-    confidence: "low",
-    previousRequestId: null,
-    previousCachedInputTokens: null,
-    currentCachedInputTokens: 0,
-    lostCachedTokens: 0,
-    breakpoint: null,
-  };
-}
-
-function diagnoseCacheReuse(
-  current: MutableUsageCall,
-  previous: MutableUsageCall | null,
-): CacheReuseDiagnostic {
-  const base = {
-    previousRequestId: previous?.id ?? null,
-    previousCachedInputTokens: previous?.cachedInputTokens ?? null,
-    currentCachedInputTokens: current.cachedInputTokens,
-    lostCachedTokens: 0,
-    breakpoint: null,
-  } satisfies Pick<
-    CacheReuseDiagnostic,
-    | "previousRequestId"
-    | "previousCachedInputTokens"
-    | "currentCachedInputTokens"
-    | "lostCachedTokens"
-    | "breakpoint"
-  >;
-
-  if (!current.cacheReadTokensReported) {
-    return {
-      ...base,
-      state: "unverified",
-      reason: "usage_unreported",
-      confidence: "low",
-    };
-  }
-  if (!previous || previous.cachedInputTokens === 0) {
-    return {
-      ...base,
-      state: current.cachedInputTokens > 0 ? "reused" : "unverified",
-      reason: current.cachedInputTokens > 0 ? "cache_hit" : "no_baseline",
-      confidence: current.cachedInputTokens > 0 ? "high" : "low",
-    };
-  }
-
-  const expectedReusableTokens = Math.min(
-    previous.cachedInputTokens,
-    current.inputTokens,
-  );
-  const lostCachedTokens = Math.max(
-    0,
-    expectedReusableTokens - current.cachedInputTokens,
-  );
-  if (lostCachedTokens === 0) {
-    return {
-      ...base,
-      state: "reused",
-      reason: "cache_hit",
-      confidence: "high",
-    };
-  }
-
-  const state = current.cachedInputTokens === 0 ? "broken" : "degraded";
-  const shared = { ...base, state, lostCachedTokens } as const;
-  if (isOpenAiCall(current) && current.inputTokens < 1_024) {
-    return {
-      ...shared,
-      reason: "input_below_minimum",
-      confidence: "high",
-      breakpoint: configurationBreakpoint("input", "input_tokens"),
-    };
-  }
-  if (changedKnownValue(previous.providerId, current.providerId)) {
-    return {
-      ...shared,
-      reason: "provider_changed",
-      confidence: "high",
-      breakpoint: configurationBreakpoint(
-        "provider",
-        current.providerId ?? "provider",
-      ),
-    };
-  }
-  if (changedKnownValue(previous.model, current.model)) {
-    return {
-      ...shared,
-      reason: "model_changed",
-      confidence: "high",
-      breakpoint: configurationBreakpoint("model", current.model ?? "model"),
-    };
-  }
-  if (
-    previous.cacheObservation.promptCacheKey !==
-      current.cacheObservation.promptCacheKey &&
-    (previous.cacheObservation.promptCacheKey !== null ||
-      current.cacheObservation.promptCacheKey !== null)
-  ) {
-    return {
-      ...shared,
-      reason: "cache_key_changed",
-      confidence: "high",
-      breakpoint: configurationBreakpoint(
-        "cache_key",
-        current.cacheObservation.promptCacheKey ?? "未设置 prompt_cache_key",
-      ),
-    };
-  }
-  if (
-    changedKnownValue(
-      previous.cacheObservation.toolCatalogSignature,
-      current.cacheObservation.toolCatalogSignature,
-    )
-  ) {
-    return {
-      ...shared,
-      reason: "tool_catalog_changed",
-      confidence: "high",
-      breakpoint: configurationBreakpoint("tool_catalog", "tool_candidates"),
-    };
-  }
-  const breakpoint = findContextBreakpoint(
-    previous.cacheObservation.contextItems,
-    current.cacheObservation.contextItems,
-  );
-  if (breakpoint) {
-    return {
-      ...shared,
-      reason: "content_changed",
-      confidence: "medium",
-      breakpoint,
-    };
-  }
-  if (
-    changedKnownValue(
-      previous.cacheObservation.systemPrompt,
-      current.cacheObservation.systemPrompt,
-    )
-  ) {
-    return {
-      ...shared,
-      reason: "system_prompt_changed",
-      confidence: "high",
-      breakpoint: configurationBreakpoint("system_prompt", "system_prompt"),
-    };
-  }
-  if (current.cacheObservation.previousResponseId) {
-    return {
-      ...shared,
-      reason: "stateful_context",
-      confidence: "low",
-    };
-  }
-  return {
-    ...shared,
-    reason: "operational_miss",
-    confidence: "low",
-  };
-}
-
-function findContextBreakpoint(
-  previous: ModelContextItem[],
-  current: ModelContextItem[],
-): CacheBreakPoint | null {
-  if (previous.length === 0 || current.length === 0) return null;
-  let index = 0;
-  while (
-    index < previous.length &&
-    index < current.length &&
-    contextItemMatches(previous[index], current[index])
-  ) {
-    index += 1;
-  }
-  if (index === previous.length) {
-    return null;
-  }
-
-  const previousItem = previous[index];
-  const currentItem = current[index];
-  const tokenOffsetEstimate = current
-    .slice(0, index)
-    .reduce((total, item) => total + item.tokenEstimate, 0);
-  if (!currentItem) {
-    return contextItemBreakpoint(
-      previousItem,
-      "removed",
-      tokenOffsetEstimate,
-      previousItem?.tokenEstimate ?? null,
-      null,
-    );
-  }
-  if (
-    current[index + 1] &&
-    previousItem &&
-    contextItemMatches(previousItem, current[index + 1])
-  ) {
-    return contextItemBreakpoint(
-      currentItem,
-      "inserted",
-      tokenOffsetEstimate,
-      null,
-      currentItem.tokenEstimate,
-    );
-  }
-  if (
-    previous[index + 1] &&
-    contextItemMatches(previous[index + 1], currentItem)
-  ) {
-    return contextItemBreakpoint(
-      previousItem,
-      "removed",
-      tokenOffsetEstimate,
-      previousItem?.tokenEstimate ?? null,
-      null,
-    );
-  }
-  return contextItemBreakpoint(
-    currentItem,
-    "changed",
-    tokenOffsetEstimate,
-    previousItem?.tokenEstimate ?? null,
-    currentItem.tokenEstimate,
-  );
-}
-
-function contextItemMatches(
-  left: ModelContextItem | undefined,
-  right: ModelContextItem | undefined,
-): boolean {
-  return Boolean(
-    left &&
-    right &&
-    left.kind === right.kind &&
-    left.role === right.role &&
-    left.authority === right.authority &&
-    left.source === right.source &&
-    left.cacheScope === right.cacheScope &&
-    left.contentHash === right.contentHash,
-  );
-}
-
-function contextItemBreakpoint(
-  item: ModelContextItem | undefined,
-  change: CacheBreakPoint["change"],
-  tokenOffsetEstimate: number,
-  previousTokenEstimate: number | null,
-  currentTokenEstimate: number | null,
-): CacheBreakPoint | null {
-  if (!item) return null;
-  return {
-    kind: item.kind,
-    source: item.source,
-    cacheScope: item.cacheScope,
-    change,
-    tokenOffsetEstimate,
-    previousTokenEstimate,
-    currentTokenEstimate,
-  };
-}
-
-function configurationBreakpoint(
-  kind: Extract<
-    CacheBreakPoint["kind"],
-    | "tool_catalog"
-    | "system_prompt"
-    | "cache_key"
-    | "model"
-    | "provider"
-    | "input"
-  >,
-  source: string,
-): CacheBreakPoint {
-  return {
-    kind,
-    source,
-    cacheScope: null,
-    change: "configuration",
-    tokenOffsetEstimate: null,
-    previousTokenEstimate: null,
-    currentTokenEstimate: null,
-  };
-}
-
-function changedKnownValue(
-  previous: string | null,
-  current: string | null,
-): boolean {
-  return previous !== null && current !== null && previous !== current;
-}
-
-function isOpenAiCall(call: UsageCall): boolean {
-  return call.adapter.toLowerCase().includes("openai");
 }
 
 function isCompatibilityRetry(reason: string): boolean {
@@ -1089,12 +761,4 @@ function percentile(values: number[], fraction: number): number | null {
 
 function ratio(numerator: number, denominator: number): number | null {
   return denominator > 0 ? numerator / denominator : null;
-}
-
-function toolResultIsError(metadata: unknown): boolean {
-  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
-    return false;
-  }
-  const value = metadata as Record<string, unknown>;
-  return value.success === false || value.isError === true;
 }

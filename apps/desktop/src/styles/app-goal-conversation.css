@@ -268,7 +268,7 @@
 
 .composer-inline-image-reference {
   display: inline-flex;
-  width: calc(var(--space-12) * 2);
+  width: auto;
   height: var(--control-height-md);
   margin: 0 var(--space-1);
   vertical-align: middle;
@@ -282,6 +282,7 @@
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-md);
   background: var(--surface-subtle);
+  color: var(--accent);
   padding: var(--space-1);
 }
 
@@ -295,12 +296,24 @@
   outline-offset: var(--space-1);
 }
 
-.composer-inline-image-button img {
-  display: block;
-  width: 100%;
-  height: 100%;
+.composer-inline-image-button {
+  min-width: calc(var(--space-12) * 2);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+}
+
+.composer-attachment-reference {
+  display: inline-block;
+  margin-inline: var(--space-1);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
-  object-fit: cover;
+  background: var(--surface-subtle);
+  color: var(--accent);
+  padding: 0 var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  line-height: var(--control-height-sm);
+  vertical-align: baseline;
 }
 
 .composer-image-context-menu {
@@ -596,14 +609,22 @@
 }
 
 .thread-row-wrap {
-  grid-template-columns: minmax(0, 1fr) 0 0;
-  transition:
-    background var(--motion-fast) var(--ease-standard),
-    grid-template-columns var(--motion-fast) var(--ease-standard);
+  grid-template-columns: minmax(0, 1fr) var(--control-height-sm) 0;
+  border-radius: var(--radius-sm);
+  margin-left: calc(-1 * var(--project-task-indent));
+  padding-left: var(--project-task-indent);
+  transition: background var(--motion-fast) var(--ease-standard);
+}
+
+.thread-row-wrap:is(:hover, :focus-within),
+.thread-row-wrap.menu-open {
+  border-radius: var(--radius-sm);
 }
 
 .project-tasks {
-  padding-left: calc(var(--space-12) - var(--space-3));
+  --project-task-indent: calc(var(--space-12) - var(--space-3));
+
+  padding-left: var(--project-task-indent);
 }
 
 .thread-row-wrap.has-status,
@@ -678,6 +699,22 @@
   color: var(--accent);
 }
 
+.thread-status-spinner {
+  display: block;
+  transform: translate3d(0, 0, 0) rotate(0deg);
+  transform-box: fill-box;
+  transform-origin: center;
+  backface-visibility: hidden;
+  will-change: transform;
+  animation: thread-status-spin calc(var(--motion-standard) * 5) linear infinite;
+}
+
+@keyframes thread-status-spin {
+  to {
+    transform: translate3d(0, 0, 0) rotate(360deg);
+  }
+}
+
 .thread-row-status.is-approval,
 .thread-row-status.is-user_action {
   color: var(--warning);
@@ -750,9 +787,17 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .thread-row-status.is-processing .spin {
+  .thread-status-spinner {
     animation: none;
+    transform: none;
+    will-change: auto;
   }
+}
+
+[data-reduce-motion="on"] .thread-status-spinner {
+  animation: none;
+  transform: none;
+  will-change: auto;
 }
 
 /* The context summary floats over the conversation instead of reserving a
@@ -1030,19 +1075,8 @@
 .conversation-status-shimmer {
   display: inline-flex;
   align-items: baseline;
-  background-image: linear-gradient(
-    90deg,
-    var(--loading-wordmark-ink),
-    var(--loading-wordmark-accent),
-    var(--loading-shimmer),
-    var(--loading-wordmark-accent),
-    var(--loading-wordmark-ink)
-  );
-  background-position: 100% 50%;
-  background-size: 200% 100%;
-  background-clip: text;
-  color: transparent;
-  -webkit-background-clip: text;
+  color: var(--loading-wordmark-ink);
+  will-change: opacity;
   animation: conversation-loading-shimmer calc(var(--motion-standard) * 8)
     var(--ease-standard) infinite;
 }
@@ -1055,7 +1089,7 @@
 .turn-activity[data-state="running"]
   .turn-activity-heading
   .conversation-status-shimmer {
-  color: transparent;
+  color: var(--loading-wordmark-ink);
 }
 
 .turn-activity-header.is-static {
@@ -1091,8 +1125,12 @@
 }
 
 @keyframes conversation-loading-shimmer {
+  50% {
+    opacity: 0.62;
+  }
+
   to {
-    background-position: -100% 50%;
+    opacity: 1;
   }
 }
 
@@ -1101,4 +1139,9 @@
   .conversation-status-shimmer {
     animation: none;
   }
+}
+
+[data-reduce-motion="on"] .conversation-loading__wordmark,
+[data-reduce-motion="on"] .conversation-status-shimmer {
+  animation: none;
 }

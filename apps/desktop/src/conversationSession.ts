@@ -18,6 +18,7 @@ export type ConversationLoadState = {
 export type PendingTurnFeedback = {
   threadId: string;
   turnId: string | null;
+  userMessageId: string;
   startedAt: string;
 };
 
@@ -137,7 +138,8 @@ export function conversationSessionReducer(
       return {
         ...state,
         activeTurnId:
-          action.turnStatus === undefined
+          action.turnStatus === undefined ||
+          (action.turnStatus === null && state.activeTurnId !== null)
             ? state.activeTurnId
             : resolveActiveTurnId(
                 action.turnStatus,
@@ -180,11 +182,6 @@ export function conversationSessionReducer(
         ...state,
         sending: true,
         commandError: null,
-        pendingTurnFeedback: {
-          threadId: state.threadId,
-          turnId: null,
-          startedAt: action.startedAt,
-        },
       };
     case "sendSucceeded": {
       const inactiveTurnIds = inactiveTurnIdsFromEvents(state.events);
@@ -197,10 +194,12 @@ export function conversationSessionReducer(
             ? action.turnId
             : state.activeTurnId,
         queuedMessageCount: state.queuedMessageCount + (action.queued ? 1 : 0),
-        pendingTurnFeedback:
-          state.pendingTurnFeedback?.startedAt === action.startedAt
-            ? { ...state.pendingTurnFeedback, turnId: action.turnId }
-            : state.pendingTurnFeedback,
+        pendingTurnFeedback: {
+          threadId: state.threadId,
+          turnId: action.turnId,
+          userMessageId: action.message.id,
+          startedAt: action.startedAt,
+        },
       };
     }
     case "sendFailed":
@@ -210,10 +209,7 @@ export function conversationSessionReducer(
         cancellationRequested: false,
         cancelling: false,
         commandError: action.error,
-        pendingTurnFeedback:
-          state.pendingTurnFeedback?.startedAt === action.startedAt
-            ? null
-            : state.pendingTurnFeedback,
+        pendingTurnFeedback: null,
       };
     case "cancelRequested":
       return {
@@ -399,5 +395,7 @@ function pendingFeedbackResolved(
   if (!resolvesFeedback) return false;
   return feedback.turnId
     ? event.turnId === feedback.turnId
-    : event.createdAt >= feedback.startedAt;
+    : event.payload.type === "turn_started"
+      ? event.payload.user_message_id === feedback.userMessageId
+      : event.createdAt >= feedback.startedAt;
 }

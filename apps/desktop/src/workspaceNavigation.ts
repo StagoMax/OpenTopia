@@ -27,6 +27,23 @@ export type SidebarDestination =
   | "flow-knowledge"
   | "plugins";
 
+export function resolveActiveFlowPrimaryView({
+  flowPrimaryView,
+  sidebarDestination,
+}: {
+  flowPrimaryView: FlowPrimaryView;
+  sidebarDestination: SidebarDestination;
+}): Exclude<FlowPrimaryView, "conversation"> | null {
+  if (
+    flowPrimaryView !== "conversation" &&
+    sidebarDestination === `flow-${flowPrimaryView}`
+  ) {
+    return flowPrimaryView;
+  }
+
+  return null;
+}
+
 export function resolveSidebarDestination({
   experienceMode,
   flowPrimaryView,

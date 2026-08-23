@@ -64,6 +64,11 @@ test("resolves and identifies the context-window source used by the runtime", ()
     knownModelContextWindowTokens("openai/deepseek-v4-flash:batch"),
     1_048_576,
   );
+  assert.equal(
+    knownModelContextWindowTokens("deepseek-v4-flash-vision-exp"),
+    1_048_576,
+  );
+  assert.equal(knownModelContextWindowTokens("glm-5.3"), 1_048_576);
   assert.deepEqual(resolveKnownModelContextWindow("deepseek-v5-flash"), {
     contextWindowTokens: 1_048_576,
     source: "inferred",
@@ -188,6 +193,7 @@ test("covers major vendors without family-wide guessing", () => {
     "mistralai/mistral-small-3.2-24b-instruct",
     "meta-llama/llama-4-scout",
     "minimax/minimax-m3",
+    "deepseek-v4-flash-vision-exp",
   ]) {
     assert.equal(knownModelSupportsVision(model), true, model);
   }
@@ -198,6 +204,7 @@ test("covers major vendors without family-wide guessing", () => {
     "deepseek-v4-flash",
     "qwen3-coder-plus",
     "glm-5",
+    "glm-5.3",
     "minimax-m2.5",
   ]) {
     assert.equal(knownModelSupportsVision(model), false, model);

@@ -76,6 +76,59 @@ test("reduces history and streamed lifecycle events deterministically", () => {
   );
 });
 
+test("anchors pending feedback to the server-confirmed user message", () => {
+  const startedAt = "2026-08-22T00:00:00.000Z";
+  const userMessage = message("confirmed-user");
+  let state = createConversationSessionState("thread-1");
+
+  state = conversationSessionReducer(state, {
+    type: "sendStarted",
+    startedAt,
+  });
+  assert.equal(state.pendingTurnFeedback, null);
+  assert.deepEqual(state.messages, []);
+
+  state = conversationSessionReducer(state, {
+    type: "sendSucceeded",
+    message: userMessage,
+    turnId: "turn-1",
+    queued: false,
+    startedAt,
+  });
+
+  assert.equal(state.pendingTurnFeedback?.userMessageId, userMessage.id);
+  assert.equal(state.pendingTurnFeedback?.turnId, "turn-1");
+  assert.deepEqual(state.messages.map((item) => item.id), [userMessage.id]);
+});
+
+test("resolves a queued message when its matching turn starts", () => {
+  const startedAt = "2026-08-22T00:00:00.000Z";
+  const userMessage = message("queued-user");
+  let state = conversationSessionReducer(
+    createConversationSessionState("thread-1"),
+    { type: "sendStarted", startedAt },
+  );
+  state = conversationSessionReducer(state, {
+    type: "sendSucceeded",
+    message: userMessage,
+    turnId: null,
+    queued: true,
+    startedAt,
+  });
+  assert.equal(state.pendingTurnFeedback?.turnId, null);
+
+  state = conversationSessionReducer(state, {
+    type: "eventsReceived",
+    events: [
+      event("queued-started", 1, {
+        type: "turn_started",
+        user_message_id: userMessage.id,
+      }),
+    ],
+  });
+  assert.equal(state.pendingTurnFeedback, null);
+});
+
 test("preserves a cancellation request until send resolves a turn id", async () => {
   let resolveSend!: (value: {
     message: Message;
@@ -179,4 +232,73 @@ test("shares one stream and keeps auxiliary failures independent", async () => {
   assert.equal(closeCalls, 0);
   releaseProjection();
   assert.equal(closeCalls, 1);
+  controller.dispose();
+});
+
+test("keeps a warm stream while switching away and reuses it on return", async () => {
+  let openCalls = 0;
+  let closeCalls = 0;
+  let onStreamEvent: ((event: AgentEvent) => void) | undefined;
+  const client = {
+    listMessages: () => Promise.resolve([message("user")]),
+    listConversationEvents: () =>
+      Promise.resolve([
+        event("started", 1, {
+          type: "turn_started",
+          user_message_id: "user",
+        }),
+      ]),
+    getTurnStatus: () => Promise.resolve(null),
+    listPendingApprovals: () => Promise.resolve([]),
+    listPendingUserInput: () => Promise.resolve([]),
+    openEventStream: (
+      _threadId: string,
+      _since: number | undefined,
+      onEvent: (event: AgentEvent) => void,
+    ) => {
+      openCalls += 1;
+      onStreamEvent = onEvent;
+      return {
+        close() {
+          closeCalls += 1;
+        },
+      };
+    },
+  } as unknown as ApiClient;
+  const controller = new ConversationSessionController(client, "thread-1");
+
+  const release = controller.retain();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(closeCalls, 0);
+  onStreamEvent?.(
+    event("background-progress", 2, {
+      type: "model_delta",
+      text: "still working",
+    }),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 40));
+
+  const releaseAgain = controller.retain();
+  assert.equal(openCalls, 1);
+  assert.equal(closeCalls, 0);
+  assert.equal(controller.getSnapshot().loadState.status, "ready");
+  assert.ok(
+    controller
+      .getSnapshot()
+      .events.some((item) => item.id === "background-progress"),
+  );
+
+  releaseAgain();
+  onStreamEvent?.(
+    event("finished", 3, { type: "turn_finished", summary: "done" }),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(controller.getSnapshot().activeTurnId, null);
+  assert.ok(
+    controller.getSnapshot().events.some((item) => item.id === "finished"),
+  );
+  assert.equal(closeCalls, 1);
+  controller.dispose();
 });

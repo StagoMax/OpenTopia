@@ -488,6 +488,16 @@
               "type": "integer"
             },
             "body": true,
+            "cache_trace": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ProviderCacheTrace"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "endpoint": {
               "type": "string"
             },
@@ -529,6 +539,16 @@
               "type": "integer"
             },
             "body": true,
+            "cache_trace": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ProviderCacheTrace"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "reason": {
               "type": "string"
             },
@@ -10045,6 +10065,115 @@
         "x_api_key",
         "codex_session",
         "none"
+      ],
+      "type": "string"
+    },
+    "ProviderCacheTrace": {
+      "description": "Describes the exact structured input sent by a provider adapter using only hashes, safe field names, and local token estimates.",
+      "properties": {
+        "configuration": {
+          "items": {
+            "$ref": "#/definitions/ProviderCacheTraceProperty"
+          },
+          "type": "array"
+        },
+        "prefixHash": {
+          "type": "string"
+        },
+        "previousResponseIdPresent": {
+          "type": "boolean"
+        },
+        "promptCacheKeyHash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "schemaVersion": {
+          "format": "uint8",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "segments": {
+          "items": {
+            "$ref": "#/definitions/ProviderCacheTraceSegment"
+          },
+          "type": "array"
+        },
+        "toolCatalogHash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "prefixHash",
+        "previousResponseIdPresent",
+        "schemaVersion",
+        "segments"
+      ],
+      "type": "object"
+    },
+    "ProviderCacheTraceProperty": {
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "valueHash": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "valueHash"
+      ],
+      "type": "object"
+    },
+    "ProviderCacheTraceSegment": {
+      "description": "A content-free fingerprint of one provider-visible prompt segment. These records are safe to keep in the compact conversation projection: they retain enough structure to explain cache-prefix changes without persisting prompt text, tool output, or image bytes a second time.",
+      "properties": {
+        "contentHash": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/definitions/ProviderCacheTraceSegmentKind"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "type": "string"
+        },
+        "tokenEstimate": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "contentHash",
+        "kind",
+        "source",
+        "tokenEstimate"
+      ],
+      "type": "object"
+    },
+    "ProviderCacheTraceSegmentKind": {
+      "enum": [
+        "instructions",
+        "system_message",
+        "developer_message",
+        "user_message",
+        "assistant_message",
+        "tool_call",
+        "tool_result",
+        "tool_image",
+        "input_item",
+        "unknown"
       ],
       "type": "string"
     },

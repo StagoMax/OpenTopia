@@ -23,6 +23,7 @@ import {
 
 import type { ToolTabKind } from "../../toolTabs";
 import type { GoalSnapshot, GoalStatus, Thread } from "../../types";
+import { conversationHeaderTitle } from "../../threadTitle";
 import { useDismissiblePopover } from "../../hooks/useDismissiblePopover";
 import { Button, IconButton } from "../../components/ui";
 
@@ -71,11 +72,15 @@ export function ThreadHeader({
     setMenuOpen(false);
   }
 
+  const headerTitle = conversationHeaderTitle(
+    title ?? thread?.title ?? "新任务",
+  );
+
   return (
     <div className="thread-header">
       <div className="thread-heading">
         {headingIcon ?? <Folder size={15} />}
-        <h1>{title ?? thread?.title ?? "新任务"}</h1>
+        <h1>{headerTitle}</h1>
         {showThreadControls ? (
           <div className="thread-heading-menu-wrap" ref={taskMenuRef}>
             <button

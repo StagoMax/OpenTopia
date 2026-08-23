@@ -32,10 +32,7 @@ import {
   resolveThreadActivityStatus,
   type ThreadActivityStatus,
 } from "../../threadActivityStatus";
-import {
-  threadTitleFromPrompt,
-  threadTitleNeedsSummary,
-} from "../../threadTitle";
+import { threadTitleFromPrompt } from "../../threadTitle";
 import type { ToolTabKind } from "../../toolTabs";
 import type {
   AgentEvent,
@@ -241,20 +238,11 @@ export function SideTaskConversation({
     if (!client || !thread || thread.title !== "侧边任务" || !firstPrompt)
       return;
     try {
-      if (threadTitleNeedsSummary(firstPrompt)) {
-        const result = await client.generateThreadTitle(
-          thread.id,
-          firstPrompt,
-          thread.title,
-        );
-        if (result.updated) onThreadUpdated(result.thread);
-      } else {
-        onThreadUpdated(
-          await client.updateThread(thread.id, {
-            title: threadTitleFromPrompt(firstPrompt),
-          }),
-        );
-      }
+      onThreadUpdated(
+        await client.updateThread(thread.id, {
+          title: threadTitleFromPrompt(firstPrompt),
+        }),
+      );
     } catch (error) {
       console.warn("OpenTopia could not title the side task", error);
     }

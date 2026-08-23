@@ -177,17 +177,31 @@ export function providerProtocolSelection(
     : "open_ai_chat";
 }
 
+/**
+ * Generic manual values. K/M context labels differ between model providers,
+ * so each option exposes the exact token count it stores.
+ */
 export const contextWindowPresets = [
-  { tokens: 8_000, label: "8K" },
-  { tokens: 32_000, label: "32K" },
-  { tokens: 64_000, label: "64K" },
-  { tokens: 128_000, label: "128K" },
-  { tokens: 200_000, label: "200K" },
-  { tokens: 256_000, label: "256K" },
-  { tokens: 400_000, label: "400K" },
-  { tokens: 1_000_000, label: "1M" },
-  { tokens: 1_050_000, label: "1.05M" },
+  { tokens: 8_000, label: "8K（8,000 tokens）" },
+  { tokens: 32_000, label: "32K（32,000 tokens）" },
+  { tokens: 64_000, label: "64K（64,000 tokens）" },
+  { tokens: 128_000, label: "128K（128,000 tokens）" },
+  { tokens: 200_000, label: "200K（200,000 tokens）" },
+  { tokens: 256_000, label: "256K（256,000 tokens）" },
+  { tokens: 400_000, label: "400K（400,000 tokens）" },
+  { tokens: 1_048_576, label: "1M（1,048,576 tokens）" },
+  { tokens: 1_050_000, label: "1.05M（1,050,000 tokens）" },
 ] as const;
+
+/**
+ * Context limits are whole token counts, but providers do not consistently
+ * publish limits aligned to KiB-sized increments. Keep the manual field
+ * compatible with every advertised preset.
+ */
+export const contextWindowInputConstraints = {
+  min: 4_096,
+  step: 1,
+} as const;
 
 export const providerBaseUrlPresetOptions = providerBaseUrlPresets.map(
   (preset) => ({

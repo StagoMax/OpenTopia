@@ -6,6 +6,8 @@ import type {
   AgentEvent,
   ModelContextItem,
   ModelRequestSnapshot,
+  ProviderCacheTrace,
+  ProviderCacheTraceSegment,
 } from "./types";
 
 const { aggregateUsageEvents } = (await import(
@@ -61,6 +63,20 @@ function modelRequest(
     previousToolCalls: [],
     toolResults: [],
     promptCacheKey,
+  };
+}
+
+function providerCacheTrace(
+  segments: ProviderCacheTraceSegment[],
+): ProviderCacheTrace {
+  return {
+    schemaVersion: 1,
+    prefixHash: segments.map((segment) => segment.contentHash).join(":"),
+    segments,
+    toolCatalogHash: "tools-v1",
+    promptCacheKeyHash: "cache-key-v1",
+    previousResponseIdPresent: false,
+    configuration: [{ name: "reasoning_effort", valueHash: "high" }],
   };
 }
 
@@ -699,4 +715,256 @@ test("does not blame an appended suffix for an operational cache miss", () => {
   assert.equal(result.cacheBreaks[0]?.cacheReuse.reason, "operational_miss");
   assert.equal(result.cacheBreaks[0]?.cacheReuse.confidence, "low");
   assert.equal(result.cacheBreaks[0]?.cacheReuse.breakpoint, null);
+});
+
+test("locates an insertion in the exact provider message prefix", () => {
+  const stableSystem: ProviderCacheTraceSegment = {
+    kind: "system_message",
+    source: "messages[0]",
+    contentHash: "system-v1",
+    tokenEstimate: 400,
+  };
+  const toolImage: ProviderCacheTraceSegment = {
+    kind: "tool_image",
+    source: "messages[1]",
+    contentHash: "image-v1",
+    tokenEstimate: 1_000,
+  };
+  const firstTrace = providerCacheTrace([stableSystem, toolImage]);
+  const secondTrace = providerCacheTrace([
+    stableSystem,
+    {
+      kind: "tool_call",
+      source: "messages[1]",
+      name: "filesystem",
+      contentHash: "tool-call-v1",
+      tokenEstimate: 100,
+    },
+    {
+      kind: "tool_result",
+      source: "messages[2]",
+      name: "filesystem",
+      contentHash: "tool-result-v1",
+      tokenEstimate: 200,
+    },
+    { ...toolImage, source: "messages[3]" },
+  ]);
+  const result = aggregateUsageEvents([
+    event(1, "2026-08-05T00:00:00.000Z", {
+      type: "provider_request_sent",
+      request_id: "request-1",
+      round: 1,
+      attempt: 1,
+      adapter: "openai_chat",
+      method: "POST",
+      endpoint: "/chat/completions",
+      cache_trace: firstTrace,
+    }),
+    event(2, "2026-08-05T00:00:00.100Z", {
+      type: "token_usage",
+      input_tokens: 1_800,
+      cached_input_tokens: 1_400,
+      output_tokens: 100,
+      total_tokens: 1_900,
+    }),
+    event(
+      3,
+      "2026-08-05T00:01:00.000Z",
+      {
+        type: "provider_request_sent",
+        request_id: "request-2",
+        round: 2,
+        attempt: 1,
+        adapter: "openai_chat",
+        method: "POST",
+        endpoint: "/chat/completions",
+        cache_trace: secondTrace,
+      },
+      "turn-2",
+    ),
+    event(
+      4,
+      "2026-08-05T00:01:00.100Z",
+      {
+        type: "token_usage",
+        input_tokens: 2_100,
+        cached_input_tokens: 600,
+        output_tokens: 100,
+        total_tokens: 2_200,
+      },
+      "turn-2",
+    ),
+  ]);
+
+  const diagnostic = result.cacheBreaks[0]?.cacheReuse;
+  assert.equal(diagnostic?.reason, "wire_prefix_changed");
+  assert.equal(diagnostic?.confidence, "high");
+  assert.deepEqual(diagnostic?.breakpoint, {
+    kind: "tool_call",
+    source: "messages[1]",
+    cacheScope: null,
+    change: "inserted",
+    tokenOffsetEstimate: 400,
+    previousTokenEstimate: null,
+    currentTokenEstimate: 100,
+    name: "filesystem",
+    affectedSegmentCount: 2,
+    anchorSource: "messages[3]",
+  });
+});
+
+test("reports a provider-side miss when the recorded request prefix is unchanged", () => {
+  const stableSegment: ProviderCacheTraceSegment = {
+    kind: "system_message",
+    source: "messages[0]",
+    contentHash: "system-v1",
+    tokenEstimate: 1_200,
+  };
+  const firstTrace = providerCacheTrace([stableSegment]);
+  const secondTrace = providerCacheTrace([
+    stableSegment,
+    {
+      kind: "user_message",
+      source: "messages[1]",
+      contentHash: "appended-user-message",
+      tokenEstimate: 200,
+    },
+  ]);
+  const result = aggregateUsageEvents([
+    event(1, "2026-08-05T00:00:00.000Z", {
+      type: "provider_request_sent",
+      request_id: "request-1",
+      round: 1,
+      attempt: 1,
+      adapter: "openai_chat",
+      method: "POST",
+      endpoint: "/chat/completions",
+      cache_trace: firstTrace,
+    }),
+    event(2, "2026-08-05T00:00:00.100Z", {
+      type: "token_usage",
+      input_tokens: 1_400,
+      cached_input_tokens: 1_200,
+      output_tokens: 100,
+      total_tokens: 1_500,
+    }),
+    event(
+      3,
+      "2026-08-05T00:01:00.000Z",
+      {
+        type: "provider_request_sent",
+        request_id: "request-2",
+        round: 2,
+        attempt: 1,
+        adapter: "openai_chat",
+        method: "POST",
+        endpoint: "/chat/completions",
+        cache_trace: secondTrace,
+      },
+      "turn-2",
+    ),
+    event(
+      4,
+      "2026-08-05T00:01:00.100Z",
+      {
+        type: "token_usage",
+        input_tokens: 1_600,
+        cached_input_tokens: 0,
+        output_tokens: 100,
+        total_tokens: 1_700,
+      },
+      "turn-2",
+    ),
+  ]);
+
+  const diagnostic = result.cacheBreaks[0]?.cacheReuse;
+  assert.equal(diagnostic?.reason, "operational_miss");
+  assert.equal(diagnostic?.confidence, "medium");
+  assert.equal(diagnostic?.breakpoint, null);
+});
+
+test("does not invent a cause across the cache-trace rollout boundary", () => {
+  const currentTrace = providerCacheTrace([
+    {
+      kind: "system_message",
+      source: "messages[0]",
+      contentHash: "system-v1",
+      tokenEstimate: 1_200,
+    },
+  ]);
+  const result = aggregateUsageEvents([
+    event(1, "2026-08-05T00:00:00.000Z", {
+      type: "provider_request_sent",
+      request_id: "request-1",
+      round: 1,
+      attempt: 1,
+      adapter: "openai_chat",
+      method: "POST",
+      endpoint: "/chat/completions",
+    }),
+    event(2, "2026-08-05T00:00:00.100Z", {
+      type: "token_usage",
+      input_tokens: 1_400,
+      cached_input_tokens: 1_200,
+      output_tokens: 100,
+      total_tokens: 1_500,
+    }),
+    event(
+      3,
+      "2026-08-05T00:01:00.000Z",
+      {
+        type: "provider_request_sent",
+        request_id: "request-2",
+        round: 2,
+        attempt: 1,
+        adapter: "openai_chat",
+        method: "POST",
+        endpoint: "/chat/completions",
+        cache_trace: currentTrace,
+      },
+      "turn-2",
+    ),
+    event(
+      4,
+      "2026-08-05T00:01:00.100Z",
+      {
+        type: "token_usage",
+        input_tokens: 1_400,
+        cached_input_tokens: 0,
+        output_tokens: 100,
+        total_tokens: 1_500,
+      },
+      "turn-2",
+    ),
+  ]);
+
+  assert.equal(
+    result.cacheBreaks[0]?.cacheReuse.reason,
+    "diagnostic_data_missing",
+  );
+});
+
+test("counts structured tool error records in the usage summary", () => {
+  const result = aggregateUsageEvents([
+    event(1, "2026-08-05T00:00:00.000Z", {
+      type: "tool_call_started",
+      call: { id: "tool-1", name: "filesystem", input: {} },
+    }),
+    event(2, "2026-08-05T00:00:00.010Z", {
+      type: "tool_call_finished",
+      result: {
+        callId: "tool-1",
+        output: "offset exceeds total characters",
+        metadata: {
+          errorRecord: {
+            code: "tool_execution_failed",
+            message: "offset exceeds total characters",
+          },
+        },
+      },
+    }),
+  ]);
+
+  assert.equal(result.summary.toolCallCount, 1);
+  assert.equal(result.summary.toolErrorCount, 1);
 });

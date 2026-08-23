@@ -176,6 +176,36 @@ export type TokenEstimateBreakdown = {
   details?: TokenEstimateDetail[];
 };
 
+export type ProviderCacheTraceSegmentKind =
+  | "instructions"
+  | "system_message"
+  | "developer_message"
+  | "user_message"
+  | "assistant_message"
+  | "tool_call"
+  | "tool_result"
+  | "tool_image"
+  | "input_item"
+  | "unknown";
+
+export type ProviderCacheTraceSegment = {
+  kind: ProviderCacheTraceSegmentKind;
+  source: string;
+  name?: string | null;
+  contentHash: string;
+  tokenEstimate: number;
+};
+
+export type ProviderCacheTrace = {
+  schemaVersion: number;
+  prefixHash: string;
+  segments: ProviderCacheTraceSegment[];
+  toolCatalogHash?: string | null;
+  promptCacheKeyHash?: string | null;
+  previousResponseIdPresent: boolean;
+  configuration?: Array<{ name: string; valueHash: string }>;
+};
+
 export type ThreadContextSnapshot = {
   capturedAt: string;
   providerId: string;
@@ -286,6 +316,7 @@ export type AgentEventPayload =
       adapter: string;
       method: string;
       endpoint: string;
+      cache_trace?: ProviderCacheTrace | null;
       body?: unknown;
     }
   | {
@@ -297,6 +328,7 @@ export type AgentEventPayload =
       retry_index?: number | null;
       retry_limit?: number | null;
       reason: string;
+      cache_trace?: ProviderCacheTrace | null;
       body?: unknown;
     }
   | {

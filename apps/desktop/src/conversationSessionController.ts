@@ -77,12 +77,14 @@ export class ConversationSessionController {
     if (this.retainCount === 1) this.connect();
     return () => {
       this.retainCount = Math.max(0, this.retainCount - 1);
-      if (this.retainCount === 0) this.disconnect();
+      if (this.retainCount === 0 && !this.hasLiveActivity()) {
+        this.disconnect();
+      }
     };
   }
 
   isRetained(): boolean {
-    return this.retainCount > 0;
+    return this.retainCount > 0 || this.hasLiveActivity();
   }
 
   retry(): void {
@@ -115,7 +117,11 @@ export class ConversationSessionController {
         request.contentParts ?? [],
         request.libraryProvider,
       );
-      this.dispatch({ type: "sendSucceeded", ...result, startedAt });
+      this.dispatch({
+        type: "sendSucceeded",
+        ...result,
+        startedAt,
+      });
       if (this.state.cancellationRequested && result.turnId) {
         await this.issueCancel(result.turnId);
       }
@@ -282,6 +288,16 @@ export class ConversationSessionController {
     this.flushPendingEvents();
   }
 
+  private hasLiveActivity(): boolean {
+    return (
+      this.state.sending ||
+      this.state.pendingTurnFeedback !== null ||
+      this.state.activeTurnId !== null ||
+      this.state.turnStatus?.status === "running" ||
+      this.state.turnStatus?.status === "cancelling"
+    );
+  }
+
   private isCurrentLoad(
     generation: number,
     controller: AbortController,
@@ -362,6 +378,9 @@ export class ConversationSessionController {
     if (next === this.state) return;
     this.state = next;
     this.stateListeners.forEach((listener) => listener());
+    if (this.retainCount === 0 && !this.hasLiveActivity() && this.stream) {
+      this.disconnect();
+    }
   }
 }
 

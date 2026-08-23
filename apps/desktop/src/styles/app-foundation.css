@@ -1820,7 +1820,7 @@ code {
   display: grid;
   place-items: center;
   align-content: center;
-  gap: 12px;
+  gap: var(--space-6);
   height: 100%;
   color: var(--text-secondary);
   text-align: center;
@@ -1845,20 +1845,57 @@ code {
 }
 
 .offline code {
-  margin-top: 6px;
+  margin-top: var(--space-3);
+}
+
+.offline-progress {
+  display: grid;
+  gap: var(--space-3);
+  inline-size: min(100%, calc(var(--popover-width-compact) * 1.5));
+}
+
+.offline-progress__bar {
+  position: relative;
+  block-size: var(--space-2);
+  overflow: hidden;
+  border-radius: var(--radius-sm);
+  background: var(--surface-active);
+}
+
+.offline-progress__bar::before {
+  position: absolute;
+  inset: var(--space-0);
+  display: block;
+  content: "";
+  border-radius: inherit;
+  background: var(--accent);
+  animation: offline-progress calc(var(--motion-standard) * 8)
+    var(--ease-standard) infinite;
+}
+
+.offline-progress__summary {
+  display: grid;
+  gap: var(--space-1);
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+}
+
+.offline-progress__summary strong {
+  color: var(--text-secondary);
+  font-weight: var(--font-weight-medium);
 }
 
 .offline-actions {
   display: grid;
   justify-items: center;
-  gap: 6px;
-  margin-top: 4px;
+  gap: var(--space-3);
+  margin-top: var(--space-2);
 }
 
 .offline-actions .secondary-button {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
 }
 
 .spin {
@@ -1869,6 +1906,26 @@ code {
   to {
     transform: rotate(360deg);
   }
+}
+
+@keyframes offline-progress {
+  from {
+    transform: translateX(-65%);
+  }
+
+  to {
+    transform: translateX(65%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .offline-progress__bar::before {
+    animation: none;
+  }
+}
+
+[data-reduce-motion="on"] .offline-progress__bar::before {
+  animation: none;
 }
 
 .monaco-editor-wrapper {

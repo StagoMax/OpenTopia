@@ -1,13 +1,17 @@
-const MAX_THREAD_TITLE_CHARS = 50;
-
-export function threadTitleNeedsSummary(prompt: string): boolean {
-  return Array.from(prompt.trim()).length > MAX_THREAD_TITLE_CHARS;
-}
+const MAX_THREAD_TITLE_CHARS = 100;
+const MAX_CONVERSATION_HEADER_TITLE_CHARS = 50;
 
 export function threadTitleFromPrompt(prompt: string): string {
-  const title = prompt.trim();
+  const title = prompt.trim().replace(/\s+/g, " ");
   const chars = Array.from(title);
   if (chars.length <= MAX_THREAD_TITLE_CHARS) return title;
-  const singleLineTitle = Array.from(title.replace(/\s+/g, " "));
-  return `${singleLineTitle.slice(0, MAX_THREAD_TITLE_CHARS - 1).join("")}…`;
+  return `${chars.slice(0, MAX_THREAD_TITLE_CHARS - 1).join("")}…`;
+}
+
+export function conversationHeaderTitle(title: string): string {
+  const chars = Array.from(title);
+  if (chars.length <= MAX_CONVERSATION_HEADER_TITLE_CHARS) return title;
+  return `${chars
+    .slice(0, MAX_CONVERSATION_HEADER_TITLE_CHARS - 1)
+    .join("")}…`;
 }

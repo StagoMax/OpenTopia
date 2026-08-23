@@ -68,6 +68,7 @@ button:disabled {
   gap: 1px;
   padding-left: 4px;
   -webkit-app-region: no-drag;
+  pointer-events: auto;
 }
 
 .window-menu-entry {
@@ -75,6 +76,8 @@ button:disabled {
   display: flex;
   height: 100%;
   align-items: center;
+  -webkit-app-region: no-drag;
+  pointer-events: auto;
 }
 
 .window-menu button,
@@ -125,7 +128,7 @@ button:disabled {
 
 .window-menu-popover {
   position: absolute;
-  z-index: 100;
+  z-index: var(--z-popover);
   top: calc(100% + 3px);
   left: 0;
   display: grid;
@@ -137,6 +140,8 @@ button:disabled {
   background: var(--surface);
   box-shadow: 0 10px 22px rgb(38 32 25 / 18%);
   padding: 5px;
+  -webkit-app-region: no-drag;
+  pointer-events: auto;
 }
 
 .window-menu-popover-wide {
@@ -623,8 +628,9 @@ button:disabled {
 .thread-row:focus-visible
   .thread-title-viewport.is-overflowing
   .thread-title-text {
-  animation: thread-title-scroll var(--thread-title-scroll-duration)
-    var(--ease-standard) forwards;
+  animation: thread-title-scroll var(--thread-title-scroll-duration) linear
+    forwards;
+  animation-delay: var(--motion-standard);
 }
 
 .thread-row-wrap:hover .thread-title-viewport.is-overflowing,
@@ -646,13 +652,11 @@ button:disabled {
 }
 
 @keyframes thread-title-scroll {
-  0%,
-  12% {
+  from {
     transform: translateX(0);
   }
 
-  88%,
-  100% {
+  to {
     transform: translateX(calc(-1 * var(--thread-title-scroll-distance)));
   }
 }
@@ -1140,7 +1144,7 @@ button:disabled {
 }
 
 .composer-plan-list li.is-completed .composer-plan-step-icon {
-  color: var(--text-muted);
+  color: var(--success);
 }
 
 .composer-plan-list li.is-in_progress .composer-plan-step-icon {
