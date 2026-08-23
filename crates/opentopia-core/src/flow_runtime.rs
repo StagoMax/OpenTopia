@@ -11,8 +11,9 @@ use crate::workflow_interrupt::{
 };
 use crate::workflow_state::{apply_state_writes, parse_state_writes};
 use crate::{
-    DeploymentSnapshotV1, RuntimeConnectionAuthorityV1, WorkflowAgentSpecV1,
-    WorkflowDeploymentStatusV1, WorkflowDeploymentV1,
+    CompiledWorkflowV1, DeploymentSnapshotV1, RuntimeConnectionAuthorityV1, WorkflowAgentSpecV1,
+    WorkflowDeploymentStatusV1, WorkflowDeploymentV1, WorkflowOutputReviewPolicyV1,
+    WorkflowOutputSpecV1, WorkflowTriggerSpecV1,
 };
 use anyhow::Context;
 use async_trait::async_trait;
@@ -235,6 +236,10 @@ pub struct FlowRunV1 {
     pub deployment_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_snapshot: Option<DeploymentSnapshotV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_draft_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_draft_revision: Option<u32>,
     pub revision: u32,
     pub status: FlowRunStatusV1,
     pub input: Value,
@@ -336,6 +341,8 @@ impl FlowRunV1 {
             definition_content_hash: definition.content_hash.clone(),
             deployment_id: None,
             deployment_snapshot: None,
+            test_draft_id: None,
+            test_draft_revision: None,
             revision: 1,
             status: FlowRunStatusV1::Queued,
             input,
@@ -392,6 +399,8 @@ impl FlowRunV1 {
             definition_content_hash: workflow.definition_content_hash.clone(),
             deployment_id: Some(deployment.id),
             deployment_snapshot: Some(deployment.snapshot.clone()),
+            test_draft_id: None,
+            test_draft_revision: None,
             revision: 1,
             status: FlowRunStatusV1::Queued,
             input,
@@ -412,7 +421,8 @@ impl FlowRunV1 {
             loop_counts: BTreeMap::new(),
             node_executions: 0,
             tool_calls: 0,
-            output_review_required: true,
+            output_review_required: deployment.snapshot.output_review_policy
+                == WorkflowOutputReviewPolicyV1::AlwaysReviewOutput,
             output_reviewed: false,
             waiting_node_id: None,
             active_human_task_id: None,
@@ -422,6 +432,31 @@ impl FlowRunV1 {
             completed_at: None,
             updated_at: now,
         })
+    }
+
+    pub fn new_for_test_run(
+        thread_id: Uuid,
+        draft_id: Uuid,
+        draft_revision: u32,
+        compiled_workflow: CompiledWorkflowV1,
+        input: Value,
+    ) -> anyhow::Result<Self> {
+        let deployment = WorkflowDeploymentV1::new_with_options(
+            "Workflow test run",
+            "test",
+            compiled_workflow,
+            WorkflowTriggerSpecV1::Manual,
+            WorkflowOutputSpecV1::Inbox,
+            WorkflowOutputReviewPolicyV1::ExplicitNodesOnly,
+            "workflow-test-runner",
+        )?;
+        let mut run = Self::new_from_deployment(thread_id, &deployment, input)?;
+        run.deployment_id = None;
+        run.test_draft_id = Some(draft_id);
+        run.test_draft_revision = Some(draft_revision);
+        run.definition_id = draft_id;
+        run.output_review_required = false;
+        Ok(run)
     }
 
     pub fn effective_connection_authority(&self) -> RuntimeConnectionAuthorityV1 {

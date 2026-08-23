@@ -89,6 +89,7 @@ export type WorkflowOutputSpecV1 =
       title: string;
       [k: string]: unknown;
     };
+export type WorkflowOutputReviewPolicyV1 = "explicit_nodes_only" | "always_review_output";
 export type WorkflowTriggerSpecV1 =
   | {
       kind: "manual";
@@ -170,6 +171,7 @@ export type CapabilityDiscoveryKindV1 = "mcp_tools_list" | "static";
 export type IntegrationKindV1 = "mcp" | "oauth_api" | "database" | "local_app";
 export type McpLifecycleStatus = "not_started" | "starting" | "ready" | "error" | "disabled";
 export type WorkflowDeploymentStatusV1 = "active" | "disabled";
+export type WorkflowIngressPolicyV1 = "immediate" | "require_review";
 export type WorkflowReleaseStatusV1 = "active" | "disabled";
 export type WorkflowTriggerInvocationStatusV1 = "accepted" | "started" | "failed";
 export type GitWorkflowActionKind =
@@ -1130,6 +1132,8 @@ export interface DesktopHttpResponsesV1 {
   startCodexLogin: CodexLoginStart;
   startDeployedWorkflowRun: FlowRunV1;
   startFlowRun: FlowRunV1;
+  startFlowTestRun: FlowRunV1;
+  startPendingWorkflowInvocation: WorkflowInvocationResult;
   startPluginAppSession: AppViewSessionResponse;
   startTerminalCommand: TerminalStartResponse;
   stopPluginAppSession: AppViewSession;
@@ -1399,6 +1403,8 @@ export interface FlowRunV1 {
   };
   status: FlowRunStatusV1;
   superstep?: number;
+  testDraftId?: string | null;
+  testDraftRevision?: number | null;
   threadId: string;
   toolCalls: number;
   updatedAt: string;
@@ -1533,6 +1539,7 @@ export interface DeploymentSnapshotV1 {
   createdBy: string;
   id: string;
   output: WorkflowOutputSpecV1;
+  outputReviewPolicy?: WorkflowOutputReviewPolicyV1 & string;
   schemaVersion: number;
   trigger: WorkflowTriggerSpecV1;
   [k: string]: unknown;
@@ -1868,6 +1875,7 @@ export interface ConnectionAccountV1 {
 }
 export interface FlowDraftView {
   draft: FlowDraftV1;
+  testRuns: FlowRunV1[];
   trials: FlowTrialV1[];
   [k: string]: unknown;
 }
@@ -2050,6 +2058,7 @@ export interface WorkflowReleaseV1 {
   createdBy: string;
   environment: string;
   id: string;
+  ingressPolicy?: WorkflowIngressPolicyV1 & string;
   previousPrimaryDeploymentId?: string | null;
   primaryDeploymentId: string;
   releaseKey: string;
@@ -2069,7 +2078,7 @@ export interface ApprovalDecisionResponse {
 export interface WorkflowInvocationResult {
   invocation: WorkflowTriggerInvocationV1;
   reused: boolean;
-  run: FlowRunV1;
+  run?: FlowRunV1 | null;
   [k: string]: unknown;
 }
 export interface WorkflowTriggerInvocationV1 {
@@ -2079,6 +2088,9 @@ export interface WorkflowTriggerInvocationV1 {
   flowRunId?: string | null;
   id: string;
   idempotencyKey: string;
+  input?: {
+    [k: string]: unknown;
+  };
   inputHash: string;
   releaseId: string;
   schemaVersion: number;

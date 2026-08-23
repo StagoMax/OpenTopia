@@ -1,7 +1,6 @@
 use crate::enterprise_connection_grants::ExecutionConnectionOperationV1;
 use crate::model_context::content_fingerprint;
 use crate::workflow::{WorkflowDeploymentStatusV1, WorkflowDeploymentV1};
-use anyhow::Context as _;
 use chrono::{DateTime, Duration, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -10,6 +9,14 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub const WORKFLOW_AUTOMATION_SCHEMA_VERSION_V1: u16 = 1;
+
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowIngressPolicyV1 {
+    #[default]
+    Immediate,
+    RequireReview,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(
@@ -230,6 +237,8 @@ pub struct WorkflowReleaseV1 {
     pub thread_id: Uuid,
     pub status: WorkflowReleaseStatusV1,
     pub trigger: WorkflowTriggerSpecV1,
+    #[serde(default)]
+    pub ingress_policy: WorkflowIngressPolicyV1,
     pub primary_deployment_id: Uuid,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canary_deployment_id: Option<Uuid>,
@@ -248,6 +257,26 @@ impl WorkflowReleaseV1 {
         thread_id: Uuid,
         deployment: &WorkflowDeploymentV1,
         trigger: WorkflowTriggerSpecV1,
+        created_by: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_ingress_policy(
+            release_key,
+            environment,
+            thread_id,
+            deployment,
+            trigger,
+            WorkflowIngressPolicyV1::Immediate,
+            created_by,
+        )
+    }
+
+    pub fn new_with_ingress_policy(
+        release_key: impl Into<String>,
+        environment: impl Into<String>,
+        thread_id: Uuid,
+        deployment: &WorkflowDeploymentV1,
+        trigger: WorkflowTriggerSpecV1,
+        ingress_policy: WorkflowIngressPolicyV1,
         created_by: impl Into<String>,
     ) -> anyhow::Result<Self> {
         let release_key = release_key.into().trim().to_string();
@@ -275,6 +304,7 @@ impl WorkflowReleaseV1 {
             thread_id,
             status: WorkflowReleaseStatusV1::Active,
             trigger,
+            ingress_policy,
             primary_deployment_id: deployment.id,
             canary_deployment_id: None,
             canary_percent: 0,
@@ -394,6 +424,8 @@ pub struct WorkflowTriggerInvocationV1 {
     pub flow_run_id: Option<Uuid>,
     pub status: WorkflowTriggerInvocationStatusV1,
     pub input_hash: String,
+    #[serde(default)]
+    pub input: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -412,7 +444,7 @@ impl WorkflowTriggerInvocationV1 {
         let trigger_id = release
             .trigger
             .trigger_id()
-            .context("manual releases do not accept external invocations")?;
+            .unwrap_or_else(|| Uuid::new_v5(&release.id, b"manual-trigger"));
         let now = Utc::now();
         Ok(Self {
             schema_version: WORKFLOW_AUTOMATION_SCHEMA_VERSION_V1,
@@ -424,6 +456,7 @@ impl WorkflowTriggerInvocationV1 {
             flow_run_id: None,
             status: WorkflowTriggerInvocationStatusV1::Accepted,
             input_hash: content_fingerprint(&serde_json::to_vec(input)?),
+            input: input.clone(),
             error: None,
             created_at: now,
             updated_at: now,

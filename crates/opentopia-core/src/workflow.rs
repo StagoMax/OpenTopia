@@ -28,6 +28,14 @@ use uuid::Uuid;
 
 pub use crate::workflow_automation::{WorkflowOutputSpecV1, WorkflowTriggerSpecV1};
 
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowOutputReviewPolicyV1 {
+    ExplicitNodesOnly,
+    #[default]
+    AlwaysReviewOutput,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowAgentSpecV1 {
@@ -283,6 +291,8 @@ pub struct DeploymentSnapshotV1 {
     pub compiled_workflow: CompiledWorkflowV1,
     pub trigger: WorkflowTriggerSpecV1,
     pub output: WorkflowOutputSpecV1,
+    #[serde(default)]
+    pub output_review_policy: WorkflowOutputReviewPolicyV1,
     pub content_hash: String,
     pub created_at: DateTime<Utc>,
     pub created_by: String,
@@ -304,17 +314,41 @@ impl DeploymentSnapshotV1 {
         output: WorkflowOutputSpecV1,
         created_by: impl Into<String>,
     ) -> Self {
+        Self::new_with_options(
+            compiled_workflow,
+            trigger,
+            output,
+            WorkflowOutputReviewPolicyV1::AlwaysReviewOutput,
+            created_by,
+        )
+    }
+
+    pub fn new_with_options(
+        compiled_workflow: CompiledWorkflowV1,
+        trigger: WorkflowTriggerSpecV1,
+        output: WorkflowOutputSpecV1,
+        output_review_policy: WorkflowOutputReviewPolicyV1,
+        created_by: impl Into<String>,
+    ) -> Self {
         let created_by = created_by.into();
         let id = Uuid::new_v4();
         let created_at = Utc::now();
-        let bytes = serde_json::to_vec(&(id, &compiled_workflow, &trigger, &output, &created_by))
-            .unwrap_or_default();
+        let bytes = serde_json::to_vec(&(
+            id,
+            &compiled_workflow,
+            &trigger,
+            &output,
+            output_review_policy,
+            &created_by,
+        ))
+        .unwrap_or_default();
         Self {
             schema_version: ENTERPRISE_SCHEMA_VERSION_V1,
             id,
             compiled_workflow,
             trigger,
             output,
+            output_review_policy,
             content_hash: content_fingerprint(&bytes),
             created_at,
             created_by,
@@ -378,6 +412,26 @@ impl WorkflowDeploymentV1 {
         output: WorkflowOutputSpecV1,
         created_by: impl Into<String>,
     ) -> Result<Self, WorkflowCompileError> {
+        Self::new_with_options(
+            name,
+            environment,
+            compiled_workflow,
+            trigger,
+            output,
+            WorkflowOutputReviewPolicyV1::AlwaysReviewOutput,
+            created_by,
+        )
+    }
+
+    pub fn new_with_options(
+        name: impl Into<String>,
+        environment: impl Into<String>,
+        compiled_workflow: CompiledWorkflowV1,
+        trigger: WorkflowTriggerSpecV1,
+        output: WorkflowOutputSpecV1,
+        output_review_policy: WorkflowOutputReviewPolicyV1,
+        created_by: impl Into<String>,
+    ) -> Result<Self, WorkflowCompileError> {
         let name = name.into().trim().to_string();
         let environment = environment.into().trim().to_string();
         let created_by = created_by.into().trim().to_string();
@@ -392,10 +446,11 @@ impl WorkflowDeploymentV1 {
             name,
             environment,
             status: WorkflowDeploymentStatusV1::Active,
-            snapshot: DeploymentSnapshotV1::new_with_io(
+            snapshot: DeploymentSnapshotV1::new_with_options(
                 compiled_workflow,
                 trigger,
                 output,
+                output_review_policy,
                 created_by.clone(),
             ),
             created_at: now,

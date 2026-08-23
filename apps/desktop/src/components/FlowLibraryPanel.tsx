@@ -1,13 +1,20 @@
 import type { ApiClient } from "../api/client";
+import type { EnterprisePageHeaderChange } from "./enterprise/pageHeader";
 import { ConnectionsWorkspacePanel } from "./connections";
 
-export type FlowLibraryPanelProps = { client: ApiClient | null };
+export type FlowLibraryPanelProps = {
+  client: ApiClient | null;
+  onPageHeaderChange?: EnterprisePageHeaderChange;
+};
 
 /**
  * Compatibility entry point for the former Flow library placeholder. The
  * primary navigation now opens the real Connections control plane.
  */
-export function FlowLibraryPanel({ client }: FlowLibraryPanelProps) {
+export function FlowLibraryPanel({
+  client,
+  onPageHeaderChange,
+}: FlowLibraryPanelProps) {
   if (!client) {
     return (
       <div className="connections-page-state" role="status">
@@ -16,5 +23,10 @@ export function FlowLibraryPanel({ client }: FlowLibraryPanelProps) {
       </div>
     );
   }
-  return <ConnectionsWorkspacePanel client={client} />;
+  return (
+    <ConnectionsWorkspacePanel
+      client={client}
+      onPageHeaderChange={onPageHeaderChange}
+    />
+  );
 }

@@ -5169,6 +5169,14 @@
         "output": {
           "$ref": "#/definitions/WorkflowOutputSpecV1"
         },
+        "outputReviewPolicy": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/WorkflowOutputReviewPolicyV1"
+            }
+          ],
+          "default": "always_review_output"
+        },
         "schemaVersion": {
           "format": "uint16",
           "minimum": 0.0,
@@ -5609,6 +5617,12 @@
         "draft": {
           "$ref": "#/definitions/FlowDraftV1"
         },
+        "testRuns": {
+          "items": {
+            "$ref": "#/definitions/FlowRunV1"
+          },
+          "type": "array"
+        },
         "trials": {
           "items": {
             "$ref": "#/definitions/FlowTrialV1"
@@ -5618,6 +5632,7 @@
       },
       "required": [
         "draft",
+        "testRuns",
         "trials"
       ],
       "type": "object"
@@ -6028,6 +6043,21 @@
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "testDraftId": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "testDraftRevision": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "threadId": {
           "format": "uuid",
@@ -14197,6 +14227,13 @@
       ],
       "type": "object"
     },
+    "WorkflowIngressPolicyV1": {
+      "enum": [
+        "immediate",
+        "require_review"
+      ],
+      "type": "string"
+    },
     "WorkflowInterruptKindV1": {
       "enum": [
         "approval",
@@ -14297,15 +14334,28 @@
           "type": "boolean"
         },
         "run": {
-          "$ref": "#/definitions/FlowRunV1"
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FlowRunV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
         "invocation",
-        "reused",
-        "run"
+        "reused"
       ],
       "type": "object"
+    },
+    "WorkflowOutputReviewPolicyV1": {
+      "enum": [
+        "explicit_nodes_only",
+        "always_review_output"
+      ],
+      "type": "string"
     },
     "WorkflowOutputSpecV1": {
       "oneOf": [
@@ -14488,6 +14538,14 @@
           "format": "uuid",
           "type": "string"
         },
+        "ingressPolicy": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/WorkflowIngressPolicyV1"
+            }
+          ],
+          "default": "immediate"
+        },
         "previousPrimaryDeploymentId": {
           "format": "uuid",
           "type": [
@@ -14605,6 +14663,9 @@
         },
         "idempotencyKey": {
           "type": "string"
+        },
+        "input": {
+          "default": null
         },
         "inputHash": {
           "type": "string"
@@ -15702,6 +15763,12 @@
     "startFlowRun": {
       "$ref": "#/definitions/FlowRunV1"
     },
+    "startFlowTestRun": {
+      "$ref": "#/definitions/FlowRunV1"
+    },
+    "startPendingWorkflowInvocation": {
+      "$ref": "#/definitions/WorkflowInvocationResult"
+    },
     "startPluginAppSession": {
       "$ref": "#/definitions/AppViewSessionResponse"
     },
@@ -15922,6 +15989,8 @@
     "startCodexLogin",
     "startDeployedWorkflowRun",
     "startFlowRun",
+    "startFlowTestRun",
+    "startPendingWorkflowInvocation",
     "startPluginAppSession",
     "startTerminalCommand",
     "stopPluginAppSession",

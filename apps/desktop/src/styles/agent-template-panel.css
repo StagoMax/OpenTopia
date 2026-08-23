@@ -63,8 +63,7 @@
 }
 
 .agent-template-panel__template:focus-visible,
-.agent-template-panel__field textarea:focus-visible,
-.agent-template-panel__field select:focus-visible {
+.agent-template-panel__field textarea:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: var(--space-1);
 }
@@ -106,8 +105,7 @@
   font-size: var(--font-size-sm);
 }
 
-.agent-template-panel__field textarea,
-.agent-template-panel__field select {
+.agent-template-panel__field textarea {
   width: 100%;
   min-block-size: var(--control-height-md);
   border: 1px solid var(--border);

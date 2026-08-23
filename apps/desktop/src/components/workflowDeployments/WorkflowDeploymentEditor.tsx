@@ -1,7 +1,10 @@
-import { ArrowLeft, Boxes, LoaderCircle } from "lucide-react";
+import { Boxes, LoaderCircle } from "lucide-react";
 import { useMemo, useState, type FormEvent } from "react";
-import { Button, Panel, Select, TextField } from "../ui";
-import type { WorkflowOutput } from "../../types";
+import { Button, Panel, SelectField, TextField } from "../ui";
+import type {
+  WorkflowOutput,
+  WorkflowOutputReviewPolicy,
+} from "../../types";
 import type {
   WorkflowDeploymentsSnapshot,
   WorkflowDeploymentsStore,
@@ -29,6 +32,8 @@ export function WorkflowDeploymentEditor({
   const [environment, setEnvironment] = useState("production");
   const [createdBy, setCreatedBy] = useState("local-user");
   const [outputKind, setOutputKind] = useState<WorkflowOutput["kind"]>("inbox");
+  const [outputReviewPolicy, setOutputReviewPolicy] =
+    useState<WorkflowOutputReviewPolicy>("explicit_nodes_only");
   const [webhookEndpoint, setWebhookEndpoint] = useState("");
   const [webhookCredentialRef, setWebhookCredentialRef] = useState("");
   const [humanTaskTitle, setHumanTaskTitle] = useState(
@@ -78,6 +83,7 @@ export function WorkflowDeploymentEditor({
       environment: environment.trim(),
       createdBy: createdBy.trim(),
       output,
+      outputReviewPolicy,
     });
   }
 
@@ -87,15 +93,8 @@ export function WorkflowDeploymentEditor({
       onSubmit={(event) => void submit(event)}
     >
       <header className="workflow-deployment-editor__header">
-        <Button
-          onClick={() => store.cancelCreate()}
-          size="compact"
-          variant="quiet"
-        >
-          <ArrowLeft aria-hidden="true" size={14} /> 返回
-        </Button>
         <span>
-          <h2>Create Deployment / 创建部署</h2>
+          <h2>Deployment Snapshot / 部署快照</h2>
           <p>
             Workflow Compiler / 工作流编译器会冻结 Flow、Agent Template 与
             operation-level Connection 权限。
@@ -134,18 +133,16 @@ export function WorkflowDeploymentEditor({
               <h3>Source / 来源</h3>
               <p>部署引用已发布的精确版本，不会自动跟随后续模板变更。</p>
             </header>
-            <label className="workflow-deployment-select-field">
-              <span>Published Flow / 已发布 Flow</span>
-              <Select
-                label="Published Flow / 已发布 Flow"
-                onChange={setDefinitionId}
-                options={snapshot.definitions.map((definition) => ({
-                  value: definition.id,
-                  label: `${definition.name} · ${definition.flowId}@${definition.version}`,
-                }))}
-                value={definitionId}
-              />
-            </label>
+            <SelectField
+              fieldClassName="workflow-deployment-select-field"
+              label="Published Flow / 已发布 Flow"
+              onChange={setDefinitionId}
+              options={snapshot.definitions.map((definition) => ({
+                value: definition.id,
+                label: `${definition.name} · ${definition.flowId}@${definition.version}`,
+              }))}
+              value={definitionId}
+            />
             {selectedDefinition ? (
               <Panel title="Compile preview / 编译预览">
                 <dl className="workflow-deployment-detail-list">
@@ -182,21 +179,38 @@ export function WorkflowDeploymentEditor({
                 DeliveryReceipt。
               </p>
             </header>
-            <label className="workflow-deployment-select-field">
-              <span>Output / 输出</span>
-              <Select
-                label="Output / 输出"
-                onChange={(value) =>
-                  setOutputKind(value as WorkflowOutput["kind"])
-                }
-                options={[
-                  { value: "inbox", label: "Inbox / 运行记录" },
-                  { value: "webhook", label: "Webhook / 外部接口" },
-                  { value: "human_task", label: "HumanTask / 人工交接" },
-                ]}
-                value={outputKind}
-              />
-            </label>
+            <SelectField
+              fieldClassName="workflow-deployment-select-field"
+              label="Output / 输出"
+              onChange={(value) =>
+                setOutputKind(value as WorkflowOutput["kind"])
+              }
+              options={[
+                { value: "inbox", label: "Inbox / 运行记录" },
+                { value: "webhook", label: "Webhook / 外部接口" },
+                { value: "human_task", label: "HumanTask / 人工交接" },
+              ]}
+              value={outputKind}
+            />
+            <SelectField
+              fieldClassName="workflow-deployment-select-field"
+              hint="工作流中的 Approval 节点始终生效；这里仅控制最终输出是否额外复核。"
+              label="Output review / 最终输出复核"
+              onChange={(value) =>
+                setOutputReviewPolicy(value as WorkflowOutputReviewPolicy)
+              }
+              options={[
+                {
+                  value: "explicit_nodes_only",
+                  label: "仅显式 Approval 节点（推荐）",
+                },
+                {
+                  value: "always_review_output",
+                  label: "每次最终输出都人工复核",
+                },
+              ]}
+              value={outputReviewPolicy}
+            />
             {outputKind === "webhook" ? (
               <div className="workflow-deployment-form-grid">
                 <TextField

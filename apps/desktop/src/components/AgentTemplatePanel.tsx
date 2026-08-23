@@ -25,7 +25,11 @@ import type {
   ExecutionResourceGrant,
 } from "../types";
 import type { AgentTemplateConnectionAccessView } from "../api/generated/desktop-http-v1.generated";
-import { Badge, Button, Panel, TextField } from "./ui";
+import { Badge, Button, Panel, SelectField, TextField } from "./ui";
+import {
+  useEnterpriseSubpageHeader,
+  type EnterprisePageHeaderChange,
+} from "./enterprise/pageHeader";
 import {
   AgentTemplateConnectionAccessSummary,
   AgentTemplateConnectionGrantsField,
@@ -38,6 +42,7 @@ type AgentTemplatePanelProps = {
   threadId: string | null;
   workspaceRoot: string | null;
   settings: AppSettings | null;
+  onPageHeaderChange?: EnterprisePageHeaderChange;
 };
 
 type DraftForm = {
@@ -66,6 +71,7 @@ export function AgentTemplatePanel({
   threadId,
   workspaceRoot,
   settings,
+  onPageHeaderChange,
 }: AgentTemplatePanelProps) {
   const [templates, setTemplates] = useState<AgentTemplateVersionView[]>([]);
   const [instances, setInstances] = useState<AgentInstance[]>([]);
@@ -88,6 +94,13 @@ export function AgentTemplatePanel({
     string | null
   >(null);
   const [connectionAccessRefresh, setConnectionAccessRefresh] = useState(0);
+
+  const closeEditor = useCallback(() => setEditing(false), []);
+  useEnterpriseSubpageHeader(onPageHeaderChange, editing, {
+    title: "Agents / 创建 Agent 模板",
+    backLabel: "返回 Agents",
+    onBack: closeEditor,
+  });
 
   const selected = useMemo(
     () => templates.find((view) => templateKey(view) === selectedKey) ?? null,
@@ -358,67 +371,69 @@ export function AgentTemplatePanel({
 
   return (
     <div className="agent-template-panel" aria-label="Agent 模板与身份">
-      <Panel
-        title="Agent 模板"
-        actions={
-          <div className="agent-template-panel__header-actions">
-            <Button
-              size="compact"
-              variant="quiet"
-              aria-label="刷新 Agent 模板"
-              disabled={!client || Boolean(busy)}
-              onClick={() => void refresh()}
-            >
-              <RefreshCw size={14} aria-hidden="true" />
-            </Button>
-            <Button
-              size="compact"
-              variant="primary"
-              disabled={!client || Boolean(busy)}
-              onClick={() => startNewVersion()}
-            >
-              <Plus size={14} aria-hidden="true" />
-              新建
-            </Button>
-          </div>
-        }
-      >
-        {templates.length ? (
-          <div className="agent-template-panel__template-list" role="list">
-            {templates.map((view) => {
-              const active = templateKey(view) === selectedKey;
-              return (
-                <button
-                  className={`agent-template-panel__template ${active ? "is-active" : ""}`}
-                  key={templateKey(view)}
-                  type="button"
-                  aria-pressed={active}
-                  onClick={() => setSelectedKey(templateKey(view))}
-                >
-                  <Bot size={16} aria-hidden="true" />
-                  <span>
-                    <strong>{view.template.name}</strong>
-                    <small>
-                      {view.template.templateId}@{view.template.version}
-                    </small>
-                  </span>
-                  <Badge
-                    variant={
-                      view.template.status === "published"
-                        ? "success"
-                        : "warning"
-                    }
+      {!editing ? (
+        <Panel
+          title="Agent 模板"
+          actions={
+            <div className="agent-template-panel__header-actions">
+              <Button
+                size="compact"
+                variant="quiet"
+                aria-label="刷新 Agent 模板"
+                disabled={!client || Boolean(busy)}
+                onClick={() => void refresh()}
+              >
+                <RefreshCw size={14} aria-hidden="true" />
+              </Button>
+              <Button
+                size="compact"
+                variant="primary"
+                disabled={!client || Boolean(busy)}
+                onClick={() => startNewVersion()}
+              >
+                <Plus size={14} aria-hidden="true" />
+                新建
+              </Button>
+            </div>
+          }
+        >
+          {templates.length ? (
+            <div className="agent-template-panel__template-list" role="list">
+              {templates.map((view) => {
+                const active = templateKey(view) === selectedKey;
+                return (
+                  <button
+                    className={`agent-template-panel__template ${active ? "is-active" : ""}`}
+                    key={templateKey(view)}
+                    type="button"
+                    aria-pressed={active}
+                    onClick={() => setSelectedKey(templateKey(view))}
                   >
-                    {view.template.status === "published" ? "已发布" : "草稿"}
-                  </Badge>
-                </button>
-              );
-            })}
-          </div>
-        ) : (
-          <p className="agent-template-panel__empty">尚未创建 Agent 模板。</p>
-        )}
-      </Panel>
+                    <Bot size={16} aria-hidden="true" />
+                    <span>
+                      <strong>{view.template.name}</strong>
+                      <small>
+                        {view.template.templateId}@{view.template.version}
+                      </small>
+                    </span>
+                    <Badge
+                      variant={
+                        view.template.status === "published"
+                          ? "success"
+                          : "warning"
+                      }
+                    >
+                      {view.template.status === "published" ? "已发布" : "草稿"}
+                    </Badge>
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <p className="agent-template-panel__empty">尚未创建 Agent 模板。</p>
+          )}
+        </Panel>
+      ) : null}
 
       {editing ? (
         <Panel title="创建不可变版本">
@@ -473,24 +488,24 @@ export function AgentTemplatePanel({
                 }))
               }
             />
-            <label className="agent-template-panel__field">
-              <span>风险等级</span>
-              <select
-                value={form.riskClass}
-                onChange={(event) =>
-                  setFormValue(
-                    setForm,
-                    "riskClass",
-                    event.target.value as DraftForm["riskClass"],
-                  )
-                }
-              >
-                <option value="low">低</option>
-                <option value="medium">中</option>
-                <option value="high">高</option>
-                <option value="critical">关键</option>
-              </select>
-            </label>
+            <SelectField
+              fieldClassName="agent-template-panel__field"
+              label="风险等级"
+              value={form.riskClass}
+              onChange={(value) =>
+                setFormValue(
+                  setForm,
+                  "riskClass",
+                  value as DraftForm["riskClass"],
+                )
+              }
+              options={[
+                { value: "low", label: "低" },
+                { value: "medium", label: "中" },
+                { value: "high", label: "高" },
+                { value: "critical", label: "关键" },
+              ]}
+            />
             <details className="agent-template-panel__advanced">
               <summary>Advanced / 高级能力与 JSON Schema</summary>
               <div className="agent-template-panel__advanced-fields">
@@ -566,7 +581,7 @@ export function AgentTemplatePanel({
               <Button
                 variant="quiet"
                 disabled={Boolean(busy)}
-                onClick={() => setEditing(false)}
+                onClick={closeEditor}
               >
                 取消
               </Button>
@@ -582,7 +597,7 @@ export function AgentTemplatePanel({
         </Panel>
       ) : null}
 
-      {selected ? (
+      {!editing && selected ? (
         <Panel
           title={`${selected.template.name} · v${selected.template.version}`}
           actions={
@@ -723,93 +738,97 @@ export function AgentTemplatePanel({
         </Panel>
       ) : null}
 
-      <Panel
-        title="当前会话 Agent"
-        actions={
-          boundInstance ? (
-            <Badge variant="success">已绑定 {shortId(boundInstance.id)}</Badge>
-          ) : (
-            <Badge>未绑定</Badge>
-          )
-        }
-      >
-        {selected?.template.status === "published" ? (
-          <div className="agent-template-panel__instantiate">
-            <TextAreaField
-              label="初始状态 JSON"
-              value={initialState}
-              onChange={setInitialState}
-              mono
-            />
-            <Button
-              variant="primary"
-              disabled={!threadId || Boolean(busy)}
-              onClick={() => void instantiateSelected()}
-            >
-              <UserRoundCog size={14} aria-hidden="true" />
-              实例化并绑定
-            </Button>
-          </div>
-        ) : (
-          <p className="agent-template-panel__empty">
-            选择一个已发布版本后可实例化。
-          </p>
-        )}
-        {instances.length ? (
-          <div className="agent-template-panel__instances">
-            {instances.map((instance) => (
-              <article
-                key={instance.id}
-                className="agent-template-panel__instance"
+      {!editing ? (
+        <Panel
+          title="当前会话 Agent"
+          actions={
+            boundInstance ? (
+              <Badge variant="success">
+                已绑定 {shortId(boundInstance.id)}
+              </Badge>
+            ) : (
+              <Badge>未绑定</Badge>
+            )
+          }
+        >
+          {selected?.template.status === "published" ? (
+            <div className="agent-template-panel__instantiate">
+              <TextAreaField
+                label="初始状态 JSON"
+                value={initialState}
+                onChange={setInitialState}
+                mono
+              />
+              <Button
+                variant="primary"
+                disabled={!threadId || Boolean(busy)}
+                onClick={() => void instantiateSelected()}
               >
-                <div>
-                  <strong>
-                    {instance.templateId}@{instance.templateVersion}
-                  </strong>
-                  <small>
-                    {shortId(instance.id)} · 状态修订 {instance.stateRevision}
-                  </small>
-                </div>
-                <Badge
-                  variant={
-                    instance.status === "active"
-                      ? "success"
-                      : instance.status === "revoked"
-                        ? "danger"
-                        : "neutral"
-                  }
+                <UserRoundCog size={14} aria-hidden="true" />
+                实例化并绑定
+              </Button>
+            </div>
+          ) : (
+            <p className="agent-template-panel__empty">
+              选择一个已发布版本后可实例化。
+            </p>
+          )}
+          {instances.length ? (
+            <div className="agent-template-panel__instances">
+              {instances.map((instance) => (
+                <article
+                  key={instance.id}
+                  className="agent-template-panel__instance"
                 >
-                  {instanceStatusLabel(instance.status)}
-                </Badge>
-                <div className="agent-template-panel__instance-actions">
-                  {instance.status === "active" &&
-                  !instance.parentInstanceId &&
-                  boundInstance?.id !== instance.id ? (
-                    <Button
-                      size="compact"
-                      variant="quiet"
-                      disabled={Boolean(busy)}
-                      onClick={() => void bindInstance(instance.id)}
-                    >
-                      绑定
-                    </Button>
-                  ) : null}
-                  {instance.status === "active" ? (
-                    <Button
-                      size="compact"
-                      variant="quiet"
-                      disabled={Boolean(busy)}
-                      onClick={() => void revokeInstance(instance.id)}
-                    >
-                      撤销
-                    </Button>
-                  ) : null}
-                </div>
-              </article>
-            ))}
-          </div>
-        ) : null}
-      </Panel>
+                  <div>
+                    <strong>
+                      {instance.templateId}@{instance.templateVersion}
+                    </strong>
+                    <small>
+                      {shortId(instance.id)} · 状态修订 {instance.stateRevision}
+                    </small>
+                  </div>
+                  <Badge
+                    variant={
+                      instance.status === "active"
+                        ? "success"
+                        : instance.status === "revoked"
+                          ? "danger"
+                          : "neutral"
+                    }
+                  >
+                    {instanceStatusLabel(instance.status)}
+                  </Badge>
+                  <div className="agent-template-panel__instance-actions">
+                    {instance.status === "active" &&
+                    !instance.parentInstanceId &&
+                    boundInstance?.id !== instance.id ? (
+                      <Button
+                        size="compact"
+                        variant="quiet"
+                        disabled={Boolean(busy)}
+                        onClick={() => void bindInstance(instance.id)}
+                      >
+                        绑定
+                      </Button>
+                    ) : null}
+                    {instance.status === "active" ? (
+                      <Button
+                        size="compact"
+                        variant="quiet"
+                        disabled={Boolean(busy)}
+                        onClick={() => void revokeInstance(instance.id)}
+                      >
+                        撤销
+                      </Button>
+                    ) : null}
+                  </div>
+                </article>
+              ))}
+            </div>
+          ) : null}
+        </Panel>
+      ) : null}
 
       {error ? (
         <p className="agent-template-panel__message is-error" role="alert">

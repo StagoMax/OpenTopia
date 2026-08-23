@@ -1,7 +1,7 @@
 # OpenTopia 企业 Agent 与 Workflow 重构设计方案
 
-> 状态：设计提案 v2.0（Phase 3.1 Per-node Agent Runtime 与 Phase 4 Enterprise Surface 已实现）
-> 日期：2026-08-20
+> 状态：实施基线 v2.1（Phase 0–5 已实现；企业子页面导航与表单边界已统一）
+> 日期：2026-08-23
 > 输入：`Flow模式重构.md`、当前仓库实现、`docs/enterprise-agent-platform-design-zh-cn.md`
 > 范围：企业 Agent 与 Workflow 控制面、模板、状态图运行时、部署、触发器、输出、连接器权限、人工任务和桌面 UI
 
@@ -914,6 +914,20 @@ Connection 详情页的主操作根据状态显示 `登录并连接`、`重新�
 
 Knowledge 页面单独展示 Source、同步状态、索引、数据等级、检索范围和引用使用情况。
 
+### 9.10 主工作区子页面与表单边界
+
+新建、编辑、发布和部署等需要持续填写或审查上下文的操作，不在列表页内纵向展开，也不默认使用模态框。它们切换中间主工作区为独立子页面，固定一级导航和左侧 Contextual Collection 保持不变，从而让用户既知道所属模块，也能专注完成当前任务。
+
+- 顶部共享标题栏是子页面导航的唯一事实源：返回按钮固定在标题最左侧，后面显示当前位置路径，例如 `Deployments / 创建部署`、`Automation / 创建发布通道`；
+- 返回动作由拥有编辑状态的领域模块提供，App 只展示路径和调用返回动作，不复制 Agent、Deployment、Release 或 Connection 的草稿状态；
+- Agent Template、Workflow Template、Deployment、Release Channel 和 Connection 的创建/编辑统一采用该模式；成功提交后回到原模块的列表或详情，返回时保留原有选择、筛选和已加载数据；
+- 页面底部的“取消”可以作为表单动作保留，但不得再创建第二套带左箭头的局部返回标题；
+- 一个表单分组只使用一层视觉边界。`Panel` 表示页面级或语义分组边界，输入控件自己拥有唯一边框，不允许用另一个带边框容器包裹已经带边框的 Select/Input；
+- Select 的可见标签、提示、错误和原生控件由统一 `SelectField` primitive 管理。Feature 页面不再通过嵌套 label/control shell 重复绘制边框或焦点环；
+- 子页面切换不得触发全局数据重载。领域 Store 继续拥有草稿、busy、error 和选择状态，顶部标题仅承担位置感与可预测返回。
+
+这套规则延续 Frontier 风格的稳定控制面：一级信息架构不因任务切换而漂移，复杂操作在主工作区获得完整空间；同时保持 OpenTopia 桌面端紧凑、低装饰和可键盘操作的设计语言。
+
 ## 10. 视觉与交互规范
 
 界面应遵守现有 `design-system/MASTER.md` 和 token，而不是引入一套“AI 紫色”主题：
@@ -1409,6 +1423,8 @@ MVP 暂不包含：
 - 非开发用户无需编辑 JSON；
 - 所有关键对象都有列表、详情、状态、版本和审计入口；
 - Flow 侧栏保持固定一级导航，Connections/Knowledge 作为一等入口；下方列表随入口切换对象类型并恢复各自筛选和选中状态；
+- 新建/编辑等复杂操作进入主工作区子页面；共享标题栏左侧提供返回按钮，并显示“一级模块 / 当前动作”路径；
+- 表单 Select/Input 只出现一层控件边框和一个焦点环，标签、提示与错误不额外绘制外层控件边框；
 - 权限 Diff、Deployment readiness、WorkflowRun 当前步骤和人工影响范围可见；
 - 键盘、焦点、对比度、加载和错误恢复满足现有设计系统要求。
 

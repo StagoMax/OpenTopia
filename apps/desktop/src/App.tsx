@@ -38,6 +38,7 @@ import {
   EnterpriseSidebarCollection,
   FlowEnterpriseWorkspace,
 } from "./components/enterprise";
+import type { EnterprisePageHeader } from "./components/enterprise/pageHeader";
 import {
   SettingsPanel as RedesignedSettingsPanel,
   type SettingsTab,
@@ -480,11 +481,12 @@ export function App() {
   );
   const [serverStatus, setServerStatus] = useState<ServerStatus>("checking");
   const [serverError, setServerError] = useState<string | null>(null);
-  const [bootstrapAttempt, setBootstrapAttempt] = useState(0);
+  const [bootstrapRetryNonce, setBootstrapRetryNonce] = useState(0);
   const [serverProbing, setServerProbing] = useState(true);
   const [backendStartupStatus, setBackendStartupStatus] =
     useState<BackendStartupStatus | null>(null);
   const clientEndpointRef = useRef<string | null>(null);
+  const readyStartupBootstrapRef = useRef<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -535,6 +537,13 @@ export function App() {
     useState<ExperienceMode>(readExperienceMode);
   const [flowPrimaryView, setFlowPrimaryView] =
     useState<FlowPrimaryView>("conversation");
+  const [flowPageHeader, setFlowPageHeader] =
+    useState<EnterprisePageHeader | null>(null);
+
+  function navigateFlowPrimaryView(view: FlowPrimaryView) {
+    setFlowPageHeader(null);
+    setFlowPrimaryView(view);
+  }
   const [flowLibraryBindings, setFlowLibraryBindings] = useState<
     Record<string, LibraryProviderId>
   >(readFlowLibraryBindings);
@@ -1570,16 +1579,14 @@ export function App() {
         setServerProbing(false);
       } catch (error) {
         if (cancelled) return;
-        // Stay in "checking" for the first probes: a warm dev launch answers
-        // within a second, and flashing the waiting screen is just noise.
-        setServerStatus(bootstrapAttempt >= 2 ? "offline" : "checking");
+        setServerStatus("offline");
         setServerError(error instanceof Error ? error.message : String(error));
         setServerProbing(false);
       }
     });
     void bootstrapping.catch((error) => {
       if (cancelled) return;
-      setServerStatus(bootstrapAttempt >= 2 ? "offline" : "checking");
+      setServerStatus("offline");
       setServerError(error instanceof Error ? error.message : String(error));
       setServerProbing(false);
     });
@@ -1587,7 +1594,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [bootstrapAttempt, threadActivityStore]);
+  }, [bootstrapRetryNonce, threadActivityStore]);
 
   useEffect(() => {
     const hasCodexProvider = Boolean(
@@ -1612,17 +1619,25 @@ export function App() {
     return () => window.clearInterval(timer);
   }, [client, codexAccount?.loginPending, refreshCodexAccount]);
 
-  // In dev the backend is spawned through `cargo run`, so a cold or post-edit
-  // build routinely outlasts the first health probe. Keep probing instead of
-  // stranding the window on the offline screen until someone reloads it.
+  // The main process owns backend startup and reports its phase to the renderer.
+  // Do not poll/retry while Cargo is still compiling: those probes cannot make
+  // the build finish and only create misleading retry activity. Once the
+  // managed backend reports ready, perform one normal workspace bootstrap.
   useEffect(() => {
-    if (serverStatus === "online" || serverProbing) return;
-    const timer = setTimeout(
-      () => setBootstrapAttempt((attempt) => attempt + 1),
-      bootstrapAttempt < 4 ? 500 : 2000,
-    );
-    return () => clearTimeout(timer);
-  }, [serverStatus, serverProbing, bootstrapAttempt]);
+    const readyAt =
+      backendStartupStatus?.phase === "ready"
+        ? backendStartupStatus.updatedAt
+        : null;
+    if (
+      !readyAt ||
+      serverStatus !== "offline" ||
+      readyStartupBootstrapRef.current === readyAt
+    ) {
+      return;
+    }
+    readyStartupBootstrapRef.current = readyAt;
+    setBootstrapRetryNonce((nonce) => nonce + 1);
+  }, [backendStartupStatus, serverStatus]);
 
   // New tasks start on the newest stable model of the active connection. This is
   // why there is no "quality vs. speed" preference to configure: the latest
@@ -1849,7 +1864,7 @@ export function App() {
     markThreadActivityRead(threadId);
     activeThreadIdRef.current = threadId;
     setActiveThreadId(threadId);
-    setFlowPrimaryView("conversation");
+    navigateFlowPrimaryView("conversation");
     if (activeToolTab?.kind === "extensions") setToolStageOpen(false);
     if (thread) setExperienceMode(thread.experienceMode);
     setDraftProjectId(null);
@@ -1872,7 +1887,7 @@ export function App() {
         markThreadActivityRead(thread.id);
         activeThreadIdRef.current = thread.id;
         setActiveThreadId(thread.id);
-        setFlowPrimaryView("conversation");
+        navigateFlowPrimaryView("conversation");
         setExperienceMode(thread.experienceMode);
         setDraftProjectId(null);
         setSelectedWorkspaceRoot(thread.workspaceRoot);
@@ -1906,7 +1921,7 @@ export function App() {
   ) {
     activeThreadIdRef.current = null;
     setActiveThreadId(null);
-    setFlowPrimaryView("conversation");
+    navigateFlowPrimaryView("conversation");
     setNewTaskLaunchMode("local");
     setToolTabs([]);
     setActiveToolTabId(null);
@@ -1921,7 +1936,7 @@ export function App() {
     if (nextMode === experienceMode) return;
     const project = activeProject ?? draftProject;
     setExperienceMode(nextMode);
-    if (nextMode !== "flow") setFlowPrimaryView("conversation");
+    if (nextMode !== "flow") navigateFlowPrimaryView("conversation");
     if (client) {
       void client
         .listThreads(true, nextMode)
@@ -3822,7 +3837,7 @@ export function App() {
             }
             onExperienceModeChange={changeExperienceMode}
             onOpenFlowPrimaryView={(view) => {
-              setFlowPrimaryView(view);
+              navigateFlowPrimaryView(view);
               setToolStageOpen(false);
               setConversationCollapsed(false);
             }}
@@ -3901,6 +3916,7 @@ export function App() {
           >
             <ThreadHeader
               thread={flowPrimarySurface ? null : activeThread}
+              backLabel={flowPageHeader?.backLabel}
               headingIcon={
                 flowPrimarySurface
                   ? flowPrimaryHeadingIcon(flowPrimaryView)
@@ -3908,9 +3924,11 @@ export function App() {
               }
               title={
                 flowPrimarySurface
-                  ? flowPrimaryHeadingTitle(flowPrimaryView)
+                  ? (flowPageHeader?.title ??
+                    flowPrimaryHeadingTitle(flowPrimaryView))
                   : undefined
               }
+              onBack={flowPrimarySurface ? flowPageHeader?.onBack : undefined}
               showThreadControls={!flowPrimarySurface}
               toolStageOpen={toolStageOpen}
               contextRailOpen={contextRailVisible}
@@ -3958,7 +3976,8 @@ export function App() {
             {flowPrimarySurface && client ? (
               <FlowEnterpriseWorkspace
                 client={client}
-                onNavigate={(view) => setFlowPrimaryView(view)}
+                onNavigate={navigateFlowPrimaryView}
+                onPageHeaderChange={setFlowPageHeader}
                 settings={settings}
                 threadId={
                   activeThread?.experienceMode === "flow"
@@ -3974,10 +3993,12 @@ export function App() {
               <OfflineState
                 backendUrl={platform?.backendUrl}
                 error={serverError}
-                attempt={bootstrapAttempt}
                 isProbing={serverProbing}
                 startupStatus={backendStartupStatus}
-                onRetry={() => setBootstrapAttempt((attempt) => attempt + 1)}
+                onRetry={() => {
+                  setServerError(null);
+                  setBootstrapRetryNonce((nonce) => nonce + 1);
+                }}
               />
             ) : activeThread ? (
               <>

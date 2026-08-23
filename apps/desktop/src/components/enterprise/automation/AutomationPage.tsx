@@ -14,18 +14,36 @@ import {
 import { useMemo, useState, type FormEvent } from "react";
 import type { ApiClient } from "../../../api/client";
 import type { WorkflowRelease, WorkflowTrigger } from "../../../types";
-import { Badge, Button, IconButton, Panel, Select, TextField } from "../../ui";
+import {
+  Badge,
+  Button,
+  IconButton,
+  Panel,
+  SelectField,
+  TextField,
+} from "../../ui";
+import {
+  useEnterpriseSubpageHeader,
+  type EnterprisePageHeaderChange,
+} from "../pageHeader";
 import { useWorkflowAutomationStore } from "./store";
 import "./automation.css";
 
 export function AutomationPage({
   client,
+  onPageHeaderChange,
   threadId,
 }: {
   client: ApiClient;
+  onPageHeaderChange?: EnterprisePageHeaderChange;
   threadId: string | null;
 }) {
   const { snapshot, store } = useWorkflowAutomationStore(client);
+  useEnterpriseSubpageHeader(onPageHeaderChange, snapshot.createOpen, {
+    title: "Automation / 创建发布通道",
+    backLabel: "返回 Automation",
+    onBack: () => store.setCreateOpen(false),
+  });
   const selected =
     snapshot.releases.find(
       (release) => release.id === snapshot.selectedReleaseId,
@@ -48,6 +66,30 @@ export function AutomationPage({
     );
   }
 
+  if (snapshot.createOpen) {
+    return (
+      <div className="enterprise-page automation-page automation-page--create">
+        {snapshot.error ? (
+          <div className="automation-feedback is-error" role="alert">
+            <span>{snapshot.error}</span>
+            <Button
+              onClick={() => store.clearFeedback()}
+              size="compact"
+              variant="quiet"
+            >
+              关闭
+            </Button>
+          </div>
+        ) : null}
+        <CreateReleaseForm
+          deployments={snapshot.deployments}
+          onCreate={(input) => store.create(input)}
+          threadId={threadId}
+        />
+      </div>
+    );
+  }
+
   return (
     <div className="enterprise-page automation-page">
       <Panel
@@ -55,12 +97,12 @@ export function AutomationPage({
         actions={
           <>
             <Button
-              onClick={() => store.setCreateOpen(!snapshot.createOpen)}
+              onClick={() => store.setCreateOpen(true)}
               size="compact"
-              variant={snapshot.createOpen ? "quiet" : "primary"}
+              variant="primary"
             >
               <Plus aria-hidden="true" size={14} />
-              {snapshot.createOpen ? "取消" : "New Release"}
+              New Release
             </Button>
             <IconButton
               aria-label="刷新自动化控制面"
@@ -122,14 +164,6 @@ export function AutomationPage({
           />
         </div>
       </Panel>
-
-      {snapshot.createOpen ? (
-        <CreateReleaseForm
-          deployments={snapshot.deployments}
-          onCreate={(input) => store.create(input)}
-          threadId={threadId}
-        />
-      ) : null}
 
       <div className="automation-layout">
         <Panel
@@ -272,7 +306,7 @@ function CreateReleaseForm({
   }
 
   return (
-    <Panel title="Create Release Channel / 创建发布通道">
+    <Panel title="Release configuration / 发布通道配置">
       <form
         className="automation-create-form"
         onSubmit={(event) => void submit(event)}
@@ -284,7 +318,7 @@ function CreateReleaseForm({
             required
             value={releaseKey}
           />
-          <Select
+          <SelectField
             label="Primary Deployment / 主部署"
             onChange={setDeploymentId}
             options={active.map((item) => ({
@@ -293,7 +327,7 @@ function CreateReleaseForm({
             }))}
             value={deploymentId}
           />
-          <Select
+          <SelectField
             label="Trigger / 触发器"
             onChange={(value) => setKind(value as typeof kind)}
             options={[
@@ -428,7 +462,7 @@ function ReleaseDetails({
         <div className="automation-actions">
           {release.status === "active" && canaryOptions.length > 0 ? (
             <>
-              <Select
+              <SelectField
                 label="Canary deployment"
                 onChange={setCanaryId}
                 options={canaryOptions.map((item) => ({

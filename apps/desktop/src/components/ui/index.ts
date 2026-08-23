@@ -22,6 +22,7 @@ export {
   type SegmentedOption,
 } from "./SegmentedControl";
 export { Select, type SelectOption, type SelectProps } from "./Select";
+export { SelectField, type SelectFieldProps } from "./SelectField";
 export { ShimmerText, type ShimmerTextProps } from "./ShimmerText";
 export { Slider, type SliderProps } from "./Slider";
 export { Switch, type SwitchProps } from "./Switch";

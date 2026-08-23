@@ -5,16 +5,27 @@ import { DeploymentCollection } from "./DeploymentCollection";
 import { WorkflowDeploymentDetails } from "./WorkflowDeploymentDetails";
 import { WorkflowDeploymentEditor } from "./WorkflowDeploymentEditor";
 import { useWorkflowDeploymentsStore } from "./store";
+import {
+  useEnterpriseSubpageHeader,
+  type EnterprisePageHeaderChange,
+} from "../enterprise/pageHeader";
 import "../../styles/workflow-deployments.css";
 
 export function WorkflowDeploymentsPanel({
   activeFlowThreadId,
   client,
+  onPageHeaderChange,
 }: {
   activeFlowThreadId: string | null;
   client: ApiClient;
+  onPageHeaderChange?: EnterprisePageHeaderChange;
 }) {
   const { snapshot, store } = useWorkflowDeploymentsStore(client);
+  useEnterpriseSubpageHeader(onPageHeaderChange, snapshot.editorOpen, {
+    title: "Deployments / 创建部署",
+    backLabel: "返回 Deployments",
+    onBack: () => store.cancelCreate(),
+  });
   const selected = snapshot.deployments.find(
     (deployment) => deployment.id === snapshot.selectedDeploymentId,
   );

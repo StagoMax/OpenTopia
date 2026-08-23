@@ -1,7 +1,7 @@
-import { AlertTriangle, Cable, Save, X } from "lucide-react";
+import { AlertTriangle, Cable, Save } from "lucide-react";
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import type { Connection, McpServerView } from "../../types";
-import { Button, Select, Switch, TextField } from "../ui";
+import { Button, SelectField, Switch, TextField } from "../ui";
 import {
   connectionFormFromConnection,
   connectionInputFromForm,
@@ -68,20 +68,9 @@ export function ConnectionEditor({ snapshot, store }: ConnectionEditorProps) {
           <Cable aria-hidden="true" size={18} />
         </span>
         <span>
-          <h2>
-            {snapshot.editorMode === "edit"
-              ? "编辑 Connection"
-              : "创建 Connection"}
-          </h2>
+          <h2>Account & runtime / 账号与运行时</h2>
           <p>配置账号上下文并绑定一个独立的 MCP runtime。凭据只保存引用。</p>
         </span>
-        <Button
-          onClick={() => store.cancelEdit()}
-          size="compact"
-          variant="quiet"
-        >
-          <X aria-hidden="true" size={14} /> 取消
-        </Button>
       </header>
 
       {snapshot.error ? (
@@ -314,22 +303,20 @@ function LabeledSelect<T extends string>({
   value: T;
 }) {
   return (
-    <label className="connections-select-field">
-      <span>{label}</span>
-      <Select
-        aria-invalid={error ? true : undefined}
-        disabled={disabled}
-        label={label}
-        onChange={onChange}
-        options={
-          options.length > 0
-            ? options
-            : [{ value: "" as T, label: "暂无可选项", disabled: true }]
-        }
-        value={value}
-      />
-      {error ? <small role="alert">{error}</small> : null}
-    </label>
+    <SelectField
+      fieldClassName="connections-select-field"
+      aria-invalid={error ? true : undefined}
+      disabled={disabled}
+      error={error}
+      label={label}
+      onChange={onChange}
+      options={
+        options.length > 0
+          ? options
+          : [{ value: "" as T, label: "暂无可选项", disabled: true }]
+      }
+      value={value}
+    />
   );
 }
 

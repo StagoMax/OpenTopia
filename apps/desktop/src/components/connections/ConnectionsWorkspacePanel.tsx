@@ -12,10 +12,28 @@ import { ConnectionDetails } from "./ConnectionDetails";
 import { ConnectionEditor } from "./ConnectionEditor";
 import { definitionForConnection } from "./model";
 import { useConnectionsStore } from "./store";
+import {
+  useEnterpriseSubpageHeader,
+  type EnterprisePageHeaderChange,
+} from "../enterprise/pageHeader";
 import "../../styles/connections.css";
 
-export function ConnectionsWorkspacePanel({ client }: { client: ApiClient }) {
+export function ConnectionsWorkspacePanel({
+  client,
+  onPageHeaderChange,
+}: {
+  client: ApiClient;
+  onPageHeaderChange?: EnterprisePageHeaderChange;
+}) {
   const { snapshot, store } = useConnectionsStore(client);
+  useEnterpriseSubpageHeader(onPageHeaderChange, Boolean(snapshot.editorMode), {
+    title:
+      snapshot.editorMode === "edit"
+        ? "Connections / 编辑 Connection"
+        : "Connections / 创建 Connection",
+    backLabel: "返回 Connections",
+    onBack: () => store.cancelEdit(),
+  });
   const selected = snapshot.connections.find(
     (connection) => connection.id === snapshot.selectedConnectionId,
   );
