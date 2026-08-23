@@ -51,8 +51,23 @@ button:disabled {
   background-repeat: no-repeat;
   background-size: 100vw 100vh;
   color: var(--text-secondary);
-  -webkit-app-region: drag;
   user-select: none;
+}
+
+/*
+ * Electron only recognizes a no-drag region when it is not enclosed by a
+ * larger draggable surface. Make the menu strip opt in to pointer handling
+ * and reserve window dragging for the remaining caption-area space.
+ */
+.topbar::after {
+  position: absolute;
+  z-index: var(--z-base);
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  content: "";
+  -webkit-app-region: drag;
 }
 
 .window-menu,
@@ -64,6 +79,8 @@ button:disabled {
 }
 
 .window-menu {
+  position: relative;
+  z-index: var(--z-sticky);
   height: 100%;
   gap: 1px;
   padding-left: 4px;
