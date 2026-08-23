@@ -358,17 +358,24 @@ pub(in crate::provider) fn openai_runtime_observation_message(
     })
 }
 
+struct OpenAiToolStateGroup<'a> {
+    item: &'a Value,
+    call_indices: Vec<usize>,
+}
+
 pub(in crate::provider) fn append_openai_tool_history(
     messages: &mut Vec<Value>,
     request: &ModelRequest,
     replay_chat_reasoning: bool,
 ) {
-    // AgentCore keeps completed calls as a flat durable history. Rebuild a
-    // valid Chat Completions sequence, grouping calls that came from the same
-    // assistant response when provider-owned reasoning state is available.
-    let mut emitted_call_ids = HashSet::new();
-    let mut emitted_results = vec![false; request.input.tool_results.len()];
-
+    // `tool_calls` is the durable chronological ledger. Provider state is a
+    // sparse annotation on that ledger, not an ordering source. Iterating
+    // states first used to insert a newly available assistant state before
+    // earlier runtime observations, invalidating the rest of the prompt-cache
+    // prefix. Derive replay groups from call order so every later request only
+    // appends to the encoded transcript.
+    let mut groups = Vec::new();
+    let mut state_at_call = vec![None; request.input.tool_calls.len()];
     for item in request.previous_response_items.iter().filter(|item| {
         item.get("type").and_then(Value::as_str) == Some(OPENAI_CHAT_ASSISTANT_STATE_TYPE)
     }) {
@@ -380,115 +387,203 @@ pub(in crate::provider) fn append_openai_tool_history(
         {
             continue;
         }
-        let call_ids = item
+        let call_indices = item
             .get("tool_call_ids")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
-            .collect::<Vec<_>>();
-        let calls = call_ids
-            .iter()
-            .filter_map(|call_id| {
+            .map(|call_id| {
                 request
                     .input
                     .tool_calls
                     .iter()
-                    .find(|call| call.id == *call_id)
+                    .position(|call| call.id == call_id)
             })
-            .collect::<Vec<_>>();
-        if calls.is_empty() || calls.len() != call_ids.len() {
+            .collect::<Option<Vec<_>>>();
+        let Some(call_indices) = call_indices else {
+            continue;
+        };
+        let is_contiguous = !call_indices.is_empty()
+            && call_indices
+                .windows(2)
+                .all(|pair| pair[1] == pair[0].saturating_add(1));
+        if !is_contiguous
+            || call_indices
+                .iter()
+                .any(|index| state_at_call[*index].is_some())
+        {
+            // A non-contiguous or overlapping state cannot be replayed as one
+            // valid assistant message without reordering history. Lower it to
+            // a runtime observation below instead of sacrificing cache lineage.
+            continue;
+        }
+        let group_index = groups.len();
+        for &call_index in &call_indices {
+            state_at_call[call_index] = Some(group_index);
+        }
+        groups.push(OpenAiToolStateGroup { item, call_indices });
+    }
+
+    let mut emitted_results = vec![false; request.input.tool_results.len()];
+    let mut deferred_image_results = Vec::new();
+    let mut call_index = 0;
+    while call_index < request.input.tool_calls.len() {
+        if let Some(group_index) = state_at_call[call_index] {
+            let group = &groups[group_index];
+            debug_assert_eq!(group.call_indices.first(), Some(&call_index));
+            let calls = group
+                .call_indices
+                .iter()
+                .map(|&index| &request.input.tool_calls[index])
+                .collect::<Vec<_>>();
+            let mut assistant = json!({
+                "role": "assistant",
+                "content": group.item.get("content").and_then(Value::as_str).unwrap_or(""),
+                "tool_calls": calls
+                    .iter()
+                    .map(|call| openai_tool_call_message(call))
+                    .collect::<Vec<_>>(),
+            });
+            if replay_chat_reasoning {
+                if let Some(reasoning) = group.item.get("reasoning_content").and_then(Value::as_str)
+                {
+                    assistant["reasoning_content"] = json!(reasoning);
+                }
+            }
+            messages.push(assistant);
+            append_openai_tool_results(
+                messages,
+                request,
+                group.call_indices.iter().copied(),
+                &mut emitted_results,
+                true,
+            );
+            call_index = group.call_indices.last().copied().unwrap_or(call_index) + 1;
             continue;
         }
 
-        let mut assistant = json!({
-            "role": "assistant",
-            "content": item.get("content").and_then(Value::as_str).unwrap_or(""),
-            "tool_calls": calls
-                .iter()
-                .map(|call| openai_tool_call_message(call))
-                .collect::<Vec<_>>(),
-        });
         if replay_chat_reasoning {
-            if let Some(reasoning) = item.get("reasoning_content").and_then(Value::as_str) {
-                assistant["reasoning_content"] = json!(reasoning);
+            // Keep each contiguous runtime span at its original position. A
+            // single envelope at the end would once again insert provider state
+            // ahead of earlier runtime observations on a later round.
+            let runtime_start = call_index;
+            call_index += 1;
+            while call_index < request.input.tool_calls.len() && state_at_call[call_index].is_none()
+            {
+                call_index += 1;
             }
+            let mut runtime_results = Vec::new();
+            let runtime_calls = (runtime_start..call_index)
+                .map(|index| {
+                    let call = &request.input.tool_calls[index];
+                    let results = request
+                        .input
+                        .tool_results
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, result)| result.call_id == call.id)
+                        .map(|(index, result)| {
+                            emitted_results[index] = true;
+                            result
+                        })
+                        .collect::<Vec<_>>();
+                    runtime_results.extend(results.iter().copied());
+                    runtime_observation_call(call, &results)
+                })
+                .collect::<Vec<_>>();
+            messages.push(openai_runtime_observation_message(
+                runtime_calls,
+                Vec::new(),
+            ));
+            if let Some(companion) = openai_tool_image_companion(runtime_results) {
+                messages.push(companion);
+            }
+            continue;
         }
-        messages.push(assistant);
 
-        for call in calls {
-            emitted_call_ids.insert(call.id.clone());
-            for (index, result) in request.input.tool_results.iter().enumerate() {
-                if result.call_id == call.id {
-                    messages.push(openai_tool_result_message(result));
-                    emitted_results[index] = true;
-                }
-            }
-        }
+        let call = &request.input.tool_calls[call_index];
+        messages.push(json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [openai_tool_call_message(call)]
+        }));
+        // Preserve the legacy Chat wire shape for calls that have no
+        // provider-owned assistant state: its image companion follows all
+        // native tool messages in this request. Stateful and runtime groups
+        // above remain position-local because they participate in cache replay.
+        deferred_image_results.extend(append_openai_tool_results(
+            messages,
+            request,
+            [call_index],
+            &mut emitted_results,
+            false,
+        ));
+        call_index += 1;
     }
 
     if replay_chat_reasoning {
-        // A harness-owned observation (step reminder, background completion,
-        // finalization guard, etc.) has no provider-issued assistant message and
-        // therefore no reasoning_content to replay. Serializing it as a fake
-        // assistant/tool pair violates DeepSeek's thinking-mode protocol. Keep
-        // the observation in context, but lower it to an unprivileged user
-        // envelope instead of inventing provider-owned reasoning.
-        let calls = request
-            .input
-            .tool_calls
-            .iter()
-            .filter(|call| !emitted_call_ids.contains(&call.id))
-            .map(|call| {
-                let results = request
-                    .input
-                    .tool_results
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, result)| result.call_id == call.id)
-                    .map(|(index, result)| {
-                        emitted_results[index] = true;
-                        result
-                    })
-                    .collect::<Vec<_>>();
-                runtime_observation_call(call, &results)
-            })
-            .collect::<Vec<_>>();
         let mut unmatched_results = Vec::new();
+        let mut unmatched_images = Vec::new();
         for (index, result) in request.input.tool_results.iter().enumerate() {
             if !emitted_results[index] {
                 emitted_results[index] = true;
                 unmatched_results.push(runtime_observation_result(result));
+                unmatched_images.push(result);
             }
         }
-        if !calls.is_empty() || !unmatched_results.is_empty() {
-            messages.push(openai_runtime_observation_message(calls, unmatched_results));
+        if !unmatched_results.is_empty() {
+            messages.push(openai_runtime_observation_message(
+                Vec::new(),
+                unmatched_results,
+            ));
+            if let Some(companion) = openai_tool_image_companion(unmatched_images) {
+                messages.push(companion);
+            }
         }
     } else {
-        for call in &request.input.tool_calls {
-            if emitted_call_ids.contains(&call.id) {
-                continue;
-            }
-            messages.push(json!({
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [openai_tool_call_message(call)]
-            }));
-            for (index, result) in request.input.tool_results.iter().enumerate() {
-                if result.call_id == call.id {
-                    messages.push(openai_tool_result_message(result));
-                    emitted_results[index] = true;
-                }
-            }
-        }
+        // Persisted legacy data can contain a result whose call was pruned. It
+        // cannot be correlated as a native Chat tool response, but preserving
+        // it as an append-only tail is still better than dropping it.
         for (index, result) in request.input.tool_results.iter().enumerate() {
             if !emitted_results[index] {
                 messages.push(openai_tool_result_message(result));
+                if let Some(companion) = openai_tool_image_companion([result]) {
+                    messages.push(companion);
+                }
+            }
+        }
+        if let Some(companion) = openai_tool_image_companion(deferred_image_results) {
+            messages.push(companion);
+        }
+    }
+}
+
+fn append_openai_tool_results<'a>(
+    messages: &mut Vec<Value>,
+    request: &'a ModelRequest,
+    call_indices: impl IntoIterator<Item = usize>,
+    emitted_results: &mut [bool],
+    append_image_companion: bool,
+) -> Vec<&'a ProviderToolResult> {
+    let mut results = Vec::new();
+    for call_index in call_indices {
+        let call = &request.input.tool_calls[call_index];
+        for (result_index, result) in request.input.tool_results.iter().enumerate() {
+            if result.call_id == call.id {
+                messages.push(openai_tool_result_message(result));
+                emitted_results[result_index] = true;
+                results.push(result);
             }
         }
     }
-    if let Some(companion) = openai_tool_image_companion(&request.input.tool_results) {
-        messages.push(companion);
+    if append_image_companion {
+        if let Some(companion) = openai_tool_image_companion(results) {
+            messages.push(companion);
+        }
+        Vec::new()
+    } else {
+        results
     }
 }
 

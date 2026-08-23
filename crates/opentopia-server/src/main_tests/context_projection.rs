@@ -135,14 +135,12 @@ fn implausible_reported_context_windows_are_ignored() {
 }
 
 #[test]
-fn generated_thread_titles_are_plain_and_unicode_bounded() {
+fn local_thread_titles_are_unicode_bounded() {
     assert_eq!(
-        normalize_generated_thread_title("**标题：修复侧栏标题滚动**\nextra"),
-        Some("修复侧栏标题滚动".to_string())
+        local_thread_title("  修复\n\n侧栏标题滚动  "),
+        Some("修复 侧栏标题滚动".to_string())
     );
-    let title =
-        normalize_generated_thread_title("This generated title is intentionally much too long")
-            .expect("normalized title");
+    let title = local_thread_title(&"一".repeat(101)).expect("local title");
     assert_eq!(title.chars().count(), MAX_THREAD_TITLE_CHARS);
     assert!(title.ends_with('…'));
 }
@@ -187,12 +185,8 @@ fn title_generation_uses_the_thread_pinned_connection_and_model() {
 }
 
 #[test]
-fn generated_thread_title_skips_empty_model_preamble_lines() {
-    assert_eq!(
-        normalize_generated_thread_title("```\n\n\"OpenTopia 标题规则\"\n```"),
-        Some("OpenTopia 标题规则".to_string())
-    );
-    assert_eq!(normalize_generated_thread_title(" \n```\n"), None);
+fn local_thread_title_rejects_blank_prompts() {
+    assert_eq!(local_thread_title(" \n\t "), None);
 }
 
 #[test]

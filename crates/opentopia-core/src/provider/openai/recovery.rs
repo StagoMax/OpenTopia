@@ -11,7 +11,10 @@ use crate::model::ProviderRetryKind;
 use reqwest::header::CONTENT_TYPE;
 use serde_json::{json, Value};
 
-use crate::provider::transport::send_provider_request_with_network_retries;
+use crate::provider::transport::{
+    provider_rate_limit_retry_delay, send_provider_request_with_network_retries,
+    PROVIDER_RATE_LIMIT_RETRY_LIMIT,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum OpenAiRecoveryProtocol {
@@ -23,6 +26,58 @@ pub(super) struct RecoveredToolResponse {
     pub(super) response: ModelResponse,
     pub(super) attempt: usize,
     pub(super) status: u16,
+}
+
+/// Provider-declared rate limits inside an HTTP-200 SSE stream are transport
+/// failures, not malformed tool calls. Atomic tool streams have not committed
+/// deltas or executed tools yet, so retrying the original streaming request is
+/// safe and preserves the negotiated wire protocol.
+pub(super) async fn schedule_rate_limited_stream_retry(
+    prepared: &PreparedProviderRequest,
+    failed_attempt: usize,
+    failed_status: u16,
+    retry_index: usize,
+    retry_after: Option<std::time::Duration>,
+    stream_error: &anyhow::Error,
+    on_transport: &mut ProviderTransportCallback<'_>,
+) -> anyhow::Result<Option<usize>> {
+    let exhausted = retry_index >= PROVIDER_RATE_LIMIT_RETRY_LIMIT;
+    on_transport(ProviderTransportEvent::Response {
+        attempt: failed_attempt,
+        status: Some(failed_status),
+        response_id: None,
+        body: json!({
+            "error": truncate_observation_text(&stream_error.to_string()),
+            "classification": "rate_limit",
+            "recovery": if exhausted {
+                "retry_streaming_rate_limit_exhausted"
+            } else {
+                "retry_streaming_rate_limit"
+            }
+        }),
+    })?;
+    if exhausted {
+        return Ok(None);
+    }
+
+    let next_retry_index = retry_index.saturating_add(1);
+    let next_attempt = failed_attempt.saturating_add(1);
+    let delay = provider_rate_limit_retry_delay(next_retry_index, retry_after);
+    on_transport(ProviderTransportEvent::Retry {
+        attempt: next_attempt,
+        retry_kind: ProviderRetryKind::Network,
+        retry_index: Some(next_retry_index),
+        retry_limit: Some(PROVIDER_RATE_LIMIT_RETRY_LIMIT),
+        reason: format!(
+            "provider rate limited the streamed response; retrying the original streaming request after {} second(s): {}",
+            delay.as_secs_f64(),
+            truncate_observation_text(&stream_error.to_string())
+        ),
+        cache_trace: prepared.cache_trace.clone(),
+        body: prepared.observation_body.clone(),
+    })?;
+    tokio::time::sleep(delay).await;
+    Ok(Some(next_attempt))
 }
 
 /// Tool-bearing streamed responses are atomic: no tool has run and no partial
@@ -55,6 +110,7 @@ pub(super) async fn recover_streamed_tool_call_non_streaming(
         object.remove("stream_options");
     }
     let observation_body = redact_transport_value(&body);
+    let cache_trace = crate::build_provider_cache_trace(&body, None, false);
     on_transport(ProviderTransportEvent::Retry {
         attempt: failed_attempt.saturating_add(1),
         retry_kind: ProviderRetryKind::StateRecovery,
@@ -64,6 +120,7 @@ pub(super) async fn recover_streamed_tool_call_non_streaming(
             "atomic tool-call stream was invalid; retrying the same logical request once without streaming: {}",
             truncate_observation_text(&stream_error.to_string())
         ),
+        cache_trace: cache_trace.clone(),
         body: observation_body.clone(),
     })?;
 
@@ -75,6 +132,7 @@ pub(super) async fn recover_streamed_tool_call_non_streaming(
         },
         failed_attempt.saturating_add(1),
         &observation_body,
+        cache_trace.as_ref(),
         on_transport,
     )
     .await?;

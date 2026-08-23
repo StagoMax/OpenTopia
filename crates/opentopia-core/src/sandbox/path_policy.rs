@@ -122,7 +122,15 @@ pub fn is_protected_metadata_path(path: &Path, writable_root: &Path) -> bool {
 }
 
 pub(super) fn protected_paths(workspace_root: &Path, config: &LocalSandboxConfig) -> Vec<PathBuf> {
-    if config.sandbox_mode != SandboxMode::WorkspaceWrite {
+    if config.sandbox_mode == SandboxMode::ReadOnly {
+        // Dedicated Windows identities retain persistent account-level grants
+        // from earlier workspace-write commands. A capability-scoped deny on
+        // the current workspace keeps a later read-only launch read-only even
+        // when its restricted token also carries the account SID for native
+        // child-process IPC compatibility.
+        return vec![absolute_path(workspace_root)];
+    }
+    if config.sandbox_mode == SandboxMode::DangerFullAccess {
         return Vec::new();
     }
     dedup_paths(

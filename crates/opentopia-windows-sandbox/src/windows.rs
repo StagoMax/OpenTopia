@@ -58,8 +58,8 @@ mod security_token;
 use acl_persistence::{
     account_sid, acl_principal_sid, capability_principal, ensure_broker_exchange_permissions,
     ensure_persistent_capability_permissions, ensure_persistent_user_permissions,
-    migrate_legacy_dedicated_user_acls, path_starts_with, verify_persistent_capability_permissions,
-    verify_persistent_user_permissions,
+    migrate_dedicated_user_write_acls_to_group, migrate_legacy_dedicated_user_acls,
+    path_starts_with, verify_persistent_capability_permissions, verify_persistent_user_permissions,
 };
 pub(super) use acl_persistence::{
     cleanup_workspace_acl, has_dedicated_user_permissions, revoke_dedicated_user_permissions,
@@ -69,6 +69,10 @@ use process_launch::{
     argv_to_command_line, create_job, last_error, launch, native_path, wide, AttributeList,
 };
 use security_token::{effective_file_access, LoggedOnToken, RestrictedToken, SidBuffer};
+
+pub(crate) fn principal_sid_bytes(principal: &str) -> Result<Vec<u8>> {
+    Ok(account_sid(principal)?.0)
+}
 
 pub(super) fn run(request: SandboxRequest) -> Result<i32> {
     suppress_process_error_ui();
@@ -310,11 +314,27 @@ fn provision_dedicated_user(request: &SandboxRequest) -> Result<()> {
     provision_runtime_registry_as_user(username, password)?;
     ensure_broker_exchange_permissions(username, user_sid.as_ptr(), logon_token.handle)?;
     migrate_legacy_dedicated_user_acls(request, username)?;
-    ensure_persistent_user_permissions(request, username, user_sid.as_ptr(), logon_token.handle)?;
+    let mut write_group = account_sid(crate::setup::SANDBOX_GROUP_NAME).context(
+        "stage=prepare_sandbox resolve managed sandbox filesystem group; rerun `opentopia-sandbox setup`",
+    )?;
+    migrate_dedicated_user_write_acls_to_group(
+        username,
+        crate::setup::SANDBOX_GROUP_NAME,
+        write_group.as_ptr(),
+    )?;
+    ensure_persistent_user_permissions(
+        request,
+        username,
+        user_sid.as_ptr(),
+        crate::setup::SANDBOX_GROUP_NAME,
+        write_group.as_ptr(),
+        logon_token.handle,
+    )?;
     let capability_principal = capability_principal(request);
     let mut capability = acl_principal_sid(&capability_principal)?;
     ensure_persistent_capability_permissions(request, &capability_principal, capability.as_ptr())
-        .context("stage=apply_acl provision dedicated-user capability permissions")
+        .context("stage=apply_acl provision dedicated-user capability permissions")?;
+    Ok(())
 }
 
 fn broker_exchange_root(account: &str) -> std::path::PathBuf {

@@ -125,6 +125,21 @@ fn completed_assistant_message_replaces_historical_stream_in_conversation_view()
 #[test]
 fn conversation_retry_event_preserves_reconnect_progress() {
     let request_id = Uuid::new_v4();
+    let cache_trace = crate::model::ProviderCacheTrace {
+        schema_version: 1,
+        prefix_hash: "prefix-hash".to_string(),
+        segments: vec![crate::model::ProviderCacheTraceSegment {
+            kind: crate::model::ProviderCacheTraceSegmentKind::ToolResult,
+            source: "messages[2]".to_string(),
+            name: Some("filesystem".to_string()),
+            content_hash: "content-hash".to_string(),
+            token_estimate: 42,
+        }],
+        tool_catalog_hash: Some("tools-hash".to_string()),
+        prompt_cache_key_hash: None,
+        previous_response_id_present: false,
+        configuration: Vec::new(),
+    };
     let payload = AgentEventPayload::ProviderRequestRetried {
         request_id,
         round: 2,
@@ -133,6 +148,7 @@ fn conversation_retry_event_preserves_reconnect_progress() {
         retry_index: Some(3),
         retry_limit: Some(5),
         reason: "connection reset".to_string(),
+        cache_trace: Some(cache_trace.clone()),
         body: serde_json::json!({"secret": "removed"}),
     };
     let full = serde_json::to_string(&payload).expect("serialize full payload");
@@ -149,9 +165,12 @@ fn conversation_retry_event_preserves_reconnect_progress() {
             retry_kind: crate::model::ProviderRetryKind::Network,
             retry_index: Some(3),
             retry_limit: Some(5),
+            cache_trace: Some(projected_cache_trace),
             body,
             ..
-        } if projected_request_id == request_id && body.is_null()
+        } if projected_request_id == request_id
+            && body.is_null()
+            && projected_cache_trace == cache_trace
     ));
 }
 
@@ -177,6 +196,7 @@ fn conversation_event_view_removes_diagnostic_bodies_and_hidden_reasoning() {
             adapter: "test".to_string(),
             method: "POST".to_string(),
             endpoint: "http://localhost/model".to_string(),
+            cache_trace: None,
             body: serde_json::json!({"input": "y".repeat(32_000)}),
         },
         AgentEventPayload::ReasoningDelta {

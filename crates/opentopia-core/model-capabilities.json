@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "verifiedAt": "2026-08-17",
+  "verifiedAt": "2026-08-21",
   "description": "Core-owned fallback shared by the Rust runtime and desktop UI when provider catalogs omit metadata. Exact provider metadata still takes precedence.",
   "sources": [
     "https://platform.openai.com/docs/models",
@@ -10,7 +10,9 @@
     "https://help.aliyun.com/zh/model-studio/vision-model/",
     "https://docs.mistral.ai/models/",
     "https://docs.x.ai/developers/models",
-    "https://openrouter.ai/api/v1/models"
+    "https://openrouter.ai/api/v1/models",
+    "https://api-docs.deepseek.com/guides/image_understanding",
+    "https://z.ai/blog/glm-5.3"
   ],
   "models": {
     "gpt-3.5-turbo": {
@@ -573,6 +575,10 @@
       "contextWindowTokens": 1048576,
       "supportsVision": false
     },
+    "deepseek-v4-flash-vision-exp": {
+      "contextWindowTokens": 1048576,
+      "supportsVision": true
+    },
     "deepseek-v4-flash-0731": {
       "contextWindowTokens": 1048576,
       "supportsVision": false
@@ -814,6 +820,10 @@
       "supportsVision": false
     },
     "glm-5.2": {
+      "contextWindowTokens": 1048576,
+      "supportsVision": false
+    },
+    "glm-5.3": {
       "contextWindowTokens": 1048576,
       "supportsVision": false
     },

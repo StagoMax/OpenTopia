@@ -407,6 +407,11 @@ fn base_agent_prompt_is_versioned_and_contains_the_runtime_contract() {
         "A catalog entry is routing metadata, not its full instructions",
         "child may perform delegated task work but cannot substitute a summary",
         "A tool call, including a plan or completion tool, never ends the turn by itself",
+        "Plans are optional.",
+        "tool availability alone is never a reason to create one",
+        "Do not create a plan for a simple or single-step request",
+        "Create a plan only when at least one of these conditions applies",
+        "The user asks for a plan or TODOs",
         "finalization-guard result",
         "Validation",
         "Completion conditions",
@@ -660,6 +665,67 @@ async fn provider_tool_loop_executes_tool_and_requests_summary() {
     assert!(requests[1].input.tool_results[0]
         .output
         .contains("hello from provider loop"));
+
+    let _ = fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
+async fn provider_tool_loop_normalizes_schema_equivalent_argument_keys() {
+    let workspace = test_workspace("provider-tool-key-normalization");
+    fs::write(workspace.join("sample.txt"), "sample").unwrap();
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ModelResponse {
+            text: String::new(),
+            tool_calls: vec![ProviderToolCall {
+                id: "call_find".to_string(),
+                name: "filesystem".to_string(),
+                arguments: json!({
+                    "operation": "find",
+                    "name_contains": "sample",
+                    "case_sensitive": false,
+                    "max_depth": 1
+                }),
+            }],
+            usage: None,
+            response_id: None,
+            provider_items: Vec::new(),
+            finish_reason: ModelFinishReason::ToolCalls,
+        },
+        ModelResponse::text("Found sample.txt."),
+    ]));
+    let agent = AgentCore::new(provider, ToolRegistry::with_builtins());
+
+    let events = agent
+        .run_turn(AgentTurnInput {
+            thread_id: Uuid::new_v4(),
+            user_message_id: Uuid::new_v4(),
+            workspace_root: workspace.clone(),
+            content: "Find sample files.".to_string(),
+            user_content: Vec::new(),
+            context_summary: None,
+            conversation: Vec::new(),
+            permission_mode: PermissionMode::FullAccess,
+            context_budget: None,
+            provider_cursor: None,
+            store: None,
+            cancellation: None,
+        })
+        .await
+        .expect("schema-equivalent key spelling is normalized");
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEventPayload::ContextWarning { stage, .. }
+            if stage == "tool_argument_key_normalization"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEventPayload::ToolCallStarted { call }
+            if call.input.get("nameContains").and_then(Value::as_str) == Some("sample")
+                && call.input.get("caseSensitive").and_then(Value::as_bool) == Some(false)
+                && call.input.get("maxDepth").and_then(Value::as_u64) == Some(1)
+    )));
+    assert!(assistant_text(&events).contains("Found sample.txt"));
 
     let _ = fs::remove_dir_all(workspace);
 }

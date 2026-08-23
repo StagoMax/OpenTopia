@@ -45,6 +45,10 @@ struct SetWorkItemInput {
     /// Legacy step field retained for static-schema compatibility.
     #[serde(default)]
     title: Option<String>,
+    /// Initial execution state. Creation may start at most one item; terminal
+    /// states still require update_plan with their ordinary evidence/reason rules.
+    #[serde(default)]
+    status: Option<InitialWorkItemStatus>,
     #[serde(default)]
     completion_disposition: CompletionDisposition,
     #[serde(default)]
@@ -52,6 +56,22 @@ struct SetWorkItemInput {
     #[serde(default)]
     #[schemars(length(max = 20))]
     acceptance: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum InitialWorkItemStatus {
+    Pending,
+    InProgress,
+}
+
+impl From<InitialWorkItemStatus> for WorkItemStatus {
+    fn from(status: InitialWorkItemStatus) -> Self {
+        match status {
+            InitialWorkItemStatus::Pending => Self::Pending,
+            InitialWorkItemStatus::InProgress => Self::InProgress,
+        }
+    }
 }
 
 pub struct SetPlanTool;
@@ -65,7 +85,7 @@ impl TypedTool for SetPlanTool {
     }
 
     fn description(&self) -> &str {
-        "Create or replace the current WorkForm as external memory for a genuinely complex task. Provide an objective and concise items with a step; item IDs are optional and otherwise generated as step_1, step_2, and so on. Dependencies and acceptance criteria remain optional. Every item starts pending."
+        "Create or replace the current task plan as external memory. Use only when the planning policy warrants it; plans are optional for simple or focused work. Provide an objective and concise executable items with a step; item IDs are optional and otherwise generated as step_1, step_2, and so on. Dependencies and acceptance criteria remain optional. Items start pending unless status is in_progress; at most one item may start in progress. Use update_plan for completed, blocked, deferred, or cancelled states."
     }
 
     fn validate_context(&self, ctx: &ToolInvocationContext) -> anyhow::Result<()> {
@@ -105,10 +125,14 @@ impl TypedTool for SetPlanTool {
             let id = item.id.unwrap_or_else(|| format!("step_{}", index + 1));
             let step = compact_or_legacy("item step", item.step, item.title)?
                 .context("item requires step")?;
+            let status = item
+                .status
+                .map(WorkItemStatus::from)
+                .unwrap_or(WorkItemStatus::Pending);
             items.push(WorkItem {
                 id: validate_text("item.id", id, MAX_ID_CHARS)?,
                 title: validate_text("item.step", step, MAX_TEXT_CHARS)?,
-                status: WorkItemStatus::Pending,
+                status,
                 completion_disposition: item.completion_disposition,
                 depends_on: validate_ids("item.depends_on", item.depends_on)?,
                 note: None,
@@ -280,7 +304,7 @@ impl TypedTool for UpdatePlanTool {
     }
 
     fn description(&self) -> &str {
-        "Update the current advisory WorkForm atomically. The compact shape batches existing item patches in items, new steps in append, removals in remove, and optional form changes; the active revision is supplied by the runtime. Completed items require acceptance criteria and evidence refs. Blocked, deferred, and cancelled items require a note."
+        "Update the current advisory task plan atomically after a plan has been created. The compact shape batches existing item patches in items, new steps in append, removals in remove, and optional form changes; the active revision is supplied by the runtime. Completed items require acceptance criteria and evidence refs. Blocked, deferred, and cancelled items require a note."
     }
 
     fn validate_context(&self, ctx: &ToolInvocationContext) -> anyhow::Result<()> {
@@ -840,7 +864,7 @@ mod tests {
                     json!({
                         "objective": "Implement and verify",
                         "items": [
-                            { "step": "Implement" },
+                            { "step": "Implement", "status": "in_progress" },
                             { "step": "Verify", "depends_on": ["step_1"] }
                         ]
                     }),
@@ -852,6 +876,7 @@ mod tests {
         let form: WorkForm =
             serde_json::from_value(created.metadata["workForm"].clone()).expect("WorkForm");
         assert_eq!(form.items[0].id, "step_1");
+        assert_eq!(form.items[0].status, WorkItemStatus::InProgress);
         assert_eq!(form.items[1].id, "step_2");
 
         let mut update_context = context(thread_id, turn_id);
@@ -887,6 +912,12 @@ mod tests {
         assert!(set_schema.contains("change_reason"));
         assert!(set_schema.contains("\"step\""));
         assert!(set_schema.contains("\"title\""));
+        assert!(SetPlanTool
+            .input_error(&json!({
+                "objective": "Invalid initial state",
+                "items": [{ "step": "Already done", "status": "completed" }]
+            }))
+            .is_some());
         let update_schema = UpdatePlanTool.schema().to_string();
         assert!(update_schema.contains("expected_revision"));
         assert!(update_schema.contains("item_id"));

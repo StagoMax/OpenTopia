@@ -174,6 +174,7 @@ pub(super) fn conversation_payload_json(
             adapter,
             method,
             endpoint,
+            cache_trace,
             ..
         } => serde_json::json!({
             "type": "provider_request_sent",
@@ -183,6 +184,7 @@ pub(super) fn conversation_payload_json(
             "adapter": adapter,
             "method": method,
             "endpoint": endpoint,
+            "cache_trace": cache_trace,
         }),
         AgentEventPayload::ProviderRequestRetried {
             request_id,
@@ -192,6 +194,7 @@ pub(super) fn conversation_payload_json(
             retry_index,
             retry_limit,
             reason,
+            cache_trace,
             ..
         } => serde_json::json!({
             "type": "provider_request_retried",
@@ -202,6 +205,7 @@ pub(super) fn conversation_payload_json(
             "retry_index": retry_index,
             "retry_limit": retry_limit,
             "reason": reason,
+            "cache_trace": cache_trace,
         }),
         AgentEventPayload::ProviderResponseReceived {
             request_id,

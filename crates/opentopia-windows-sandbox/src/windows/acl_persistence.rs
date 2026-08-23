@@ -1,4 +1,6 @@
-use super::acl_transaction::{update_dacl, AclTransaction, NamedAclMutex};
+use super::acl_transaction::{
+    propagate_inherited_dacl, update_dacl, AclTransaction, NamedAclMutex,
+};
 use super::process_launch::{last_error, wide};
 use super::security_token::{effective_file_access, SidBuffer};
 use super::{
@@ -219,6 +221,8 @@ pub(super) fn ensure_persistent_user_permissions(
     request: &SandboxRequest,
     account: &str,
     sid: PSID,
+    write_account: &str,
+    write_sid: PSID,
     token: HANDLE,
 ) -> Result<()> {
     let ledger = load_acl_ledger()?;
@@ -303,14 +307,20 @@ pub(super) fn ensure_persistent_user_permissions(
     let mut ledger = load_acl_ledger()?;
     let mut transaction = AclTransaction::default();
     let sid_bytes = SidBuffer::copy_from_sid(sid)?.0;
+    let write_sid_bytes = SidBuffer::copy_from_sid(write_sid)?.0;
     let mut applied_entries = Vec::new();
 
     for (path, kind) in desired {
+        let (entry_account, entry_sid_bytes, acl_sid) = if kind == PersistentAclKind::Write {
+            (write_account, &write_sid_bytes, write_sid)
+        } else {
+            (account, &sid_bytes, sid)
+        };
         let entry = PersistentAclEntry {
-            account: account.to_string(),
+            account: entry_account.to_string(),
             path: path.clone(),
             kind: kind.clone(),
-            sid: sid_bytes.clone(),
+            sid: entry_sid_bytes.clone(),
             permissions_version: ACL_ENTRY_PERMISSIONS_VERSION,
         };
         revoke_replaced_acl_principals(&ledger, &entry)?;
@@ -326,15 +336,21 @@ pub(super) fn ensure_persistent_user_permissions(
             ),
         );
         match kind {
-            PersistentAclKind::Read => {
-                transaction.grant(&path, sid, true, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)?
-            }
+            PersistentAclKind::Read => transaction.grant(
+                &path,
+                acl_sid,
+                true,
+                FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+            )?,
             PersistentAclKind::Write => {
-                transaction.grant(&path, sid, true, WORKSPACE_WRITE_PERMISSIONS)?
+                transaction.grant(&path, acl_sid, true, WORKSPACE_WRITE_PERMISSIONS)?
             }
-            PersistentAclKind::DenyRead => {
-                transaction.deny(&path, sid, true, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)?
-            }
+            PersistentAclKind::DenyRead => transaction.deny(
+                &path,
+                acl_sid,
+                true,
+                FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+            )?,
             PersistentAclKind::DenyWrite => unreachable!(),
         }
         ledger.entries.retain(|existing| {
@@ -409,6 +425,89 @@ pub(super) fn migrate_legacy_dedicated_user_acls(
             "removed {} identity-wide protected-path deny ACL entries for {account}; capability_scope={}",
             stale.len(),
             capability_principal(request)
+        ),
+    );
+    Ok(())
+}
+
+/// Older versions granted each dedicated account a direct write ACE. Once the
+/// account SID is included as a restricted SID for native named-pipe IPC, that
+/// direct ACE can satisfy both access checks and reopen another workspace's
+/// historical grant. Move the normal-token half of every managed write grant
+/// to a stable local group; the per-command capability SID remains the only
+/// restricted identity with a write ACE for the current policy scope.
+pub(super) fn migrate_dedicated_user_write_acls_to_group(
+    account: &str,
+    group: &str,
+    group_sid: PSID,
+) -> Result<()> {
+    let preliminary = load_acl_ledger()?;
+    let stale_paths = preliminary
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.account.eq_ignore_ascii_case(account) && entry.kind == PersistentAclKind::Write
+        })
+        .map(|entry| entry.path.clone())
+        .collect::<BTreeSet<_>>();
+    if stale_paths.is_empty() {
+        return Ok(());
+    }
+
+    let _guards = NamedAclMutex::acquire_paths(stale_paths.iter().map(|path| path.as_path()))?;
+    let ledger = load_acl_ledger()?;
+    let account_entries = ledger
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.account.eq_ignore_ascii_case(account) && stale_paths.contains(&entry.path)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut account_sid = account_sid(account)?;
+    let group_sid_bytes = SidBuffer::copy_from_sid(group_sid)?.0;
+    let mut transaction = AclTransaction::default();
+    let mut replacements = Vec::new();
+
+    for path in &stale_paths {
+        transaction.grant(path, group_sid, true, WORKSPACE_WRITE_PERMISSIONS)?;
+        update_dacl(path, account_sid.as_ptr(), REVOKE_ACCESS, false, 0)?;
+        replacements.push(PersistentAclEntry {
+            account: group.to_string(),
+            path: path.clone(),
+            kind: PersistentAclKind::Write,
+            sid: group_sid_bytes.clone(),
+            permissions_version: ACL_ENTRY_PERMISSIONS_VERSION,
+        });
+    }
+    let propagation_roots = stale_paths.iter().filter(|candidate| {
+        !stale_paths
+            .iter()
+            .any(|other| *candidate != other && path_starts_with(candidate, other))
+    });
+    for root in propagation_roots {
+        propagate_inherited_dacl(root)?;
+    }
+    let _ledger_guard = NamedAclMutex::acquire_metadata()?;
+    let mut latest = load_acl_ledger()?;
+    latest
+        .entries
+        .retain(|entry| !account_entries.contains(entry));
+    for entry in replacements {
+        latest.entries.retain(|existing| {
+            existing.account != entry.account
+                || existing.path != entry.path
+                || existing.kind != entry.kind
+        });
+        latest.entries.push(entry);
+    }
+    save_acl_ledger(&latest)?;
+    transaction.commit();
+    crate::logging::event(
+        "migrate_acl",
+        format!(
+            "moved {} direct write ACL roots from {account} to {group}",
+            stale_paths.len()
         ),
     );
     Ok(())
@@ -814,6 +913,31 @@ mod tests {
             acl_principal_sid(&old).expect("legacy SID").0,
             acl_principal_sid(&new).expect("current SID").0
         );
+    }
+
+    #[test]
+    fn dedicated_write_grants_use_the_managed_group_identity() {
+        let source = include_str!("acl_persistence.rs");
+        let ensure = source
+            .split("pub(super) fn ensure_persistent_user_permissions")
+            .nth(1)
+            .expect("persistent user permission implementation")
+            .split("pub(super) fn migrate_legacy_dedicated_user_acls")
+            .next()
+            .expect("permission implementation boundary");
+        assert!(ensure.contains("if kind == PersistentAclKind::Write"));
+        assert!(ensure.contains("(write_account, &write_sid_bytes, write_sid)"));
+
+        let migration = source
+            .split("pub(super) fn migrate_dedicated_user_write_acls_to_group")
+            .nth(1)
+            .expect("dedicated write ACL migration")
+            .split("pub(super) fn ensure_persistent_capability_permissions")
+            .next()
+            .expect("migration boundary");
+        assert!(migration.contains("transaction.grant(path, group_sid"));
+        assert!(migration.contains("REVOKE_ACCESS"));
+        assert!(migration.contains("propagate_inherited_dacl(root)"));
     }
 
     fn capability_request(write_roots: &[&str]) -> SandboxRequest {

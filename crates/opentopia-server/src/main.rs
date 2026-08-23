@@ -140,8 +140,8 @@ use conversation_api::{
 };
 #[cfg(test)]
 use conversation_api::{
-    normalize_generated_thread_title, CreateThreadRequest, PatchValue, UpdateProjectRequest,
-    UpdateThreadRequest, MAX_THREAD_TITLE_CHARS,
+    local_thread_title, CreateThreadRequest, PatchValue, UpdateProjectRequest, UpdateThreadRequest,
+    MAX_THREAD_TITLE_CHARS,
 };
 use event_bus::EventBus;
 use events_api::project_conversation_payload;

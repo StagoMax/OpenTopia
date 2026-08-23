@@ -253,6 +253,7 @@ mod tests {
                 endpoint: "provider://encoded".to_string(),
                 body: serde_json::json!({"encoded": request.input.current_user.message}),
                 observation_body: serde_json::json!({"encoded": true}),
+                cache_trace: None,
                 logical_request: request,
                 tool_contracts: Vec::new(),
                 response_commit: ProviderResponseCommitMode::Streaming,
@@ -350,6 +351,7 @@ mod tests {
                 endpoint: "provider://atomic-test".to_string(),
                 body: serde_json::json!({}),
                 observation_body: serde_json::json!({}),
+                cache_trace: None,
                 logical_request: request,
                 tool_contracts: Vec::new(),
                 response_commit: ProviderResponseCommitMode::Atomic,
@@ -430,6 +432,7 @@ mod tests {
                 retry_index: None,
                 retry_limit: None,
                 reason: "retry transaction".to_string(),
+                cache_trace: None,
                 body: serde_json::json!({}),
             })?;
             on_delta(ModelStreamDelta::Text {

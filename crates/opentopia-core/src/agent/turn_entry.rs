@@ -417,7 +417,7 @@ impl AgentCore {
             AgentContinuationState::Provider {
                 model_user_message,
                 model_user_content,
-                tool_candidates,
+                mut tool_candidates,
                 provider_tool_calls,
                 mut provider_tool_results,
                 mut pending_tool_calls,
@@ -427,8 +427,25 @@ impl AgentCore {
                 rollout_reviews,
                 mut runtime_state,
                 branch_developer_instructions,
-                provider_compatibility_hash,
+                mut provider_compatibility_hash,
             } => {
+                let refreshed_tool_candidates =
+                    self.refresh_resumed_tool_candidates(&tool_candidates);
+                if refreshed_tool_candidates != tool_candidates {
+                    tool_candidates = refreshed_tool_candidates;
+                    provider_compatibility_hash = super::provider_compatibility_hash(
+                        &continuation.model_context,
+                        continuation.context_summary.as_deref(),
+                        &tool_candidates,
+                        branch_developer_instructions.as_deref(),
+                    );
+                    events.push(AgentEventPayload::ProviderContextStateInvalidated {
+                        provider_id: None,
+                        model: None,
+                        reason: "tool catalog changed while the turn was suspended; refreshed current tool contracts"
+                            .to_string(),
+                    });
+                }
                 let first_new_result = provider_tool_results.len();
                 match signal {
                     crate::agent_runtime::AgentResumeSignal::Approval { approved, .. } => {

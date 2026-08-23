@@ -533,6 +533,62 @@ fn progressive_tool_search_reveals_only_matching_deferred_schemas() {
 }
 
 #[test]
+fn resumed_tool_catalog_refreshes_contracts_without_losing_disclosure_state() {
+    let mut registry = ToolRegistry::with_builtins();
+    registry.insert_mcp(
+        "mcp_issue_lookup".to_string(),
+        Arc::new(CatalogTestTool {
+            name: "mcp_issue_lookup".to_string(),
+            description: "Current issue lookup contract".to_string(),
+        }),
+    );
+    let mut agent = AgentCore::new(Arc::new(MockProvider), registry);
+    agent.set_tool_exposure_policy(ToolExposurePolicy::Progressive);
+    let mut saved = agent.provider_tool_catalog();
+    let mut events = TurnEvents::new(None);
+    let result = agent
+        .execute_tool_search_call(
+            &ProviderToolCall {
+                id: "search-tools".to_string(),
+                name: TOOL_SEARCH_NAME.to_string(),
+                arguments: json!({ "query": "issue lookup" }),
+            },
+            &mut events,
+        )
+        .expect("search deferred tools");
+    assert!(agent.reveal_tools_from_search_result(&result, &mut saved));
+    let revealed = saved
+        .iter_mut()
+        .find(|candidate| candidate.name == "mcp_issue_lookup")
+        .expect("revealed tool");
+    revealed.description = "stale checkpoint contract".to_string();
+    revealed.input_schema = json!({ "type": "null" });
+    saved.push(ProviderToolCandidate::direct(
+        "removed_tool",
+        "No longer available",
+        json!({ "type": "object" }),
+    ));
+
+    let refreshed = agent.refresh_resumed_tool_candidates(&saved);
+
+    let revealed = refreshed
+        .iter()
+        .find(|candidate| candidate.name == "mcp_issue_lookup")
+        .expect("previously revealed tool remains available");
+    assert_eq!(revealed.description, "Current issue lookup contract");
+    assert_eq!(
+        revealed.input_schema,
+        json!({ "type": "object", "properties": {}, "additionalProperties": false })
+    );
+    assert!(!refreshed
+        .iter()
+        .any(|candidate| candidate.name == "removed_tool"));
+    assert!(refreshed
+        .iter()
+        .any(|candidate| candidate.name == TOOL_SEARCH_NAME));
+}
+
+#[test]
 fn automatic_tool_disclosure_keeps_small_local_catalogs_eager() {
     let mut registry = ToolRegistry::with_builtins();
     registry.insert_mcp(

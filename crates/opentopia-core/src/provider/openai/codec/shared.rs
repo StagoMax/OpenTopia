@@ -147,8 +147,8 @@ pub(in crate::provider) fn openai_tool_result_part(part: &ModelInputContent) -> 
     }
 }
 
-pub(in crate::provider) fn openai_tool_image_companion(
-    results: &[ProviderToolResult],
+pub(in crate::provider) fn openai_tool_image_companion<'a>(
+    results: impl IntoIterator<Item = &'a ProviderToolResult>,
 ) -> Option<Value> {
     let mut content = Vec::new();
     for result in results {

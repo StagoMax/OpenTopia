@@ -231,6 +231,78 @@ fn schema_union_errors_report_each_rejected_shape() {
 }
 
 #[test]
+fn tool_argument_keys_follow_the_advertised_schema_without_alias_tables() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "yieldTimeMs": { "type": "integer" },
+            "rows": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "depends_on": { "type": "array", "items": { "type": "string" } }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        },
+        "additionalProperties": false
+    });
+    let mut arguments = json!({
+        "yield_time_ms": 30_000,
+        "rows": [{ "depends-on": ["step_1"] }]
+    });
+
+    let normalized = normalize_tool_argument_keys(&schema, &mut arguments);
+
+    assert_eq!(
+        arguments,
+        json!({
+            "yieldTimeMs": 30_000,
+            "rows": [{ "depends_on": ["step_1"] }]
+        })
+    );
+    assert_eq!(normalized.len(), 2);
+    assert_eq!(
+        tool_input_schema_error(&schema, &arguments, "arguments"),
+        None
+    );
+}
+
+#[test]
+fn tool_argument_key_normalization_preserves_unknown_and_ambiguous_fields() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "fooBar": { "type": "string" },
+            "foo_bar": { "type": "string" }
+        },
+        "additionalProperties": false
+    });
+    let mut arguments = json!({ "foo-bar": "ambiguous", "semanticExtra": true });
+
+    assert!(normalize_tool_argument_keys(&schema, &mut arguments).is_empty());
+    assert_eq!(
+        arguments,
+        json!({ "foo-bar": "ambiguous", "semanticExtra": true })
+    );
+    assert!(tool_input_schema_error(&schema, &arguments, "arguments").is_some());
+
+    let permissive_schema = json!({
+        "type": "object",
+        "properties": { "displayName": { "type": "string" } },
+        "additionalProperties": true
+    });
+    let mut freeform_arguments = json!({ "display_name": "literal data key" });
+    assert!(normalize_tool_argument_keys(&permissive_schema, &mut freeform_arguments).is_empty());
+    assert_eq!(
+        freeform_arguments,
+        json!({ "display_name": "literal data key" })
+    );
+}
+
+#[test]
 fn responses_tool_representation_is_capability_driven_with_function_fallback() {
     let portable = ProviderToolCandidate {
         name: "apply_patch".to_string(),

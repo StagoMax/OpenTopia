@@ -891,6 +891,60 @@ pub struct ContextSummary {
     pub checkpoint: Option<ContextCheckpoint>,
 }
 
+/// A content-free fingerprint of one provider-visible prompt segment. These
+/// records are safe to keep in the compact conversation projection: they retain
+/// enough structure to explain cache-prefix changes without persisting prompt
+/// text, tool output, or image bytes a second time.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCacheTraceSegment {
+    pub kind: ProviderCacheTraceSegmentKind,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub content_hash: String,
+    pub token_estimate: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCacheTraceSegmentKind {
+    Instructions,
+    SystemMessage,
+    DeveloperMessage,
+    UserMessage,
+    AssistantMessage,
+    ToolCall,
+    ToolResult,
+    ToolImage,
+    InputItem,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCacheTraceProperty {
+    pub name: String,
+    pub value_hash: String,
+}
+
+/// Describes the exact structured input sent by a provider adapter using only
+/// hashes, safe field names, and local token estimates.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCacheTrace {
+    pub schema_version: u8,
+    pub prefix_hash: String,
+    pub segments: Vec<ProviderCacheTraceSegment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_catalog_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key_hash: Option<String>,
+    pub previous_response_id_present: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub configuration: Vec<ProviderCacheTraceProperty>,
+}
+
 impl ContextSummary {
     pub fn new(
         thread_id: Uuid,
@@ -1390,6 +1444,8 @@ pub enum AgentEventPayload {
         adapter: String,
         method: String,
         endpoint: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_trace: Option<ProviderCacheTrace>,
         #[serde(default, skip_serializing_if = "Value::is_null")]
         body: Value,
     },
@@ -1404,6 +1460,8 @@ pub enum AgentEventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_limit: Option<usize>,
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_trace: Option<ProviderCacheTrace>,
         #[serde(default, skip_serializing_if = "Value::is_null")]
         body: Value,
     },

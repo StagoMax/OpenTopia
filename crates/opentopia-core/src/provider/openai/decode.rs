@@ -876,3 +876,155 @@ pub(crate) fn tool_input_schema_error(schema: &Value, value: &Value, path: &str)
     }
     None
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolArgumentKeyNormalization {
+    pub path: String,
+    pub from: String,
+    pub to: String,
+}
+
+/// Normalizes only spelling variants that resolve to exactly one property in
+/// the advertised schema. Semantic unknown fields and ambiguous aliases are
+/// deliberately left untouched for the ordinary strict validator.
+pub(crate) fn normalize_tool_argument_keys(
+    schema: &Value,
+    value: &mut Value,
+) -> Vec<ToolArgumentKeyNormalization> {
+    let mut normalizations = Vec::new();
+    normalize_tool_argument_keys_at(schema, schema, value, "arguments", &mut normalizations);
+    normalizations
+}
+
+fn normalize_tool_argument_keys_at(
+    root_schema: &Value,
+    schema: &Value,
+    value: &mut Value,
+    path: &str,
+    normalizations: &mut Vec<ToolArgumentKeyNormalization>,
+) {
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        if let Some(resolved) = resolve_local_schema_reference(root_schema, reference) {
+            normalize_tool_argument_keys_at(root_schema, resolved, value, path, normalizations);
+        }
+        return;
+    }
+
+    normalize_direct_schema_properties(root_schema, schema, value, path, normalizations);
+
+    if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
+        for branch in branches {
+            normalize_tool_argument_keys_at(root_schema, branch, value, path, normalizations);
+        }
+    }
+
+    for keyword in ["oneOf", "anyOf"] {
+        let Some(branches) = schema.get(keyword).and_then(Value::as_array) else {
+            continue;
+        };
+        let mut matching = branches.iter().filter_map(|branch| {
+            let mut candidate = value.clone();
+            let mut candidate_normalizations = Vec::new();
+            normalize_tool_argument_keys_at(
+                root_schema,
+                branch,
+                &mut candidate,
+                path,
+                &mut candidate_normalizations,
+            );
+            tool_input_schema_error(branch, &candidate, path)
+                .is_none()
+                .then_some((candidate, candidate_normalizations))
+        });
+        let Some(selected) = matching.next() else {
+            continue;
+        };
+        if matching.next().is_none() {
+            *value = selected.0;
+            normalizations.extend(selected.1);
+        }
+    }
+}
+
+fn normalize_direct_schema_properties(
+    root_schema: &Value,
+    schema: &Value,
+    value: &mut Value,
+    path: &str,
+    normalizations: &mut Vec<ToolArgumentKeyNormalization>,
+) {
+    if let (Some(properties), Some(object)) = (
+        schema.get("properties").and_then(Value::as_object),
+        value.as_object_mut(),
+    ) {
+        if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+            let existing_keys = object.keys().cloned().collect::<Vec<_>>();
+            for key in existing_keys {
+                if properties.contains_key(&key) {
+                    continue;
+                }
+                let normalized_key = normalized_tool_argument_key(&key);
+                if normalized_key.is_empty() {
+                    continue;
+                }
+                let mut matches = properties
+                    .keys()
+                    .filter(|candidate| normalized_tool_argument_key(candidate) == normalized_key);
+                let Some(canonical_key) = matches.next().cloned() else {
+                    continue;
+                };
+                if matches.next().is_some() || object.contains_key(&canonical_key) {
+                    continue;
+                }
+                let Some(item) = object.remove(&key) else {
+                    continue;
+                };
+                object.insert(canonical_key.clone(), item);
+                normalizations.push(ToolArgumentKeyNormalization {
+                    path: format!("{path}.{canonical_key}"),
+                    from: key,
+                    to: canonical_key,
+                });
+            }
+        }
+
+        for (key, property_schema) in properties {
+            if let Some(item) = object.get_mut(key) {
+                normalize_tool_argument_keys_at(
+                    root_schema,
+                    property_schema,
+                    item,
+                    &format!("{path}.{key}"),
+                    normalizations,
+                );
+            }
+        }
+    }
+
+    if let (Some(items), Some(values)) = (schema.get("items"), value.as_array_mut()) {
+        for (index, item) in values.iter_mut().enumerate() {
+            normalize_tool_argument_keys_at(
+                root_schema,
+                items,
+                item,
+                &format!("{path}[{index}]"),
+                normalizations,
+            );
+        }
+    }
+}
+
+fn normalized_tool_argument_key(key: &str) -> String {
+    key.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
+}
+
+fn resolve_local_schema_reference<'a>(
+    root_schema: &'a Value,
+    reference: &str,
+) -> Option<&'a Value> {
+    let pointer = reference.strip_prefix('#')?;
+    root_schema.pointer(pointer)
+}

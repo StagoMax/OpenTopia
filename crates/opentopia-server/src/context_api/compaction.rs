@@ -594,6 +594,7 @@ pub(crate) async fn generate_context_summary(
             adapter: prepared.adapter.clone(),
             method: prepared.method.clone(),
             endpoint: prepared.endpoint.clone(),
+            cache_trace: prepared.cache_trace.clone(),
             body: prepared.observation_body.clone(),
         },
     );
@@ -644,6 +645,7 @@ pub(crate) async fn generate_context_summary(
                 retry_index,
                 retry_limit,
                 reason,
+                cache_trace,
                 body,
             } => publish_payload(
                 state,
@@ -657,6 +659,7 @@ pub(crate) async fn generate_context_summary(
                     retry_index,
                     retry_limit,
                     reason,
+                    cache_trace,
                     body,
                 },
             ),

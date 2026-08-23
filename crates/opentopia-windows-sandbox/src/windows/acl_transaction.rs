@@ -8,8 +8,9 @@ use std::ptr;
 use uuid::Uuid;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT};
 use windows_sys::Win32::Security::Authorization::{
-    GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, DENY_ACCESS, EXPLICIT_ACCESS_W,
-    GRANT_ACCESS, REVOKE_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_W,
+    GetNamedSecurityInfoW, ProgressInvokeNever, SetEntriesInAclW, SetNamedSecurityInfoW,
+    TreeResetNamedSecurityInfoW, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS, REVOKE_ACCESS,
+    SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
     DACL_SECURITY_INFORMATION, PSID, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
@@ -265,6 +266,61 @@ pub(super) fn update_dacl(
     if set_result != 0 {
         anyhow::bail!(
             "SetNamedSecurityInfoW failed for {}: {set_result}",
+            path.display()
+        )
+    }
+    Ok(())
+}
+
+/// Rebuild descendant inherited ACEs from the directory's current DACL while
+/// preserving explicit child ACLs. This is reserved for one-time identity
+/// migrations; steady-state provisioning only updates capability roots.
+pub(super) fn propagate_inherited_dacl(path: &Path) -> Result<()> {
+    if !path.is_dir() {
+        return Ok(());
+    }
+    let name = wide(path.as_os_str());
+    let mut dacl = ptr::null_mut();
+    let mut descriptor = ptr::null_mut();
+    let get_result = unsafe {
+        GetNamedSecurityInfoW(
+            name.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut dacl,
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if get_result != 0 {
+        anyhow::bail!(
+            "GetNamedSecurityInfoW failed before ACL propagation for {}: {get_result}",
+            path.display()
+        )
+    }
+    let reset_result = unsafe {
+        TreeResetNamedSecurityInfoW(
+            name.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            dacl,
+            ptr::null_mut(),
+            1,
+            None,
+            ProgressInvokeNever,
+            ptr::null(),
+        )
+    };
+    if !descriptor.is_null() {
+        unsafe { windows_sys::Win32::Foundation::LocalFree(descriptor.cast()) };
+    }
+    if reset_result != 0 {
+        anyhow::bail!(
+            "TreeResetNamedSecurityInfoW failed for {}: {reset_result}",
             path.display()
         )
     }

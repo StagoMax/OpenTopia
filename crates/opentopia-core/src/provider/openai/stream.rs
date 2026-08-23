@@ -9,6 +9,126 @@ use super::decode::{
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::Duration;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderStreamErrorKind {
+    RateLimit,
+    Rejected,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{protocol} stream returned an error: {detail}")]
+pub(super) struct ProviderStreamError {
+    protocol: &'static str,
+    detail: Value,
+    kind: ProviderStreamErrorKind,
+    retry_after: Option<Duration>,
+}
+
+impl ProviderStreamError {
+    fn from_event(protocol: &'static str, detail: Value) -> Self {
+        Self {
+            kind: if stream_error_is_rate_limited(&detail) {
+                ProviderStreamErrorKind::RateLimit
+            } else {
+                ProviderStreamErrorKind::Rejected
+            },
+            retry_after: stream_error_retry_after(&detail),
+            protocol,
+            detail,
+        }
+    }
+
+    pub(super) fn is_rate_limit(&self) -> bool {
+        self.kind == ProviderStreamErrorKind::RateLimit
+    }
+
+    pub(super) fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
+    }
+}
+
+pub(super) fn provider_stream_rate_limit(error: &anyhow::Error) -> Option<&ProviderStreamError> {
+    error
+        .downcast_ref::<ProviderStreamError>()
+        .filter(|error| error.is_rate_limit())
+}
+
+fn stream_error_is_rate_limited(value: &Value) -> bool {
+    match value {
+        Value::Object(values) => values.iter().any(|(key, value)| {
+            let key = key.to_ascii_lowercase();
+            if key == "status" && value.as_u64() == Some(429) {
+                return true;
+            }
+            if matches!(key.as_str(), "type" | "code")
+                && value.as_str().is_some_and(rate_limit_marker)
+            {
+                return true;
+            }
+            if key == "message"
+                && value.as_str().is_some_and(|message| {
+                    let message = message.to_ascii_lowercase();
+                    message.contains("concurrency limit exceeded")
+                        || message.contains("too many concurrent requests")
+                        || message.contains("too many requests")
+                })
+            {
+                return true;
+            }
+            stream_error_is_rate_limited(value)
+        }),
+        Value::Array(values) => values.iter().any(stream_error_is_rate_limited),
+        Value::String(value) => {
+            rate_limit_marker(value) || {
+                let message = value.to_ascii_lowercase();
+                message.contains("concurrency limit exceeded")
+                    || message.contains("too many concurrent requests")
+                    || message.contains("too many requests")
+            }
+        }
+        _ => false,
+    }
+}
+
+fn rate_limit_marker(value: &str) -> bool {
+    let marker = value.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    marker.contains("rate_limit")
+        || matches!(
+            marker.as_str(),
+            "rpm_limited" | "tpm_limited" | "too_many_requests" | "concurrency_limited"
+        )
+}
+
+fn stream_error_retry_after(value: &Value) -> Option<Duration> {
+    match value {
+        Value::Object(values) => {
+            for (key, value) in values {
+                let key = key.to_ascii_lowercase();
+                let duration = match key.as_str() {
+                    "retry_after_ms" => numeric_value(value).map(Duration::from_millis),
+                    "retry_after" | "retry_after_seconds" => {
+                        numeric_value(value).map(Duration::from_secs)
+                    }
+                    _ => None,
+                };
+                if let Some(duration) = duration {
+                    return Some(duration.min(Duration::from_secs(60)));
+                }
+            }
+            values.values().find_map(stream_error_retry_after)
+        }
+        Value::Array(values) => values.iter().find_map(stream_error_retry_after),
+        _ => None,
+    }
+}
+
+fn numeric_value(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str()?.trim().parse::<u64>().ok())
+}
 
 #[derive(Debug, Default)]
 pub(in crate::provider) struct StreamingToolCall {
@@ -200,7 +320,7 @@ impl OpenAiStreamAccumulator {
         on_delta: &mut ModelStreamCallback<'_>,
     ) -> anyhow::Result<()> {
         if let Some(error) = event.get("error") {
-            anyhow::bail!("provider stream returned an error: {error}");
+            return Err(ProviderStreamError::from_event("provider", error.clone()).into());
         }
 
         if let Some(usage) = parse_model_usage(event.get("usage")) {
@@ -399,7 +519,7 @@ impl ResponsesStreamAccumulator {
     ) -> anyhow::Result<()> {
         let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
         if matches!(event_type, "error" | "response.failed") {
-            anyhow::bail!("Responses stream returned an error: {event}");
+            return Err(ProviderStreamError::from_event("Responses", event.clone()).into());
         }
         if let Some(response_id) = event
             .get("response_id")

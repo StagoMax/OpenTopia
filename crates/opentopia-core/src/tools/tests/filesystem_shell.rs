@@ -295,6 +295,7 @@ async fn shell_automatically_yields_a_slow_command_to_the_existing_registry() {
     );
     context.thread_id = Some(Uuid::new_v4());
     context.background = Some(BackgroundProcessRegistry::default());
+    context.minimum_foreground_yield = Duration::from_millis(10);
     let scope = background_scope(&context).unwrap();
     let registry = context.background.clone().unwrap();
     let command = if cfg!(windows) {
@@ -328,6 +329,24 @@ async fn shell_automatically_yields_a_slow_command_to_the_existing_registry() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     fs::remove_dir_all(workspace_root).unwrap();
+}
+
+#[test]
+fn shell_cannot_shorten_the_runtime_foreground_window() {
+    assert_eq!(
+        effective_foreground_yield_milliseconds(
+            Some(1_000),
+            Duration::from_millis(DEFAULT_FOREGROUND_YIELD_MILLISECONDS),
+        ),
+        DEFAULT_FOREGROUND_YIELD_MILLISECONDS
+    );
+    assert_eq!(
+        effective_foreground_yield_milliseconds(
+            Some(60_000),
+            Duration::from_millis(DEFAULT_FOREGROUND_YIELD_MILLISECONDS),
+        ),
+        60_000
+    );
 }
 
 #[tokio::test]

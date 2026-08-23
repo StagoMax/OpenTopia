@@ -39,6 +39,18 @@ pub(super) const DEFAULT_BACKGROUND_TIMEOUT_SECONDS: u64 = 3_600;
 pub(super) const DEFAULT_FOREGROUND_YIELD_MILLISECONDS: u64 = 30_000;
 pub(super) const MAX_FOREGROUND_YIELD_MILLISECONDS: u64 = 120_000;
 
+pub(super) fn effective_foreground_yield_milliseconds(
+    requested: Option<u64>,
+    minimum: Duration,
+) -> u64 {
+    let minimum = u64::try_from(minimum.as_millis())
+        .unwrap_or(MAX_FOREGROUND_YIELD_MILLISECONDS)
+        .clamp(1, MAX_FOREGROUND_YIELD_MILLISECONDS);
+    requested
+        .unwrap_or(DEFAULT_FOREGROUND_YIELD_MILLISECONDS)
+        .clamp(minimum, MAX_FOREGROUND_YIELD_MILLISECONDS)
+}
+
 pub(super) fn background_scope(ctx: &ToolInvocationContext) -> anyhow::Result<BackgroundScope> {
     Ok(BackgroundScope {
         thread_id: ctx
@@ -163,7 +175,7 @@ impl TypedTool for BackgroundOutputTool {
     }
 
     fn description(&self) -> &str {
-        "Control background jobs and persistent stdio sessions you started: list them, read, write input, or stop one. Read is a cancellable wait, not a polling snapshot: for ordinary commands it waits for terminal completion, and for interactive sessions it also returns on new output. It defaults to one hour; set timeoutMs to 0 only when an immediate snapshot is genuinely needed."
+        "Control background jobs and persistent stdio sessions you started: list them, read, write input, or stop one. Ordinary command completions are delivered automatically, so do not call read immediately after shell or browser merely to collect a result. Read is reserved for work that is blocked on a still-running job, or for interactive sessions where it also returns on new output. It is a cancellable wait and defaults to one hour; set timeoutMs to 0 only when an immediate snapshot is genuinely needed."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
@@ -315,13 +327,15 @@ pub(super) struct ShellInput {
     /// Timeout in seconds.
     #[serde(default)]
     timeout_seconds: Option<u64>,
-    /// Run detached and return a job id immediately.
+    /// Run detached and return a job id immediately. Use only for work genuinely
+    /// expected to exceed the ordinary foreground window, not for quick searches,
+    /// reads, or inspections.
     #[serde(default)]
     background: bool,
-    /// How long an ordinary command may stay in the foreground before it
-    /// automatically continues as a background job.
+    /// Optionally extend how long an ordinary command stays in the foreground.
+    /// The runtime always enforces its own 30-second minimum.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 120000))]
+    #[schemars(range(min = 30000, max = 120000))]
     yield_time_ms: Option<u64>,
     /// Keep stdin open as a persistent stdio session.
     #[serde(default)]
@@ -338,9 +352,9 @@ impl TypedTool for ShellTool {
 
     fn description(&self) -> &str {
         if cfg!(windows) {
-            "Run a command with the configured Windows PowerShell runtime (PowerShell 7 preferred, Windows PowerShell 5.1 fallback) in a workspace directory with timeout and output caps. The runtime prompt and result metadata identify the active dialect. Multiple shell calls from one model response may start concurrently, so emit dependent or overlapping writes in separate rounds. Commands that outlast yieldTimeMs automatically continue in the background and return a job id; set background for immediate detachment, or interactive for a persistent stdio session through background_output."
+            "Run a command with the configured Windows PowerShell runtime (PowerShell 7 preferred, Windows PowerShell 5.1 fallback) in a workspace directory with timeout and output caps. The runtime prompt and result metadata identify the active dialect. Multiple shell calls from one model response may start concurrently, so emit dependent or overlapping writes in separate rounds. Ordinary commands remain in the foreground for at least 30 seconds; yieldTimeMs may only extend that window. Use background only for genuinely long work, not quick inspection. Commands that outlast the foreground window continue in the background and report completion automatically; use interactive for a persistent stdio session through background_output."
         } else {
-            "Run a POSIX `sh` command in a workspace directory with timeout and output caps; do not use PowerShell cmdlets or `$env:` syntax. Multiple shell calls from one model response may start concurrently, so emit dependent or overlapping writes in separate rounds. Commands that outlast yieldTimeMs automatically continue in the background and return a job id; set background for immediate detachment, or interactive for a persistent stdio session through background_output."
+            "Run a POSIX `sh` command in a workspace directory with timeout and output caps; do not use PowerShell cmdlets or `$env:` syntax. Multiple shell calls from one model response may start concurrently, so emit dependent or overlapping writes in separate rounds. Ordinary commands remain in the foreground for at least 30 seconds; yieldTimeMs may only extend that window. Use background only for genuinely long work, not quick inspection. Commands that outlast the foreground window continue in the background and report completion automatically; use interactive for a persistent stdio session through background_output."
         }
     }
 
@@ -486,10 +500,10 @@ impl TypedTool for ShellTool {
                 return shell_background_result(call_id, &job, &workdir, false, None);
             }
 
-            let yield_time_ms = input
-                .yield_time_ms
-                .unwrap_or(DEFAULT_FOREGROUND_YIELD_MILLISECONDS)
-                .clamp(1, MAX_FOREGROUND_YIELD_MILLISECONDS);
+            let yield_time_ms = effective_foreground_yield_milliseconds(
+                input.yield_time_ms,
+                ctx.minimum_foreground_yield,
+            );
             if let Some(chunk) = registry
                 .wait_for_output(&scope, job.job_id, Duration::from_millis(yield_time_ms))
                 .await?
@@ -577,9 +591,9 @@ fn shell_background_result(
     yield_time_ms: Option<u64>,
 ) -> anyhow::Result<ToolResult> {
     let note = if auto_detached {
-        "The command exceeded the foreground wait and is still running. Carry on with independent work; completion is delivered automatically. Use background_output only to stop it, interact with it, or wait when no independent work remains."
+        "The command exceeded the foreground wait and is still running. Carry on with independent work; completion is delivered automatically. Do not immediately call background_output merely to collect it; use that tool only to stop it, interact with it, or when progress is blocked on this still-running job and no independent work remains."
     } else {
-        "The command is running detached. Carry on with independent work; completion is delivered automatically. Use background_output only to stop it, interact with it, or wait when no independent work remains."
+        "The command is running detached. Carry on with independent work; completion is delivered automatically. Do not immediately call background_output merely to collect it; use that tool only to stop it, interact with it, or when progress is blocked on this still-running job and no independent work remains."
     };
     let value = json!({
         "jobId": job.job_id,

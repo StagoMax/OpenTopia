@@ -931,6 +931,42 @@ OPENTOPIA_SANDBOX_ERROR {"version":1,"stage":"broker","nonce":"abc123","message"
             String::from_utf8_lossy(&nested_runtime.stderr)
         );
 
+        // Node-based tools normally launch compilers, workers, or another Node
+        // process. A top-level `node --version` cannot detect a sandbox/job
+        // policy that permits the parent but rejects its descendants.
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_ok()
+        {
+            let child_probe = root.join("node-child-process-canary.cjs");
+            std::fs::write(
+                &child_probe,
+                r#"const { spawnSync } = require('node:child_process');
+const child = spawnSync(process.execPath, ['-e', 'process.stdout.write("child-ok")'], { encoding: 'utf8' });
+if (child.error) throw child.error;
+process.stdout.write(child.stdout || '');
+process.stderr.write(child.stderr || '');
+process.exit(child.status ?? 1);
+"#,
+            )
+            .expect("write Node child-process canary");
+            let nested_child = env
+                .exec(
+                    ExecRequest::shell(format!("node '{}'", quote(&child_probe))),
+                    ExecutionContext::with_timeout(Duration::from_secs(60)),
+                )
+                .await
+                .expect("dedicated-user Node child-process canary should start");
+            assert!(
+                nested_child.success
+                    && String::from_utf8_lossy(&nested_child.stdout).contains("child-ok"),
+                "Node child process failed inside the sandbox\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&nested_child.stdout),
+                String::from_utf8_lossy(&nested_child.stderr)
+            );
+        }
+
         let inside = root.join("inside.txt");
         let write_inside = env
             .exec(
@@ -944,6 +980,25 @@ OPENTOPIA_SANDBOX_ERROR {"version":1,"stage":"broker","nonce":"abc123","message"
             .expect("dedicated-user workspace write command should start");
         assert!(write_inside.success, "workspace write should succeed");
         assert!(inside.exists());
+
+        let other_root = std::env::temp_dir().join(format!("opentopia-core-other-{id}"));
+        std::fs::create_dir_all(&other_root).expect("create second workspace");
+        let other_env =
+            LocalExecutionEnvironment::with_sandbox_config(other_root.clone(), config.clone());
+        let cross_workspace = other_env
+            .exec(
+                ExecRequest::shell(format!(
+                    "$ErrorActionPreference='Stop'; Set-Content -LiteralPath '{}' -Value escaped",
+                    quote(&inside)
+                )),
+                ExecutionContext::with_timeout(Duration::from_secs(60)),
+            )
+            .await
+            .expect("cross-workspace write probe should start");
+        assert!(
+            !cross_workspace.success,
+            "dedicated identity escaped into a previously granted workspace"
+        );
 
         let write_outside = env
             .exec(
@@ -983,6 +1038,7 @@ OPENTOPIA_SANDBOX_ERROR {"version":1,"stage":"broker","nonce":"abc123","message"
         assert!(!read_only_target.exists());
 
         std::fs::remove_dir_all(root).expect("remove dedicated workspace");
+        std::fs::remove_dir_all(other_root).expect("remove second workspace");
         std::fs::remove_dir_all(outside).expect("remove host read fixture");
         let _ = std::fs::remove_dir_all(sandbox_home);
     }

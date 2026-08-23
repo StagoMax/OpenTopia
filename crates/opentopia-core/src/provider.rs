@@ -42,7 +42,9 @@ use openai::{
     validate_provider_response_protocol, validate_tool_probe_response, OpenAiProbeOutcome,
     StreamingToolCall, NATIVE_WEB_SEARCH_PRIORITY_INSTRUCTION,
 };
-pub(crate) use openai::{invalid_tool_arguments_json_details, tool_input_schema_error};
+pub(crate) use openai::{
+    invalid_tool_arguments_json_details, normalize_tool_argument_keys, tool_input_schema_error,
+};
 
 #[cfg(test)]
 use openai::{
@@ -374,6 +376,9 @@ pub struct PreparedProviderRequest {
     pub endpoint: String,
     pub body: Value,
     pub observation_body: Value,
+    /// Content-free fingerprints computed from the exact, unredacted wire
+    /// request before it crosses the provider boundary.
+    pub cache_trace: Option<crate::model::ProviderCacheTrace>,
     pub logical_request: ModelRequest,
     /// Exact function-tool contracts compiled for this provider request. The
     /// response decoder uses the same artifacts that produced the advertised
@@ -434,6 +439,7 @@ pub enum ProviderTransportEvent {
         retry_index: Option<usize>,
         retry_limit: Option<usize>,
         reason: String,
+        cache_trace: Option<crate::model::ProviderCacheTrace>,
         body: Value,
     },
     Response {
@@ -575,6 +581,7 @@ pub trait ModelProvider: Send + Sync {
             method: "MODEL".to_string(),
             endpoint: "provider://logical".to_string(),
             observation_body: redact_transport_value(&body),
+            cache_trace: crate::build_provider_cache_trace(&body, None, false),
             body,
             logical_request: request,
             tool_contracts: Vec::new(),

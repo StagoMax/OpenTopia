@@ -55,11 +55,11 @@ use crate::prompt_runtime::{
 };
 use crate::provider::{
     estimate_provider_tool_surface_tokens, invalid_tool_arguments_json_details,
-    redact_model_observation, tool_input_schema_error, IncompleteReason, ModelConversationMessage,
-    ModelConversationRole, ModelDecision, ModelProvider, ModelRequest, ModelResponse,
-    ModelStreamDelta, ModelUsage, PromptCacheBreakpointPolicy, ProviderToolCall,
-    ProviderToolCandidate, ProviderToolDisclosure, ProviderToolNamespace, ProviderToolResult,
-    ProviderTransportEvent,
+    normalize_tool_argument_keys, redact_model_observation, tool_input_schema_error,
+    IncompleteReason, ModelConversationMessage, ModelConversationRole, ModelDecision,
+    ModelProvider, ModelRequest, ModelResponse, ModelStreamDelta, ModelUsage,
+    PromptCacheBreakpointPolicy, ProviderToolCall, ProviderToolCandidate, ProviderToolDisclosure,
+    ProviderToolNamespace, ProviderToolResult, ProviderTransportEvent,
 };
 #[cfg(test)]
 use crate::provider::{MockProvider, ModelInputLedger, ModelUserInput};
@@ -2435,7 +2435,7 @@ pub fn agent_model_context_with_runtime(
     }
 }
 
-pub const BASE_AGENT_PROMPT_VERSION: &str = "2026-08-10.1";
+pub const BASE_AGENT_PROMPT_VERSION: &str = "2026-08-22.1";
 
 pub fn base_agent_prompt_hash() -> String {
     crate::model_context::content_fingerprint(base_agent_prompt().as_bytes())

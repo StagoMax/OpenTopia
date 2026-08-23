@@ -354,6 +354,7 @@ impl CodexAppServerProvider {
                             retry_index: Some(session.network_retry_count),
                             retry_limit: Some(PROVIDER_NETWORK_RETRY_LIMIT),
                             reason: detail.to_string(),
+                            cache_trace: None,
                             body: redact_transport_value(error),
                         })?;
                     } else {

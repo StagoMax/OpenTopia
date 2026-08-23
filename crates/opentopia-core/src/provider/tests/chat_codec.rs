@@ -17,6 +17,86 @@ fn portable_chat_envelope_keeps_volatile_context_after_the_user_anchor() {
 }
 
 #[test]
+fn chat_tool_history_appends_provider_state_without_reordering_runtime_observations() {
+    let call = |id: &str, name: &str| ProviderToolCall {
+        id: id.to_string(),
+        name: name.to_string(),
+        arguments: json!({ "id": id }),
+    };
+    let result = |call_id: &str, name: &str| ProviderToolResult {
+        call_id: call_id.to_string(),
+        name: name.to_string(),
+        output: format!("{name} completed"),
+        content: Vec::new(),
+        is_error: false,
+        metadata: json!({}),
+    };
+    let provider_state = |call_id: &str| {
+        json!({
+            "type": OPENAI_CHAT_ASSISTANT_STATE_TYPE,
+            "content": "",
+            "reasoning_content": format!("reason about {call_id}"),
+            "tool_call_ids": [call_id],
+        })
+    };
+
+    // Round one ends with a runtime-owned observation. On round two the model
+    // has emitted another provider-owned state. The prior encoder replayed all
+    // provider state before every runtime observation, inserting `call_new`
+    // before `runtime_old` and destroying the cached suffix.
+    let mut first = model_request();
+    first.input.tool_calls = vec![
+        call("provider_initial", "read_file"),
+        call("runtime_old", "runtime_step_reminder"),
+    ];
+    first.input.tool_results = vec![
+        result("provider_initial", "read_file"),
+        result("runtime_old", "runtime_step_reminder"),
+    ];
+    first.previous_response_items = vec![provider_state("provider_initial")];
+
+    let mut second = first.clone();
+    second
+        .input
+        .tool_calls
+        .push(call("provider_new", "apply_patch"));
+    second
+        .input
+        .tool_results
+        .push(result("provider_new", "apply_patch"));
+    second
+        .previous_response_items
+        .push(provider_state("provider_new"));
+
+    for replay_chat_reasoning in [false, true] {
+        let first_messages = openai_messages_with_reasoning(&first, replay_chat_reasoning);
+        let second_messages = openai_messages_with_reasoning(&second, replay_chat_reasoning);
+        assert_eq!(
+            second_messages[..first_messages.len()],
+            first_messages,
+            "adding provider-owned state must append, never insert into prior history"
+        );
+    }
+
+    let second_messages = openai_messages_with_reasoning(&second, true);
+    assert_eq!(
+        second_messages
+            .iter()
+            .filter_map(|message| message["tool_calls"].as_array())
+            .flat_map(|calls| calls.iter())
+            .map(|call| call["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["provider_initial", "provider_new"]
+    );
+    assert!(second_messages.iter().any(|message| {
+        message["role"] == "user"
+            && message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("runtime_old"))
+    }));
+}
+
+#[test]
 fn portable_chat_envelope_preserves_structured_cross_turn_tool_history() {
     let mut request = model_request();
     request.input.conversation = vec![

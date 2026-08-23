@@ -255,6 +255,7 @@ impl AnthropicMessagesProvider {
             method: "POST".to_string(),
             endpoint,
             observation_body: redact_transport_value(&payload),
+            cache_trace: crate::build_provider_cache_trace(&payload, None, false),
             body: payload,
             logical_request: request,
             tool_contracts: Vec::new(),
@@ -285,6 +286,7 @@ impl AnthropicMessagesProvider {
             },
             1,
             &prepared.observation_body,
+            prepared.cache_trace.as_ref(),
             on_transport,
         )
         .await?;

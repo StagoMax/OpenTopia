@@ -15,11 +15,11 @@ use windows_sys::Win32::Security::Authorization::{
 use windows_sys::Win32::Security::{
     AccessCheck, CopySid, CreateRestrictedToken, CreateWellKnownSid, DuplicateToken, GetLengthSid,
     GetTokenInformation, LogonUserW, MapGenericMask, SecurityImpersonation, SetTokenInformation,
-    TokenDefaultDacl, TokenGroups, DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE,
+    TokenDefaultDacl, TokenGroups, TokenUser, DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE,
     GENERIC_MAPPING, GROUP_SECURITY_INFORMATION, LOGON32_LOGON_INTERACTIVE,
     LOGON32_PROVIDER_DEFAULT, LUA_TOKEN, OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, PSID,
     SID_AND_ATTRIBUTES, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID,
-    TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY, WRITE_RESTRICTED,
+    TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY, TOKEN_USER, WRITE_RESTRICTED,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
@@ -179,14 +179,22 @@ impl RestrictedToken {
                 return Err(error);
             }
         };
+        let mut user_sid = match current_user_sid(base_token) {
+            Ok(sid) => sid,
+            Err(error) => {
+                unsafe { CloseHandle(base_token) };
+                return Err(error);
+            }
+        };
         let mut everyone_sid = SidBuffer::well_known(WIN_WORLD_SID)?;
-        let mut restricting_sids = [unsafe { std::mem::zeroed::<SID_AND_ATTRIBUTES>() }; 4];
+        let mut restricting_sids = [unsafe { std::mem::zeroed::<SID_AND_ATTRIBUTES>() }; 5];
         restricting_sids[0].Sid = capability_sid;
         let restricting_sid_count = if let Some(runtime_sid) = runtime_sid {
             restricting_sids[1].Sid = runtime_sid;
             restricting_sids[2].Sid = logon_sid.as_ptr();
             restricting_sids[3].Sid = everyone_sid.as_ptr();
-            4
+            restricting_sids[4].Sid = user_sid.as_ptr();
+            5
         } else {
             restricting_sids[1].Sid = logon_sid.as_ptr();
             restricting_sids[2].Sid = everyone_sid.as_ptr();
@@ -221,20 +229,20 @@ impl RestrictedToken {
         if created == 0 || restricted.is_null() {
             return Err(last_error("CreateRestrictedToken"));
         }
-        // Dedicated runtimes need the logon and world compatibility SIDs for
-        // session kernel objects and Windows pseudo devices. This means the
-        // dedicated backend is not a complete host-wide write allowlist; the
-        // per-scope SID still makes explicit protected-root deny ACEs effective.
+        // Dedicated runtimes need the account SID for the system-defined DACL
+        // used by Node/libuv named pipes. Managed filesystem roots never grant
+        // that SID directly: a stable sandbox group satisfies the normal-token
+        // check and the per-command capability SID independently satisfies the
+        // restricted-token check, preserving cross-workspace write isolation.
         if let Some(runtime_sid) = runtime_sid {
-            if let Err(error) = augment_default_dacl(
-                restricted,
-                &[
-                    capability_sid,
-                    runtime_sid,
-                    logon_sid.as_ptr(),
-                    everyone_sid.as_ptr(),
-                ],
-            ) {
+            let default_dacl_sids = [
+                capability_sid,
+                runtime_sid,
+                logon_sid.as_ptr(),
+                everyone_sid.as_ptr(),
+                user_sid.as_ptr(),
+            ];
+            if let Err(error) = set_default_dacl(restricted, &default_dacl_sids) {
                 unsafe { CloseHandle(restricted) };
                 return Err(error);
             }
@@ -253,78 +261,6 @@ impl Drop for RestrictedToken {
     fn drop(&mut self) {
         unsafe { CloseHandle(self.handle) };
     }
-}
-
-fn augment_default_dacl(token: HANDLE, sids: &[PSID]) -> Result<()> {
-    let mut needed = 0_u32;
-    unsafe { GetTokenInformation(token, TokenDefaultDacl, ptr::null_mut(), 0, &mut needed) };
-    anyhow::ensure!(
-        needed as usize >= std::mem::size_of::<TokenDefaultDaclInfo>(),
-        "GetTokenInformation(TokenDefaultDacl) returned an invalid size"
-    );
-    let mut buffer = vec![0_u8; needed as usize];
-    let queried = unsafe {
-        GetTokenInformation(
-            token,
-            TokenDefaultDacl,
-            buffer.as_mut_ptr().cast(),
-            needed,
-            &mut needed,
-        )
-    };
-    if queried == 0 {
-        return Err(last_error("GetTokenInformation(TokenDefaultDacl)"));
-    }
-    let existing = unsafe {
-        std::ptr::read_unaligned(buffer.as_ptr().cast::<TokenDefaultDaclInfo>()).default_dacl
-    };
-    let entries = sids
-        .iter()
-        .map(|sid| EXPLICIT_ACCESS_W {
-            grfAccessPermissions: GENERIC_ALL,
-            grfAccessMode: GRANT_ACCESS,
-            grfInheritance: 0,
-            Trustee: TRUSTEE_W {
-                pMultipleTrustee: ptr::null_mut(),
-                MultipleTrusteeOperation: 0,
-                TrusteeForm: TRUSTEE_IS_SID,
-                TrusteeType: TRUSTEE_IS_UNKNOWN_VALUE,
-                ptstrName: sid.cast(),
-            },
-        })
-        .collect::<Vec<_>>();
-    let mut augmented = ptr::null_mut();
-    let assembled = unsafe {
-        SetEntriesInAclW(
-            entries.len() as u32,
-            entries.as_ptr(),
-            existing,
-            &mut augmented,
-        )
-    };
-    if assembled != 0 {
-        anyhow::bail!("SetEntriesInAclW for augmented token DACL failed: {assembled}")
-    }
-    let mut info = TokenDefaultDaclInfo {
-        default_dacl: augmented,
-    };
-    let applied = unsafe {
-        SetTokenInformation(
-            token,
-            TokenDefaultDacl,
-            (&mut info as *mut TokenDefaultDaclInfo).cast(),
-            std::mem::size_of::<TokenDefaultDaclInfo>() as u32,
-        )
-    };
-    if !augmented.is_null() {
-        unsafe { windows_sys::Win32::Foundation::LocalFree(augmented.cast()) };
-    }
-    if applied == 0 {
-        return Err(last_error(
-            "SetTokenInformation(augmented TokenDefaultDacl)",
-        ));
-    }
-    Ok(())
 }
 
 fn set_default_dacl(token: HANDLE, sids: &[PSID]) -> Result<()> {
@@ -469,10 +405,33 @@ fn current_logon_sid(token: HANDLE) -> Result<SidBuffer> {
     anyhow::bail!("TokenGroups did not include a logon SID")
 }
 
+fn current_user_sid(token: HANDLE) -> Result<SidBuffer> {
+    let mut needed = 0;
+    unsafe { GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut needed) };
+    if needed < std::mem::size_of::<TOKEN_USER>() as u32 {
+        return Err(last_error("GetTokenInformation(TokenUser)"));
+    }
+    let mut buffer = vec![0_u8; needed as usize];
+    let queried = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    };
+    if queried == 0 {
+        return Err(last_error("GetTokenInformation(TokenUser)"));
+    }
+    let user = unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<TOKEN_USER>()) };
+    SidBuffer::copy_from_sid(user.User.Sid)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
-    fn dedicated_restricted_token_keeps_runtime_compatibility_sids_explicit() {
+    fn dedicated_restricted_token_replaces_default_dacl_with_scoped_sids() {
         let source = include_str!("security_token.rs");
         let function = source
             .split("impl RestrictedToken")
@@ -485,8 +444,9 @@ mod tests {
         assert!(function.contains("restricting_sids[1].Sid = runtime_sid"));
         assert!(function.contains("restricting_sids[2].Sid = logon_sid.as_ptr()"));
         assert!(function.contains("restricting_sids[3].Sid = everyone_sid.as_ptr()"));
+        assert!(function.contains("restricting_sids[4].Sid = user_sid.as_ptr()"));
         assert!(!function.contains("ensure_runtime_registry_access"));
-        assert!(function.contains("augment_default_dacl"));
-        assert!(!function.contains("current_user_sid"));
+        assert!(function.contains("set_default_dacl"));
+        assert!(function.contains("current_user_sid"));
     }
 }

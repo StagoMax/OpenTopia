@@ -58,6 +58,12 @@ pub(crate) fn insert_classified_anyhow_error_record(metadata: &mut Value, error:
     let execution_failure = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<ExecutionFailure>());
+    let io_error = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>());
+    let transient_file_conflict = io_error
+        .and_then(std::io::Error::raw_os_error)
+        .is_some_and(|code| cfg!(windows) && matches!(code, 32 | 33 | 1224));
     let (code, phase, executed, retryable) = match execution_failure.map(|failure| failure.stage) {
         Some(ExecutionStage::ResolveRuntime) => {
             ("execution_runtime_unavailable", "preflight", false, true)
@@ -77,22 +83,27 @@ pub(crate) fn insert_classified_anyhow_error_record(metadata: &mut Value, error:
         Some(ExecutionStage::CollectOutput) => {
             ("output_collection_failed", "execution", true, false)
         }
+        None if transient_file_conflict => ("filesystem_temporarily_busy", "execution", true, true),
         None => ("tool_execution_failed", "execution", true, false),
     };
     insert_anyhow_error_record(metadata, code, phase, executed, retryable, error);
-    let Some(failure) = execution_failure else {
-        return;
-    };
     let Some(object) = metadata.as_object_mut() else {
         return;
     };
-    object.insert("executionStage".to_string(), json!(failure.stage));
-    if let Some(os_error) = failure.os_error {
+    let os_error = execution_failure
+        .and_then(|failure| failure.os_error)
+        .or_else(|| io_error.and_then(std::io::Error::raw_os_error));
+    if let Some(failure) = execution_failure {
+        object.insert("executionStage".to_string(), json!(failure.stage));
+    }
+    if let Some(os_error) = os_error {
         object.insert("osError".to_string(), json!(os_error));
     }
     if let Some(record) = object.get_mut("errorRecord").and_then(Value::as_object_mut) {
-        record.insert("executionStage".to_string(), json!(failure.stage));
-        if let Some(os_error) = failure.os_error {
+        if let Some(failure) = execution_failure {
+            record.insert("executionStage".to_string(), json!(failure.stage));
+        }
+        if let Some(os_error) = os_error {
             record.insert("osError".to_string(), json!(os_error));
         }
     }
@@ -142,4 +153,29 @@ pub(crate) fn ensure_tool_error_record(result: &mut ToolResult) {
         retryable,
         &message,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::insert_classified_anyhow_error_record;
+    use serde_json::json;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_mapping_conflict_is_structured_and_retryable() {
+        let error = anyhow::Error::from(std::io::Error::from_raw_os_error(1224));
+        let mut metadata = json!({});
+
+        insert_classified_anyhow_error_record(&mut metadata, &error);
+
+        assert_eq!(
+            metadata.pointer("/errorRecord/code"),
+            Some(&json!("filesystem_temporarily_busy"))
+        );
+        assert_eq!(
+            metadata.pointer("/errorRecord/retryable"),
+            Some(&json!(true))
+        );
+        assert_eq!(metadata.get("osError"), Some(&json!(1224)));
+    }
 }

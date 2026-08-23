@@ -59,6 +59,7 @@ pub mod process_quota;
 mod process_supervisor;
 pub mod prompt_runtime;
 pub mod provider;
+mod provider_cache_trace;
 pub mod round_compaction;
 pub mod sandbox;
 pub mod scm_connector;
@@ -84,6 +85,7 @@ pub mod workflow_automation;
 pub mod workflow_interrupt;
 pub mod workflow_state;
 pub mod workspace;
+mod workspace_execution_capsule;
 
 pub use agent::{
     agent_model_context_with_runtime, default_agent_model_context, AgentContinuation,
@@ -356,6 +358,7 @@ pub use provider::{
     ProviderToolCandidate, ProviderToolDisclosure, ProviderToolNamespace, ProviderToolResult,
     ProviderTransportEvent,
 };
+pub(crate) use provider_cache_trace::build_provider_cache_trace;
 pub use round_compaction::{
     context_compact_threshold_percent, RoundContextCompactionRequest, RoundContextCompactionResult,
     RoundContextCompactor,

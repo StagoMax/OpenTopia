@@ -533,8 +533,9 @@ async fn openai_provider_reconnects_after_initial_network_failure() {
             retry_kind: ProviderRetryKind::Network,
             retry_index: Some(1),
             retry_limit: Some(PROVIDER_NETWORK_RETRY_LIMIT),
+            cache_trace: Some(cache_trace),
             ..
-        }
+        } if !cache_trace.segments.is_empty()
     )));
 }
 
@@ -602,6 +603,158 @@ async fn openai_provider_honors_rate_limit_retry_after() {
             reason,
             ..
         } if reason.contains("rate limited")
+    )));
+}
+
+#[tokio::test]
+async fn chat_provider_retries_sse_rate_limit_without_changing_transport() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for attempt in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            requests.push(read_http_request(&mut socket).await);
+            let response = if attempt == 0 {
+                concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Type: text/event-stream\r\n",
+                    "Connection: close\r\n\r\n",
+                    "data: {\"error\":{\"message\":\"Concurrency limit exceeded for account, please retry later\",\"type\":\"rate_limit_error\",\"retry_after\":0}}\n\n"
+                )
+            } else {
+                concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Type: text/event-stream\r\n",
+                    "Connection: close\r\n\r\n",
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_lookup\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"query\\\":\\\"retry\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+            };
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        }
+        requests
+    });
+
+    let mut provider =
+        OpenAiCompatibleProvider::new(format!("http://{address}/v1"), "test-key", "test-model");
+    provider.tool_protocol.streaming_tools = ProviderFeatureSupport::Supported;
+    let mut transport = Vec::new();
+    let response = provider
+        .stream_prepared(
+            provider.prepare(Uuid::new_v4(), tool_request()).unwrap(),
+            &mut |_| Ok(()),
+            &mut |event| {
+                transport.push(event);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    let requests = server.await.unwrap();
+
+    assert_eq!(response.tool_calls[0].name, "lookup");
+    assert_eq!(response.tool_calls[0].arguments, json!({"query": "retry"}));
+    assert_eq!(requests.len(), 2);
+    assert!(requests
+        .iter()
+        .all(|request| request.contains(r#""stream":true"#)));
+    assert!(transport.iter().any(|event| matches!(
+        event,
+        ProviderTransportEvent::Retry {
+            attempt: 2,
+            retry_kind: ProviderRetryKind::Network,
+            retry_index: Some(1),
+            retry_limit: Some(retry_limit),
+            reason,
+            ..
+        } if *retry_limit == super::transport::PROVIDER_RATE_LIMIT_RETRY_LIMIT
+            && reason.contains("rate limited the streamed response")
+    )));
+    assert!(!transport.iter().any(|event| matches!(
+        event,
+        ProviderTransportEvent::Retry {
+            retry_kind: ProviderRetryKind::StateRecovery,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn responses_provider_retries_sse_rate_limit_without_changing_transport() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for attempt in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            requests.push(read_http_request(&mut socket).await);
+            let response = if attempt == 0 {
+                concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Type: text/event-stream\r\n",
+                    "Connection: close\r\n\r\n",
+                    "data: {\"type\":\"error\",\"error\":{\"message\":\"too many concurrent requests\",\"type\":\"rate_limit_error\",\"retry_after_ms\":0}}\n\n"
+                )
+            } else {
+                concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Type: text/event-stream\r\n",
+                    "Connection: close\r\n\r\n",
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_retry\"}}\n\n",
+                    "data: {\"type\":\"response.output_item.added\",\"response_id\":\"resp_retry\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_lookup\",\"name\":\"lookup\",\"arguments\":\"\"}}\n\n",
+                    "data: {\"type\":\"response.output_item.done\",\"response_id\":\"resp_retry\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_lookup\",\"name\":\"lookup\",\"arguments\":\"{\\\"query\\\":\\\"retry\\\"}\"}}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_retry\",\"output\":[{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_lookup\",\"name\":\"lookup\",\"arguments\":\"{\\\"query\\\":\\\"retry\\\"}\"}]}}\n\n",
+                    "data: [DONE]\n\n"
+                )
+            };
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        }
+        requests
+    });
+
+    let mut provider =
+        OpenAiResponsesProvider::new(format!("http://{address}/v1"), "test-key", "test-model");
+    provider.tool_protocol.streaming_tools = ProviderFeatureSupport::Supported;
+    let mut transport = Vec::new();
+    let response = provider
+        .stream_prepared(
+            provider.prepare(Uuid::new_v4(), tool_request()).unwrap(),
+            &mut |_| Ok(()),
+            &mut |event| {
+                transport.push(event);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    let requests = server.await.unwrap();
+
+    assert_eq!(response.response_id.as_deref(), Some("resp_retry"));
+    assert_eq!(response.tool_calls[0].name, "lookup");
+    assert_eq!(response.tool_calls[0].arguments, json!({"query": "retry"}));
+    assert_eq!(requests.len(), 2);
+    assert!(requests
+        .iter()
+        .all(|request| request.contains(r#""stream":true"#)));
+    assert!(transport.iter().any(|event| matches!(
+        event,
+        ProviderTransportEvent::Retry {
+            attempt: 2,
+            retry_kind: ProviderRetryKind::Network,
+            retry_index: Some(1),
+            retry_limit: Some(retry_limit),
+            ..
+        } if *retry_limit == super::transport::PROVIDER_RATE_LIMIT_RETRY_LIMIT
+    )));
+    assert!(!transport.iter().any(|event| matches!(
+        event,
+        ProviderTransportEvent::Retry {
+            retry_kind: ProviderRetryKind::StateRecovery,
+            ..
+        }
     )));
 }
 
@@ -808,8 +961,9 @@ async fn chat_provider_recovers_invalid_streamed_tool_json_once_without_streamin
             retry_kind: ProviderRetryKind::StateRecovery,
             retry_index: Some(1),
             retry_limit: Some(1),
+            cache_trace: Some(cache_trace),
             ..
-        }
+        } if !cache_trace.segments.is_empty()
     )));
 }
 

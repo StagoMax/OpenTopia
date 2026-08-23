@@ -1,25 +1,15 @@
-use super::{
-    current_settings, ensure_thread, load_bound_agent_context, publish_payload, truncate_chars,
-    ApiError, AppState, DeleteResponse,
-};
+use super::{current_settings, ensure_thread, publish_payload, ApiError, AppState, DeleteResponse};
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use opentopia_core::{
-    configured_provider_from_settings, AgentEventPayload, AppSettings, CanonicalModelRequest,
-    CompiledModelContext, ContextAssembler, ContextAssemblyInput, ContextCacheScope,
-    ContextItemKind, ContextRole, ContextSensitivity, DefaultContextAssembler, ExperienceMode,
-    ExperienceSurfaceProfile, GoalSnapshot, GoalStatus, Message, ModelContextItem, ModelGateway,
-    PromptCacheBreakpointPolicy, ProviderModelGateway, ProviderSettings, ProviderTransportKind,
-    SessionStore, ThreadModelSelection,
+    AgentEventPayload, AppSettings, ExperienceMode, ExperienceSurfaceProfile, GoalSnapshot,
+    GoalStatus, Message, ProviderSettings, SessionStore, ThreadModelSelection,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::path::{Path as FsPath, PathBuf};
-use std::time::Duration;
-use tokio::time::timeout;
 use uuid::Uuid;
 
 pub(super) fn router() -> Router<AppState> {
@@ -125,24 +115,9 @@ async fn generate_thread_title(
         }));
     }
 
-    let settings = current_settings(&state);
-    ensure_experience_mode_enabled(&settings, current.experience_mode)?;
-    if let (Some(instance), _) = load_bound_agent_context(&state, &current)? {
-        let provider = provider_settings_for_thread(&settings, current.model_selection.as_ref());
-        if !instance
-            .execution_context
-            .model_policy
-            .allows(&provider.id, &provider.model)
-        {
-            return Err(ApiError::forbidden(format!(
-                "Agent template {}@{} does not allow model {}:{}",
-                instance.template_id, instance.template_version, provider.id, provider.model
-            )));
-        }
-    }
-
-    let title =
-        summarize_thread_title(&state, &request.prompt, current.model_selection.as_ref()).await?;
+    ensure_experience_mode_enabled(&current_settings(&state), current.experience_mode)?;
+    let title = local_thread_title(&request.prompt)
+        .ok_or_else(|| ApiError::bad_request("thread title prompt cannot be empty"))?;
     let latest = state
         .store
         .get_thread(thread_id)?
@@ -164,99 +139,24 @@ async fn generate_thread_title(
     }))
 }
 
-async fn summarize_thread_title(
-    state: &AppState,
-    prompt: &str,
-    model_selection: Option<&ThreadModelSelection>,
-) -> Result<String, ApiError> {
-    const TITLE_PROMPT_LIMIT: usize = 12_000;
+pub(super) const MAX_THREAD_TITLE_CHARS: usize = 100;
 
-    let prompt = prompt.trim();
-    if prompt.is_empty() {
-        return Err(ApiError::bad_request("thread title prompt cannot be empty"));
+pub(super) fn local_thread_title(prompt: &str) -> Option<String> {
+    let title = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.is_empty() {
+        return None;
     }
-
-    let settings = current_settings(state);
-    let mut provider_settings = provider_settings_for_thread(&settings, model_selection);
-    if provider_settings.effective_transport() == ProviderTransportKind::Mock {
-        return Err(ApiError::bad_request(
-            "thread title generation requires a configured model provider",
-        ));
+    let chars = title.chars().collect::<Vec<_>>();
+    if chars.len() <= MAX_THREAD_TITLE_CHARS {
+        return Some(title);
     }
-    provider_settings.temperature = provider_settings
-        .temperature
-        .map(|temperature| temperature.min(0.2));
-    provider_settings.max_output_tokens =
-        Some(provider_settings.max_output_tokens.unwrap_or(64).min(64));
-    // The title prompt is too short to justify an explicit cache write. Keep
-    // this one-shot path out of the append-only user-anchor policy.
-    provider_settings.prompt_cache_policy = None;
-    let provider = configured_provider_from_settings(&provider_settings).ok_or_else(|| {
-        ApiError::bad_request(format!(
-            "provider '{}' has no configured API key",
-            provider_settings.id
-        ))
-    })?;
-    let system_prompt = format!(
-            "Create a concise sidebar title for the user's first message. Use the same language as the user and preserve specific product, file, and error names. Return only the title: no quotes, Markdown, label, or trailing punctuation. The title must contain at most {MAX_THREAD_TITLE_CHARS} Unicode characters."
-        );
-    let request = assemble_one_shot_model_request(
-        "opentopia:thread_title",
-        &system_prompt,
-        truncate_chars(prompt, TITLE_PROMPT_LIMIT),
-        None,
-    )
-    .map_err(|error| ApiError::internal(format!("title request assembly failed: {error}")))?;
-    let gateway = ProviderModelGateway::from_provider(provider);
-    let prepared = gateway.prepare(Uuid::new_v4(), request).map_err(|error| {
-        ApiError::bad_gateway(format!("title request encoding failed: {error}"))
-    })?;
-    let response = timeout(
-        Duration::from_secs(45),
-        gateway.stream_prepared(prepared, &mut |_| Ok(()), &mut |_| Ok(()), &mut |_| Ok(())),
-    )
-    .await
-    .map_err(|_| ApiError::gateway_timeout("thread title generation timed out"))?
-    .map_err(|error| ApiError::bad_gateway(format!("thread title generation failed: {error}")))?;
-    normalize_generated_thread_title(&response.text)
-        .ok_or_else(|| ApiError::bad_gateway("thread title provider returned an empty title"))
+    let mut shortened = chars
+        .into_iter()
+        .take(MAX_THREAD_TITLE_CHARS - 1)
+        .collect::<String>();
+    shortened.push('…');
+    Some(shortened)
 }
-
-pub(super) fn assemble_one_shot_model_request(
-    source: &str,
-    system_prompt: &str,
-    user_message: String,
-    final_output_json_schema: Option<Value>,
-) -> anyhow::Result<CanonicalModelRequest> {
-    let context = CompiledModelContext {
-        items: vec![ModelContextItem::text(
-            ContextItemKind::BaseInstructions,
-            ContextRole::System,
-            source,
-            system_prompt,
-            ContextCacheScope::Stable,
-            ContextSensitivity::Public,
-        )],
-        prompt_cache_key: None,
-    };
-    DefaultContextAssembler.compile(ContextAssemblyInput {
-        model_context: &context,
-        context_summary: None,
-        conversation: Vec::new(),
-        user_message,
-        user_content: Vec::new(),
-        tool_candidates: Vec::new(),
-        previous_tool_calls: Vec::new(),
-        tool_results: Vec::new(),
-        previous_response_items: Vec::new(),
-        previous_response_id: None,
-        branch_developer_instructions: None,
-        prompt_cache_breakpoint_policy: PromptCacheBreakpointPolicy::StableOnly,
-        final_output_json_schema,
-    })
-}
-
-pub(super) const MAX_THREAD_TITLE_CHARS: usize = 50;
 
 pub(super) fn provider_settings_for_thread(
     settings: &AppSettings,
@@ -273,45 +173,6 @@ pub(super) fn provider_settings_for_thread(
         ),
         None => connection.clone(),
     }
-}
-
-pub(super) fn normalize_generated_thread_title(response: &str) -> Option<String> {
-    response.lines().find_map(|line| {
-        let mut title = line.trim();
-        if title.is_empty() || title == "```" {
-            return None;
-        }
-        title = title.trim_start_matches(['#', '-', '*', ' ']);
-        for prefix in ["Title:", "Title：", "标题:", "标题："] {
-            if let Some(value) = title.strip_prefix(prefix) {
-                title = value.trim();
-                break;
-            }
-        }
-        title = title
-            .trim_matches('`')
-            .trim_matches('*')
-            .trim_matches('"')
-            .trim_matches('\'')
-            .trim_matches('“')
-            .trim_matches('”')
-            .trim_matches('「')
-            .trim_matches('」')
-            .trim();
-        if title.is_empty() {
-            return None;
-        }
-        let chars = title.chars().collect::<Vec<_>>();
-        if chars.len() <= MAX_THREAD_TITLE_CHARS {
-            return Some(title.to_string());
-        }
-        let mut shortened = chars
-            .into_iter()
-            .take(MAX_THREAD_TITLE_CHARS - 1)
-            .collect::<String>();
-        shortened.push('…');
-        Some(shortened)
-    })
 }
 
 async fn update_thread(

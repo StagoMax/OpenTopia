@@ -249,6 +249,17 @@ pub struct ExecutionRequirements {
     pub network: Option<NetworkPolicy>,
 }
 
+/// Host-provided capabilities that must be projected into an execution.
+///
+/// Capabilities are intentionally separate from [`RuntimeRequirements`]. A
+/// runtime describes the executable being launched, while a capability
+/// describes workspace-scoped tools and policy that descendants of that
+/// executable also need (for example Git policy inside PowerShell).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionCapability {
+    WorkspaceShell,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutionSpec {
     pub program: String,
@@ -262,6 +273,7 @@ pub struct ExecutionSpec {
     pub env: HashMap<OsString, OsString>,
     pub runtime: RuntimeRequirements,
     pub requirements: ExecutionRequirements,
+    pub capabilities: Vec<ExecutionCapability>,
 }
 
 impl ExecutionSpec {
@@ -277,6 +289,7 @@ impl ExecutionSpec {
             env: HashMap::new(),
             runtime: RuntimeRequirements::default(),
             requirements: ExecutionRequirements::default(),
+            capabilities: Vec::new(),
         }
     }
 
@@ -292,8 +305,12 @@ impl ExecutionSpec {
                 .arg("-Command")
                 .arg(powershell_wrapper(&command))
                 .runtime("powershell", runtime.runtime_read_roots())
+                .capability(ExecutionCapability::WorkspaceShell)
         } else {
-            Self::new("sh").arg("-lc").arg(command)
+            Self::new("sh")
+                .arg("-lc")
+                .arg(command)
+                .capability(ExecutionCapability::WorkspaceShell)
         }
     }
 
@@ -372,6 +389,17 @@ impl ExecutionSpec {
     pub fn requirements(mut self, requirements: ExecutionRequirements) -> Self {
         self.requirements = requirements;
         self
+    }
+
+    pub fn capability(mut self, capability: ExecutionCapability) -> Self {
+        if !self.capabilities.contains(&capability) {
+            self.capabilities.push(capability);
+        }
+        self
+    }
+
+    pub fn requires_capability(&self, capability: ExecutionCapability) -> bool {
+        self.capabilities.contains(&capability)
     }
 }
 

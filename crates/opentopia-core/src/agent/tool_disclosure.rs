@@ -1,13 +1,13 @@
 use super::{
     bundle_is_visible, calibrated_input_estimate, estimate_provider_tool_surface_tokens,
-    external_namespace, json, mcp_tool_declares_image_inspection, redact_model_observation,
-    tool_bundle, AgentCore, AgentEventPayload, Arc, AtomicBool, AtomicOrdering, BTreeMap,
-    CancellationToken, CanonicalModelRequest, CollaborationMode, CompiledModelContext,
-    ContextAssemblyInput, HashSet, ModelCallPurpose, ModelContentPart, ModelConversationMessage,
-    ModelGatewayMetricEvent, ModelResponse, ModelStreamDelta, MultiAgentMode,
-    PromptCacheBreakpointPolicy, ProviderFeatureSupport, ProviderToolCall, ProviderToolCandidate,
-    ProviderToolDisclosure, ProviderToolNamespace, ProviderToolResult, ProviderTransportEvent,
-    ToolClass, ToolExposurePolicy, ToolSource, TurnEvents, Uuid, Value,
+    external_namespace, json, mcp_tool_declares_image_inspection, normalize_tool_argument_keys,
+    redact_model_observation, tool_bundle, AgentCore, AgentEventPayload, Arc, AtomicBool,
+    AtomicOrdering, BTreeMap, CancellationToken, CanonicalModelRequest, CollaborationMode,
+    CompiledModelContext, ContextAssemblyInput, HashSet, ModelCallPurpose, ModelContentPart,
+    ModelConversationMessage, ModelGatewayMetricEvent, ModelResponse, ModelStreamDelta,
+    MultiAgentMode, PromptCacheBreakpointPolicy, ProviderFeatureSupport, ProviderToolCall,
+    ProviderToolCandidate, ProviderToolDisclosure, ProviderToolNamespace, ProviderToolResult,
+    ProviderTransportEvent, ToolClass, ToolExposurePolicy, ToolSource, TurnEvents, Uuid, Value,
     AUTOMATIC_TOOL_DISCLOSURE_COUNT_THRESHOLD, AUTOMATIC_TOOL_DISCLOSURE_TOKEN_THRESHOLD,
     DEFAULT_EAGER_OFFICE_TOOLS, MAX_TOOL_SEARCH_RESULTS, TOOL_SEARCH_NAME,
 };
@@ -53,6 +53,12 @@ impl AgentCore {
         cancellation: Option<&CancellationToken>,
     ) -> anyhow::Result<ModelResponse> {
         let request_id = Uuid::new_v4();
+        let tool_input_schemas = request
+            .logical()
+            .tool_candidates
+            .iter()
+            .map(|candidate| (candidate.name.clone(), candidate.input_schema.clone()))
+            .collect::<BTreeMap<_, _>>();
         let input_breakdown = request.logical().token_estimate_breakdown();
         let local_input_estimate = calibrated_input_estimate(events, input_breakdown.total);
         let materialized_context = request.materialized_context().clone();
@@ -83,6 +89,7 @@ impl AgentCore {
             adapter: prepared.adapter.clone(),
             method: prepared.method.clone(),
             endpoint: prepared.endpoint.clone(),
+            cache_trace: prepared.cache_trace.clone(),
             body: prepared.observation_body.clone(),
         });
         let live_event_sender = events.sender.clone();
@@ -96,6 +103,7 @@ impl AgentCore {
                     retry_index,
                     retry_limit,
                     reason,
+                    cache_trace,
                     body,
                 } => {
                     if reason.contains("stored response cursor unavailable") {
@@ -113,6 +121,7 @@ impl AgentCore {
                         retry_index,
                         retry_limit,
                         reason,
+                        cache_trace,
                         body,
                     });
                 }
@@ -233,7 +242,33 @@ impl AgentCore {
                 input_breakdown: Some(input_breakdown),
             });
         }
-        response
+        let mut response = response?;
+        let mut normalized_keys = Vec::new();
+        for call in &mut response.tool_calls {
+            let Some(schema) = tool_input_schemas.get(&call.name) else {
+                continue;
+            };
+            normalized_keys.extend(
+                normalize_tool_argument_keys(schema, &mut call.arguments)
+                    .into_iter()
+                    .map(|normalization| {
+                        format!(
+                            "{}:{} ({}→{})",
+                            call.name, normalization.path, normalization.from, normalization.to
+                        )
+                    }),
+            );
+        }
+        if !normalized_keys.is_empty() {
+            events.push(AgentEventPayload::ContextWarning {
+                stage: "tool_argument_key_normalization".to_string(),
+                message: format!(
+                    "Normalized tool argument key spelling to the advertised schema: {}",
+                    normalized_keys.join(", ")
+                ),
+            });
+        }
+        Ok(response)
     }
 
     pub(super) fn eligible_provider_tool_candidates(&self) -> Vec<ProviderToolCandidate> {
@@ -453,6 +488,45 @@ impl AgentCore {
             }),
         ));
         exposed
+    }
+
+    /// Reconciles a checkpoint's disclosure state with the currently executable
+    /// catalog. Previously revealed tools remain revealed, but their contracts
+    /// are always replaced with the current definitions.
+    pub(super) fn refresh_resumed_tool_candidates(
+        &self,
+        saved: &[ProviderToolCandidate],
+    ) -> Vec<ProviderToolCandidate> {
+        let baseline = self.provider_tool_candidates();
+        let baseline_by_name = baseline
+            .iter()
+            .cloned()
+            .map(|candidate| (candidate.name.clone(), candidate))
+            .collect::<BTreeMap<_, _>>();
+        let eligible_by_name = self
+            .eligible_provider_tool_candidates()
+            .into_iter()
+            .map(|candidate| (candidate.name.clone(), candidate))
+            .collect::<BTreeMap<_, _>>();
+        let mut refreshed = Vec::new();
+        let mut included = HashSet::new();
+
+        for candidate in saved {
+            let current = baseline_by_name
+                .get(&candidate.name)
+                .or_else(|| eligible_by_name.get(&candidate.name));
+            if let Some(current) = current {
+                if included.insert(current.name.clone()) {
+                    refreshed.push(current.clone());
+                }
+            }
+        }
+        for candidate in baseline {
+            if included.insert(candidate.name.clone()) {
+                refreshed.push(candidate);
+            }
+        }
+        refreshed
     }
 
     pub(super) fn search_deferred_tools(

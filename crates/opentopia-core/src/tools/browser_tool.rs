@@ -1,8 +1,8 @@
 use super::{
-    background_scope, decode_typed_tool_input, derived_tool_schema, enforce_policy_decision,
-    required_typed_string, Tool, ToolExecutionPolicy, ToolInvocationContext, TypedTool,
-    DEFAULT_BACKGROUND_TIMEOUT_SECONDS, DEFAULT_FOREGROUND_YIELD_MILLISECONDS,
-    MAX_BACKGROUND_TIMEOUT_SECONDS, MAX_FOREGROUND_YIELD_MILLISECONDS,
+    background_scope, decode_typed_tool_input, derived_tool_schema,
+    effective_foreground_yield_milliseconds, enforce_policy_decision, required_typed_string, Tool,
+    ToolExecutionPolicy, ToolInvocationContext, TypedTool, DEFAULT_BACKGROUND_TIMEOUT_SECONDS,
+    MAX_BACKGROUND_TIMEOUT_SECONDS,
 };
 use crate::browser::{
     BrowserAction, BrowserActionReceipt, BrowserContent, BrowserDownloadRequest,
@@ -151,7 +151,7 @@ pub(super) enum BrowserInput {
         #[schemars(range(min = 1, max = 21600000))]
         timeout_ms: Option<u64>,
         #[serde(default)]
-        #[schemars(range(min = 1, max = 120000))]
+        #[schemars(range(min = 30000, max = 120000))]
         yield_time_ms: Option<u64>,
         #[serde(default)]
         expected_filename: Option<String>,
@@ -589,10 +589,10 @@ impl TypedTool for BrowserTool {
                                 .context("failed to serialize browser download result")
                         },
                     )?;
-                    let yield_time_ms = input
-                        .yield_time_ms
-                        .unwrap_or(DEFAULT_FOREGROUND_YIELD_MILLISECONDS)
-                        .clamp(1, MAX_FOREGROUND_YIELD_MILLISECONDS);
+                    let yield_time_ms = effective_foreground_yield_milliseconds(
+                        input.yield_time_ms,
+                        ctx.minimum_foreground_yield,
+                    );
                     if let Some(chunk) = registry
                         .wait_for_output(&scope, job.job_id, Duration::from_millis(yield_time_ms))
                         .await?
@@ -617,7 +617,7 @@ impl TypedTool for BrowserTool {
                             "startedAt": job.started_at,
                             "autoDetached": true,
                             "yieldTimeMs": yield_time_ms,
-                            "note": "The download is still running. Carry on with independent work; completion is delivered automatically. Use background_output only to stop it or to wait when no independent work remains."
+                            "note": "The download is still running. Carry on with independent work; completion is delivered automatically. Do not immediately call background_output merely to collect it; use that tool only to stop it or when progress is blocked on this still-running download and no independent work remains."
                         });
                         return Ok(ToolResult {
                             call_id,

@@ -1,13 +1,10 @@
-use super::transport::{
-    next_stream_chunk, send_provider_request_with_network_retries, stream_idle_timeout, SseDecoder,
-};
+use super::transport::{next_stream_chunk, stream_idle_timeout, SseDecoder};
 use super::{
-    apply_provider_auth, ensure_visual_input_supported, provider_api_key,
-    provider_rejected_image_input, redact_transport_value, rejected_chat_profile_capability,
-    rejected_responses_profile_capability, request_image_part_count, require_function_tools,
-    truncate_observation_text, ModelFinishReason, ModelProvider, ModelRequest, ModelResponse,
-    ModelStreamCallback, ModelStreamDelta, PreparedProviderRequest, ProviderAdapterError,
-    ProviderEnv, ProviderResponseCommitMode, ProviderToolCandidate, ProviderTransportCallback,
+    apply_provider_auth, ensure_visual_input_supported, provider_api_key, redact_transport_value,
+    rejected_responses_profile_capability, require_function_tools, truncate_observation_text,
+    ModelFinishReason, ModelProvider, ModelRequest, ModelResponse, ModelStreamCallback,
+    ModelStreamDelta, PreparedProviderRequest, ProviderAdapterError, ProviderEnv,
+    ProviderResponseCommitMode, ProviderToolCandidate, ProviderTransportCallback,
     ProviderTransportEvent,
 };
 use crate::model::ProviderRetryKind;
@@ -30,6 +27,7 @@ use uuid::Uuid;
 
 mod codec;
 mod decode;
+mod execute;
 mod probe;
 mod reasoning;
 mod recovery;
@@ -55,7 +53,9 @@ pub(in crate::provider) use decode::{
     extract_provider_tool_calls, extract_response_text, parse_model_response_body,
     INVALID_TOOL_ARGUMENTS_JSON_KEY,
 };
-pub(crate) use decode::{invalid_tool_arguments_json_details, tool_input_schema_error};
+pub(crate) use decode::{
+    invalid_tool_arguments_json_details, normalize_tool_argument_keys, tool_input_schema_error,
+};
 pub(in crate::provider) use decode::{
     model_response_observation, parse_model_usage, parse_required_tool_arguments,
     tool_call_protocol_error_observation,
@@ -64,9 +64,6 @@ pub(in crate::provider) use probe::OpenAiProbeClient;
 use reasoning::{
     apply_reasoning_protocol, default_reasoning_protocol, reasoning_probe_candidates,
     reasoning_protocol_label, AppliedReasoning,
-};
-use recovery::{
-    recover_streamed_tool_call_non_streaming, OpenAiRecoveryProtocol, RecoveredToolResponse,
 };
 pub(in crate::provider) use stream::{
     chat_finish_reason, OpenAiStreamAccumulator, ResponsesStreamAccumulator, StreamingToolCall,
@@ -612,6 +609,19 @@ impl OpenAiCompatibleProvider {
             };
         responses_streaming_tools_payload["stream"] = json!(true);
         responses_streaming_tools_payload["parallel_tool_calls"] = json!(true);
+        let mut developer_payload = json!({
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": "System compatibility probe."},
+                {"role": "developer", "content": "Developer compatibility probe."},
+                {"role": "user", "content": "Reply with OK."}
+            ],
+            "max_tokens": 16,
+            "stream": false
+        });
+        self.apply_probe_reasoning_options(chat_reasoning_protocol, &mut developer_payload);
+        let probe_developer_in_main_batch =
+            chat_function_tools.support == ProviderFeatureSupport::Supported;
 
         let (
             mut chat,
@@ -624,9 +634,40 @@ impl OpenAiCompatibleProvider {
             responses_json_schema_output,
             responses_custom_tools,
             responses_apply_patch,
+            early_developer,
         ) = tokio::join!(
-            self.probe_openai_endpoint(&probe_client, "/chat/completions", chat_payload, false),
-            self.probe_openai_endpoint(&probe_client, "/responses", responses_payload, false),
+            async {
+                if chat_function_tools.support == ProviderFeatureSupport::Supported {
+                    OpenAiProbeOutcome {
+                        support: ProviderFeatureSupport::Supported,
+                        detail: None,
+                    }
+                } else {
+                    self.probe_openai_endpoint(
+                        &probe_client,
+                        "/chat/completions",
+                        chat_payload,
+                        false,
+                    )
+                    .await
+                }
+            },
+            async {
+                if responses_function_tools.support == ProviderFeatureSupport::Supported {
+                    OpenAiProbeOutcome {
+                        support: ProviderFeatureSupport::Supported,
+                        detail: None,
+                    }
+                } else {
+                    self.probe_openai_endpoint(
+                        &probe_client,
+                        "/responses",
+                        responses_payload,
+                        false,
+                    )
+                    .await
+                }
+            },
             async {
                 if chat_function_tools.support == ProviderFeatureSupport::Supported {
                     self.probe_openai_function_tool_roundtrip(
@@ -765,6 +806,22 @@ impl OpenAiCompatibleProvider {
                     }
                 }
             },
+            async {
+                if probe_developer_in_main_batch {
+                    self.probe_openai_endpoint(
+                        &probe_client,
+                        "/chat/completions",
+                        developer_payload.clone(),
+                        true,
+                    )
+                    .await
+                } else {
+                    OpenAiProbeOutcome {
+                        support: ProviderFeatureSupport::Unknown,
+                        detail: None,
+                    }
+                }
+            },
         );
         if chat_function_tools.support == ProviderFeatureSupport::Supported {
             chat.support = ProviderFeatureSupport::Supported;
@@ -778,18 +835,9 @@ impl OpenAiCompatibleProvider {
         let chat_parallel_tool_calls = chat_streaming_tools.clone();
         let responses_parallel_tool_calls = responses_streaming_tools.clone();
 
-        let developer = if chat.support == ProviderFeatureSupport::Supported {
-            let mut developer_payload = json!({
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": "System compatibility probe."},
-                    {"role": "developer", "content": "Developer compatibility probe."},
-                    {"role": "user", "content": "Reply with OK."}
-                ],
-                "max_tokens": 16,
-                "stream": false
-            });
-            self.apply_probe_reasoning_options(chat_reasoning_protocol, &mut developer_payload);
+        let developer = if probe_developer_in_main_batch {
+            early_developer
+        } else if chat.support == ProviderFeatureSupport::Supported {
             self.probe_openai_endpoint(&probe_client, "/chat/completions", developer_payload, true)
                 .await
         } else {
@@ -1092,75 +1140,94 @@ impl OpenAiCompatibleProvider {
         payload: Value,
         expected_token: &str,
     ) -> OpenAiProbeOutcome {
-        let response = match probe_client.send(path, &payload).await {
-            Ok(response) => response,
-            Err(error) => {
-                return OpenAiProbeOutcome {
-                    support: ProviderFeatureSupport::Unknown,
-                    detail: Some(error),
+        let mut embedded_rate_limit_retry = 0;
+        loop {
+            let response = match probe_client.send(path, &payload).await {
+                Ok(response) => response,
+                Err(error) => {
+                    return OpenAiProbeOutcome {
+                        support: ProviderFeatureSupport::Unknown,
+                        detail: Some(error),
+                    }
                 }
-            }
-        };
-        let (response, _probe_permit) = response.into_parts();
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return OpenAiProbeOutcome {
-                support: if matches!(status.as_u16(), 400 | 404 | 405 | 422 | 501) {
-                    ProviderFeatureSupport::Unsupported
-                } else {
-                    ProviderFeatureSupport::Unknown
-                },
-                detail: Some(format!(
-                    "HTTP {}: {}",
-                    status.as_u16(),
-                    truncate_observation_text(body.trim())
-                )),
             };
-        }
-        let streamed = payload
-            .get("stream")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let candidate = compatibility_probe_candidate(expected_token);
-        let candidates = [candidate];
-        let mut ignore_delta = |_| Ok(());
-        let decoded = tokio::time::timeout(Duration::from_secs(20), async {
-            if path == "/responses" {
-                decode_openai_responses_response(
-                    response,
-                    streamed,
-                    &candidates,
-                    &mut ignore_delta,
-                    false,
-                )
-                .await
-            } else {
-                decode_openai_chat_response(
-                    response,
-                    streamed,
-                    &candidates,
-                    &mut ignore_delta,
-                    false,
-                )
-                .await
+            let (response, _probe_permit) = response.into_parts();
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return OpenAiProbeOutcome {
+                    support: if matches!(status.as_u16(), 400 | 404 | 405 | 422 | 501) {
+                        ProviderFeatureSupport::Unsupported
+                    } else {
+                        ProviderFeatureSupport::Unknown
+                    },
+                    detail: Some(format!(
+                        "HTTP {}: {}",
+                        status.as_u16(),
+                        truncate_observation_text(body.trim())
+                    )),
+                };
             }
-        })
-        .await;
-        let parsed = match decoded {
-            Ok(Ok(response)) => validate_tool_probe_response(&response, expected_token),
-            Ok(Err(error)) => Err(error.to_string()),
-            Err(_) => Err("HTTP 200 tool response did not complete within 20 seconds".to_string()),
-        };
-        match parsed {
-            Ok(()) => OpenAiProbeOutcome {
-                support: ProviderFeatureSupport::Supported,
-                detail: None,
-            },
-            Err(detail) => OpenAiProbeOutcome {
-                support: ProviderFeatureSupport::Unsupported,
-                detail: Some(detail),
-            },
+            let streamed = payload
+                .get("stream")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let candidate = compatibility_probe_candidate(expected_token);
+            let candidates = [candidate];
+            let mut ignore_delta = |_| Ok(());
+            let decoded = tokio::time::timeout(Duration::from_secs(20), async {
+                if path == "/responses" {
+                    decode_openai_responses_response(
+                        response,
+                        streamed,
+                        &candidates,
+                        &mut ignore_delta,
+                        false,
+                    )
+                    .await
+                } else {
+                    decode_openai_chat_response(
+                        response,
+                        streamed,
+                        &candidates,
+                        &mut ignore_delta,
+                        false,
+                    )
+                    .await
+                }
+            })
+            .await;
+            let parsed = match decoded {
+                Ok(Ok(response)) => validate_tool_probe_response(&response, expected_token),
+                Ok(Err(error)) => {
+                    if let Some(rate_limit) = stream::provider_stream_rate_limit(&error) {
+                        embedded_rate_limit_retry += 1;
+                        if probe_client
+                            .schedule_embedded_rate_limit_retry(
+                                embedded_rate_limit_retry,
+                                rate_limit.retry_after(),
+                            )
+                            .await
+                        {
+                            continue;
+                        }
+                    }
+                    Err(error.to_string())
+                }
+                Err(_) => {
+                    Err("HTTP 200 tool response did not complete within 20 seconds".to_string())
+                }
+            };
+            return match parsed {
+                Ok(()) => OpenAiProbeOutcome {
+                    support: ProviderFeatureSupport::Supported,
+                    detail: None,
+                },
+                Err(detail) => OpenAiProbeOutcome {
+                    support: ProviderFeatureSupport::Unsupported,
+                    detail: Some(detail),
+                },
+            };
         }
     }
 
@@ -1305,6 +1372,7 @@ impl OpenAiCompatibleProvider {
             method: "POST".to_string(),
             endpoint: url,
             observation_body: redact_transport_value(&payload),
+            cache_trace: crate::build_provider_cache_trace(&payload, None, false),
             body: payload,
             logical_request: request,
             tool_contracts: compiled_tools.contracts,
@@ -1314,131 +1382,6 @@ impl OpenAiCompatibleProvider {
                 ProviderResponseCommitMode::Streaming
             },
         })
-    }
-
-    async fn execute_chat_request(
-        &self,
-        prepared: PreparedProviderRequest,
-        on_delta: &mut ModelStreamCallback<'_>,
-        on_transport: &mut ProviderTransportCallback<'_>,
-    ) -> anyhow::Result<ModelResponse> {
-        let (response, attempt) = send_provider_request_with_network_retries(
-            || {
-                apply_provider_auth(
-                    self.client.post(&prepared.endpoint),
-                    self.auth,
-                    &self.api_key,
-                )
-                .header(CONTENT_TYPE, "application/json")
-                .json(&prepared.body)
-            },
-            1,
-            &prepared.observation_body,
-            on_transport,
-        )
-        .await?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await?;
-            on_transport(ProviderTransportEvent::Response {
-                attempt,
-                status: Some(status.as_u16()),
-                response_id: None,
-                body: json!({ "error": truncate_observation_text(&body) }),
-            })?;
-            if status.as_u16() == 400 {
-                let image_parts = request_image_part_count(&prepared.logical_request);
-                if image_parts > 0 && provider_rejected_image_input(&body) {
-                    anyhow::bail!(
-                        "provider does not support image input (imageParts={image_parts}); choose a vision-capable model or disable image attachments: {}",
-                        truncate_observation_text(&body)
-                    );
-                }
-                if let Some(capability) = rejected_chat_profile_capability(&prepared.body, &body) {
-                    return Err(ProviderAdapterError::CapabilityProfileStale {
-                        capability,
-                        detail: body,
-                    }
-                    .into());
-                }
-            }
-            anyhow::bail!("provider request failed ({status}): {body}");
-        }
-
-        let streamed = prepared
-            .body
-            .get("stream")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        let atomic_stream =
-            streamed && prepared.response_commit == ProviderResponseCommitMode::Atomic;
-        let mut provisional_deltas = Vec::new();
-        let decoded = if atomic_stream {
-            let mut buffer_delta = |delta| {
-                provisional_deltas.push(delta);
-                Ok(())
-            };
-            decode_openai_chat_response(
-                response,
-                streamed,
-                &prepared.logical_request.tool_candidates,
-                &mut buffer_delta,
-                true,
-            )
-            .await
-        } else {
-            decode_openai_chat_response(
-                response,
-                streamed,
-                &prepared.logical_request.tool_candidates,
-                on_delta,
-                true,
-            )
-            .await
-        };
-        let (mut response, response_attempt, response_status, commit_deltas) = match decoded {
-            Ok(response) => (response, attempt, status.as_u16(), provisional_deltas),
-            Err(error) if atomic_stream => {
-                let RecoveredToolResponse {
-                    response,
-                    attempt,
-                    status,
-                } = recover_streamed_tool_call_non_streaming(
-                    OpenAiRecoveryProtocol::ChatCompletions,
-                    &self.client,
-                    self.auth,
-                    &self.api_key,
-                    &prepared,
-                    attempt,
-                    status.as_u16(),
-                    &error,
-                    on_delta,
-                    on_transport,
-                )
-                .await?;
-                (response, attempt, status, Vec::new())
-            }
-            Err(error) => {
-                on_transport(ProviderTransportEvent::Response {
-                    attempt,
-                    status: Some(status.as_u16()),
-                    response_id: None,
-                    body: tool_call_protocol_error_observation(&error, None),
-                })?;
-                return Err(error);
-            }
-        };
-        normalize_provider_tool_calls(&mut response.tool_calls, &prepared.tool_contracts);
-        for delta in commit_deltas {
-            on_delta(delta)?;
-        }
-        on_transport(ProviderTransportEvent::Response {
-            attempt: response_attempt,
-            status: Some(response_status),
-            response_id: response.response_id.clone(),
-            body: model_response_observation(&response),
-        })?;
-        Ok(response)
     }
 }
 
@@ -1882,6 +1825,7 @@ impl OpenAiResponsesProvider {
             method: "POST".to_string(),
             endpoint,
             observation_body: redact_transport_value(&payload),
+            cache_trace: crate::build_provider_cache_trace(&payload, None, false),
             body: payload,
             logical_request: request,
             tool_contracts: compiled_tools.contracts,
@@ -1891,117 +1835,6 @@ impl OpenAiResponsesProvider {
                 ProviderResponseCommitMode::Streaming
             },
         })
-    }
-
-    async fn execute_responses_request(
-        &self,
-        prepared: PreparedProviderRequest,
-        attempt: usize,
-        on_delta: &mut ModelStreamCallback<'_>,
-        on_transport: &mut ProviderTransportCallback<'_>,
-    ) -> anyhow::Result<ModelResponse> {
-        let (response, transport_attempt) = send_provider_request_with_network_retries(
-            || {
-                apply_provider_auth(
-                    self.client.post(&prepared.endpoint),
-                    self.auth,
-                    &self.api_key,
-                )
-                .header(CONTENT_TYPE, "application/json")
-                .json(&prepared.body)
-            },
-            attempt,
-            &prepared.observation_body,
-            on_transport,
-        )
-        .await?;
-        let attempt = transport_attempt;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await?;
-            on_transport(ProviderTransportEvent::Response {
-                attempt,
-                status: Some(status.as_u16()),
-                response_id: None,
-                body: json!({ "error": truncate_observation_text(&body) }),
-            })?;
-            return Err(ResponsesRequestError { status, body }.into());
-        }
-
-        let streamed = prepared
-            .body
-            .get("stream")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        let atomic_stream =
-            streamed && prepared.response_commit == ProviderResponseCommitMode::Atomic;
-        let mut provisional_deltas = Vec::new();
-        let decoded = if atomic_stream {
-            let mut buffer_delta = |delta| {
-                provisional_deltas.push(delta);
-                Ok(())
-            };
-            decode_openai_responses_response(
-                response,
-                streamed,
-                &prepared.logical_request.tool_candidates,
-                &mut buffer_delta,
-                true,
-            )
-            .await
-        } else {
-            decode_openai_responses_response(
-                response,
-                streamed,
-                &prepared.logical_request.tool_candidates,
-                on_delta,
-                true,
-            )
-            .await
-        };
-        let (mut response, response_attempt, response_status, commit_deltas) = match decoded {
-            Ok(response) => (response, attempt, status.as_u16(), provisional_deltas),
-            Err(error) if atomic_stream => {
-                let RecoveredToolResponse {
-                    response,
-                    attempt,
-                    status,
-                } = recover_streamed_tool_call_non_streaming(
-                    OpenAiRecoveryProtocol::Responses,
-                    &self.client,
-                    self.auth,
-                    &self.api_key,
-                    &prepared,
-                    attempt,
-                    status.as_u16(),
-                    &error,
-                    on_delta,
-                    on_transport,
-                )
-                .await?;
-                (response, attempt, status, Vec::new())
-            }
-            Err(error) => {
-                on_transport(ProviderTransportEvent::Response {
-                    attempt,
-                    status: Some(status.as_u16()),
-                    response_id: None,
-                    body: tool_call_protocol_error_observation(&error, None),
-                })?;
-                return Err(error);
-            }
-        };
-        normalize_provider_tool_calls(&mut response.tool_calls, &prepared.tool_contracts);
-        for delta in commit_deltas {
-            on_delta(delta)?;
-        }
-        on_transport(ProviderTransportEvent::Response {
-            attempt: response_attempt,
-            status: Some(response_status),
-            response_id: response.response_id.clone(),
-            body: model_response_observation(&response),
-        })?;
-        Ok(response)
     }
 }
 
@@ -2233,6 +2066,7 @@ impl ModelProvider for OpenAiResponsesProvider {
                     retry_limit: None,
                     reason: "stored response cursor unavailable; replaying canonical local context"
                         .to_string(),
+                    cache_trace: replay.cache_trace.clone(),
                     body: replay.observation_body.clone(),
                 })?;
                 self.execute_responses_request(replay, 2, on_delta, on_transport)

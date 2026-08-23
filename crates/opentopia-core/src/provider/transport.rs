@@ -1,8 +1,9 @@
 use super::{ProviderTransportCallback, ProviderTransportEvent};
-use crate::model::ProviderRetryKind;
+use crate::model::{ProviderCacheTrace, ProviderRetryKind};
 use serde_json::Value;
 use std::time::Duration;
 pub(super) const PROVIDER_NETWORK_RETRY_LIMIT: usize = 5;
+pub(super) const PROVIDER_RATE_LIMIT_RETRY_LIMIT: usize = PROVIDER_NETWORK_RETRY_LIMIT;
 const PROVIDER_NETWORK_RETRY_DELAYS: [Duration; PROVIDER_NETWORK_RETRY_LIMIT] = [
     Duration::from_secs(1),
     Duration::from_secs(2),
@@ -25,19 +26,28 @@ fn retryable_provider_status(status: reqwest::StatusCode) -> bool {
 }
 
 fn provider_retry_delay(response: &reqwest::Response, retry_index: usize) -> Duration {
-    response
+    let retry_after = response
         .headers()
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(|seconds| Duration::from_secs(seconds.min(60)))
-        .unwrap_or_else(|| {
-            if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                PROVIDER_RATE_LIMIT_RETRY_DELAYS[retry_index - 1]
-            } else {
-                PROVIDER_NETWORK_RETRY_DELAYS[retry_index - 1]
-            }
-        })
+        .map(|seconds| Duration::from_secs(seconds.min(60)));
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        provider_rate_limit_retry_delay(retry_index, retry_after)
+    } else {
+        retry_after.unwrap_or(PROVIDER_NETWORK_RETRY_DELAYS[retry_index - 1])
+    }
+}
+
+pub(super) fn provider_rate_limit_retry_delay(
+    retry_index: usize,
+    retry_after: Option<Duration>,
+) -> Duration {
+    retry_after.unwrap_or_else(|| {
+        PROVIDER_RATE_LIMIT_RETRY_DELAYS[retry_index
+            .saturating_sub(1)
+            .min(PROVIDER_RATE_LIMIT_RETRY_DELAYS.len() - 1)]
+    })
 }
 
 fn retryable_provider_network_error(error: &reqwest::Error) -> bool {
@@ -48,6 +58,7 @@ pub(super) async fn send_provider_request_with_network_retries<F>(
     mut request: F,
     first_attempt: usize,
     observation_body: &Value,
+    cache_trace: Option<&ProviderCacheTrace>,
     on_transport: &mut ProviderTransportCallback<'_>,
 ) -> anyhow::Result<(reqwest::Response, usize)>
 where
@@ -79,6 +90,7 @@ where
                     retry_index: Some(retry_index),
                     retry_limit: Some(PROVIDER_NETWORK_RETRY_LIMIT),
                     reason,
+                    cache_trace: cache_trace.cloned(),
                     body: observation_body.clone(),
                 })?;
                 tokio::time::sleep(delay).await;
@@ -96,6 +108,7 @@ where
                     retry_index: Some(retry_index),
                     retry_limit: Some(PROVIDER_NETWORK_RETRY_LIMIT),
                     reason: format!("provider connection failed: {error}"),
+                    cache_trace: cache_trace.cloned(),
                     body: observation_body.clone(),
                 })?;
                 tokio::time::sleep(PROVIDER_NETWORK_RETRY_DELAYS[retry_index - 1]).await;

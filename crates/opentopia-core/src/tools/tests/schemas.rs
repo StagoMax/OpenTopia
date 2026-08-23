@@ -37,8 +37,12 @@ fn every_static_builtin_uses_an_inline_derived_input_schema() {
 }
 
 #[test]
-fn foreground_yield_schema_allows_two_minutes() {
+fn foreground_yield_schema_enforces_runtime_floor_and_allows_two_minutes() {
     let shell = ShellTool.schema();
+    assert_eq!(
+        shell["properties"]["yieldTimeMs"]["minimum"].as_f64(),
+        Some(30_000.0)
+    );
     assert_eq!(
         shell["properties"]["yieldTimeMs"]["maximum"].as_f64(),
         Some(120_000.0)
@@ -46,6 +50,7 @@ fn foreground_yield_schema_allows_two_minutes() {
 
     let browser = BrowserTool.schema();
     let download = &action_schema_branch(&browser, "download")["properties"];
+    assert_eq!(download["yieldTimeMs"]["minimum"].as_f64(), Some(30_000.0));
     assert_eq!(download["yieldTimeMs"]["maximum"].as_f64(), Some(120_000.0));
 }
 

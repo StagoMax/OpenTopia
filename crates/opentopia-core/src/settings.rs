@@ -532,6 +532,10 @@ mod tests {
             known_model_context_window_tokens("glm-5.2"),
             Some(1_048_576)
         );
+        assert_eq!(
+            known_model_context_window_tokens("glm-5.3"),
+            Some(1_048_576)
+        );
         assert_eq!(known_model_context_window_tokens("glm-5"), Some(204_800));
         assert_eq!(
             known_model_context_window_tokens("claude-sonnet-4-6"),
@@ -668,6 +672,7 @@ mod tests {
             "mistralai/mistral-small-3.2-24b-instruct",
             "meta-llama/llama-4-scout",
             "minimax/minimax-m3",
+            "deepseek-v4-flash-vision-exp",
         ] {
             assert_eq!(known_model_supports_vision(model), Some(true), "{model}");
         }
@@ -678,6 +683,7 @@ mod tests {
             "deepseek-v4-flash",
             "qwen3-coder-plus",
             "glm-5",
+            "glm-5.3",
             "minimax-m2.5",
         ] {
             assert_eq!(known_model_supports_vision(model), Some(false), "{model}");

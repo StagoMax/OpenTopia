@@ -1,5 +1,8 @@
-use crate::execution_spec::{EnvironmentPolicy, ExecutionFailure, ExecutionSpec, ExecutionStage};
+use crate::execution_spec::{
+    EnvironmentPolicy, ExecutionCapability, ExecutionFailure, ExecutionSpec, ExecutionStage,
+};
 use crate::sandbox::LocalSandboxConfig;
+use crate::workspace_execution_capsule::WorkspaceExecutionCapsule;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -59,8 +62,12 @@ pub(crate) fn resolve_runtime(
     cwd: &Path,
     workspace_root: &Path,
     config: &LocalSandboxConfig,
+    capsule: &WorkspaceExecutionCapsule,
 ) -> Result<ResolvedRuntime, ExecutionFailure> {
-    let environment = resolve_execution_environment(request)?;
+    let capsule = request
+        .requires_capability(ExecutionCapability::WorkspaceShell)
+        .then_some(capsule);
+    let environment = resolve_execution_environment(request, capsule)?;
     let program = resolve_executable(&request.program, cwd, &environment)?;
     let mut roots = BTreeSet::new();
     if let Some(parent) = program.parent() {
@@ -78,6 +85,21 @@ pub(crate) fn resolve_runtime(
             ));
         }
         roots.insert(canonical_or_original(root));
+    }
+    if let Some(capsule) = capsule {
+        for root in capsule.read_roots() {
+            if !root.is_dir() {
+                return Err(ExecutionFailure::without_os_error(
+                    ExecutionStage::ResolveRuntime,
+                    format!(
+                        "workspace execution capsule {} requires a missing read root: {}",
+                        capsule.fingerprint(),
+                        root.display()
+                    ),
+                ));
+            }
+            roots.insert(canonical_or_original(root));
+        }
     }
     roots.extend(runtime_roots_from_environment(&environment)?);
 
@@ -225,6 +247,7 @@ fn is_runtime_root_environment_key(key: &str) -> bool {
 
 fn resolve_execution_environment(
     request: &ExecutionSpec,
+    capsule: Option<&WorkspaceExecutionCapsule>,
 ) -> Result<Vec<(OsString, OsString)>, ExecutionFailure> {
     let mut environment = BTreeMap::<String, (OsString, OsString, bool)>::new();
     for (key, value) in inherited_environment(request) {
@@ -238,6 +261,16 @@ fn resolve_execution_environment(
             key.to_string_lossy().to_ascii_uppercase(),
             (key.clone(), value.clone(), true),
         );
+    }
+
+    if let Some(capsule) = capsule {
+        for (key, value) in capsule.environment() {
+            environment.insert(
+                key.to_string_lossy().to_ascii_uppercase(),
+                (key.clone(), value.clone(), true),
+            );
+        }
+        prepend_path_entries(&mut environment, capsule.path_entries())?;
     }
 
     if let Some((key, value, _)) = environment.get("PATH").cloned() {
@@ -303,6 +336,29 @@ fn resolve_execution_environment(
         .into_values()
         .map(|(key, value, _)| (key, value))
         .collect())
+}
+
+fn prepend_path_entries(
+    environment: &mut BTreeMap<String, (OsString, OsString, bool)>,
+    entries: &[PathBuf],
+) -> Result<(), ExecutionFailure> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let current = environment
+        .get("PATH")
+        .map(|(_, value, _)| value.clone())
+        .unwrap_or_default();
+    let mut paths = entries.to_vec();
+    paths.extend(std::env::split_paths(&current));
+    let value = std::env::join_paths(paths.iter()).map_err(|error| {
+        ExecutionFailure::without_os_error(
+            ExecutionStage::ResolveRuntime,
+            format!("failed to prepend workspace tool paths: {error}"),
+        )
+    })?;
+    environment.insert("PATH".to_string(), (OsString::from("PATH"), value, true));
+    Ok(())
 }
 
 pub(crate) fn configure_command_environment(
@@ -492,12 +548,13 @@ mod tests {
         resolve_execution_environment, runtime_roots_from_environment,
     };
     use crate::execution_spec::ExecutionSpec;
+    use crate::workspace_execution_capsule::WorkspaceExecutionCapsule;
     use std::ffi::OsString;
     use std::path::Path;
 
     #[test]
     fn missing_executable_fails_during_runtime_resolution() {
-        let environment = resolve_execution_environment(&ExecutionSpec::new("tool"))
+        let environment = resolve_execution_environment(&ExecutionSpec::new("tool"), None)
             .expect("resolve environment");
         let error = resolve_executable(
             "opentopia-command-that-does-not-exist",
@@ -519,7 +576,7 @@ mod tests {
         assert!(is_sensitive_environment_key("CARGO_HOME"));
         assert!(!is_sensitive_environment_key("JAVA_HOME"));
 
-        let environment = resolve_execution_environment(&ExecutionSpec::new("tool"))
+        let environment = resolve_execution_environment(&ExecutionSpec::new("tool"), None)
             .expect("resolve environment");
         let keys = environment
             .iter()
@@ -529,6 +586,38 @@ mod tests {
         assert!(!keys
             .iter()
             .any(|key| key.eq_ignore_ascii_case("OPENAI_API_KEY")));
+    }
+
+    #[test]
+    fn workspace_capsule_environment_is_projected_for_shells() {
+        let root = std::env::temp_dir().join(format!(
+            "opentopia-execution-capsule-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create capsule workspace");
+        let capsule = WorkspaceExecutionCapsule::discover(&root);
+        let expected_root = normalized_canonical_path(&root);
+
+        let shell = resolve_execution_environment(
+            &ExecutionSpec::shell("echo ok").env_clear(),
+            Some(&capsule),
+        )
+        .expect("resolve shell capsule environment");
+        assert!(shell.iter().any(|(key, value)| {
+            key.to_string_lossy()
+                .eq_ignore_ascii_case("GIT_CONFIG_VALUE_0")
+                && value
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&expected_root.to_string_lossy())
+        }));
+
+        let direct = resolve_execution_environment(&ExecutionSpec::new("tool").env_clear(), None)
+            .expect("resolve direct execution environment");
+        assert!(!direct.iter().any(|(key, _)| key
+            .to_string_lossy()
+            .eq_ignore_ascii_case("GIT_CONFIG_VALUE_0")));
+
+        std::fs::remove_dir_all(root).expect("remove capsule workspace");
     }
 
     #[test]
@@ -559,7 +648,8 @@ mod tests {
         let path = std::env::join_paths([missing, root.clone()]).expect("join PATH fixture");
         let request = ExecutionSpec::new("tool").env_clear().env("PATH", path);
 
-        let environment = resolve_execution_environment(&request).expect("resolve environment");
+        let environment =
+            resolve_execution_environment(&request, None).expect("resolve environment");
         let resolved_path = environment
             .iter()
             .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case("PATH"))
@@ -590,7 +680,8 @@ mod tests {
             .expect("join ordered PATH fixture");
         let request = ExecutionSpec::new("tool").env_clear().env("PATH", path);
 
-        let environment = resolve_execution_environment(&request).expect("resolve environment");
+        let environment =
+            resolve_execution_environment(&request, None).expect("resolve environment");
         let resolved_path = environment
             .iter()
             .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case("PATH"))
@@ -611,6 +702,7 @@ mod tests {
             &ExecutionSpec::new("tool")
                 .env_clear()
                 .env("JAVA_HOME", missing.as_os_str()),
+            None,
         )
         .expect_err("explicit runtime roots must be valid");
 

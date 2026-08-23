@@ -20,6 +20,7 @@ use crate::sandbox::{
     OsSandboxPlatform, SandboxBackendCapabilities, SandboxCommandStatus, SandboxLaunchOptions,
     SandboxMode, SandboxPreparationPlan,
 };
+use crate::workspace_execution_capsule::WorkspaceExecutionCapsule;
 use anyhow::Context;
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
@@ -31,11 +32,84 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
+const TRANSIENT_WRITE_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(25),
+    Duration::from_millis(75),
+    Duration::from_millis(200),
+];
+
+fn is_transient_write_error(error: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        // Sharing violation, lock violation, and a file with a mapped section
+        // open. Editors, indexers, antivirus, and running binaries can hold
+        // these conditions briefly; retrying other I/O failures hides bugs.
+        matches!(error.raw_os_error(), Some(32 | 33 | 1224))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+async fn read_write_retry_snapshot(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match tokio::fs::read(path).await {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+async fn write_file_with_transient_retry(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    let first_error = match tokio::fs::write(path, contents).await {
+        Ok(()) => return Ok(()),
+        Err(error) if is_transient_write_error(&error) => error,
+        Err(error) => return Err(error.into()),
+    };
+    let expected = read_write_retry_snapshot(path).await.with_context(|| {
+        format!(
+            "failed to revalidate {} after a transient write conflict",
+            path.display()
+        )
+    })?;
+    let mut last_error = first_error;
+
+    for delay in TRANSIENT_WRITE_RETRY_DELAYS {
+        tokio::time::sleep(delay).await;
+        let current = read_write_retry_snapshot(path).await.with_context(|| {
+            format!(
+                "failed to revalidate {} before retrying a transient write conflict",
+                path.display()
+            )
+        })?;
+        anyhow::ensure!(
+            current == expected,
+            "file changed while waiting to retry a transient write conflict: {}; reread the latest file and retry",
+            path.display()
+        );
+        match tokio::fs::write(path, contents).await {
+            Ok(()) => return Ok(()),
+            Err(error) if is_transient_write_error(&error) => last_error = error,
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    Err(last_error).with_context(|| {
+        format!(
+            "transient write conflict persisted after {} retries for {}",
+            TRANSIENT_WRITE_RETRY_DELAYS.len(),
+            path.display()
+        )
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalExecutionEnvironment {
     id: String,
     workspace_root: PathBuf,
     sandbox_config: LocalSandboxConfig,
+    execution_capsule: Arc<WorkspaceExecutionCapsule>,
     pub(super) running: Arc<Mutex<HashMap<String, CancellationToken>>>,
     prepared_sandbox_scopes: Arc<Mutex<HashSet<String>>>,
     sandbox_preparation_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
@@ -43,39 +117,26 @@ pub struct LocalExecutionEnvironment {
 
 impl LocalExecutionEnvironment {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
-        Self {
-            id: "local".to_string(),
-            workspace_root: workspace_root.into(),
-            sandbox_config: LocalSandboxConfig::default(),
-            running: Arc::new(Mutex::new(HashMap::new())),
-            prepared_sandbox_scopes: Arc::new(Mutex::new(HashSet::new())),
-            sandbox_preparation_locks: Arc::new(Mutex::new(HashMap::new())),
-        }
+        Self::build(
+            "local".to_string(),
+            workspace_root.into(),
+            LocalSandboxConfig::default(),
+        )
     }
 
     pub fn with_id(id: impl Into<String>, workspace_root: impl Into<PathBuf>) -> Self {
-        Self {
-            id: id.into(),
-            workspace_root: workspace_root.into(),
-            sandbox_config: LocalSandboxConfig::default(),
-            running: Arc::new(Mutex::new(HashMap::new())),
-            prepared_sandbox_scopes: Arc::new(Mutex::new(HashSet::new())),
-            sandbox_preparation_locks: Arc::new(Mutex::new(HashMap::new())),
-        }
+        Self::build(
+            id.into(),
+            workspace_root.into(),
+            LocalSandboxConfig::default(),
+        )
     }
 
     pub fn with_sandbox_config(
         workspace_root: impl Into<PathBuf>,
         sandbox_config: LocalSandboxConfig,
     ) -> Self {
-        Self {
-            id: "local".to_string(),
-            workspace_root: workspace_root.into(),
-            sandbox_config,
-            running: Arc::new(Mutex::new(HashMap::new())),
-            prepared_sandbox_scopes: Arc::new(Mutex::new(HashSet::new())),
-            sandbox_preparation_locks: Arc::new(Mutex::new(HashMap::new())),
-        }
+        Self::build("local".to_string(), workspace_root.into(), sandbox_config)
     }
 
     pub fn with_id_and_sandbox_config(
@@ -83,10 +144,29 @@ impl LocalExecutionEnvironment {
         workspace_root: impl Into<PathBuf>,
         sandbox_config: LocalSandboxConfig,
     ) -> Self {
+        Self::build(id.into(), workspace_root.into(), sandbox_config)
+    }
+
+    fn build(id: String, workspace_root: PathBuf, sandbox_config: LocalSandboxConfig) -> Self {
+        let execution_capsule = Arc::new(WorkspaceExecutionCapsule::discover(&workspace_root));
+        for issue in execution_capsule.issues() {
+            tracing::warn!(
+                workspace = %workspace_root.display(),
+                capability = issue.capability,
+                reason = %issue.reason,
+                "workspace execution capability is unavailable"
+            );
+        }
+        tracing::debug!(
+            workspace = %workspace_root.display(),
+            capsule = execution_capsule.fingerprint(),
+            "workspace execution capsule resolved"
+        );
         Self {
-            id: id.into(),
-            workspace_root: workspace_root.into(),
+            id,
+            workspace_root,
             sandbox_config,
+            execution_capsule,
             running: Arc::new(Mutex::new(HashMap::new())),
             prepared_sandbox_scopes: Arc::new(Mutex::new(HashSet::new())),
             sandbox_preparation_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -368,7 +448,13 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             .transpose()?
             .unwrap_or(self.workspace_root_canonical()?);
 
-        let runtime = resolve_runtime(&request, &cwd, &self.workspace_root, &self.sandbox_config)?;
+        let runtime = resolve_runtime(
+            &request,
+            &cwd,
+            &self.workspace_root,
+            &self.sandbox_config,
+            &self.execution_capsule,
+        )?;
         let program = runtime.program.to_string_lossy().into_owned();
         let mut effective_config = self.sandbox_config.clone();
         if request.requirements.network == Some(NetworkPolicy::Deny) {
@@ -662,7 +748,13 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             .transpose()?
             .unwrap_or(self.workspace_root_canonical()?);
 
-        let runtime = resolve_runtime(&request, &cwd, &self.workspace_root, &self.sandbox_config)?;
+        let runtime = resolve_runtime(
+            &request,
+            &cwd,
+            &self.workspace_root,
+            &self.sandbox_config,
+            &self.execution_capsule,
+        )?;
         let program = runtime.program.to_string_lossy().into_owned();
 
         let command_plan = build_local_sandbox_command_with_options(
@@ -840,7 +932,7 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             }
         }
         let bytes_written = request.contents.len();
-        tokio::fs::write(&path, request.contents)
+        write_file_with_transient_retry(&path, &request.contents)
             .await
             .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(WriteResult {

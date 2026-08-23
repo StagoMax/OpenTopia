@@ -7,18 +7,22 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_CANCELLED, ERROR_FILE_NOT_FOUND,
-    ERROR_PATH_NOT_FOUND, HLOCAL, INVALID_HANDLE_VALUE,
+    CloseHandle, GetLastError, LocalFree, ERROR_ALIAS_EXISTS, ERROR_CANCELLED,
+    ERROR_FILE_NOT_FOUND, ERROR_MEMBER_IN_ALIAS, ERROR_PATH_NOT_FOUND, HLOCAL,
+    INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::NetworkManagement::NetManagement::{
-    NERR_Success, NERR_UserExists, NERR_UserNotFound, NetApiBufferFree, NetUserAdd, NetUserDel,
-    NetUserGetInfo, NetUserSetInfo, UF_DONT_EXPIRE_PASSWD, UF_SCRIPT, USER_INFO_1, USER_INFO_1003,
+    NERR_GroupExists, NERR_GroupNotFound, NERR_Success, NERR_UserExists, NERR_UserNotFound,
+    NetApiBufferFree, NetLocalGroupAdd, NetLocalGroupAddMember, NetLocalGroupDel,
+    NetLocalGroupGetInfo, NetUserAdd, NetUserDel, NetUserGetInfo, NetUserSetInfo,
+    LOCALGROUP_INFO_1, UF_DONT_EXPIRE_PASSWD, UF_SCRIPT, USER_INFO_1, USER_INFO_1003,
     USER_INFO_1007, USER_INFO_4, USER_PRIV_USER,
 };
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::{
-    AllocateAndInitializeSid, CheckTokenMembership, CopySid, FreeSid, GetLengthSid, LogonUserW,
-    LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT, PSID, SECURITY_NT_AUTHORITY,
+    AllocateAndInitializeSid, CheckTokenMembership, CopySid, DuplicateToken, FreeSid, GetLengthSid,
+    LogonUserW, SecurityImpersonation, LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT, PSID,
+    SECURITY_NT_AUTHORITY,
 };
 use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
 use windows_sys::Win32::UI::Shell::{
@@ -28,7 +32,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
 pub(crate) const OFFLINE_USERNAME: &str = "OpenTopiaSbOffline";
 pub(crate) const ONLINE_USERNAME: &str = "OpenTopiaSbOnline";
+pub(crate) const SANDBOX_GROUP_NAME: &str = "OpenTopiaSandboxUsers";
 const ACCOUNT_COMMENT: &str = "Managed by OpenTopia dedicated-user sandbox";
+const GROUP_COMMENT: &str = "Managed by OpenTopia filesystem sandbox";
 const LOCAL_ACCOUNT_NAME_MAX_UTF16: usize = 20;
 const LIFECYCLE_RESULT_VERSION: u32 = 1;
 const LIFECYCLE_RESULT_DIR: &str = "lifecycle-results";
@@ -136,6 +142,7 @@ fn perform_setup() -> Result<i32> {
     ensure_user(&credentials.online_username, &credentials.online_password)?;
     credentials.offline_sid = account_sid_bytes(&credentials.offline_username)?;
     credentials.online_sid = account_sid_bytes(&credentials.online_username)?;
+    ensure_sandbox_group(&credentials)?;
     save_credentials(&credentials)?;
     crate::wfp::install_offline_filters(&credentials.offline_username)
         .context("install offline-user WFP filters")?;
@@ -201,8 +208,12 @@ fn perform_teardown() -> Result<i32> {
             .as_ref()
             .map(|value| value.online_password.as_str()),
     )?;
-    crate::windows::revoke_dedicated_user_permissions(&[OFFLINE_USERNAME, ONLINE_USERNAME])
-        .context("revoke dedicated-user filesystem permissions")?;
+    crate::windows::revoke_dedicated_user_permissions(&[
+        OFFLINE_USERNAME,
+        ONLINE_USERNAME,
+        SANDBOX_GROUP_NAME,
+    ])
+    .context("revoke dedicated-user filesystem permissions")?;
     crate::wfp::remove_offline_filters().context("remove offline-user WFP filters")?;
     delete_user(
         OFFLINE_USERNAME,
@@ -216,6 +227,7 @@ fn perform_teardown() -> Result<i32> {
             .as_ref()
             .map(|value| value.online_password.as_str()),
     )?;
+    delete_sandbox_group()?;
     match std::fs::remove_file(credentials_path()) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -407,6 +419,19 @@ pub(crate) fn provisioning_status() -> SandboxSetupStatus {
 
     let offline_account = checked_account_exists(OFFLINE_USERNAME, &mut issues);
     let online_account = checked_account_exists(ONLINE_USERNAME, &mut issues);
+    let sandbox_group = match sandbox_group_is_managed() {
+        Ok(true) => true,
+        Ok(false) => {
+            issues.push(format!(
+                "managed sandbox group {SANDBOX_GROUP_NAME} is missing"
+            ));
+            false
+        }
+        Err(error) => {
+            issues.push(format!("sandbox group health check failed: {error:#}"));
+            false
+        }
+    };
     let network_policy = match crate::wfp::offline_filters_installed() {
         Ok(installed) => installed,
         Err(error) => {
@@ -419,6 +444,7 @@ pub(crate) fn provisioning_status() -> SandboxSetupStatus {
     let filesystem_permissions = match crate::windows::has_dedicated_user_permissions(&[
         OFFLINE_USERNAME,
         ONLINE_USERNAME,
+        SANDBOX_GROUP_NAME,
     ]) {
         Ok(present) => present,
         Err(error) => {
@@ -432,6 +458,7 @@ pub(crate) fn provisioning_status() -> SandboxSetupStatus {
         || filesystem_permissions
         || offline_account
         || online_account
+        || sandbox_group
         || network_policy;
 
     let credentials_complete = credentials
@@ -441,7 +468,7 @@ pub(crate) fn provisioning_status() -> SandboxSetupStatus {
         credentials: credentials_complete,
         offline_identity: credentials
             .as_ref()
-            .filter(|_| offline_account)
+            .filter(|_| offline_account && sandbox_group)
             .is_some_and(|value| {
                 checked_identity(
                     &value.offline_username,
@@ -449,16 +476,26 @@ pub(crate) fn provisioning_status() -> SandboxSetupStatus {
                     &value.offline_sid,
                     "offline",
                     &mut issues,
+                ) && checked_sandbox_group_membership(
+                    &value.offline_username,
+                    &value.offline_password,
+                    "offline",
+                    &mut issues,
                 )
             }),
         online_identity: credentials
             .as_ref()
-            .filter(|_| online_account)
+            .filter(|_| online_account && sandbox_group)
             .is_some_and(|value| {
                 checked_identity(
                     &value.online_username,
                     &value.online_password,
                     &value.online_sid,
+                    "online",
+                    &mut issues,
+                ) && checked_sandbox_group_membership(
+                    &value.online_username,
+                    &value.online_password,
                     "online",
                     &mut issues,
                 )
@@ -483,6 +520,9 @@ pub(crate) fn provisioning_status() -> SandboxSetupStatus {
         }
         if !online_account {
             issues.push("online sandbox account is missing".into());
+        }
+        if !sandbox_group {
+            issues.push("sandbox filesystem group is missing".into());
         }
         if !network_policy {
             issues.push("offline sandbox network policy is missing".into());
@@ -638,6 +678,77 @@ fn checked_logon(username: &str, password: &str, identity: &str, issues: &mut Ve
             false
         }
     }
+}
+
+fn checked_sandbox_group_membership(
+    username: &str,
+    password: &str,
+    identity: &str,
+    issues: &mut Vec<String>,
+) -> bool {
+    match sandbox_group_membership(username, password) {
+        Ok(true) => true,
+        Ok(false) => {
+            issues.push(format!(
+                "{identity} sandbox identity is not a member of {SANDBOX_GROUP_NAME}"
+            ));
+            false
+        }
+        Err(error) => {
+            issues.push(format!(
+                "failed to inspect {identity} sandbox group membership: {error:#}"
+            ));
+            false
+        }
+    }
+}
+
+fn sandbox_group_membership(username: &str, password: &str) -> Result<bool> {
+    let username_w = wide(username);
+    let domain_w = wide(".");
+    let password_w = wide(password);
+    let mut token = std::ptr::null_mut();
+    let logged_on = unsafe {
+        LogonUserW(
+            username_w.as_ptr(),
+            domain_w.as_ptr(),
+            password_w.as_ptr(),
+            LOGON32_LOGON_INTERACTIVE,
+            LOGON32_PROVIDER_DEFAULT,
+            &mut token,
+        )
+    };
+    if logged_on == 0 {
+        anyhow::bail!("LogonUserW returned Windows error {}", unsafe {
+            GetLastError()
+        })
+    }
+    let mut group_sid = crate::windows::principal_sid_bytes(SANDBOX_GROUP_NAME)?;
+    let mut impersonation_token = std::ptr::null_mut();
+    let duplicated =
+        unsafe { DuplicateToken(token, SecurityImpersonation, &mut impersonation_token) };
+    if duplicated == 0 || impersonation_token.is_null() {
+        let error = unsafe { GetLastError() };
+        unsafe { CloseHandle(token) };
+        anyhow::bail!("DuplicateToken returned Windows error {error}")
+    }
+    let mut is_member = 0;
+    let checked = unsafe {
+        CheckTokenMembership(
+            impersonation_token,
+            group_sid.as_mut_ptr().cast(),
+            &mut is_member,
+        )
+    };
+    let check_error = (checked == 0).then(|| unsafe { GetLastError() });
+    unsafe {
+        CloseHandle(impersonation_token);
+        CloseHandle(token);
+    }
+    if let Some(error) = check_error {
+        anyhow::bail!("CheckTokenMembership returned Windows error {error}")
+    }
+    Ok(is_member != 0)
 }
 
 fn checked_identity(
@@ -834,6 +945,98 @@ fn ensure_user(username: &str, password: &str) -> Result<()> {
     Ok(())
 }
 
+fn ensure_sandbox_group(credentials: &SandboxCredentials) -> Result<()> {
+    let group_w = wide(SANDBOX_GROUP_NAME);
+    let comment_w = wide(GROUP_COMMENT);
+    let info = LOCALGROUP_INFO_1 {
+        lgrpi1_name: group_w.as_ptr() as *mut u16,
+        lgrpi1_comment: comment_w.as_ptr() as *mut u16,
+    };
+    let status = unsafe {
+        NetLocalGroupAdd(
+            std::ptr::null(),
+            1,
+            (&info as *const LOCALGROUP_INFO_1).cast(),
+            std::ptr::null_mut(),
+        )
+    };
+    let group_already_exists = group_already_exists_status(status);
+    if status != NERR_Success && !group_already_exists {
+        anyhow::bail!(
+            "NetLocalGroupAdd failed for {SANDBOX_GROUP_NAME}: status={status}; administrator approval is required"
+        )
+    }
+    if group_already_exists && !sandbox_group_is_managed()? {
+        anyhow::bail!(
+            "refusing to reuse existing local group {SANDBOX_GROUP_NAME} because it is not owned by OpenTopia"
+        )
+    }
+
+    for (username, sid) in [
+        (
+            credentials.offline_username.as_str(),
+            &credentials.offline_sid,
+        ),
+        (
+            credentials.online_username.as_str(),
+            &credentials.online_sid,
+        ),
+    ] {
+        anyhow::ensure!(!sid.is_empty(), "sandbox account {username} SID is missing");
+        let mut sid = sid.clone();
+        let member_status = unsafe {
+            NetLocalGroupAddMember(std::ptr::null(), group_w.as_ptr(), sid.as_mut_ptr().cast())
+        };
+        if member_status != NERR_Success && member_status != ERROR_MEMBER_IN_ALIAS {
+            anyhow::bail!(
+                "NetLocalGroupAddMember failed for {username}: status={member_status}; administrator approval is required"
+            )
+        }
+    }
+    Ok(())
+}
+
+fn group_already_exists_status(status: u32) -> bool {
+    status == NERR_GroupExists || status == ERROR_ALIAS_EXISTS
+}
+
+fn sandbox_group_is_managed() -> Result<bool> {
+    let group_w = wide(SANDBOX_GROUP_NAME);
+    let mut buffer = std::ptr::null_mut();
+    let status =
+        unsafe { NetLocalGroupGetInfo(std::ptr::null(), group_w.as_ptr(), 1, &mut buffer) };
+    if status == NERR_GroupNotFound {
+        return Ok(false);
+    }
+    if status != NERR_Success {
+        anyhow::bail!("NetLocalGroupGetInfo returned {status}")
+    }
+    let managed = if buffer.is_null() {
+        false
+    } else {
+        let info = unsafe { &*(buffer.cast::<LOCALGROUP_INFO_1>()) };
+        wide_ptr_string(info.lgrpi1_comment).as_deref() == Some(GROUP_COMMENT)
+    };
+    if !buffer.is_null() {
+        unsafe { NetApiBufferFree(buffer.cast()) };
+    }
+    Ok(managed)
+}
+
+fn delete_sandbox_group() -> Result<()> {
+    if !sandbox_group_is_managed()? {
+        return Ok(());
+    }
+    let group_w = wide(SANDBOX_GROUP_NAME);
+    let status = unsafe { NetLocalGroupDel(std::ptr::null(), group_w.as_ptr()) };
+    if status != NERR_Success && status != NERR_GroupNotFound {
+        anyhow::bail!(
+            "NetLocalGroupDel failed for {SANDBOX_GROUP_NAME}: status={status}; administrator approval is required"
+        )
+    }
+    Ok(())
+}
+
 fn validate_local_account_name(username: &str) -> Result<()> {
     let utf16_length = username.encode_utf16().count();
     anyhow::ensure!(!username.is_empty(), "local sandbox account name is empty");
@@ -913,6 +1116,13 @@ pub(crate) fn ensure_parent(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_creation_is_idempotent_across_windows_status_families() {
+        assert!(group_already_exists_status(NERR_GroupExists));
+        assert!(group_already_exists_status(ERROR_ALIAS_EXISTS));
+        assert!(!group_already_exists_status(NERR_Success));
+    }
 
     #[test]
     fn reserved_account_names_respect_windows_sam_limit() {

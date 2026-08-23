@@ -76,6 +76,10 @@ pub struct ToolInvocationContext {
     pub collaboration: Option<AgentCollaborationInvocation>,
     /// Commands that outlive the tool call that started them.
     pub background: Option<BackgroundProcessRegistry>,
+    /// Runtime-owned lower bound for keeping ordinary commands in the
+    /// foreground. Model arguments may extend this window, but cannot shorten
+    /// it and turn quick commands into background jobs.
+    pub(crate) minimum_foreground_yield: Duration,
     pub agent_turn_id: Option<Uuid>,
     /// Process-shared sink for exact, committed file mutations. The server uses
     /// it to build per-Turn diffs without scanning the workspace at Turn start.
@@ -163,6 +167,7 @@ impl ToolInvocationContext {
             cancel: None,
             collaboration: None,
             background: None,
+            minimum_foreground_yield: Duration::from_millis(DEFAULT_FOREGROUND_YIELD_MILLISECONDS),
             agent_turn_id: None,
             file_mutation_observer: None,
             agent_depth: 0,
@@ -216,6 +221,7 @@ impl ToolInvocationContext {
             cancel: None,
             collaboration: None,
             background: None,
+            minimum_foreground_yield: Duration::from_millis(DEFAULT_FOREGROUND_YIELD_MILLISECONDS),
             agent_turn_id: None,
             file_mutation_observer: None,
             agent_depth: 0,
@@ -1468,8 +1474,8 @@ use workspace_search_tool::{find_literal_match, run_fallback_search};
 
 mod shell_tool;
 use shell_tool::{
-    background_scope, DEFAULT_BACKGROUND_TIMEOUT_SECONDS, DEFAULT_FOREGROUND_YIELD_MILLISECONDS,
-    MAX_BACKGROUND_TIMEOUT_SECONDS, MAX_FOREGROUND_YIELD_MILLISECONDS,
+    background_scope, effective_foreground_yield_milliseconds, DEFAULT_BACKGROUND_TIMEOUT_SECONDS,
+    DEFAULT_FOREGROUND_YIELD_MILLISECONDS, MAX_BACKGROUND_TIMEOUT_SECONDS,
 };
 #[cfg(test)]
 use shell_tool::{shell_execution_intent, BackgroundOutputInput};
