@@ -3,6 +3,8 @@ import type { ConversationSendTrace } from "./conversationSendTrace";
 import type {
   BackendEventStreamMessage,
   BackendStartupStatus,
+  DesktopToolMenuAction,
+  DesktopToolMenuRequest,
 } from "./types/platform";
 import type {
   ContextSourcePickResult,
@@ -33,6 +35,22 @@ const unavailableKeyring = {
   envTarget: "OPENTOPIA_API_KEY",
   status: "unavailable",
 };
+
+export function canShowDesktopToolMenu(): boolean {
+  return (
+    typeof window !== "undefined" && Boolean(window.opentopia?.showToolMenu)
+  );
+}
+
+export async function showDesktopToolMenu(
+  options: DesktopToolMenuRequest,
+): Promise<DesktopToolMenuAction | null> {
+  if (typeof window === "undefined" || !window.opentopia?.showToolMenu) {
+    return null;
+  }
+  return window.opentopia.showToolMenu(options);
+}
+
 export async function loadPlatformInfo(): Promise<PlatformInfo> {
   const info = window.opentopia
     ? await window.opentopia.getPlatformInfo()

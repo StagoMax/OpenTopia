@@ -1,4 +1,5 @@
 import {
+  startTransition,
   useCallback,
   useEffect,
   useMemo,
@@ -189,6 +190,7 @@ import type {
 import { reuseUnchangedAgentList } from "./agentListState";
 import { PreviewSessionStore } from "./previewSessionStore";
 import { ConversationSessionRegistry } from "./conversationSessionController";
+import { newBrowserTabSessionId } from "./browserNavigation";
 import { useConversationSessionSelector } from "./useConversationSession";
 import { useThreadRunState } from "./useThreadActivityStore";
 import {
@@ -767,6 +769,8 @@ export function App() {
     nonce: number;
   } | null>(null);
   const [toolTabs, setToolTabs] = useState<ToolTab[]>([]);
+  const toolTabsRef = useRef<ToolTab[]>(toolTabs);
+  toolTabsRef.current = toolTabs;
   const [previewSessionStore] = useState(() => new PreviewSessionStore());
   const hasDirtyPreviewSessions = useSyncExternalStore(
     previewSessionStore.subscribeToDirtySessions,
@@ -811,6 +815,8 @@ export function App() {
   } | null>(null);
   const workspaceResizeFrameRef = useRef<number | null>(null);
   const markdownNavigationIdRef = useRef(0);
+  const browserTabSequenceRef = useRef(0);
+  const browserTabLaunchGenerationRef = useRef(0);
   const taskNotificationPreferencesRef = useRef(taskNotificationPreferences);
   const pendingTaskNotificationEventsRef = useRef<AgentEvent[]>([]);
   const pendingEventCommitTraceRef = useRef(
@@ -827,6 +833,14 @@ export function App() {
   const agentRefreshRequestRef = useRef<(() => void) | null>(null);
 
   activeThreadIdRef.current = activeThreadId;
+
+  useEffect(
+    () => () => {
+      browserTabLaunchGenerationRef.current += 1;
+      for (const tab of toolTabsRef.current) releaseBrowserTabSession(tab);
+    },
+    [],
+  );
   const markThreadActivityRead = useCallback(
     (threadId: string) => threadActivityStore.markRead(threadId),
     [threadActivityStore],
@@ -1851,12 +1865,14 @@ export function App() {
     const thread = threads.find((item) => item.id === threadId);
     markThreadActivityRead(threadId);
     activeThreadIdRef.current = threadId;
-    setActiveThreadId(threadId);
-    navigateFlowPrimaryView("conversation");
-    if (activeToolTab?.kind === "extensions") setToolStageOpen(false);
-    if (thread) setExperienceMode(thread.experienceMode);
-    setDraftProjectId(null);
-    if (thread?.workspaceRoot) setSelectedWorkspaceRoot(thread.workspaceRoot);
+    startTransition(() => {
+      setActiveThreadId(threadId);
+      navigateFlowPrimaryView("conversation");
+      if (activeToolTab?.kind === "extensions") setToolStageOpen(false);
+      if (thread) setExperienceMode(thread.experienceMode);
+      setDraftProjectId(null);
+      if (thread?.workspaceRoot) setSelectedWorkspaceRoot(thread.workspaceRoot);
+    });
   }
 
   useEffect(() => {
@@ -1911,7 +1927,7 @@ export function App() {
     setActiveThreadId(null);
     navigateFlowPrimaryView("conversation");
     setNewTaskLaunchMode("local");
-    setToolTabs([]);
+    clearToolTabs();
     setActiveToolTabId(null);
     setToolStageOpen(false);
     setConversationCollapsed(false);
@@ -2059,6 +2075,10 @@ export function App() {
 
   function openToolTab(kind: ToolTabKind) {
     if (kind === "image" || kind === "preview" || kind === "side-task") return;
+    if (kind === "browser") {
+      openSharedBrowserTab();
+      return;
+    }
     const id = `tool-${kind}`;
     setToolTabs((current) =>
       current.some((tab) => tab.id === id)
@@ -2066,6 +2086,61 @@ export function App() {
         : [...current, { id, kind, title: toolTabTitle(kind) }],
     );
     setActiveToolTabId(id);
+    setToolStageOpen(true);
+    setConversationCollapsed(false);
+  }
+
+  function openNewBrowserTab() {
+    const browserHost = window.opentopia?.browserHost;
+    if (!browserHost) {
+      openSharedBrowserTab();
+      return;
+    }
+    const sessionId = newBrowserTabSessionId();
+    const launchGeneration = browserTabLaunchGenerationRef.current;
+    void browserHost
+      .createSession({ sessionId, visible: false })
+      .then(() => {
+        if (launchGeneration !== browserTabLaunchGenerationRef.current) {
+          void browserHost.destroySession(sessionId).catch(() => {});
+          return;
+        }
+        const id = `tool-browser:${sessionId}`;
+        const sequence = ++browserTabSequenceRef.current;
+        setToolTabs((current) => [
+          ...current,
+          {
+            id,
+            kind: "browser",
+            title: `浏览器 ${sequence}`,
+            browserSessionId: sessionId,
+          },
+        ]);
+        setActiveToolTabId(id);
+        setToolStageOpen(true);
+        setConversationCollapsed(false);
+      })
+      .catch((error: unknown) => {
+        if (launchGeneration === browserTabLaunchGenerationRef.current) {
+          setActionError(`无法新建浏览器：${errorMessage(error)}`);
+        }
+      });
+  }
+
+  function openSharedBrowserTab() {
+    setToolTabs((current) =>
+      current.some((tab) => tab.id === "tool-browser")
+        ? current
+        : [
+            ...current,
+            {
+              id: "tool-browser",
+              kind: "browser",
+              title: toolTabTitle("browser"),
+            },
+          ],
+    );
+    setActiveToolTabId("tool-browser");
     setToolStageOpen(true);
     setConversationCollapsed(false);
   }
@@ -2140,6 +2215,10 @@ export function App() {
   }
 
   function toggleToolPanel(kind: Exclude<ToolTabKind, "image" | "preview">) {
+    if (kind === "browser") {
+      openNewBrowserTab();
+      return;
+    }
     const tabId = `tool-${kind}`;
     if (toolStageOpen && activeToolTabId === tabId) {
       setToolStageOpen(false);
@@ -2147,6 +2226,23 @@ export function App() {
       return;
     }
     openToolTab(kind);
+  }
+
+  function releaseBrowserTabSession(tab: ToolTab | undefined) {
+    const sessionId = tab?.browserSessionId;
+    const browserHost = window.opentopia?.browserHost;
+    if (!sessionId || !browserHost) return;
+    void browserHost.destroySession(sessionId).catch(() => {
+      // A tab can be closed before its native view finishes initializing, or
+      // after Electron has already removed sessions while the window closes.
+    });
+  }
+
+  function clearToolTabs() {
+    browserTabLaunchGenerationRef.current += 1;
+    for (const tab of toolTabsRef.current) releaseBrowserTabSession(tab);
+    browserTabSequenceRef.current = 0;
+    setToolTabs([]);
   }
 
   const openPreviewTab = useCallback(function openPreviewTab(
@@ -2265,6 +2361,9 @@ export function App() {
     ) {
       return;
     }
+    releaseBrowserTabSession(
+      toolTabsRef.current.find((tab) => tab.id === tabId),
+    );
     previewSessionStore.delete(tabId);
     setToolTabs((current) => {
       const next = closeToolTabState(current, activeToolTabId, tabId);
@@ -2744,7 +2843,7 @@ export function App() {
       setActiveThreadId(thread.id);
       setSelectedWorkspaceRoot(thread.workspaceRoot);
       setDraftProjectId(null);
-      setToolTabs([]);
+      clearToolTabs();
       setActiveToolTabId(null);
       setToolStageOpen(false);
       if (directCommand) {
@@ -2937,7 +3036,9 @@ export function App() {
         );
         setSelectedSkillIds((current) =>
           current.length === submittedSkillIds.length &&
-          current.every((skillId, index) => skillId === submittedSkillIds[index])
+          current.every(
+            (skillId, index) => skillId === submittedSkillIds[index],
+          )
             ? []
             : current,
         );
@@ -3743,7 +3844,7 @@ export function App() {
         toggleToolPanel("terminal");
       } else if (key === "t" && !event.shiftKey) {
         event.preventDefault();
-        toggleToolPanel("browser");
+        openNewBrowserTab();
       } else if (key === "p" && !event.shiftKey) {
         event.preventDefault();
         toggleToolPanel("files");
@@ -4320,6 +4421,7 @@ export function App() {
             }
             onOpenImagePreview={openInlineImagePreview}
             onOpenToolTab={openToolTab}
+            onOpenNewBrowserTab={openNewBrowserTab}
             onOpenSideTask={() => void openSideTask()}
             onThreadUpdated={(updatedThread) =>
               setThreads((current) =>

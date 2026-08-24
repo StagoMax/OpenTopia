@@ -61,6 +61,8 @@ contextBridge.exposeInMainWorld("opentopia", {
   closeWindow: () => ipcRenderer.invoke("platform:close-window"),
   quit: () => ipcRenderer.invoke("platform:quit"),
   getPlatformInfo: () => ipcRenderer.invoke("platform:get-info"),
+  showToolMenu: (options) =>
+    ipcRenderer.invoke("platform:show-tool-menu", options),
   getBackendStartupStatus: () =>
     ipcRenderer.invoke("backend:get-startup-status"),
   onBackendStartupStatus: (listener) => {

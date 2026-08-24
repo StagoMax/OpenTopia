@@ -3,8 +3,10 @@ import test from "node:test";
 
 const {
   STANDALONE_BROWSER_SESSION_ID,
+  browserTabSessionId,
   browserSessionId,
   navigateBrowserAddress,
+  newBrowserTabSessionId,
   resolveAddressBarInput,
 } = await import("./browserNavigation" + ".ts");
 
@@ -19,6 +21,15 @@ test("uses a valid standalone session before a task exists", () => {
     browserSessionId("00000000-0000-4000-8000-000000000001"),
     "00000000-0000-4000-8000-000000000001",
   );
+});
+
+test("creates independent valid browser tab sessions", () => {
+  assert.equal(
+    browserTabSessionId("00000000-0000-4000-8000-000000000001"),
+    "browser:tab:00000000-0000-4000-8000-000000000001",
+  );
+  assert.match(newBrowserTabSessionId(), /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
+  assert.throws(() => browserTabSessionId("not valid"), /有效的浏览器会话/);
 });
 
 test("keeps absolute HTTP and HTTPS URLs", () => {

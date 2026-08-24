@@ -7,7 +7,7 @@ import {
   Plus,
   X,
 } from "lucide-react";
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { ApiClient } from "../../api/client";
 import type {
   DiffReviewFileContent,
@@ -33,6 +33,7 @@ import { Button, IconButton, Popover } from "../../components/ui";
 import { ConversationSessionRegistry } from "../../conversationSessionController";
 import { useConversationSession } from "../../useConversationSession";
 import { PreviewSessionStore } from "../../previewSessionStore";
+import { canShowDesktopToolMenu, showDesktopToolMenu } from "../../platform";
 import type { SendShortcut } from "../../editorPreferences";
 import {
   toolStageLauncherKinds,
@@ -70,6 +71,7 @@ import type {
   WorkspaceFilePreview,
   WorkspaceTree,
 } from "../../types";
+import type { DesktopToolMenuAction } from "../../types/platform";
 import type { ExecutionPermissionMode } from "../composer/Composer";
 import { ConversationLoadingState } from "../conversation/ConversationHeader";
 import { SideTaskConversation } from "../side-task/SideTaskConversation";
@@ -148,6 +150,7 @@ export function RightPanel({
   onGitAction,
   onGetArtifact,
   onOpenToolTab,
+  onOpenNewBrowserTab,
   onOpenSideTask,
   onThreadUpdated,
   onChangePermissionMode,
@@ -251,6 +254,7 @@ export function RightPanel({
   onGitAction(action: DiffReviewGitAction, message: string): Promise<string>;
   onGetArtifact(threadId: string, artifactId: string): Promise<ArtifactContent>;
   onOpenToolTab(kind: ToolTabKind): void;
+  onOpenNewBrowserTab(): void;
   onOpenSideTask(): void;
   onThreadUpdated(thread: Thread): void;
   onChangePermissionMode(mode: ExecutionPermissionMode): void;
@@ -357,6 +361,7 @@ export function RightPanel({
           onActivate={onActivateToolTab}
           onClose={onCloseToolTab}
           onOpen={onOpenToolTab}
+          onOpenNewBrowserTab={onOpenNewBrowserTab}
           onOpenSideTask={onOpenSideTask}
           canOpenSideTask={Boolean(thread)}
           conversationCollapsed={conversationCollapsed}
@@ -368,7 +373,9 @@ export function RightPanel({
           {!activeToolTab ? (
             <ToolStageLauncher
               canOpenFlow={thread?.experienceMode === "flow"}
-              onOpen={onOpenToolTab}
+              onOpen={(kind) =>
+                kind === "browser" ? onOpenNewBrowserTab() : onOpenToolTab(kind)
+              }
             />
           ) : activeToolTab.kind === "flow" ? (
             thread?.experienceMode === "flow" ? (
@@ -421,6 +428,7 @@ export function RightPanel({
               client={client}
               threadId={thread?.id ?? null}
               events={events}
+              sessionId={activeToolTab.browserSessionId}
               navigationRequest={activeToolTab.browserNavigation ?? null}
             />
           ) : activeToolTab.kind === "computer" ? (
@@ -539,6 +547,7 @@ function ToolTabStrip({
   onActivate,
   onClose,
   onOpen,
+  onOpenNewBrowserTab,
   onOpenSideTask,
   canOpenSideTask,
   conversationCollapsed,
@@ -553,6 +562,7 @@ function ToolTabStrip({
   onActivate(tabId: string): void;
   onClose(tabId: string): void;
   onOpen(kind: ToolTabKind): void;
+  onOpenNewBrowserTab(): void;
   onOpenSideTask(): void;
   canOpenSideTask: boolean;
   conversationCollapsed: boolean;
@@ -560,9 +570,41 @@ function ToolTabStrip({
   onToggleConversation(): void;
   onHide(): void;
 }) {
+  const [nativeMenuOpen, setNativeMenuOpen] = useState(false);
+  const nativeToolMenuAvailable = canShowDesktopToolMenu();
+
   function open(kind: ToolTabKind, close: () => void) {
-    onOpen(kind);
+    if (kind === "browser") onOpenNewBrowserTab();
+    else onOpen(kind);
     close();
+  }
+
+  function handleToolMenuAction(action: DesktopToolMenuAction) {
+    if (action === "side-task") {
+      onOpenSideTask();
+      return;
+    }
+    if (action === "browser") {
+      onOpenNewBrowserTab();
+      return;
+    }
+    onOpen(action);
+  }
+
+  async function openNativeToolMenu() {
+    if (nativeMenuOpen) return;
+    setNativeMenuOpen(true);
+    try {
+      const action = await showDesktopToolMenu({
+        canOpenFlow,
+        canOpenSideTask,
+      });
+      if (action) handleToolMenuAction(action);
+    } catch (error) {
+      console.warn("OpenTopia could not show the native tool menu", error);
+    } finally {
+      setNativeMenuOpen(false);
+    }
   }
 
   return (
@@ -611,58 +653,76 @@ function ToolTabStrip({
         })}
       </div>
       <div className="tool-tab-add-wrap">
-        <Popover
-          label="打开工具"
-          align="end"
-          placement="bottom"
-          trigger={(props) => (
-            <IconButton
-              className="tool-tab-add"
-              size="compact"
-              variant="quiet"
-              title="打开工具"
-              aria-label="打开工具"
-              {...props}
-            >
-              <Plus size={14} aria-hidden="true" />
-            </IconButton>
-          )}
-        >
-          {({ close }) => (
-            <div className="tool-popover tool-tab-add-popover" role="menu">
-              {toolTabMenuItems
-                .filter(({ kind }) => kind !== "flow" || canOpenFlow)
-                .map(({ kind, shortcut }) => {
-                  const Icon = toolTabIcon(kind);
-                  return (
-                    <button
-                      key={kind}
-                      role="menuitem"
-                      onClick={() => open(kind, close)}
-                    >
-                      <Icon size={14} aria-hidden="true" />
-                      <span>{toolTabTitle(kind)}</span>
-                      {shortcut ? <kbd>{shortcut}</kbd> : null}
-                    </button>
-                  );
-                })}
-              <button
-                type="button"
-                role="menuitem"
-                disabled={!canOpenSideTask}
-                title={canOpenSideTask ? "新建侧边会话" : "请先打开一个任务"}
-                onClick={() => {
-                  close();
-                  onOpenSideTask();
-                }}
+        {nativeToolMenuAvailable ? (
+          <IconButton
+            className="tool-tab-add"
+            size="compact"
+            variant="quiet"
+            title="打开工具"
+            aria-label="打开工具"
+            aria-expanded={nativeMenuOpen}
+            aria-haspopup="menu"
+            disabled={nativeMenuOpen}
+            onClick={() => void openNativeToolMenu()}
+          >
+            <Plus size={14} aria-hidden="true" />
+          </IconButton>
+        ) : (
+          <Popover
+            label="打开工具"
+            align="end"
+            placement="bottom"
+            trigger={(props) => (
+              <IconButton
+                className="tool-tab-add"
+                size="compact"
+                variant="quiet"
+                title="打开工具"
+                aria-label="打开工具"
+                {...props}
               >
-                <CirclePlus size={14} aria-hidden="true" />
-                <span>侧边任务</span>
-                <kbd>Ctrl+Alt+S</kbd>
-              </button>
-            </div>
-          )}
-        </Popover>
+                <Plus size={14} aria-hidden="true" />
+              </IconButton>
+            )}
+          >
+            {({ close }) => (
+              <div className="tool-popover tool-tab-add-popover" role="menu">
+                {toolTabMenuItems
+                  .filter(({ kind }) => kind !== "flow" || canOpenFlow)
+                  .map(({ kind, shortcut }) => {
+                    const Icon = toolTabIcon(kind);
+                    const label =
+                      kind === "browser" ? "新建浏览器" : toolTabTitle(kind);
+                    return (
+                      <button
+                        key={kind}
+                        role="menuitem"
+                        onClick={() => open(kind, close)}
+                      >
+                        <Icon size={14} aria-hidden="true" />
+                        <span>{label}</span>
+                        {shortcut ? <kbd>{shortcut}</kbd> : null}
+                      </button>
+                    );
+                  })}
+                <button
+                  type="button"
+                  role="menuitem"
+                  disabled={!canOpenSideTask}
+                  title={canOpenSideTask ? "新建侧边会话" : "请先打开一个任务"}
+                  onClick={() => {
+                    close();
+                    onOpenSideTask();
+                  }}
+                >
+                  <CirclePlus size={14} aria-hidden="true" />
+                  <span>侧边任务</span>
+                  <kbd>Ctrl+Alt+S</kbd>
+                </button>
+              </div>
+            )}
+          </Popover>
+        )}
       </div>
       <div className="tool-tab-actions">
         {conversationToggleAvailable ? (

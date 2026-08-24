@@ -16,11 +16,19 @@ class FakeNavigationHistory {
     this.pendingIndex = null;
   }
 
+  canGoToOffset(offset) {
+    // Model the Electron 41 behavior for same-document history: the legacy
+    // direction helpers can be stale while the offset API is authoritative.
+    return this.entries[this.activeIndex + offset] !== undefined;
+  }
+
   canGoBack() {
+    if (this.sameDocumentEntry) return false;
     return this.activeIndex > 0;
   }
 
   canGoForward() {
+    if (this.sameDocumentEntry) return false;
     return this.activeIndex < this.entries.length - 1;
   }
 
@@ -42,6 +50,11 @@ class FakeNavigationHistory {
     this.pendingIndex = this.activeIndex + 1;
   }
 
+  goToOffset(offset) {
+    this.calls.push(offset < 0 ? "back-offset" : "forward-offset");
+    this.pendingIndex = this.activeIndex + offset;
+  }
+
   finishNavigation() {
     assert.notEqual(this.pendingIndex, null, "expected a pending history move");
     this.activeIndex = this.pendingIndex;
@@ -49,7 +62,11 @@ class FakeNavigationHistory {
     const entry = this.entries[this.activeIndex];
     this.webContents.url = entry.url;
     this.webContents.title = entry.title;
-    this.webContents.emit("did-navigate", {}, entry.url, 200, "OK");
+    if (this.sameDocumentEntry) {
+      this.webContents.emit("did-navigate-in-page", {}, entry.url, true);
+    } else {
+      this.webContents.emit("did-navigate", {}, entry.url, 200, "OK");
+    }
   }
 }
 
@@ -186,7 +203,7 @@ test("back and forward resolve only after the corresponding history navigation c
         return null;
       });
     await waitFor(() => history.calls.length === 1);
-    assert.deepEqual(history.calls, ["back"]);
+    assert.deepEqual(history.calls, ["back-offset"]);
     assert.equal(backSettled, false);
     assert.equal((await invoke(IPC_CHANNELS.getState, sessionId)).url, initial.url);
 
@@ -216,7 +233,7 @@ test("back and forward resolve only after the corresponding history navigation c
       return state;
     });
     await waitFor(() => history.calls.length === 2);
-    assert.deepEqual(history.calls, ["back", "forward"]);
+    assert.deepEqual(history.calls, ["back-offset", "forward-offset"]);
     assert.equal(forwardSettled, false);
 
     history.finishNavigation();
@@ -228,6 +245,38 @@ test("back and forward resolve only after the corresponding history navigation c
       channel: IPC_CHANNELS.state,
       state: afterForward,
     });
+  } finally {
+    await host.close();
+  }
+});
+
+test("same-document history remains navigable when legacy direction checks are stale", async () => {
+  const { host, invoke, views } = createHarness();
+  const sessionId = "browser:same-document-history-test";
+  try {
+    await invoke(IPC_CHANNELS.create, { sessionId, visible: false });
+    const history = views[0].webContents.navigationHistory;
+    history.sameDocumentEntry = true;
+    history.entries = [
+      { url: "https://example.test/app", title: "App" },
+      { url: "https://example.test/app#settings", title: "Settings" },
+    ];
+    history.activeIndex = 1;
+    views[0].webContents.url = history.entries[1].url;
+    views[0].webContents.title = history.entries[1].title;
+
+    const state = await invoke(IPC_CHANNELS.getState, sessionId);
+    assert.equal(state.canGoBack, true);
+    assert.equal(state.canGoForward, false);
+
+    const back = invoke(IPC_CHANNELS.back, sessionId);
+    await waitFor(() => history.calls.length === 1);
+    assert.deepEqual(history.calls, ["back-offset"]);
+    history.finishNavigation();
+    const afterBack = await back;
+    assert.equal(afterBack.url, "https://example.test/app");
+    assert.equal(afterBack.canGoBack, false);
+    assert.equal(afterBack.canGoForward, true);
   } finally {
     await host.close();
   }

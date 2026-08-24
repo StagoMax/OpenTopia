@@ -5,6 +5,7 @@ const {
   clipboard,
   dialog,
   ipcMain,
+  Menu,
   Notification,
   nativeImage,
   safeStorage,
@@ -41,6 +42,13 @@ const {
   applyAgentToolsEnvironment,
   resolveDevelopmentAgentToolsRuntime,
 } = require("./agent-tools-runtime.cjs");
+const {
+  autostartDeploymentLibraryServices,
+} = require("./deployment-library-autostart.cjs");
+const {
+  createDesktopToolMenuTemplate,
+  normalizeDesktopToolMenuRequest,
+} = require("./desktop-tool-menu.cjs");
 
 const isDev = !app.isPackaged;
 if (isDev) {
@@ -1490,6 +1498,7 @@ async function waitForBackendHealth(attempts) {
         backend: backendEndpointInfo(),
       });
       updateBackendStartupStatus("ready");
+      void ensureDeploymentLibraryServices();
       return true;
     }
   }
@@ -1561,6 +1570,7 @@ async function startBackendIfNeeded({
   updateBackendStartupStatus("checking", { resetElapsed: true });
   if (await isBackendHealthy()) {
     updateBackendStartupStatus("ready");
+    void ensureDeploymentLibraryServices();
     return;
   }
 
@@ -1938,6 +1948,22 @@ function getLibraryProviderServiceManager(provider) {
   throw new Error(`未知的资料库后端：${provider}`);
 }
 
+async function ensureDeploymentLibraryServices() {
+  try {
+    const providers = await autostartDeploymentLibraryServices({
+      backendUrl: defaultBackendUrl,
+      apiToken: backendApiToken,
+      ensureProvider: (provider) =>
+        getLibraryProviderServiceManager(provider).ensureReady(),
+    });
+    if (providers.length > 0) {
+      writeLog("info", "library.provider.autostart.ready", { providers });
+    }
+  } catch (error) {
+    logConsole("warn", "library.provider.autostart.failed", { error });
+  }
+}
+
 function listSecretSources() {
   const backendEnv = createBackendEnv(resolveRepoRoot(), {
     includeKeyring: false,
@@ -2070,6 +2096,31 @@ function registerIpc() {
       );
     }
   };
+  ipcMain.handle("platform:show-tool-menu", (event, request) => {
+    assertMainRenderer(event);
+    const owner = BrowserWindow.fromWebContents(event.sender);
+    if (!owner || owner.isDestroyed()) {
+      throw new Error("The application window is unavailable.");
+    }
+    const options = normalizeDesktopToolMenuRequest(request);
+    return new Promise((resolve) => {
+      let selectedAction = null;
+      const menu = Menu.buildFromTemplate(
+        createDesktopToolMenuTemplate(options, (action) => {
+          selectedAction = action;
+        }),
+      );
+      const popupOptions = {
+        window: owner,
+        callback: () => resolve(selectedAction),
+      };
+      if (options.x !== undefined && options.y !== undefined) {
+        popupOptions.x = options.x;
+        popupOptions.y = options.y;
+      }
+      menu.popup(popupOptions);
+    });
+  });
   ipcMain.on("backend-event-stream:open", (event, request) => {
     try {
       assertMainRenderer(event);

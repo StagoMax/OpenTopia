@@ -25,6 +25,16 @@ export type PlatformInfo = {
   };
 };
 
+export type DesktopToolMenuAction =
+  "flow" | "terminal" | "browser" | "computer" | "files" | "side-task";
+
+export type DesktopToolMenuRequest = {
+  canOpenFlow: boolean;
+  canOpenSideTask: boolean;
+  x?: number;
+  y?: number;
+};
+
 export type BackendEventStreamMessage = {
   streamId: string;
   type: "connected" | "chunk" | "error" | "closed";
@@ -310,6 +320,9 @@ declare global {
       closeWindow(): Promise<boolean>;
       quit(): Promise<boolean>;
       getPlatformInfo(): Promise<PlatformInfo>;
+      showToolMenu(
+        options: DesktopToolMenuRequest,
+      ): Promise<DesktopToolMenuAction | null>;
       getBackendStartupStatus(): Promise<BackendStartupStatus>;
       onBackendStartupStatus(
         listener: (status: BackendStartupStatus) => void,

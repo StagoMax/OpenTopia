@@ -321,8 +321,8 @@ export function TopBar({
                 role="menuitem"
                 onClick={() => runAction(() => onToggleTool("browser"))}
               >
-                <span>浏览器</span>
-                <kbd />
+                <span>新建浏览器</span>
+                <kbd>Ctrl+T</kbd>
               </button>
             </div>
           ) : null}

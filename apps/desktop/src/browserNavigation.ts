@@ -2,6 +2,30 @@ const HTTP_SCHEMES = new Set(["http:", "https:"]);
 const BROWSER_SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 export const STANDALONE_BROWSER_SESSION_ID = "browser:standalone";
+const BROWSER_TAB_SESSION_PREFIX = "browser:tab:";
+
+/**
+ * Generates a session for a browser tab a person opens themselves. These tabs
+ * intentionally do not reuse the task session: an agent can continue to use
+ * its shared browser while the person keeps other pages open independently.
+ */
+export function newBrowserTabSessionId(): string {
+  const nonce =
+    globalThis.crypto?.randomUUID?.() ??
+    `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return browserTabSessionId(nonce);
+}
+
+export function browserTabSessionId(nonce: string): string {
+  if (typeof nonce !== "string" || nonce.length === 0) {
+    throw new Error("无法创建有效的浏览器会话标识。");
+  }
+  const sessionId = `${BROWSER_TAB_SESSION_PREFIX}${nonce}`;
+  if (!BROWSER_SESSION_ID_PATTERN.test(sessionId)) {
+    throw new Error("无法创建有效的浏览器会话标识。");
+  }
+  return sessionId;
+}
 
 interface AddressBarBrowserHost {
   createSession(input: {

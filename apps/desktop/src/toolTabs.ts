@@ -33,6 +33,8 @@ export type ToolTab = {
   imagePreview?: ImagePreviewSource;
   sideTaskThreadId?: string;
   previewTarget?: PreviewTarget;
+  /** An explicit value denotes a person-created, independent browser tab. */
+  browserSessionId?: string;
   browserNavigation?: BrowserNavigationRequest;
 };
 

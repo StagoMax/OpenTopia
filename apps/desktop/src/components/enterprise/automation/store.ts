@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useSyncExternalStore } from "react";
 import type { ApiClient } from "../../../api/client";
+import { ensureLibraryProviderService } from "../../../platform";
 import type {
   WorkflowDeliveryReceipt,
   WorkflowDeployment,
@@ -9,6 +10,15 @@ import type {
   WorkflowTrigger,
   WorkflowTriggerInvocation,
 } from "../../../types";
+import type {
+  LibraryProviderId,
+  LibraryProviderServiceRuntimeStatus,
+} from "../../../types/platform";
+import { requiredDeploymentLibraryProviders } from "./requiredLibraries";
+
+type EnsureLibraryProviderService = (
+  provider: LibraryProviderId,
+) => Promise<LibraryProviderServiceRuntimeStatus | null>;
 
 export type AutomationSnapshot = {
   status: "idle" | "loading" | "ready" | "error";
@@ -46,7 +56,10 @@ export class WorkflowAutomationStore {
   private loadPromise: Promise<void> | null = null;
   private summaryGeneration = 0;
 
-  constructor(private readonly client: ApiClient) {}
+  constructor(
+    private readonly client: ApiClient,
+    private readonly ensureLibraryProvider: EnsureLibraryProviderService = ensureLibraryProviderService,
+  ) {}
 
   readonly getSnapshot = (): AutomationSnapshot => this.snapshot;
 
@@ -205,6 +218,7 @@ export class WorkflowAutomationStore {
 
   async startPending(invocation: WorkflowTriggerInvocation): Promise<boolean> {
     return this.perform(`start:${invocation.id}`, async () => {
+      await this.ensureInvocationLibraries(invocation);
       const result = await this.client.startPendingWorkflowInvocation(
         invocation.id,
       );
@@ -221,6 +235,22 @@ export class WorkflowAutomationStore {
       });
       await this.loadSummary();
     });
+  }
+
+  private async ensureInvocationLibraries(
+    invocation: WorkflowTriggerInvocation,
+  ): Promise<void> {
+    const deployment = this.snapshot.deployments.find(
+      (item) => item.id === invocation.deploymentId,
+    );
+    for (const provider of requiredDeploymentLibraryProviders(deployment)) {
+      const runtime = await this.ensureLibraryProvider(provider);
+      if (runtime?.state === "unavailable") {
+        throw new Error(
+          runtime.message || `${provider.toUpperCase()} 资料库服务尚未就绪`,
+        );
+      }
+    }
   }
 
   private async loadSummary(): Promise<void> {

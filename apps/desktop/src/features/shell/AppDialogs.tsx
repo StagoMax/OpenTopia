@@ -258,7 +258,7 @@ export function KeyboardShortcutsDialog({ onClose }: { onClose(): void }) {
     ["切换侧栏", "Ctrl+B"],
     ["设置", "Ctrl+,"],
     ["打开终端", "Ctrl+`"],
-    ["打开浏览器", "Ctrl+T"],
+    ["新建浏览器", "Ctrl+T"],
     ["打开文件", "Ctrl+P"],
     ["侧边任务", "Ctrl+Alt+S"],
     ["切换文件树", "Ctrl+Shift+E"],

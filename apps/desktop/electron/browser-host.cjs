@@ -331,20 +331,38 @@ function navigationHistory(webContents) {
   return webContents.navigationHistory || webContents;
 }
 
-function canGoBack(webContents) {
-  try {
-    return Boolean(navigationHistory(webContents).canGoBack());
-  } catch {
-    return false;
+function canGoToHistoryOffset(history, offset, legacyMethod) {
+  // Electron's legacy canGoBack/canGoForward methods can report false for
+  // same-document entries created by pushState or hash navigation. The
+  // offset API covers both document and same-document history entries.
+  if (typeof history?.canGoToOffset === "function") {
+    try {
+      return Boolean(history.canGoToOffset(offset));
+    } catch {
+      // Fall through to the legacy API on older or partially initialized
+      // Electron implementations.
+    }
   }
+  try {
+    if (typeof history?.[legacyMethod] === "function") {
+      return Boolean(history[legacyMethod]());
+    }
+  } catch {
+    // Treat an unavailable or already-disposed history object as unavailable.
+  }
+  return false;
+}
+
+function canGoBack(webContents) {
+  return canGoToHistoryOffset(navigationHistory(webContents), -1, "canGoBack");
 }
 
 function canGoForward(webContents) {
-  try {
-    return Boolean(navigationHistory(webContents).canGoForward());
-  } catch {
-    return false;
-  }
+  return canGoToHistoryOffset(
+    navigationHistory(webContents),
+    1,
+    "canGoForward",
+  );
 }
 
 function browserOutput(webContents, action, contents = [], metadata = {}) {
@@ -945,7 +963,11 @@ function createDesktopBrowserHost(options) {
     try {
       history = navigationHistory(webContents);
       canNavigate =
-        direction === "back" ? history.canGoBack() : history.canGoForward();
+        canGoToHistoryOffset(
+          history,
+          offset,
+          direction === "back" ? "canGoBack" : "canGoForward",
+        );
       if (typeof history.getActiveIndex === "function") {
         const activeIndex = history.getActiveIndex();
         if (Number.isInteger(activeIndex)) {
@@ -963,7 +985,11 @@ function createDesktopBrowserHost(options) {
       return Promise.resolve(sessionState(entry));
     }
     const navigate =
-      direction === "back" ? () => history.goBack() : () => history.goForward();
+      typeof history.goToOffset === "function"
+        ? () => history.goToOffset(offset)
+        : direction === "back"
+          ? () => history.goBack()
+          : () => history.goForward();
 
     const navigationGeneration = (entry.navigationGeneration += 1);
     entry.lastError = null;

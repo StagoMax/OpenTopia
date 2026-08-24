@@ -15,7 +15,7 @@ import {
 } from "../browserHandoff";
 import { syncBrowserAddress } from "../browserAddressState";
 import {
-  browserSessionId,
+  browserSessionId as sharedBrowserSessionId,
   navigateBrowserAddress,
   resolveAddressBarInput,
 } from "../browserNavigation";
@@ -32,13 +32,17 @@ export function WebPreviewSurface({
   client,
   threadId,
   events,
+  sessionId: explicitSessionId,
   navigationRequest,
 }: {
   client: ApiClient | null;
   threadId: string | null;
   events: AgentEvent[];
+  /** An explicit id is a person-created tab, separate from the task browser. */
+  sessionId?: string;
   navigationRequest: BrowserNavigationRequest | null;
 }) {
+  const isSharedTaskBrowser = !explicitSessionId;
   const nativeApi = window.opentopia?.browserHost;
   if (!nativeApi) {
     return (
@@ -46,14 +50,18 @@ export function WebPreviewSurface({
         client={client}
         threadId={threadId}
         events={events}
-        navigationRequest={navigationRequest}
+        navigationRequest={isSharedTaskBrowser ? navigationRequest : null}
       />
     );
   }
 
-  const handoff = activeBrowserHandoff(events, threadId);
-  const handoffTurnId = activeBrowserHandoffTurnId(events, threadId);
-  const sessionId = browserSessionId(threadId);
+  const handoff = isSharedTaskBrowser
+    ? activeBrowserHandoff(events, threadId)
+    : null;
+  const handoffTurnId = isSharedTaskBrowser
+    ? activeBrowserHandoffTurnId(events, threadId)
+    : null;
+  const sessionId = explicitSessionId ?? sharedBrowserSessionId(threadId);
 
   return (
     <NativeWebPreview
@@ -63,7 +71,7 @@ export function WebPreviewSurface({
       threadId={threadId}
       handoff={handoff}
       handoffTurnId={handoffTurnId}
-      navigationRequest={navigationRequest}
+      navigationRequest={isSharedTaskBrowser ? navigationRequest : null}
     />
   );
 }
@@ -116,10 +124,17 @@ function NativeWebPreview({
 
   useEffect(() => {
     if (!handoff) return;
+    let disposed = false;
     void api
       .createSession({ sessionId })
-      .then(() => api.beginUserControl(sessionId))
+      .then(() => {
+        if (disposed) return;
+        return api.beginUserControl(sessionId);
+      })
       .catch((cause) => setError(errorMessage(cause)));
+    return () => {
+      disposed = true;
+    };
   }, [api, handoff, sessionId]);
 
   const reportBounds = useCallback(() => {
@@ -234,7 +249,10 @@ function NativeWebPreview({
     setError(null);
     void api
       .createSession({ sessionId, visible: false })
-      .then(() => api.navigateFromAddressBar(sessionId, navigationRequest.url))
+      .then(() => {
+        if (disposed) return;
+        return api.navigateFromAddressBar(sessionId, navigationRequest.url);
+      })
       .catch((cause) => {
         if (!disposed) {
           pendingAddressRef.current = null;
