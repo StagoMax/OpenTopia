@@ -104,10 +104,52 @@ impl AgentCore {
             checkpoint,
         });
         let live_event_sender = events.sender.clone();
+        let first_token_pending = Arc::new(AtomicBool::new(false));
+        let first_token_observed = Arc::new(AtomicBool::new(false));
+        let transport_first_token_observed = Arc::clone(&first_token_observed);
         let mut transport_events = Vec::new();
         let mut on_transport = |observation| {
             let mut payloads = Vec::new();
             match observation {
+                ProviderTransportEvent::ResponseHeaders { attempt, status } => {
+                    payloads.push(AgentEventPayload::ProviderResponseHeadersReceived {
+                        request_id,
+                        round,
+                        attempt,
+                        status,
+                    });
+                }
+                ProviderTransportEvent::OutputStarted { .. } => {
+                    if !transport_first_token_observed.swap(true, AtomicOrdering::SeqCst) {
+                        payloads.push(AgentEventPayload::ProviderFirstTokenReceived { request_id });
+                    }
+                }
+                ProviderTransportEvent::StreamProgress {
+                    attempt,
+                    output_events,
+                    output_bytes,
+                    elapsed_ms,
+                } => payloads.push(AgentEventPayload::ProviderStreamProgress {
+                    request_id,
+                    round,
+                    attempt,
+                    output_events,
+                    output_bytes,
+                    elapsed_ms,
+                }),
+                ProviderTransportEvent::ResponseCommitStarted {
+                    attempt,
+                    output_events,
+                    output_bytes,
+                    elapsed_ms,
+                } => payloads.push(AgentEventPayload::ProviderResponseCommitStarted {
+                    request_id,
+                    round,
+                    attempt,
+                    output_events,
+                    output_bytes,
+                    elapsed_ms,
+                }),
                 ProviderTransportEvent::Retry {
                     attempt,
                     retry_kind,
@@ -117,6 +159,17 @@ impl AgentCore {
                     cache_trace,
                     body,
                 } => {
+                    tracing::warn!(
+                        target: "opentopia::provider_timing",
+                        %request_id,
+                        round,
+                        attempt,
+                        ?retry_kind,
+                        ?retry_index,
+                        ?retry_limit,
+                        reason = %reason,
+                        "provider request retrying"
+                    );
                     if reason.contains("stored response cursor unavailable") {
                         payloads.push(AgentEventPayload::ProviderContextStateInvalidated {
                             provider_id: None,
@@ -165,8 +218,8 @@ impl AgentCore {
         let mut latest_usage = None;
         let mut proposed_plan_parser = (self.collaboration_mode == CollaborationMode::Plan)
             .then(super::proposed_plan::ProposedPlanStreamParser::default);
-        let first_token_pending = Arc::new(AtomicBool::new(false));
         let metric_pending = Arc::clone(&first_token_pending);
+        let metric_first_token_observed = Arc::clone(&first_token_observed);
         let metric_event_sender = events.sender.clone();
         let mut on_metric = |metric| {
             match metric {
@@ -174,10 +227,12 @@ impl AgentCore {
                     request_id: metric_request_id,
                 } => {
                     debug_assert_eq!(metric_request_id, request_id);
-                    metric_pending.store(true, AtomicOrdering::SeqCst);
-                    if let Some(sender) = &metric_event_sender {
-                        let _ = sender
-                            .send(AgentEventPayload::ProviderFirstTokenReceived { request_id });
+                    if !metric_first_token_observed.swap(true, AtomicOrdering::SeqCst) {
+                        metric_pending.store(true, AtomicOrdering::SeqCst);
+                        if let Some(sender) = &metric_event_sender {
+                            let _ = sender
+                                .send(AgentEventPayload::ProviderFirstTokenReceived { request_id });
+                        }
                     }
                 }
             }

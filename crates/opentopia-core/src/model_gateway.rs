@@ -6,11 +6,13 @@
 use crate::context_runtime::CanonicalModelRequest;
 use crate::provider::{
     ModelProvider, ModelRequest, ModelResponse, ModelStreamCallback, ModelStreamDelta,
-    PreparedProviderRequest, ProviderResponseCommitMode, ProviderTransportCallback,
+    PreparedProviderRequest, ProviderTransportCallback, ProviderTransportEvent,
 };
 use async_trait::async_trait;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use uuid::Uuid;
 
 #[async_trait]
@@ -136,64 +138,35 @@ impl ModelGateway for ProviderModelGateway {
         on_metric: &mut ModelGatewayMetricCallback<'_>,
     ) -> anyhow::Result<ModelResponse> {
         let request_id = prepared.request_id;
-        if prepared.response_commit == ProviderResponseCommitMode::Streaming {
-            let mut first_token_received = false;
-            let mut observed_delta = |delta: ModelStreamDelta| {
-                if !first_token_received && delta.contains_output_token() {
-                    first_token_received = true;
-                    on_metric(ModelGatewayMetricEvent::FirstOutputTokenReceived { request_id })?;
-                }
-                on_delta(delta)
-            };
-            return self
-                .transport
-                .send(prepared, &mut observed_delta, on_transport)
-                .await;
-        }
-
-        // A tool-capable model turn is one semantic transaction. Transport
-        // fragments are provisional until the adapter has assembled and
-        // validated the terminal response; otherwise a malformed tool call can
-        // leak its accompanying text into durable conversation events before
-        // the turn is rejected. Retries clear the fragments from the abandoned
-        // attempt, and only the successfully decoded attempt is committed.
-        let pending_deltas = Arc::new(Mutex::new(Vec::<ModelStreamDelta>::new()));
-        let delta_buffer = Arc::clone(&pending_deltas);
-        let mut first_token_received = false;
-        let mut buffered_delta = move |delta: ModelStreamDelta| {
-            if !first_token_received && delta.contains_output_token() {
-                first_token_received = true;
-                on_metric(ModelGatewayMetricEvent::FirstOutputTokenReceived { request_id })?;
-            }
-            delta_buffer
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(delta);
-            Ok(())
-        };
-        let retry_buffer = Arc::clone(&pending_deltas);
-        let mut observed_transport = |event| {
-            if matches!(event, crate::provider::ProviderTransportEvent::Retry { .. }) {
-                retry_buffer
+        let first_token_received = Arc::new(AtomicBool::new(false));
+        let metric = Arc::new(Mutex::new(on_metric));
+        let delta_first_token = Arc::clone(&first_token_received);
+        let delta_metric = Arc::clone(&metric);
+        let mut observed_delta = |delta: ModelStreamDelta| {
+            if delta.contains_output_token() && !delta_first_token.swap(true, Ordering::SeqCst) {
+                let mut callback = delta_metric
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clear();
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (**callback)(ModelGatewayMetricEvent::FirstOutputTokenReceived { request_id })?;
+            }
+            on_delta(delta)
+        };
+        let transport_first_token = Arc::clone(&first_token_received);
+        let transport_metric = Arc::clone(&metric);
+        let mut observed_transport = |event| {
+            if matches!(event, ProviderTransportEvent::OutputStarted { .. })
+                && !transport_first_token.swap(true, Ordering::SeqCst)
+            {
+                let mut callback = transport_metric
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (**callback)(ModelGatewayMetricEvent::FirstOutputTokenReceived { request_id })?;
             }
             on_transport(event)
         };
-        let response = self
-            .transport
-            .send(prepared, &mut buffered_delta, &mut observed_transport)
-            .await?;
-        let deltas = std::mem::take(
-            &mut *pending_deltas
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        for delta in deltas {
-            on_delta(delta)?;
-        }
-        Ok(response)
+        self.transport
+            .send(prepared, &mut observed_delta, &mut observed_transport)
+            .await
     }
 }
 
@@ -201,9 +174,10 @@ impl ModelGateway for ProviderModelGateway {
 mod tests {
     use super::*;
     use crate::context_runtime::{ContextAssembler, ContextAssemblyInput, DefaultContextAssembler};
-    use crate::model::ProviderRetryKind;
     use crate::model_context::CompiledModelContext;
-    use crate::provider::{MockProvider, ModelFinishReason, ProviderTransportEvent};
+    use crate::provider::{
+        MockProvider, ModelFinishReason, ProviderResponseCommitMode, ProviderTransportEvent,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn accepts_object_safe_gateway(_gateway: &dyn ModelGateway) {}
@@ -361,90 +335,25 @@ mod tests {
         }
     }
 
-    struct FailingAtomicTransport;
+    struct TimingTransport;
 
     #[async_trait]
-    impl ProviderTransport for FailingAtomicTransport {
-        async fn send(
-            &self,
-            _prepared: PreparedProviderRequest,
-            on_delta: &mut ModelStreamCallback<'_>,
-            _on_transport: &mut ProviderTransportCallback<'_>,
-        ) -> anyhow::Result<ModelResponse> {
-            on_delta(ModelStreamDelta::Text {
-                text: "provisional".to_string(),
-            })?;
-            anyhow::bail!("terminal tool protocol validation failed")
-        }
-    }
-
-    #[tokio::test]
-    async fn atomic_response_discards_deltas_when_terminal_validation_fails() {
-        let gateway = ProviderModelGateway::from_parts(
-            Arc::new(AtomicCodec),
-            Arc::new(FailingAtomicTransport),
-        );
-        let prepared = gateway
-            .prepare(Uuid::from_u128(2), canonical_request())
-            .unwrap();
-        let mut committed = Vec::new();
-        let mut metrics = Vec::new();
-
-        gateway
-            .stream_prepared(
-                prepared,
-                &mut |delta| {
-                    committed.push(delta);
-                    Ok(())
-                },
-                &mut |_| Ok(()),
-                &mut |metric| {
-                    metrics.push(metric);
-                    Ok(())
-                },
-            )
-            .await
-            .expect_err("invalid atomic response must fail");
-
-        assert!(committed.is_empty());
-        assert_eq!(
-            metrics,
-            vec![ModelGatewayMetricEvent::FirstOutputTokenReceived {
-                request_id: Uuid::from_u128(2)
-            }]
-        );
-    }
-
-    struct RetryingAtomicTransport;
-
-    #[async_trait]
-    impl ProviderTransport for RetryingAtomicTransport {
+    impl ProviderTransport for TimingTransport {
         async fn send(
             &self,
             _prepared: PreparedProviderRequest,
             on_delta: &mut ModelStreamCallback<'_>,
             on_transport: &mut ProviderTransportCallback<'_>,
         ) -> anyhow::Result<ModelResponse> {
+            on_transport(ProviderTransportEvent::OutputStarted { attempt: 1 })?;
             on_delta(ModelStreamDelta::Text {
-                text: "discarded-attempt".to_string(),
-            })?;
-            on_transport(ProviderTransportEvent::Retry {
-                attempt: 2,
-                retry_kind: ProviderRetryKind::StateRecovery,
-                retry_index: None,
-                retry_limit: None,
-                reason: "retry transaction".to_string(),
-                cache_trace: None,
-                body: serde_json::json!({}),
-            })?;
-            on_delta(ModelStreamDelta::Text {
-                text: "committed-attempt".to_string(),
+                text: "committed".to_string(),
             })?;
             Ok(ModelResponse {
-                text: "committed-attempt".to_string(),
+                text: "committed".to_string(),
                 tool_calls: Vec::new(),
                 usage: None,
-                response_id: Some("response-2".to_string()),
+                response_id: Some("response-timing".to_string()),
                 provider_items: Vec::new(),
                 finish_reason: ModelFinishReason::Stop,
             })
@@ -452,33 +361,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn atomic_response_clears_abandoned_attempt_before_commit() {
-        let gateway = ProviderModelGateway::from_parts(
-            Arc::new(AtomicCodec),
-            Arc::new(RetryingAtomicTransport),
-        );
+    async fn transport_output_start_records_true_ttft_once_before_semantic_delta() {
+        let gateway =
+            ProviderModelGateway::from_parts(Arc::new(AtomicCodec), Arc::new(TimingTransport));
         let prepared = gateway
-            .prepare(Uuid::from_u128(3), canonical_request())
+            .prepare(Uuid::from_u128(2), canonical_request())
             .unwrap();
-        let mut committed = Vec::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let delta_order = Arc::clone(&order);
+        let transport_order = Arc::clone(&order);
+        let metric_order = Arc::clone(&order);
+        let metrics = Arc::new(Mutex::new(Vec::new()));
+        let recorded_metrics = Arc::clone(&metrics);
 
         gateway
             .stream_prepared(
                 prepared,
-                &mut |delta| {
-                    committed.push(delta);
+                &mut move |_| {
+                    delta_order.lock().unwrap().push("delta");
                     Ok(())
                 },
-                &mut |_| Ok(()),
-                &mut |_| Ok(()),
+                &mut move |_| {
+                    transport_order.lock().unwrap().push("transport");
+                    Ok(())
+                },
+                &mut move |metric| {
+                    metric_order.lock().unwrap().push("metric");
+                    recorded_metrics.lock().unwrap().push(metric);
+                    Ok(())
+                },
             )
             .await
             .unwrap();
 
+        assert_eq!(*order.lock().unwrap(), vec!["metric", "transport", "delta"]);
         assert_eq!(
-            committed,
-            vec![ModelStreamDelta::Text {
-                text: "committed-attempt".to_string()
+            *metrics.lock().unwrap(),
+            vec![ModelGatewayMetricEvent::FirstOutputTokenReceived {
+                request_id: Uuid::from_u128(2)
             }]
         );
     }

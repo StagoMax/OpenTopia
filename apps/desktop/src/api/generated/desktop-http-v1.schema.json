@@ -603,6 +603,43 @@
         },
         {
           "properties": {
+            "attempt": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "request_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "round": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "status": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "type": {
+              "enum": [
+                "provider_response_headers_received"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "attempt",
+            "request_id",
+            "round",
+            "status",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
             "request_id": {
               "format": "uuid",
               "type": "string"
@@ -616,6 +653,104 @@
           },
           "required": [
             "request_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "attempt": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "elapsed_ms": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "output_bytes": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "output_events": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "request_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "round": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "type": {
+              "enum": [
+                "provider_stream_progress"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "attempt",
+            "elapsed_ms",
+            "output_bytes",
+            "output_events",
+            "request_id",
+            "round",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "attempt": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "elapsed_ms": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "output_bytes": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "output_events": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "request_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "round": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "type": {
+              "enum": [
+                "provider_response_commit_started"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "attempt",
+            "elapsed_ms",
+            "output_bytes",
+            "output_events",
+            "request_id",
+            "round",
             "type"
           ],
           "type": "object"

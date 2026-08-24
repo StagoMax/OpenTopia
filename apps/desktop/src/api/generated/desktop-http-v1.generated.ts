@@ -570,8 +570,36 @@ export type AgentEventPayload =
       [k: string]: unknown;
     }
   | {
+      attempt: number;
+      request_id: string;
+      round: number;
+      status: number;
+      type: "provider_response_headers_received";
+      [k: string]: unknown;
+    }
+  | {
       request_id: string;
       type: "provider_first_token_received";
+      [k: string]: unknown;
+    }
+  | {
+      attempt: number;
+      elapsed_ms: number;
+      output_bytes: number;
+      output_events: number;
+      request_id: string;
+      round: number;
+      type: "provider_stream_progress";
+      [k: string]: unknown;
+    }
+  | {
+      attempt: number;
+      elapsed_ms: number;
+      output_bytes: number;
+      output_events: number;
+      request_id: string;
+      round: number;
+      type: "provider_response_commit_started";
       [k: string]: unknown;
     }
   | {

@@ -350,6 +350,7 @@ export class ConversationSessionController {
     this.dispatch({ type: "loadStarted" });
 
     const since = latestPersistedEventSeq(this.state.events);
+    const loadingFeedbackPainted = waitForLoadingFeedbackPaint();
     void (async () => {
       try {
         const messagesPromise = hasSnapshot
@@ -376,6 +377,9 @@ export class ConversationSessionController {
               controller.signal,
             );
         const [turnStatus, approvals, userInput] = await auxiliaryPromise;
+        // Keep the data requests parallel, but do not replace the switching
+        // state before the renderer has had one opportunity to paint it.
+        await loadingFeedbackPainted;
         if (!this.isCurrentLoad(generation, controller)) return;
         events.forEach((event) => this.rememberEventId(event.id));
         this.activityStore.applyEvents(events);
@@ -622,6 +626,15 @@ function latestPersistedEventSeq(events: AgentEvent[]): number | undefined {
     latest = latest === undefined ? event.seq : Math.max(latest, event.seq);
   }
   return latest;
+}
+
+function waitForLoadingFeedbackPaint(): Promise<void> {
+  if (typeof requestAnimationFrame !== "function") {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => setTimeout(resolve, 0));
+  });
 }
 
 function isTerminalActivityEvent(event: AgentEvent): boolean {

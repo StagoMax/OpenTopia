@@ -24,6 +24,7 @@ use std::sync::{Arc, OnceLock};
 use uuid::Uuid;
 
 mod openai;
+mod telemetry;
 mod token_estimate;
 mod transport;
 
@@ -559,6 +560,30 @@ fn require_function_tools(
 
 #[derive(Debug, Clone)]
 pub enum ProviderTransportEvent {
+    /// The provider accepted the request and returned HTTP response headers.
+    /// This is emitted before any response body is decoded, so the UI can
+    /// distinguish connection latency from time-to-first-output.
+    ResponseHeaders { attempt: usize, status: u16 },
+    /// The first output-bearing fragment arrived from the provider. Unlike
+    /// semantic model deltas, this event is never held behind atomic response
+    /// validation and is therefore the authoritative TTFT boundary.
+    OutputStarted { attempt: usize },
+    /// Rate-limited, content-free evidence that a response stream is still
+    /// advancing while semantic deltas remain provisional.
+    StreamProgress {
+        attempt: usize,
+        output_events: usize,
+        output_bytes: usize,
+        elapsed_ms: u64,
+    },
+    /// The adapter decoded and validated the terminal response and is about to
+    /// release it through the semantic commit boundary.
+    ResponseCommitStarted {
+        attempt: usize,
+        output_events: usize,
+        output_bytes: usize,
+        elapsed_ms: u64,
+    },
     Retry {
         attempt: usize,
         retry_kind: ProviderRetryKind,
@@ -722,7 +747,28 @@ pub trait ModelProvider: Send + Sync {
         on_delta: &mut ModelStreamCallback<'_>,
         on_transport: &mut ProviderTransportCallback<'_>,
     ) -> anyhow::Result<ModelResponse> {
-        let response = self.stream(prepared.logical_request, on_delta).await?;
+        let request_id = prepared.request_id;
+        let atomic_response = prepared.response_commit == ProviderResponseCommitMode::Atomic;
+        let mut telemetry = telemetry::ProviderStreamTelemetry::new(request_id, 1);
+        let mut provisional_deltas = Vec::new();
+        let response = {
+            let mut observed_delta = |delta| {
+                telemetry.observe(&delta, on_transport)?;
+                if atomic_response {
+                    provisional_deltas.push(delta);
+                    Ok(())
+                } else {
+                    on_delta(delta)
+                }
+            };
+            self.stream(prepared.logical_request, &mut observed_delta)
+                .await?
+        };
+        telemetry.finish_progress(on_transport)?;
+        telemetry.emit_commit_started(on_transport)?;
+        for delta in provisional_deltas {
+            on_delta(delta)?;
+        }
         on_transport(ProviderTransportEvent::Response {
             attempt: 1,
             status: None,

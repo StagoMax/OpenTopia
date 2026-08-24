@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  activeProviderRequestPhase,
   hasPendingProviderRequest,
   hasPendingToolCall,
 } from "./turnActivityStatus.ts";
@@ -42,7 +43,7 @@ function providerResponse(
   });
 }
 
-test("derives thinking from an unanswered provider request", () => {
+test("derives a provider wait from an unanswered request", () => {
   assert.equal(hasPendingProviderRequest([]), false);
   assert.equal(
     hasPendingProviderRequest([
@@ -60,7 +61,7 @@ test("derives thinking from an unanswered provider request", () => {
   );
 });
 
-test("stops thinking when the matching provider response arrives", () => {
+test("stops the provider wait when the matching response arrives", () => {
   assert.equal(
     hasPendingProviderRequest([
       providerResponse(3, "request-1", 2),
@@ -77,7 +78,64 @@ test("stops thinking when the matching provider response arrives", () => {
   );
 });
 
-test("keeps thinking while any provider request remains unanswered", () => {
+test("distinguishes provider wait, generation, retry, and commit phases", () => {
+  const request = providerRequest(1, "request-1");
+  assert.equal(activeProviderRequestPhase([request]), "connecting");
+  assert.equal(
+    activeProviderRequestPhase([
+      request,
+      event(2, {
+        type: "provider_response_headers_received",
+        request_id: "request-1",
+        round: 1,
+        attempt: 1,
+        status: 200,
+      }),
+    ]),
+    "waiting-output",
+  );
+  assert.equal(
+    activeProviderRequestPhase([
+      request,
+      event(2, {
+        type: "provider_first_token_received",
+        request_id: "request-1",
+      }),
+    ]),
+    "generating",
+  );
+  assert.equal(
+    activeProviderRequestPhase([
+      request,
+      event(2, {
+        type: "provider_request_retried",
+        request_id: "request-1",
+        round: 1,
+        attempt: 2,
+        retry_kind: "state_recovery",
+        reason: "retry non-streaming",
+      }),
+    ]),
+    "retrying",
+  );
+  assert.equal(
+    activeProviderRequestPhase([
+      request,
+      event(2, {
+        type: "provider_response_commit_started",
+        request_id: "request-1",
+        round: 1,
+        attempt: 1,
+        output_events: 20,
+        output_bytes: 1000,
+        elapsed_ms: 5000,
+      }),
+    ]),
+    "committing",
+  );
+});
+
+test("keeps a provider phase while any request remains unanswered", () => {
   assert.equal(
     hasPendingProviderRequest([
       providerRequest(1, "request-1"),

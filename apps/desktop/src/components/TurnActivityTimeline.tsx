@@ -189,7 +189,14 @@ export function PendingTurnStatus({
   threadId: string;
   turnId?: string | null;
 }) {
-  const label = phase === "thinking" ? "正在思考" : "处理中";
+  const label = {
+    connecting: "正在连接模型",
+    "waiting-output": "等待模型输出",
+    generating: "模型正在生成",
+    retrying: "模型请求重试中",
+    committing: "正在校验并提交响应",
+    processing: "处理中",
+  }[phase];
   useStatusPaintTrace(label, threadId, turnId);
   return (
     <section className="turn-activity" data-state="running">

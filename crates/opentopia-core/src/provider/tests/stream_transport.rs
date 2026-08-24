@@ -1065,10 +1065,14 @@ async fn chat_provider_reports_protocol_corruption_when_nonstreaming_recovery_is
     let mut provider =
         OpenAiCompatibleProvider::new(format!("http://{address}/v1"), "test-key", "test-model");
     provider.tool_protocol.streaming_tools = ProviderFeatureSupport::Supported;
+    let mut deltas = Vec::new();
     let error = provider
         .stream_prepared(
             provider.prepare(Uuid::new_v4(), tool_request()).unwrap(),
-            &mut |_| Ok(()),
+            &mut |delta| {
+                deltas.push(delta);
+                Ok(())
+            },
             &mut |_| Ok(()),
         )
         .await
@@ -1079,6 +1083,10 @@ async fn chat_provider_reports_protocol_corruption_when_nonstreaming_recovery_is
     assert!(message.contains("provider tool-call protocol error"));
     assert!(message.contains("both streamed decoding and one non-streaming recovery failed"));
     assert!(!message.contains("capability profile is stale"));
+    assert!(
+        deltas.is_empty(),
+        "invalid atomic attempts must not leak deltas"
+    );
 }
 
 #[tokio::test]

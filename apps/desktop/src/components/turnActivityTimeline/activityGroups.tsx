@@ -122,11 +122,21 @@ export function ActivityEntryView({
     );
   }
   if (entry.kind === "reconnect") {
+    const retryCount =
+      typeof entry.retryIndex === "number" &&
+      typeof entry.retryLimit === "number"
+        ? ` ${entry.retryIndex}/${entry.retryLimit}`
+        : "";
+    const title =
+      entry.retryKind === "state_recovery"
+        ? `正在恢复模型响应${retryCount}`
+        : `正在重新连接${retryCount}`;
     return (
       <ActivityNotice
         className="is-reconnect"
         icon={<Wifi size={13} />}
-        title={`正在重新连接 ${entry.retryIndex}/${entry.retryLimit}`}
+        title={title}
+        detail={entry.reason}
       />
     );
   }

@@ -1478,8 +1478,30 @@ pub enum AgentEventPayload {
         #[serde(default, skip_serializing_if = "Value::is_null")]
         body: Value,
     },
+    ProviderResponseHeadersReceived {
+        request_id: Uuid,
+        round: usize,
+        attempt: usize,
+        status: u16,
+    },
     ProviderFirstTokenReceived {
         request_id: Uuid,
+    },
+    ProviderStreamProgress {
+        request_id: Uuid,
+        round: usize,
+        attempt: usize,
+        output_events: usize,
+        output_bytes: usize,
+        elapsed_ms: u64,
+    },
+    ProviderResponseCommitStarted {
+        request_id: Uuid,
+        round: usize,
+        attempt: usize,
+        output_events: usize,
+        output_bytes: usize,
+        elapsed_ms: u64,
     },
     ProviderResponseReceived {
         request_id: Uuid,
@@ -1677,7 +1699,10 @@ impl AgentEventPayload {
             Self::ModelRequest { .. } => "model_request",
             Self::ProviderRequestSent { .. } => "provider_request_sent",
             Self::ProviderRequestRetried { .. } => "provider_request_retried",
+            Self::ProviderResponseHeadersReceived { .. } => "provider_response_headers_received",
             Self::ProviderFirstTokenReceived { .. } => "provider_first_token_received",
+            Self::ProviderStreamProgress { .. } => "provider_stream_progress",
+            Self::ProviderResponseCommitStarted { .. } => "provider_response_commit_started",
             Self::ProviderResponseReceived { .. } => "provider_response_received",
             Self::ModelDelta { .. } => "model_delta",
             Self::ReasoningDelta { .. } => "reasoning_delta",

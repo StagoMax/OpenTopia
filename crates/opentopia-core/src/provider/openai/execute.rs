@@ -15,6 +15,7 @@ use super::{
     normalize_provider_tool_calls, tool_call_protocol_error_observation, OpenAiCompatibleProvider,
     OpenAiResponsesProvider, ResponsesRequestError,
 };
+use crate::provider::telemetry::{emit_response_headers, ProviderStreamTelemetry};
 use crate::provider::transport::{
     provider_stream_stalled, send_provider_request_with_network_retries,
 };
@@ -48,6 +49,7 @@ impl OpenAiCompatibleProvider {
             )
             .await?;
             let status = response.status();
+            emit_response_headers(prepared.request_id, attempt, status.as_u16(), on_transport)?;
             if !status.is_success() {
                 let body = response.text().await?;
                 on_transport(ProviderTransportEvent::Response {
@@ -85,32 +87,30 @@ impl OpenAiCompatibleProvider {
                 .get("stream")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            let atomic_stream =
-                streamed && prepared.response_commit == ProviderResponseCommitMode::Atomic;
+            let atomic_response = prepared.response_commit == ProviderResponseCommitMode::Atomic;
+            let atomic_stream = streamed && atomic_response;
+            let mut telemetry = ProviderStreamTelemetry::new(prepared.request_id, attempt);
             let mut provisional_deltas = Vec::new();
-            let decoded = if atomic_stream {
-                let mut buffer_delta = |delta| {
-                    provisional_deltas.push(delta);
-                    Ok(())
+            let decoded = {
+                let mut observed_delta = |delta| {
+                    telemetry.observe(&delta, on_transport)?;
+                    if atomic_response {
+                        provisional_deltas.push(delta);
+                        Ok(())
+                    } else {
+                        on_delta(delta)
+                    }
                 };
                 decode_openai_chat_response(
                     response,
                     streamed,
                     &prepared.logical_request.tool_candidates,
-                    &mut buffer_delta,
-                    true,
-                )
-                .await
-            } else {
-                decode_openai_chat_response(
-                    response,
-                    streamed,
-                    &prepared.logical_request.tool_candidates,
-                    on_delta,
+                    &mut observed_delta,
                     true,
                 )
                 .await
             };
+            telemetry.finish_progress(on_transport)?;
             let (mut response, response_attempt, response_status, commit_deltas) = match decoded {
                 Ok(response) => (response, attempt, status.as_u16(), provisional_deltas),
                 Err(error) if atomic_stream && provider_stream_rate_limit(&error).is_some() => {
@@ -175,6 +175,9 @@ impl OpenAiCompatibleProvider {
                 }
             };
             normalize_provider_tool_calls(&mut response.tool_calls, &prepared.tool_contracts);
+            if response_attempt == attempt {
+                telemetry.emit_commit_started(on_transport)?;
+            }
             for delta in commit_deltas {
                 on_delta(delta)?;
             }
@@ -238,6 +241,7 @@ impl OpenAiResponsesProvider {
             .await?;
             let attempt = transport_attempt;
             let status = response.status();
+            emit_response_headers(prepared.request_id, attempt, status.as_u16(), on_transport)?;
             if !status.is_success() {
                 let body = response.text().await?;
                 on_transport(ProviderTransportEvent::Response {
@@ -257,32 +261,30 @@ impl OpenAiResponsesProvider {
                 .get("stream")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            let atomic_stream =
-                streamed && prepared.response_commit == ProviderResponseCommitMode::Atomic;
+            let atomic_response = prepared.response_commit == ProviderResponseCommitMode::Atomic;
+            let atomic_stream = streamed && atomic_response;
+            let mut telemetry = ProviderStreamTelemetry::new(prepared.request_id, attempt);
             let mut provisional_deltas = Vec::new();
-            let decoded = if atomic_stream {
-                let mut buffer_delta = |delta| {
-                    provisional_deltas.push(delta);
-                    Ok(())
+            let decoded = {
+                let mut observed_delta = |delta| {
+                    telemetry.observe(&delta, on_transport)?;
+                    if atomic_response {
+                        provisional_deltas.push(delta);
+                        Ok(())
+                    } else {
+                        on_delta(delta)
+                    }
                 };
                 decode_openai_responses_response(
                     response,
                     streamed,
                     &prepared.logical_request.tool_candidates,
-                    &mut buffer_delta,
-                    true,
-                )
-                .await
-            } else {
-                decode_openai_responses_response(
-                    response,
-                    streamed,
-                    &prepared.logical_request.tool_candidates,
-                    on_delta,
+                    &mut observed_delta,
                     true,
                 )
                 .await
             };
+            telemetry.finish_progress(on_transport)?;
             let (mut response, response_attempt, response_status, commit_deltas) = match decoded {
                 Ok(response) => (response, attempt, status.as_u16(), provisional_deltas),
                 Err(error) if atomic_stream && provider_stream_rate_limit(&error).is_some() => {
@@ -347,6 +349,9 @@ impl OpenAiResponsesProvider {
                 }
             };
             normalize_provider_tool_calls(&mut response.tool_calls, &prepared.tool_contracts);
+            if response_attempt == attempt {
+                telemetry.emit_commit_started(on_transport)?;
+            }
             for delta in commit_deltas {
                 on_delta(delta)?;
             }

@@ -43,7 +43,7 @@ import {
 import type { PendingTurnFeedback } from "../../threadRunState";
 import { friendlyProviderError } from "../../providerErrors";
 import {
-  hasPendingProviderRequest,
+  activeProviderRequestPhase,
   hasPendingToolCall,
 } from "../../turnActivityStatus";
 import type {
@@ -54,6 +54,7 @@ import type {
   TurnFileChange,
   TurnFileDiffPreview,
 } from "../../types";
+import { ConversationLoadingIndicator } from "./ConversationLoadingIndicator";
 import { MessagePartView } from "./MessagePartView";
 
 const emptyAttachmentSources: ContextSourceRef[] = [];
@@ -207,11 +208,12 @@ export function MessageList({
         : ([...turnIdsByUserMessage.entries()].find(([, turnIds]) =>
             turnIds.includes(activeTurnId),
           )?.[0] ?? null);
-  const showModelThinkingStatus =
-    activeTurnIsAnchored && hasPendingProviderRequest(activeTurnEvents);
+  const providerRequestPhase = activeTurnIsAnchored
+    ? activeProviderRequestPhase(activeTurnEvents)
+    : null;
   const showActiveProcessingStatus =
     activeTurnIsAnchored &&
-    !showModelThinkingStatus &&
+    providerRequestPhase === null &&
     !hasPendingToolCall(activeTurnEvents);
   const showTrailingTurnStatus = showPendingTurnStatus;
 
@@ -328,15 +330,8 @@ export function MessageList({
         onCopy={trimCopiedSelection}
       >
         {syncing ? (
-          <div
-            className="conversation-refresh-overlay"
-            role="status"
-            aria-live="polite"
-          >
-            <div className="conversation-refresh-overlay__status">
-              <Loader2 aria-hidden="true" size={16} className="spin" />
-              <span>正在同步最新内容</span>
-            </div>
+          <div className="conversation-refresh-overlay">
+            <ConversationLoadingIndicator label="正在同步最新内容" />
           </div>
         ) : null}
         <div
@@ -443,12 +438,10 @@ export function MessageList({
                   ) : null}
                   {activeTurnUserMessageId === message.id &&
                   activeTurnId &&
-                  (showModelThinkingStatus || showActiveProcessingStatus) ? (
+                  (providerRequestPhase || showActiveProcessingStatus) ? (
                     <PendingTurnStatus
                       key={`active-${activeTurnId}`}
-                      phase={
-                        showModelThinkingStatus ? "thinking" : "processing"
-                      }
+                      phase={providerRequestPhase ?? "processing"}
                       threadId={threadId}
                       turnId={activeTurnId}
                     />

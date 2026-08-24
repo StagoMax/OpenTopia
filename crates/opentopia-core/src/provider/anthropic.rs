@@ -11,6 +11,7 @@ use super::{
     ProviderToolCandidate, ProviderTransportCallback, ProviderTransportEvent, SseDecoder,
     StreamingToolCall,
 };
+use crate::provider::telemetry::{emit_response_headers, ProviderStreamTelemetry};
 use crate::settings::{
     ProviderAdapterKind, ProviderAuthKind, ProviderFeatureSupport, ProviderHealthCheck,
     ProviderSettings, ProviderToolProtocolCapabilities,
@@ -293,6 +294,7 @@ impl AnthropicMessagesProvider {
         )
         .await?;
         let status = response.status();
+        emit_response_headers(prepared.request_id, attempt, status.as_u16(), on_transport)?;
         if !status.is_success() {
             let body = response.text().await?;
             on_transport(ProviderTransportEvent::Response {
@@ -312,14 +314,29 @@ impl AnthropicMessagesProvider {
             .get("stream")
             .and_then(Value::as_bool)
             .unwrap_or(true);
-        let decoded = decode_anthropic_messages_response(
-            response,
-            streamed,
-            &prepared.logical_request.tool_candidates,
-            on_delta,
-            true,
-        )
-        .await;
+        let atomic_response = prepared.response_commit == ProviderResponseCommitMode::Atomic;
+        let mut telemetry = ProviderStreamTelemetry::new(prepared.request_id, attempt);
+        let mut provisional_deltas = Vec::new();
+        let decoded = {
+            let mut observed_delta = |delta| {
+                telemetry.observe(&delta, on_transport)?;
+                if atomic_response {
+                    provisional_deltas.push(delta);
+                    Ok(())
+                } else {
+                    on_delta(delta)
+                }
+            };
+            decode_anthropic_messages_response(
+                response,
+                streamed,
+                &prepared.logical_request.tool_candidates,
+                &mut observed_delta,
+                true,
+            )
+            .await
+        };
+        telemetry.finish_progress(on_transport)?;
         let response = match decoded {
             Ok(response) => response,
             Err(error)
@@ -352,6 +369,10 @@ impl AnthropicMessagesProvider {
                 return Err(error);
             }
         };
+        telemetry.emit_commit_started(on_transport)?;
+        for delta in provisional_deltas {
+            on_delta(delta)?;
+        }
         on_transport(ProviderTransportEvent::Response {
             attempt,
             status: Some(status.as_u16()),

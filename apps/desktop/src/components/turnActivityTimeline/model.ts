@@ -97,8 +97,10 @@ type PrimitiveActivity =
       kind: "reconnect";
       seq: number;
       requestId: string;
-      retryIndex: number;
-      retryLimit: number;
+      retryKind: "network" | "state_recovery";
+      retryIndex?: number | null;
+      retryLimit?: number | null;
+      reason: string;
       createdAt: string;
     }
   | { kind: "error"; seq: number; message: string; createdAt: string }
@@ -275,24 +277,23 @@ export function buildActivityEntries(events: AgentEvent[]): ActivityEntry[] {
         seq: event.seq,
         createdAt: event.createdAt,
       });
-    } else if (
-      payload.type === "provider_request_retried" &&
-      payload.retry_kind === "network" &&
-      typeof payload.retry_index === "number" &&
-      typeof payload.retry_limit === "number"
-    ) {
+    } else if (payload.type === "provider_request_retried") {
       const current = reconnects.get(payload.request_id);
       if (current) {
+        current.retryKind = payload.retry_kind ?? "network";
         current.retryIndex = payload.retry_index;
         current.retryLimit = payload.retry_limit;
+        current.reason = payload.reason;
         current.createdAt = event.createdAt;
       } else {
         const entry: Extract<PrimitiveActivity, { kind: "reconnect" }> = {
           kind: "reconnect",
           seq: event.seq,
           requestId: payload.request_id,
+          retryKind: payload.retry_kind ?? "network",
           retryIndex: payload.retry_index,
           retryLimit: payload.retry_limit,
+          reason: payload.reason,
           createdAt: event.createdAt,
         };
         reconnects.set(payload.request_id, entry);

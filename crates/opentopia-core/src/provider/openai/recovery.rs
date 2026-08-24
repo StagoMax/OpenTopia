@@ -11,6 +11,7 @@ use crate::model::ProviderRetryKind;
 use reqwest::header::CONTENT_TYPE;
 use serde_json::{json, Value};
 
+use crate::provider::telemetry::{emit_response_headers, ProviderStreamTelemetry};
 use crate::provider::transport::{
     provider_rate_limit_retry_delay, send_provider_request_with_network_retries,
     PROVIDER_RATE_LIMIT_RETRY_LIMIT,
@@ -137,6 +138,7 @@ pub(super) async fn recover_streamed_tool_call_non_streaming(
     )
     .await?;
     let status = response.status();
+    emit_response_headers(prepared.request_id, attempt, status.as_u16(), on_transport)?;
     if !status.is_success() {
         let response_body = response.text().await?;
         on_transport(ProviderTransportEvent::Response {
@@ -153,28 +155,38 @@ pub(super) async fn recover_streamed_tool_call_non_streaming(
         );
     }
 
-    let decoded = match protocol {
-        OpenAiRecoveryProtocol::ChatCompletions => {
-            decode_openai_chat_response(
-                response,
-                false,
-                &prepared.logical_request.tool_candidates,
-                on_delta,
-                true,
-            )
-            .await
-        }
-        OpenAiRecoveryProtocol::Responses => {
-            decode_openai_responses_response(
-                response,
-                false,
-                &prepared.logical_request.tool_candidates,
-                on_delta,
-                true,
-            )
-            .await
+    let mut telemetry = ProviderStreamTelemetry::new(prepared.request_id, attempt);
+    let mut provisional_deltas = Vec::new();
+    let decoded = {
+        let mut observed_delta = |delta| {
+            telemetry.observe(&delta, on_transport)?;
+            provisional_deltas.push(delta);
+            Ok(())
+        };
+        match protocol {
+            OpenAiRecoveryProtocol::ChatCompletions => {
+                decode_openai_chat_response(
+                    response,
+                    false,
+                    &prepared.logical_request.tool_candidates,
+                    &mut observed_delta,
+                    true,
+                )
+                .await
+            }
+            OpenAiRecoveryProtocol::Responses => {
+                decode_openai_responses_response(
+                    response,
+                    false,
+                    &prepared.logical_request.tool_candidates,
+                    &mut observed_delta,
+                    true,
+                )
+                .await
+            }
         }
     };
+    telemetry.finish_progress(on_transport)?;
     let response = match decoded {
         Ok(response) => response,
         Err(recovery_error) => {
@@ -193,6 +205,11 @@ pub(super) async fn recover_streamed_tool_call_non_streaming(
             return Err(error);
         }
     };
+
+    telemetry.emit_commit_started(on_transport)?;
+    for delta in provisional_deltas {
+        on_delta(delta)?;
+    }
 
     Ok(RecoveredToolResponse {
         response,

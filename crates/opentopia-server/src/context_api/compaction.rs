@@ -23,6 +23,10 @@ use opentopia_core::{
 };
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::sync::{
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
 use uuid::Uuid;
@@ -487,7 +491,10 @@ fn compact_event_time_index(events: &[AgentEvent], after_seq: i64) -> String {
                     | AgentEventPayload::ModelRequest { .. }
                     | AgentEventPayload::ProviderRequestSent { .. }
                     | AgentEventPayload::ProviderRequestRetried { .. }
+                    | AgentEventPayload::ProviderResponseHeadersReceived { .. }
                     | AgentEventPayload::ProviderFirstTokenReceived { .. }
+                    | AgentEventPayload::ProviderStreamProgress { .. }
+                    | AgentEventPayload::ProviderResponseCommitStarted { .. }
                     | AgentEventPayload::ProviderResponseReceived { .. }
                     | AgentEventPayload::ModelDelta { .. }
                     | AgentEventPayload::ReasoningDelta { .. }
@@ -638,19 +645,23 @@ pub(crate) async fn generate_context_summary(
     );
     let mut transport_events = Vec::new();
     let mut streamed_usage = None;
+    let first_token_observed = Arc::new(AtomicBool::new(false));
+    let metric_first_token_observed = Arc::clone(&first_token_observed);
     let mut on_metric = |metric| {
         match metric {
             ModelGatewayMetricEvent::FirstOutputTokenReceived {
                 request_id: metric_request_id,
             } => {
                 debug_assert_eq!(metric_request_id, request_id);
-                emit_context_compaction_payload(
-                    state,
-                    thread_id,
-                    turn_id,
-                    event_sender,
-                    AgentEventPayload::ProviderFirstTokenReceived { request_id },
-                );
+                if !metric_first_token_observed.swap(true, AtomicOrdering::SeqCst) {
+                    emit_context_compaction_payload(
+                        state,
+                        thread_id,
+                        turn_id,
+                        event_sender,
+                        AgentEventPayload::ProviderFirstTokenReceived { request_id },
+                    );
+                }
             }
         }
         Ok(())
@@ -661,8 +672,54 @@ pub(crate) async fn generate_context_summary(
         }
         Ok(())
     };
+    let transport_first_token_observed = Arc::clone(&first_token_observed);
     let mut on_transport = |event| {
-        transport_events.push(event);
+        let payload = match event {
+            ProviderTransportEvent::ResponseHeaders { attempt, status } => {
+                Some(AgentEventPayload::ProviderResponseHeadersReceived {
+                    request_id,
+                    round: 0,
+                    attempt,
+                    status,
+                })
+            }
+            ProviderTransportEvent::OutputStarted { .. } => (!transport_first_token_observed
+                .swap(true, AtomicOrdering::SeqCst))
+            .then_some(AgentEventPayload::ProviderFirstTokenReceived { request_id }),
+            ProviderTransportEvent::StreamProgress {
+                attempt,
+                output_events,
+                output_bytes,
+                elapsed_ms,
+            } => Some(AgentEventPayload::ProviderStreamProgress {
+                request_id,
+                round: 0,
+                attempt,
+                output_events,
+                output_bytes,
+                elapsed_ms,
+            }),
+            ProviderTransportEvent::ResponseCommitStarted {
+                attempt,
+                output_events,
+                output_bytes,
+                elapsed_ms,
+            } => Some(AgentEventPayload::ProviderResponseCommitStarted {
+                request_id,
+                round: 0,
+                attempt,
+                output_events,
+                output_bytes,
+                elapsed_ms,
+            }),
+            terminal_or_retry => {
+                transport_events.push(terminal_or_retry);
+                None
+            }
+        };
+        if let Some(payload) = payload {
+            emit_context_compaction_payload(state, thread_id, turn_id, event_sender, payload);
+        }
         Ok(())
     };
     // Long-history structured checkpoints can legitimately require more than
@@ -722,6 +779,10 @@ pub(crate) async fn generate_context_summary(
                     body,
                 },
             ),
+            ProviderTransportEvent::ResponseHeaders { .. }
+            | ProviderTransportEvent::OutputStarted { .. }
+            | ProviderTransportEvent::StreamProgress { .. }
+            | ProviderTransportEvent::ResponseCommitStarted { .. } => {}
         }
     }
     let response = response_result

@@ -14,6 +14,17 @@ const messageListSource = readFileSync(
   new URL("./features/conversation/MessageList.tsx", import.meta.url),
   "utf8",
 );
+const conversationHeaderSource = readFileSync(
+  new URL("./features/conversation/ConversationHeader.tsx", import.meta.url),
+  "utf8",
+);
+const loadingIndicatorSource = readFileSync(
+  new URL(
+    "./features/conversation/ConversationLoadingIndicator.tsx",
+    import.meta.url,
+  ),
+  "utf8",
+);
 const sidebarRowSource = readFileSync(
   new URL("./features/sidebar/SidebarThreadRow.tsx", import.meta.url),
   "utf8",
@@ -79,8 +90,40 @@ test("does not force a synchronous scroll layout for every event batch", () => {
   assert.match(messageListSource, /window\.requestAnimationFrame/);
 });
 
+test("keeps switching feedback visible and consistent for cold and cached loads", () => {
+  assert.match(loadingIndicatorSource, /<ShimmerText/);
+  assert.match(
+    conversationHeaderSource,
+    /<ConversationLoadingIndicator label="正在加载会话内容"/,
+  );
+  assert.match(
+    messageListSource,
+    /<ConversationLoadingIndicator label="正在同步最新内容"/,
+  );
+
+  const connectSource = conversationControllerSource.slice(
+    conversationControllerSource.indexOf("private connect(): void"),
+    conversationControllerSource.indexOf("private disconnect(): void"),
+  );
+  assert.match(connectSource, /const loadingFeedbackPainted/);
+  assert.ok(
+    connectSource.indexOf("await loadingFeedbackPainted") <
+      connectSource.indexOf('type: "syncCompleted"'),
+  );
+});
+
 test("keeps unchanged sidebar rows behind a memo boundary", () => {
   assert.match(sidebarRowSource, /memo\(function SidebarThreadRow/);
+});
+
+test("schedules task navigation as interruptible rendering work", () => {
+  const selectThreadSource = appSource.slice(
+    appSource.indexOf("function selectThread"),
+    appSource.indexOf("useEffect", appSource.indexOf("function selectThread")),
+  );
+
+  assert.match(selectThreadSource, /startTransition\(\(\) => \{/);
+  assert.match(selectThreadSource, /setActiveThreadId\(threadId\)/);
 });
 
 test("limits commit tracing to the newly appended event tail", () => {

@@ -332,8 +332,33 @@ export type AgentEventPayload =
       body?: unknown;
     }
   | {
+      type: "provider_response_headers_received";
+      request_id: string;
+      round: number;
+      attempt: number;
+      status: number;
+    }
+  | {
       type: "provider_first_token_received";
       request_id: string;
+    }
+  | {
+      type: "provider_stream_progress";
+      request_id: string;
+      round: number;
+      attempt: number;
+      output_events: number;
+      output_bytes: number;
+      elapsed_ms: number;
+    }
+  | {
+      type: "provider_response_commit_started";
+      request_id: string;
+      round: number;
+      attempt: number;
+      output_events: number;
+      output_bytes: number;
+      elapsed_ms: number;
     }
   | {
       type: "provider_response_received";

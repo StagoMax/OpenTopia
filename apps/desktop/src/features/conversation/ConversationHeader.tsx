@@ -26,7 +26,8 @@ import type { ToolTabKind } from "../../toolTabs";
 import type { GoalSnapshot, GoalStatus, Thread } from "../../types";
 import { conversationHeaderTitle } from "../../threadTitle";
 import { useDismissiblePopover } from "../../hooks/useDismissiblePopover";
-import { Button, IconButton, ShimmerText } from "../../components/ui";
+import { Button, IconButton } from "../../components/ui";
+import { ConversationLoadingIndicator } from "./ConversationLoadingIndicator";
 
 export function ThreadHeader({
   thread,
@@ -394,20 +395,8 @@ function goalStatusLabel(status: GoalStatus): string {
 
 export function ConversationLoadingState() {
   return (
-    <section
-      className="conversation-loading"
-      role="status"
-      aria-label="正在加载"
-      aria-live="polite"
-    >
-      <div className="conversation-loading__content">
-        <ShimmerText
-          className="conversation-loading__wordmark"
-          aria-hidden="true"
-        >
-          OpenTopia
-        </ShimmerText>
-      </div>
+    <section className="conversation-loading">
+      <ConversationLoadingIndicator label="正在加载会话内容" />
     </section>
   );
 }
