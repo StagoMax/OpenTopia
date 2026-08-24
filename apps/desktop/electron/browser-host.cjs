@@ -933,6 +933,153 @@ function createDesktopBrowserHost(options) {
     );
   }
 
+  function navigateHistory(entry, direction) {
+    const webContents = entry.view.webContents;
+    if (webContents.isDestroyed()) return Promise.resolve(sessionState(entry));
+
+    const offset = direction === "back" ? -1 : 1;
+    let history;
+    let targetIndex = null;
+    let targetUrl = null;
+    let canNavigate = false;
+    try {
+      history = navigationHistory(webContents);
+      canNavigate =
+        direction === "back" ? history.canGoBack() : history.canGoForward();
+      if (typeof history.getActiveIndex === "function") {
+        const activeIndex = history.getActiveIndex();
+        if (Number.isInteger(activeIndex)) {
+          targetIndex = activeIndex + offset;
+          if (typeof history.getEntryAtIndex === "function") {
+            targetUrl = history.getEntryAtIndex(targetIndex)?.url || null;
+          }
+        }
+      }
+    } catch {
+      // Keep the controls fail-closed when Electron has already discarded the
+      // underlying navigation history.
+    }
+    if (!history || !canNavigate) {
+      return Promise.resolve(sessionState(entry));
+    }
+    const navigate =
+      direction === "back" ? () => history.goBack() : () => history.goForward();
+
+    const navigationGeneration = (entry.navigationGeneration += 1);
+    entry.lastError = null;
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let timer = null;
+
+      const cleanup = () => {
+        clearTimeout(timer);
+        webContents.removeListener("did-navigate", onNavigate);
+        webContents.removeListener("did-navigate-in-page", onInPageNavigate);
+        webContents.removeListener("did-fail-load", onFailLoad);
+        webContents.removeListener("destroyed", onDestroyed);
+      };
+
+      const complete = (error = null) => {
+        if (settled || entry.navigationGeneration !== navigationGeneration) return;
+        settled = true;
+        cleanup();
+        if (error) {
+          if (!entry.destroyed) {
+            entry.lastError = serializeError(error);
+            emitState(entry);
+          }
+          reject(error);
+          return;
+        }
+        if (entry.destroyed) {
+          reject(
+            new BrowserHostError(
+              "session_closed",
+              "Browser session closed during history navigation.",
+              409,
+            ),
+          );
+          return;
+        }
+        resolve(emitState(entry));
+      };
+
+      const historyMoveCommitted = () => {
+        if (targetIndex === null || typeof history.getActiveIndex !== "function") {
+          return true;
+        }
+        try {
+          return history.getActiveIndex() === targetIndex;
+        } catch {
+          return false;
+        }
+      };
+      const onNavigate = () => {
+        if (historyMoveCommitted()) complete();
+      };
+      const onInPageNavigate = (_event, _url, isMainFrame) => {
+        if (isMainFrame !== false && historyMoveCommitted()) complete();
+      };
+      const onFailLoad = (
+        _event,
+        errorCode,
+        errorDescription,
+        validatedURL,
+        isMainFrame,
+      ) => {
+        // A prior navigation can report ERR_ABORTED while this history move is
+        // taking over. Wait for this move's own terminal event in that case.
+        if (isMainFrame === false || errorCode === -3) return;
+        if (
+          targetUrl &&
+          validatedURL &&
+          validatedURL !== targetUrl &&
+          !historyMoveCommitted()
+        ) {
+          return;
+        }
+        complete(
+          new BrowserHostError(
+            "history_navigation_failed",
+            `Browser history navigation failed: ${errorDescription || errorCode}.`,
+            502,
+            { errorCode, url: validatedURL || null },
+          ),
+        );
+      };
+      const onDestroyed = () =>
+        complete(
+          new BrowserHostError(
+            "session_closed",
+            "Browser session closed during history navigation.",
+            409,
+          ),
+        );
+
+      webContents.on("did-navigate", onNavigate);
+      webContents.on("did-navigate-in-page", onInPageNavigate);
+      webContents.on("did-fail-load", onFailLoad);
+      webContents.once("destroyed", onDestroyed);
+      timer = setTimeout(() => {
+        complete(
+          new BrowserHostError(
+            "history_navigation_timeout",
+            `Browser history navigation timed out after ${MAX_WAIT_MS} ms.`,
+            504,
+          ),
+        );
+      }, MAX_WAIT_MS);
+      timer.unref?.();
+
+      try {
+        navigate();
+      } catch (error) {
+        complete(error);
+      }
+    });
+  }
+
   function navigateFromAddressBar(sessionId, url) {
     const entry = requireSession(sessionId);
     return runExclusive(entry, () => {
@@ -2315,22 +2462,18 @@ function createDesktopBrowserHost(options) {
       const entry = requireSession(sessionId);
       return runExclusive(entry, () => beginUserControl(entry));
     });
-    handle(IPC_CHANNELS.back, async (sessionId) => {
+    handle(IPC_CHANNELS.back, (sessionId) => {
       const entry = requireSession(sessionId);
-      return runExclusive(entry, async () => {
+      return runExclusive(entry, () => {
         beginUserControl(entry);
-        const history = navigationHistory(entry.view.webContents);
-        if (history.canGoBack()) history.goBack();
-        return sessionState(entry);
+        return navigateHistory(entry, "back");
       });
     });
-    handle(IPC_CHANNELS.forward, async (sessionId) => {
+    handle(IPC_CHANNELS.forward, (sessionId) => {
       const entry = requireSession(sessionId);
-      return runExclusive(entry, async () => {
+      return runExclusive(entry, () => {
         beginUserControl(entry);
-        const history = navigationHistory(entry.view.webContents);
-        if (history.canGoForward()) history.goForward();
-        return sessionState(entry);
+        return navigateHistory(entry, "forward");
       });
     });
     handle(IPC_CHANNELS.reload, async (sessionId) => {

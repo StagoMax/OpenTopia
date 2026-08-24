@@ -424,9 +424,9 @@ declare global {
           url: string,
         ): Promise<unknown>;
         beginUserControl(sessionId: string): Promise<unknown>;
-        back(sessionId: string): Promise<unknown>;
-        forward(sessionId: string): Promise<unknown>;
-        reload(sessionId: string): Promise<unknown>;
+        back(sessionId: string): Promise<WebPreviewState>;
+        forward(sessionId: string): Promise<WebPreviewState>;
+        reload(sessionId: string): Promise<WebPreviewState>;
         setBounds(
           sessionId: string,
           bounds: WebPreviewBounds,

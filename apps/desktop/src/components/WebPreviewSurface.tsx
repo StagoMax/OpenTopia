@@ -98,9 +98,13 @@ function NativeWebPreview({
   const [error, setError] = useState<string | null>(null);
   const [isResuming, setIsResuming] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
+  const [navigationAction, setNavigationAction] = useState<
+    "back" | "forward" | "reload" | null
+  >(null);
   const visibleRef = useRef(true);
   const hasUrlRef = useRef(false);
   const handledNavigationIdRef = useRef<string | null>(null);
+  const navigationActionPendingRef = useRef(false);
   const addressValueRef = useRef("");
   const addressEditingRef = useRef(false);
   const addressDirtyRef = useRef(false);
@@ -177,6 +181,8 @@ function NativeWebPreview({
       canGoForward: false,
     });
     hasUrlRef.current = false;
+    navigationActionPendingRef.current = false;
+    setNavigationAction(null);
     addressValueRef.current = "";
     addressEditingRef.current = false;
     addressDirtyRef.current = false;
@@ -319,13 +325,26 @@ function NativeWebPreview({
   }
 
   async function run(action: "back" | "forward" | "reload") {
+    if (navigationActionPendingRef.current) return;
+    navigationActionPendingRef.current = true;
+    setNavigationAction(action);
     setError(null);
     try {
-      if (action === "back") await api.back(sessionId);
-      else if (action === "forward") await api.forward(sessionId);
-      else await api.reload(sessionId);
+      const next =
+        action === "back"
+          ? await api.back(sessionId)
+          : action === "forward"
+            ? await api.forward(sessionId)
+            : await api.reload(sessionId);
+      hasUrlRef.current = Boolean(next.url);
+      setState(next);
+      syncAddress(next);
+      setError(next.error ?? null);
     } catch (cause) {
       setError(errorMessage(cause));
+    } finally {
+      navigationActionPendingRef.current = false;
+      setNavigationAction(null);
     }
   }
 
@@ -372,7 +391,7 @@ function NativeWebPreview({
           type="button"
           title="后退"
           aria-label="后退"
-          disabled={!state.canGoBack}
+          disabled={navigationAction !== null || !state.canGoBack}
           onClick={() => void run("back")}
         >
           <ArrowLeft size={14} />
@@ -382,7 +401,7 @@ function NativeWebPreview({
           type="button"
           title="前进"
           aria-label="前进"
-          disabled={!state.canGoForward}
+          disabled={navigationAction !== null || !state.canGoForward}
           onClick={() => void run("forward")}
         >
           <ArrowRight size={14} />
@@ -392,7 +411,7 @@ function NativeWebPreview({
           type="button"
           title="重新加载"
           aria-label="重新加载"
-          disabled={!state.url}
+          disabled={navigationAction !== null || !state.url}
           onClick={() => void run("reload")}
         >
           {state.loading ? (
