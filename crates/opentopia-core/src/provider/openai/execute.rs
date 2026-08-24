@@ -15,7 +15,9 @@ use super::{
     normalize_provider_tool_calls, tool_call_protocol_error_observation, OpenAiCompatibleProvider,
     OpenAiResponsesProvider, ResponsesRequestError,
 };
-use crate::provider::transport::send_provider_request_with_network_retries;
+use crate::provider::transport::{
+    provider_stream_stalled, send_provider_request_with_network_retries,
+};
 use reqwest::header::CONTENT_TYPE;
 use serde_json::{json, Value};
 
@@ -130,6 +132,16 @@ impl OpenAiCompatibleProvider {
                     stream_rate_limit_retries = stream_rate_limit_retries.saturating_add(1);
                     next_attempt = attempt;
                     continue;
+                }
+                Err(error) if provider_stream_stalled(&error) => {
+                    let body = stream_decode_error_observation(&error);
+                    on_transport(ProviderTransportEvent::Response {
+                        attempt,
+                        status: Some(status.as_u16()),
+                        response_id: None,
+                        body,
+                    })?;
+                    return Err(error);
                 }
                 Err(error) if atomic_stream => {
                     let RecoveredToolResponse {
@@ -292,6 +304,16 @@ impl OpenAiResponsesProvider {
                     stream_rate_limit_retries = stream_rate_limit_retries.saturating_add(1);
                     next_attempt = attempt;
                     continue;
+                }
+                Err(error) if provider_stream_stalled(&error) => {
+                    let body = stream_decode_error_observation(&error);
+                    on_transport(ProviderTransportEvent::Response {
+                        attempt,
+                        status: Some(status.as_u16()),
+                        response_id: None,
+                        body,
+                    })?;
+                    return Err(error);
                 }
                 Err(error) if atomic_stream => {
                     let RecoveredToolResponse {

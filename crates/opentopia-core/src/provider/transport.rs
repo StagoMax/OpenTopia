@@ -1,10 +1,10 @@
 use super::{
-    provider_error_is_quota_exhausted, truncate_observation_text, ProviderAdapterError,
-    ProviderTransportCallback, ProviderTransportEvent,
+    provider_error_is_quota_exhausted, truncate_observation_text, ModelStreamDelta,
+    ProviderAdapterError, ProviderTransportCallback, ProviderTransportEvent,
 };
 use crate::model::{ProviderCacheTrace, ProviderRetryKind};
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 pub(super) const PROVIDER_NETWORK_RETRY_LIMIT: usize = 5;
 pub(super) const PROVIDER_RATE_LIMIT_RETRY_LIMIT: usize = PROVIDER_NETWORK_RETRY_LIMIT;
 const PROVIDER_NETWORK_RETRY_DELAYS: [Duration; PROVIDER_NETWORK_RETRY_LIMIT] = [
@@ -21,6 +21,25 @@ const PROVIDER_RATE_LIMIT_RETRY_DELAYS: [Duration; PROVIDER_NETWORK_RETRY_LIMIT]
     Duration::from_secs(16),
     Duration::from_secs(30),
 ];
+
+#[derive(Clone, Copy)]
+struct ProviderRequestStartedAt(Instant);
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum ProviderStallError {
+    #[error("provider request stalled before response headers for {seconds} seconds")]
+    BeforeResponseHeaders { seconds: u64 },
+    #[error(
+        "provider stream stalled after response headers: no output within {seconds} seconds of request start"
+    )]
+    BeforeFirstOutput { seconds: u64 },
+    #[error("provider stream stalled: no data for {seconds} seconds")]
+    Idle { seconds: u64 },
+}
+
+pub(super) fn provider_stream_stalled(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ProviderStallError>().is_some()
+}
 
 fn retryable_provider_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS
@@ -70,7 +89,24 @@ where
     let mut attempt = first_attempt;
     let mut retry_index = 0;
     loop {
-        match request().send().await {
+        let attempt_started_at = Instant::now();
+        let send_result = match tokio::time::timeout(first_output_timeout(), request().send()).await
+        {
+            Ok(Ok(mut response)) => {
+                response
+                    .extensions_mut()
+                    .insert(ProviderRequestStartedAt(attempt_started_at));
+                Ok(response)
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => {
+                return Err(ProviderStallError::BeforeResponseHeaders {
+                    seconds: first_output_timeout().as_secs(),
+                }
+                .into())
+            }
+        };
+        match send_result {
             Ok(response)
                 if retryable_provider_status(response.status())
                     && retry_index < PROVIDER_NETWORK_RETRY_LIMIT =>
@@ -146,6 +182,10 @@ where
 /// is not obliged to send keep-alive events while it does.
 const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 300;
 
+/// Maximum time from starting an HTTP model request to its first normalized
+/// output. Response headers and transport heartbeats do not reset this deadline.
+const DEFAULT_FIRST_OUTPUT_TIMEOUT_SECS: u64 = 120;
+
 /// Default ceiling on the gap between two Codex App Server events.
 ///
 /// This stream carries a whole turn rather than one model response, so the gaps
@@ -169,6 +209,13 @@ pub(super) fn stream_idle_timeout() -> Duration {
     )
 }
 
+fn first_output_timeout() -> Duration {
+    env_timeout_secs(
+        "OPENTOPIA_FIRST_OUTPUT_TIMEOUT_SECS",
+        DEFAULT_FIRST_OUTPUT_TIMEOUT_SECS,
+    )
+}
+
 pub(super) fn app_server_idle_timeout() -> Duration {
     env_timeout_secs(
         "OPENTOPIA_APP_SERVER_IDLE_TIMEOUT_SECS",
@@ -176,16 +223,80 @@ pub(super) fn app_server_idle_timeout() -> Duration {
     )
 }
 
-pub(super) async fn next_stream_chunk(
-    response: &mut reqwest::Response,
+pub(super) struct ProviderStreamWatchdog {
     idle_timeout: Duration,
-) -> anyhow::Result<Option<impl std::ops::Deref<Target = [u8]>>> {
-    match tokio::time::timeout(idle_timeout, response.chunk()).await {
-        Ok(chunk) => Ok(chunk?),
-        Err(_) => anyhow::bail!(
-            "provider stream stalled: no data for {} seconds",
-            idle_timeout.as_secs()
-        ),
+    first_output_timeout: Duration,
+    first_output_deadline: Instant,
+    output_observed: bool,
+}
+
+impl ProviderStreamWatchdog {
+    pub(super) fn new(response: &reqwest::Response) -> Self {
+        Self::with_timeouts_and_start(
+            stream_idle_timeout(),
+            first_output_timeout(),
+            response
+                .extensions()
+                .get::<ProviderRequestStartedAt>()
+                .map(|started| started.0)
+                .unwrap_or_else(Instant::now),
+        )
+    }
+
+    #[cfg(test)]
+    fn with_timeouts(idle_timeout: Duration, first_output_timeout: Duration) -> Self {
+        Self::with_timeouts_and_start(idle_timeout, first_output_timeout, Instant::now())
+    }
+
+    fn with_timeouts_and_start(
+        idle_timeout: Duration,
+        first_output_timeout: Duration,
+        request_started_at: Instant,
+    ) -> Self {
+        Self {
+            idle_timeout,
+            first_output_timeout,
+            first_output_deadline: request_started_at + first_output_timeout,
+            output_observed: false,
+        }
+    }
+
+    pub(super) fn observe(&mut self, delta: &ModelStreamDelta) {
+        self.output_observed |= delta.contains_output_token();
+    }
+
+    pub(super) async fn next_chunk(
+        &self,
+        response: &mut reqwest::Response,
+    ) -> anyhow::Result<Option<impl std::ops::Deref<Target = [u8]>>> {
+        let wait = self.next_wait()?;
+        match tokio::time::timeout(wait, response.chunk()).await {
+            Ok(chunk) => Ok(chunk?),
+            Err(_) if !self.output_observed => Err(ProviderStallError::BeforeFirstOutput {
+                seconds: self.first_output_timeout.as_secs(),
+            }
+            .into()),
+            Err(_) => Err(ProviderStallError::Idle {
+                seconds: self.idle_timeout.as_secs(),
+            }
+            .into()),
+        }
+    }
+
+    fn next_wait(&self) -> anyhow::Result<Duration> {
+        if self.output_observed {
+            return Ok(self.idle_timeout);
+        }
+        let remaining = self
+            .first_output_deadline
+            .saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ProviderStallError::BeforeFirstOutput {
+                seconds: self.first_output_timeout.as_secs(),
+            }
+            .into());
+        }
+        Ok(self.idle_timeout.min(remaining))
     }
 }
 
@@ -241,5 +352,44 @@ impl SseDecoder {
         if !self.data_lines.is_empty() {
             events.push(std::mem::take(&mut self.data_lines).join("\n"));
         }
+    }
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    use super::*;
+
+    #[test]
+    fn first_output_deadline_is_not_extended_by_transport_activity() {
+        let watchdog = ProviderStreamWatchdog::with_timeouts(
+            Duration::from_secs(300),
+            Duration::from_secs(180),
+        );
+        let wait = watchdog.next_wait().expect("first output wait");
+        assert!(wait <= Duration::from_secs(180));
+        assert!(wait > Duration::from_secs(179));
+    }
+
+    #[test]
+    fn response_header_wait_consumes_the_first_output_budget() {
+        let watchdog = ProviderStreamWatchdog::with_timeouts_and_start(
+            Duration::from_secs(300),
+            Duration::from_secs(120),
+            Instant::now() - Duration::from_secs(121),
+        );
+        let error = watchdog.next_wait().expect_err("deadline must expire");
+        assert!(provider_stream_stalled(&error));
+    }
+
+    #[test]
+    fn output_switches_the_watchdog_to_the_idle_gap_timeout() {
+        let mut watchdog = ProviderStreamWatchdog::with_timeouts(
+            Duration::from_secs(300),
+            Duration::from_secs(180),
+        );
+        watchdog.observe(&ModelStreamDelta::Text {
+            text: "ready".to_string(),
+        });
+        assert_eq!(watchdog.next_wait().unwrap(), Duration::from_secs(300));
     }
 }

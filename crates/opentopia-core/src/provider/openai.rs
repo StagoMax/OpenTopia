@@ -1,4 +1,4 @@
-use super::transport::{next_stream_chunk, stream_idle_timeout, SseDecoder};
+use super::transport::{ProviderStreamWatchdog, SseDecoder};
 use super::{
     apply_provider_auth, ensure_visual_input_supported, provider_api_key, redact_transport_value,
     rejected_responses_profile_capability, require_function_tools, truncate_observation_text,
@@ -1456,9 +1456,9 @@ pub(super) async fn decode_openai_chat_response(
 
     let mut decoder = SseDecoder::default();
     let mut accumulator = OpenAiStreamAccumulator::default();
-    let idle_timeout = stream_idle_timeout();
+    let mut watchdog = ProviderStreamWatchdog::new(&response);
     loop {
-        let Some(chunk) = next_stream_chunk(&mut response, idle_timeout).await? else {
+        let Some(chunk) = watchdog.next_chunk(&mut response).await? else {
             break;
         };
         for data in decoder.push(&chunk)? {
@@ -1467,7 +1467,11 @@ pub(super) async fn decode_openai_chat_response(
             }
             let event: Value = serde_json::from_str(&data)
                 .map_err(|err| anyhow::anyhow!("invalid provider SSE data: {err}: {data}"))?;
-            accumulator.apply(&event, on_delta)?;
+            let mut observed_delta = |delta: ModelStreamDelta| {
+                watchdog.observe(&delta);
+                on_delta(delta)
+            };
+            accumulator.apply(&event, &mut observed_delta)?;
         }
     }
     for data in decoder.finish()? {
@@ -1885,9 +1889,9 @@ pub(super) async fn decode_openai_responses_response(
 
     let mut decoder = SseDecoder::default();
     let mut accumulator = ResponsesStreamAccumulator::default();
-    let idle_timeout = stream_idle_timeout();
+    let mut watchdog = ProviderStreamWatchdog::new(&response);
     loop {
-        let Some(chunk) = next_stream_chunk(&mut response, idle_timeout).await? else {
+        let Some(chunk) = watchdog.next_chunk(&mut response).await? else {
             break;
         };
         for data in decoder.push(&chunk)? {
@@ -1896,7 +1900,11 @@ pub(super) async fn decode_openai_responses_response(
             }
             let event: Value = serde_json::from_str(&data)
                 .map_err(|err| anyhow::anyhow!("invalid Responses SSE data: {err}: {data}"))?;
-            accumulator.apply(&event, on_delta)?;
+            let mut observed_delta = |delta: ModelStreamDelta| {
+                watchdog.observe(&delta);
+                on_delta(delta)
+            };
+            accumulator.apply(&event, &mut observed_delta)?;
         }
     }
     for data in decoder.finish()? {

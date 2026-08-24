@@ -1,15 +1,15 @@
 use super::{
     apply_provider_auth, chat_finish_reason, compatibility_probe_candidate, emit_response_deltas,
     ensure_visual_input_supported, is_tool_call_protocol_error, model_response_observation,
-    next_stream_chunk, parse_model_usage, parse_required_tool_arguments, provider_api_key,
+    parse_model_usage, parse_required_tool_arguments, provider_api_key,
     provider_error_is_quota_exhausted, redact_transport_value, require_function_tools,
-    send_provider_request_with_network_retries, stream_idle_timeout,
-    tool_call_protocol_error_observation, truncate_observation_text,
-    validate_provider_response_protocol, validate_tool_probe_response, ModelFinishReason,
-    ModelProvider, ModelRequest, ModelResponse, ModelStreamCallback, ModelStreamDelta, ModelUsage,
-    OpenAiProbeOutcome, PreparedProviderRequest, ProviderAdapterError, ProviderResponseCommitMode,
-    ProviderToolCall, ProviderToolCandidate, ProviderTransportCallback, ProviderTransportEvent,
-    SseDecoder, StreamingToolCall,
+    send_provider_request_with_network_retries, tool_call_protocol_error_observation,
+    truncate_observation_text, validate_provider_response_protocol, validate_tool_probe_response,
+    ModelFinishReason, ModelProvider, ModelRequest, ModelResponse, ModelStreamCallback,
+    ModelStreamDelta, ModelUsage, OpenAiProbeOutcome, PreparedProviderRequest,
+    ProviderAdapterError, ProviderResponseCommitMode, ProviderStreamWatchdog, ProviderToolCall,
+    ProviderToolCandidate, ProviderTransportCallback, ProviderTransportEvent, SseDecoder,
+    StreamingToolCall,
 };
 use crate::settings::{
     ProviderAdapterKind, ProviderAuthKind, ProviderFeatureSupport, ProviderHealthCheck,
@@ -383,16 +383,20 @@ async fn decode_anthropic_messages_response(
 
     let mut decoder = SseDecoder::default();
     let mut accumulator = AnthropicStreamAccumulator::default();
-    let idle_timeout = stream_idle_timeout();
+    let mut watchdog = ProviderStreamWatchdog::new(&response);
     loop {
-        let Some(chunk) = next_stream_chunk(&mut response, idle_timeout).await? else {
+        let Some(chunk) = watchdog.next_chunk(&mut response).await? else {
             break;
         };
         for data in decoder.push(&chunk)? {
             let event: Value = serde_json::from_str(&data).map_err(|error| {
                 anyhow::anyhow!("invalid Anthropic Messages SSE data: {error}: {data}")
             })?;
-            accumulator.apply(&event, on_delta)?;
+            let mut observed_delta = |delta: ModelStreamDelta| {
+                watchdog.observe(&delta);
+                on_delta(delta)
+            };
+            accumulator.apply(&event, &mut observed_delta)?;
         }
     }
     for data in decoder.finish()? {

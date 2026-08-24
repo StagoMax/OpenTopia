@@ -59,8 +59,8 @@ use openai::{
 };
 
 use transport::{
-    app_server_idle_timeout, next_stream_chunk, send_provider_request_with_network_retries,
-    stream_idle_timeout, SseDecoder, PROVIDER_NETWORK_RETRY_LIMIT,
+    app_server_idle_timeout, send_provider_request_with_network_retries, ProviderStreamWatchdog,
+    SseDecoder, PROVIDER_NETWORK_RETRY_LIMIT,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
