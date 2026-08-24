@@ -105,6 +105,7 @@ import {
   resolveThreadActivityEventStatus,
 } from "./threadActivityStatus";
 import { ThreadActivityStore } from "./threadActivityStore";
+import { promoteThreadByActivity } from "./threadRecency";
 import { useThreadActivityStatus } from "./useThreadActivityStore";
 import { errorMessage, isAbortError } from "./errorMessage";
 import { threadTitleFromPrompt } from "./threadTitle";
@@ -509,6 +510,16 @@ export function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
+  useEffect(
+    () =>
+      threadActivityStore.subscribeToChanges((threadId, activity) => {
+        if (!activity?.optimistic) return;
+        setThreads((current) =>
+          promoteThreadByActivity(current, threadId, activity.updatedAt),
+        );
+      }),
+    [threadActivityStore],
+  );
   const conversationEventEffectRef = useRef<(event: AgentEvent) => void>(
     () => {},
   );

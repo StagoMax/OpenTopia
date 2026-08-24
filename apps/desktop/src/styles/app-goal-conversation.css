@@ -659,6 +659,28 @@
   grid-row: 1;
 }
 
+/* A selected processing task keeps its lifecycle signal even while its row
+ * actions are exposed. Give the action its own column instead of replacing
+ * the spinner in the shared trailing slot. */
+.thread-row-wrap.active.is-processing:is(:hover, :focus-within),
+.thread-row-wrap.active.is-processing.menu-open {
+  grid-template-columns: minmax(0, 1fr) var(--control-height-sm) var(
+      --control-height-sm
+    );
+}
+
+.thread-row-wrap.active.is-processing:is(:hover, :focus-within)
+  .thread-row-status,
+.thread-row-wrap.active.is-processing.menu-open .thread-row-status {
+  visibility: visible;
+}
+
+.thread-row-wrap.active.is-processing:is(:hover, :focus-within)
+  .thread-row-menu-wrap,
+.thread-row-wrap.active.is-processing.menu-open .thread-row-menu-wrap {
+  grid-column: 3;
+}
+
 .thread-row-wrap:focus-within .thread-row-more {
   visibility: visible;
   opacity: 1;
