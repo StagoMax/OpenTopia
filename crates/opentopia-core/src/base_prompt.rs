@@ -16,44 +16,52 @@ pub const BASE_PROMPT_MODULES: &[BasePromptModule] = &[
         content: include_str!("prompts/base/identity_and_objective.md"),
     },
     BasePromptModule {
-        id: "instruction_hierarchy",
-        content: include_str!("prompts/base/instruction_hierarchy.md"),
+        id: "personality",
+        content: include_str!("prompts/base/personality.md"),
     },
     BasePromptModule {
-        id: "request_interpretation",
-        content: include_str!("prompts/base/request_interpretation.md"),
+        id: "writing_style",
+        content: include_str!("prompts/base/writing_style.md"),
     },
     BasePromptModule {
-        id: "workspace_discipline",
-        content: include_str!("prompts/base/workspace_discipline.md"),
+        id: "technical_communication",
+        content: include_str!("prompts/base/technical_communication.md"),
     },
     BasePromptModule {
-        id: "codebase_exploration",
-        content: include_str!("prompts/base/codebase_exploration.md"),
+        id: "working_with_user",
+        content: include_str!("prompts/base/working_with_user.md"),
     },
     BasePromptModule {
-        id: "git_safety",
-        content: include_str!("prompts/base/git_safety.md"),
+        id: "intermediate_commentary",
+        content: include_str!("prompts/base/intermediate_commentary.md"),
+    },
+    BasePromptModule {
+        id: "final_answer",
+        content: include_str!("prompts/base/final_answer.md"),
+    },
+    BasePromptModule {
+        id: "formatting_and_visualizations",
+        content: include_str!("prompts/base/formatting_and_visualizations.md"),
+    },
+    BasePromptModule {
+        id: "working_rules",
+        content: include_str!("prompts/base/working_rules.md"),
+    },
+    BasePromptModule {
+        id: "file_editing_constraints",
+        content: include_str!("prompts/base/file_editing_constraints.md"),
+    },
+    BasePromptModule {
+        id: "autonomy_and_persistence",
+        content: include_str!("prompts/base/autonomy_and_persistence.md"),
+    },
+    BasePromptModule {
+        id: "destructive_actions",
+        content: include_str!("prompts/base/destructive_actions.md"),
     },
     BasePromptModule {
         id: "skills",
         content: include_str!("prompts/base/skills.md"),
-    },
-    BasePromptModule {
-        id: "tool_loop",
-        content: include_str!("prompts/base/tool_loop.md"),
-    },
-    BasePromptModule {
-        id: "validation",
-        content: include_str!("prompts/base/validation.md"),
-    },
-    BasePromptModule {
-        id: "communication",
-        content: include_str!("prompts/base/communication.md"),
-    },
-    BasePromptModule {
-        id: "completion",
-        content: include_str!("prompts/base/completion.md"),
     },
 ];
 
@@ -89,16 +97,18 @@ mod tests {
             ids,
             [
                 "identity_and_objective",
-                "instruction_hierarchy",
-                "request_interpretation",
-                "workspace_discipline",
-                "codebase_exploration",
-                "git_safety",
+                "personality",
+                "writing_style",
+                "technical_communication",
+                "working_with_user",
+                "intermediate_commentary",
+                "final_answer",
+                "formatting_and_visualizations",
+                "working_rules",
+                "file_editing_constraints",
+                "autonomy_and_persistence",
+                "destructive_actions",
                 "skills",
-                "tool_loop",
-                "validation",
-                "communication",
-                "completion",
             ]
         );
         assert_eq!(ids.iter().copied().collect::<HashSet<_>>().len(), ids.len());
