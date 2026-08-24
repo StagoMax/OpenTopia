@@ -7,15 +7,15 @@
 
 Planning Tools 不是一个独立 Planner Model（规划模型），也不是一个会自动推进步骤的 Workflow Engine（工作流引擎）。它由四个工具、一个结构化计划对象和几处运行时投影共同组成。必须先区分三种经常都被叫作“计划”的东西：
 
-1. **Prose Plan（自然语言计划）**：主模型在普通 Assistant Message（助手消息）里列出步骤。Default Mode（默认模式）可以这样做，但它只是文本，不生成 `TaskPlan`，也不触发计划状态、修订号或证据守卫。
+1. **Proposed Plan（建议方案）**：Plan Mode 把 `<proposed_plan>`解析成独立 `MessagePart::ProposedPlan`。它是可审阅的方案内容，不生成 `WorkForm`，也不触发修订号、步骤状态或证据守卫。
 2. **Runtime TaskPlan（运行时任务计划）**：Default Mode 和 Goal Mode 通过计划工具维护、由 `PlanUpdated（计划已更新）`事件携带的结构化状态。它负责界面清单、跨 Turn 恢复、步骤推进和收尾约束。
 3. **Goal Plan（目标计划）**：Runtime TaskPlan 在线程已有 `GoalRecord（目标记录）`时投影出的持久目标快照。这才是 Goal Mode 的额外持久层。
 
 四个模型可调用工具在当前 Tool Surface（工具表面）中的分工是：
 
-- `request_user_input（请求用户输入）`：只在 Plan Mode（规划模式）给根智能体使用，用于暂停同一 Turn 并取得结构化选择；
-- `set_plan（设置计划）`：在当前新请求的工具目录中仅向 Goal Mode（目标模式）暴露，用于原子创建或替换完整 `TaskPlan（任务计划）`；
-- `update_plan（更新计划）`：向 Default Mode 与 Goal Mode 暴露，对计划做一次带 revision（修订号）保护的原子变更；在 Default 首次 `append_step（追加步骤）`时也负责创建计划；
+- `request_user_input（请求用户输入）`：schema 在所有根模式稳定暴露，但只有 Plan Mode（规划模式）可执行，用于暂停同一 Turn 并取得结构化选择；
+- `set_plan（设置计划）`：schema 在所有根模式稳定暴露，在 Default / Goal 中用于原子创建或替换完整执行清单，Plan 的运行时门禁会拒绝它；
+- `update_plan（更新计划）`：schema 在所有根模式稳定暴露，在 Default / Goal 中对已经存在的 WorkForm 做带 revision（修订号）保护的原子变更，Plan 的运行时门禁会拒绝它；
 - `complete_task（声明任务完成）`：向 Default Mode 与 Goal Mode 暴露，写入本轮完成摘要、验证描述和剩余工作，但不修改 `TaskPlan`；
 - `PlanUpdated（计划已更新）`事件：把计划工具结果投影成 AgentCore 和服务端都能读取的结构化状态；
 - `Finalization Guard（收尾守卫）`：用确定性代码检查计划是否仍有未终结承诺、覆盖关系是否完整、证据引用是否有效。
@@ -97,15 +97,14 @@ flowchart TB
 当前 Tool Surface（工具表面）把计划相关能力分成三个职责清楚的 Bundle（工具包）：
 
 - Plan Bundle（规划工具包）：只服务“先产出方案”的 Plan Mode，提供结构化澄清，不写执行状态；
-- Task Bundle（任务执行工具包）：由 Default Mode 和 Goal Mode 共享，提供 `update_plan / complete_task`，负责复杂任务的创建、推进与完成声明；
-- Goal Bundle（目标工具包）：只为 Goal Mode 增加 `set_plan`，因为它绑定服务器分配的 Goal UUID（目标唯一标识）。
+- Task Bundle（任务执行工具包）：由 Default Mode 和 Goal Mode 共享，提供 `set_plan / update_plan / complete_task`，负责复杂任务的创建、推进与完成声明；
+- Goal ownership（目标所有权）：Goal Mode 让同一套 WorkForm 工具自动落到服务器分配的 Goal UUID；Default 则落到当前 Turn scope（轮次作用域）。
 
 | 能力 | Default Mode（默认模式） | Plan Mode（规划模式） | Goal Mode（目标模式） |
 |---|---|---|---|
 | 在普通回复里列 Prose Plan（自然语言计划） | 可以 | 可以，而且这是该模式的正式产物 | 可以 |
-| 新模型请求看见 `request_user_input（请求用户输入）` | 否 | 是，仅 root agent（根智能体） | 否 |
-| 新模型请求看见 `update_plan / complete_task` | 是 | 否 | 是 |
-| 新模型请求看见 `set_plan` | 否 | 否 | 是 |
+| 新模型请求看见 `request_user_input（请求用户输入）` schema | 是，但不可调用 | 是，仅 root agent（根智能体）可调用 | 是，但不可调用 |
+| 新模型请求看见 `set_plan / update_plan` schema | 是，可调用 | 是，但不可调用 | 是，可调用 |
 | 读取已有 `PlanUpdated（计划已更新）` | 是 | 是 | 是 |
 | 活动 Runtime TaskPlan 注入下一 Turn 的 Durable Context（持久上下文） | 是 | 是 | 是 |
 | 已有 Runtime TaskPlan 参与 Finalization Guard（收尾守卫） | 是 | Plan Mode 跳过步骤和覆盖阻塞 | 是 |
@@ -142,7 +141,7 @@ flowchart LR
     RUNTIME -.->|"only if GoalRecord exists<br/>仅目标记录存在时"| GOAL
 ```
 
-Plan Mode 和 Runtime TaskPlan 也不是同义词：Plan Mode 的正式产物是决策完备的普通助手计划文本，并额外暴露结构化提问；Default / Goal 的 Task Bundle 才记录实际执行承诺。Goal Mode 在共享执行计划之上再增加服务器目标绑定，并要求计划必须存在。
+Plan Mode 和 Runtime TaskPlan 也不是同义词：Plan Mode 的正式产物是决策完备的 `ProposedPlan`消息部件，并允许结构化提问；Default / Goal 的 WorkForm 工具才记录实际执行承诺。工具 schema 跨模式保持稳定只是缓存策略，可调用性仍由运行时模式门禁决定。
 
 ### 3.1 Default 为什么会在复杂任务中自动列出并完成步骤
 
@@ -153,9 +152,9 @@ Plan Mode 和 Runtime TaskPlan 也不是同义词：Plan Mode 的正式产物是
 因此流程由两个条件共同形成：
 
 1. 主模型根据请求语义判断它是 `non-trivial multi-step work（非简单多步骤工作）`；这里没有固定 Token 数、文件数或步骤数阈值；
-2. Default Provider Tool Catalog（默认模式提供商工具目录）暴露 `update_plan`，所以主模型能把这一语义判断落实成结构化 `TaskPlan`。
+2. Default Provider Tool Catalog（默认模式提供商工具目录）暴露 `set_plan / update_plan`，所以主模型能把这一语义判断落实成结构化 `TaskPlan`。
 
-这里不恢复 `set_plan`给 Default：该工具的职责是用服务器分配的 Goal UUID 原子设置完整目标计划。Default 没有 `GoalRecord（目标记录）`，用首个 `update_plan(operation = append_step, expected_revision = 0)`即可创建运行时计划，`goal_id`在这里是本任务稳定的 Plan Namespace（计划命名空间）。
+`set_plan`在 Default 中创建或替换 Turn-scoped WorkForm（轮次作用域执行清单）；在 Goal 中则创建或替换 Goal-scoped WorkForm（目标作用域执行清单）。`update_plan`只更新已经存在的 WorkForm。两者都是执行期状态工具，都不属于 Plan Mode 的方案产物。
 
 Default 结构化计划的当前原理是：
 
@@ -163,25 +162,27 @@ Default 结构化计划的当前原理是：
 sequenceDiagram
     participant M as Default Main Model<br/>默认模式主模型
     participant A as AgentCore<br/>智能体核心
+    participant S as set_plan<br/>设置计划
     participant U as update_plan<br/>更新计划
     participant E as Event Ledger<br/>事件账本
     participant D as Desktop / Next Turn<br/>桌面端 / 下一轮
 
     M->>M: judge task as non-trivial multi-step<br/>判断为非简单多步骤任务
-    M->>A: update_plan append_step（创建首个步骤）
-    A->>U: current plan + expected revision（当前计划 + 预期修订号）
-    U-->>A: taskPlan in Tool Result（工具结果携带任务计划）
-    A->>E: ToolCallFinished + PlanUpdated（工具完成 + 计划已更新）
-    loop Add remaining commitments（加入其余任务承诺）
-        M->>A: update_plan append_step（追加步骤）
-        A->>E: next plan revision（下一计划修订）
+    M->>A: set_plan with complete items（原子创建完整清单）
+    A->>S: Turn-scoped context（轮次作用域上下文）
+    S-->>A: workForm in Tool Result（工具结果携带执行清单）
+    A->>E: ToolCallFinished + WorkFormUpdated（工具完成 + 清单已更新）
+    loop Implement and maintain commitments（实施并维护承诺）
+        M->>A: update_plan with expected revision（按修订号更新）
+        A->>U: current WorkForm + atomic changes（当前清单 + 原子变更）
+        U-->>E: next WorkForm revision（下一清单修订）
     end
     E-->>D: current-turn checklist（当前轮任务清单）
     E-->>D: active plan in durable context（活动计划进入持久上下文）
     Note over E,D: no GoalRecord means no GoalSnapshot<br/>没有目标记录就不生成目标快照
 ```
 
-首个 `append_step（追加步骤）`可以在 `expected_revision = 0`且没有当前计划时建立计划；它必须同时声明当前完整需求集。`goal_id`在 Default 中只是稳定的 Plan Namespace（计划命名空间），不是服务端 Goal UUID。其余步骤继续以 `append_step`加入，并通过 `dependencies（依赖）`组成 DAG（有向无环图）。每次成功变更都会递增 `plan_revision（计划修订号）`并产生新的 `PlanUpdated`事件。
+`set_plan`负责创建或完整替换 WorkForm；`update_plan`要求当前作用域已经存在 WorkForm，并用 `expected_revision`防止覆盖并发更新。Default 的作用域来自当前 Turn ID，Goal 的作用域来自服务器 Goal ID，模型都不传这些运行时控制 ID。每次成功变更都会递增 revision，并产生新的 `WorkFormUpdated`事件。
 
 ### 3.2 “逐个步骤完成”到底是谁推进的
 
@@ -766,7 +767,7 @@ Default Mode 没有上述“必须属于服务器 Goal”的入口校验；如�
 
 ### 13.1 同一请求在 Default Mode 下是什么样
 
-如果主模型判断这是非简单多步骤任务，它会用首个 `update_plan append_step（更新计划：追加步骤）`同时声明当前已知 Requirement（需求）和第一个 Step（步骤），然后继续追加：
+如果主模型判断这是非简单多步骤任务，它会用 `set_plan（设置计划）`原子建立当前已知的完整 WorkForm，再用 `update_plan（更新计划）`推进或修订：
 
 1. 检查现有导出路径；
 2. 实现导出接口；
@@ -775,7 +776,7 @@ Default Mode 没有上述“必须属于服务器 Goal”的入口校验；如�
 
 这些步骤进入 Runtime TaskPlan 后拥有 Step ID、依赖、状态、需求覆盖和 revision。主模型每完成一段实际工作，就用 `update_step（更新步骤）`推进状态并绑定成功的工具调用证据；如果尝试在 Pending / InProgress 尚未终结时回答完成，Finalization Guard 会把阻塞事实反馈给同一个主模型。
 
-Default 与 Goal 的区别不在“有没有执行计划”，而在目标所有权：Default 的 `goal_id`只是本任务计划的稳定命名空间，服务端不会因此创建 GoalRecord；Goal Mode 使用服务器分配的 UUID，并可先用 `set_plan`原子建立完整计划。简单任务仍可不创建 Runtime TaskPlan；在回复中临时列出的 Prose Plan 也不会自动升级为结构化状态。
+Default 与 Goal 的区别不在“有没有执行计划”，而在目标所有权：Default 使用当前 Turn scope，服务端不会因此创建 GoalRecord；Goal Mode 使用服务器分配的 Goal UUID。两者都可先用 `set_plan`原子建立完整计划。简单任务仍可不创建 Runtime TaskPlan；在回复中临时列出的 Prose Plan 也不会自动升级为结构化状态。
 
 ## 14. 当前设计的关键不变量与边界
 
@@ -787,7 +788,7 @@ Default 与 Goal 的区别不在“有没有执行计划”，而在目标所有
 6. **Requirement changes invalidate proof（需求变化会使证明失效）。** revision 和状态回退防止旧证据继续证明新需求。
 7. **Plan tools do not end the Turn（计划工具不结束轮次）。** 所有工具结果都回到主模型，最终文本仍需通过收尾守卫。
 8. **Finalization Guard is code, not a reviewer model（收尾守卫是代码，不是评审模型）。** 它反馈客观 blocker，同一个主模型负责修正。
-9. **Task plan is shared, goal ownership is not（任务计划可共享，目标所有权不共享）。** Default 与 Goal 共享 `update_plan / complete_task`；只有 Goal 暴露需要服务器 Goal UUID 的 `set_plan`。
+9. **Task plan is shared, goal ownership is not（任务计划可共享，目标所有权不共享）。** Default 与 Goal 共享 `set_plan / update_plan / complete_task`；工具根据当前上下文选择 Turn scope 或 Goal scope，模型不传运行时控制 ID。
 10. **Current proof is referential, not semantic（当前证明是引用级，不是语义级）。** 真正函数化需要版本化谓词和可信验证器产生证明记录。
 
 ## 15. 主要源码锚点

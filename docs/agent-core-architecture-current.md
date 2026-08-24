@@ -458,7 +458,7 @@ flowchart LR
 
 三类任务状态工具的职责不同：
 
-- `set_plan（设置计划）`：Goal Mode 专属，使用服务器分配的 Goal UUID 创建或替换带目标、需求、步骤、依赖和验收标准的完整计划；
+- `set_plan（设置计划）`：Default / Goal 共享，创建或替换带目标、需求、步骤、依赖和验收标准的完整执行清单；运行时分别选择当前 Turn scope 或服务器 Goal scope；
 - `update_plan（更新计划）`：Default / Goal 共享，用 revision（修订号）保护的增量操作创建或修改步骤、状态、需求覆盖和工具证据，并可用 `currentScopeComplete（当前范围已完成）`标记本次范围是否已经完整闭合；
 - `complete_task（声明任务完成）`：Default / Goal 共享。它不修改 `TaskPlan`，而是返回 `metadata.taskCompletion`中的摘要、验证和剩余工作；其中 `remainingWork（剩余工作）`参与最终 `Completed / Partial`分类。Goal Mode 下还会额外要求计划已经没有 Pending / In Progress Step。
 
@@ -711,9 +711,9 @@ Finalization Guard 检查事实，不评价最终文本写得是否好。每次�
 7. 每个需求必须同时有 fulfillment evidence（实现或观察证据）和 verification evidence（验证证据）；
 8. 查询当前作用域的后代智能体和 mailbox；仍有运行中的后代或未交付消息时加入 `descendant_agents_unresolved`。
 
-这里的计划状态与模式工具面是两层：Default Mode 与 Goal Mode 都能消费 `PlanUpdated（计划已更新）`，也都能通过共享 Task Bundle（任务执行工具包）的 `update_plan / complete_task`写入执行状态；Goal Mode 额外拥有需要服务器 Goal UUID 的 `set_plan`，并要求完成前计划必须存在。Plan Mode 的交付物是方案文本，不暴露执行计划工具。
+这里的计划状态与模式工具面是两层：Default Mode 与 Goal Mode 都能通过 `set_plan / update_plan`写入执行期 `WorkForm`状态；Plan Mode 的交付物则是从 `<proposed_plan>`解析出的 `MessagePart::ProposedPlan`。为保持 prompt cache，根 Agent 的 schema 目录跨模式稳定，Plan 仍会看见执行清单工具，但工具执行入口会确定性拒绝；schema 暴露不代表模式授权。
 
-Default 的复杂任务闭环由三部分组成：Base Prompt（基础提示词）要求非简单多步骤任务使用计划机制作为 Durable External Memory（持久外部记忆）；主模型根据语义判断任务复杂度，通过首个 `append_step（追加步骤）`创建 Runtime TaskPlan，随后选择普通工具工作，并反复调用 `update_step（更新步骤）`将步骤从 Pending / InProgress 推到 Completed；Finalization Guard 在仍有未完成步骤时阻止收尾。`nextRunnableStep（下一可运行步骤）`只提供依赖提示，不代替主模型调度。
+Default 的复杂任务闭环由三部分组成：Base Prompt（基础提示词）要求非简单多步骤任务使用计划机制作为 Durable External Memory（持久外部记忆）；主模型根据语义判断任务复杂度，通过 `set_plan`创建 WorkForm，随后选择普通工具工作，并反复调用 `update_plan`把条目从 Pending / InProgress 推到终态；Finalization Guard 在仍有阻塞性未完成条目时阻止收尾。`nextRunnableItem`只提供依赖提示，不代替主模型调度。
 
 证据检查也是 Referential Validation（引用校验），不是语义审判。主模型负责把抽象需求拆成 Requirement、Step 和 Acceptance Criteria；代码只检查需求覆盖集合、当前修订号、Completed Step 和成功 Tool Call ID 之间的关系。它不会执行自然语言验收标准，也不会重新阅读成功工具结果来判断内容是否真的支持证据摘要。完整细节见 [Planning Tools 当前架构与完整流程](./planning-tools-architecture-current.md)。
 

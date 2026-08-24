@@ -9,7 +9,9 @@
 本次已经把工具面改成两层正交分类，而不是根据每条消息做复杂的逐工具意图门控：
 
 - 工作体验模式：Work/Code 共享 Common；Flow 在 Common 上追加 `flow_*`。
-- 协作流程模式：Plan 只追加 `request_user_input`；Goal 追加 `set_plan`、`update_plan`、`complete_task`。
+- 协作流程模式（审计时实现）：Plan 只追加 `request_user_input`；Goal 追加 `set_plan`、`update_plan`、`complete_task`。
+
+> 2026-08-24 更新：根 Agent 的 Default / Plan / Goal 核心工具 schema 现已稳定化。`request_user_input`与 `set_plan/update_plan`通过运行时模式门禁控制可调用性，不再通过协作模式增删 schema；Plan 的 `<proposed_plan>`另行解析成消息部件，不写入 Default/Goal 的执行 `WorkForm`。
 - Multi-agent 属于 Common，但仅在运行时确实配置了 scheduler 且没有关闭多 Agent 时暴露。
 - Bundled plugin 与 MCP 统一视为 External，完整 Schema 默认延迟。
 

@@ -325,6 +325,31 @@ KnowledgeSource -> KnowledgeBase -> KnowledgeGrant
 
 `KnowledgeSource` 负责同步，`KnowledgeBase` 是可检索集合，`KnowledgeGrant` 约束查询范围、数据等级和可导出字段。不要把 RAG 资料与可写业务 App 都塞进一个泛化 Library 字符串列表。
 
+#### 审核场景的数据边界
+
+工伤医疗费用审核和信贷审核采用三层数据边界，案件样例不能因为保存在项目 `data/` 目录就被当作知识源：
+
+```text
+KnowledgeBase（知识库）
+  └── Policy / Regulation / SOP（政策、法规与审核口径）
+
+Connection（结构化连接）
+  ├── Case Detail Lookup（按 caseId 获取案件详情）
+  └── Reference Catalog Lookup（药品、耗材、试剂等基础目录查询）
+
+InboundEvent（入站事件）
+  └── caseId + payloadRef + non-sensitive summary（案件引用与非敏感摘要）
+        ├── require_review -> Pending Inbox（待处理队列，人工确认触发）
+        └── immediate      -> FlowRun（直接创建工作流运行）
+```
+
+- `KnowledgeBase（知识库）` 只保存可检索的政策依据。一个业务域使用一个隔离 namespace，域内每份真实来源登记为独立 `KnowledgeSource（知识源）`，SAG 再负责切片和索引；
+- `Connection（结构化连接）` 保存或代理案件详情和精确目录查询。大规模代码表不进入向量检索，案件详情也不复制到知识库；
+- `InboundEvent（入站事件）` 是被审核对象进入 Deployment 的入口。事件只携带 `caseId`、`payloadRef`、合成数据标记和非敏感摘要；Flow 启动后再通过冻结授权的 Connection 读取详情；
+- `Trigger Review（触发前审核）` 与 Flow 内部的 `HumanTask（人工任务）` 是两个独立边界：前者决定是否创建 Run，后者处理运行中的审批、补充输入、恢复或输出审阅。
+
+当前 Demo 按此边界配置：工伤域为 1 个知识库、18 个逻辑知识源和 107 个原始政策片段，20 个合成案件作为待处理事件；信贷域为 1 个知识库、26 个知识源，35 个合成案件作为待处理事件。工伤药品、耗材和试剂目录继续由结构化 Connection 查询。初始化脚本定向调用本次创建的 Release，因此不会把同一批 Demo 事件广播给历史同类型 Release；`require_review` 保证所有事件保持 `accepted`，人工点击后才创建 FlowRun。
+
 ### 4.2 登录、能力发现与配置版本
 
 Connection 创建过程建议固定为：
