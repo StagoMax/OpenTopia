@@ -299,7 +299,7 @@ export function ContextCompactionActivity({
   if (messageCount) chips.push({ label: `${messageCount} 条消息` });
   if (metrics?.tokenReductionPercent) {
     chips.push({
-      label: `减少 ${metrics.tokenReductionPercent}%`,
+      label: `估算减少 ${metrics.tokenReductionPercent}%`,
       tone: "success",
     });
   }
@@ -327,11 +327,11 @@ export function ContextCompactionActivity({
         }
       : null,
     inputTokens
-      ? { label: "输入 Token", value: inputTokens.toLocaleString() }
+      ? { label: "估算输入 Token", value: inputTokens.toLocaleString() }
       : null,
     checkpointTokens
       ? {
-          label: "检查点 Token",
+          label: "估算检查点 Token",
           value: checkpointTokens.toLocaleString(),
         }
       : null,

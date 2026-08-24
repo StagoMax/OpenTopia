@@ -127,6 +127,8 @@ contextBridge.exposeInMainWorld("opentopia", {
     ipcRenderer.invoke("logs:read", path, offset, limit),
   recordConversationRenderTrace: (trace) =>
     ipcRenderer.send("logs:conversation-render-trace", trace),
+  recordConversationSendTrace: (trace) =>
+    ipcRenderer.send("logs:conversation-send-trace", trace),
   browserHost,
   chromeBridge,
 });

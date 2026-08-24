@@ -103,6 +103,19 @@ export class McpApi extends WorkspaceApi {
     );
   }
 
+  openThreadActivityStream(
+    onEvent: (event: AgentEvent) => void,
+    onConnected?: () => void,
+  ): StreamHandle {
+    return this.openAuthenticatedSse(
+      "/api/activity/events/stream",
+      decodeAgentEvent,
+      onEvent,
+      "projected",
+      onConnected,
+    );
+  }
+
   openAgentEventStream(
     threadId: string,
     since: number | undefined,

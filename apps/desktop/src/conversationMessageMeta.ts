@@ -44,6 +44,7 @@ export function conversationMessageCopyText(parts: MessagePart[]): string {
   const text = parts
     .flatMap((part) => {
       if (part.type === "text") return [part.text];
+      if (part.type === "proposed_plan") return [part.text];
       if (part.type === "error") return [part.message];
       if (part.type === "file_ref") return [part.path];
       if (part.type === "source_ref") return [part.source.path];

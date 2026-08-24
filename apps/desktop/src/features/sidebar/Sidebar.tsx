@@ -163,6 +163,7 @@ export function Sidebar({
   onNewThreadForProject,
   onRenameThread,
   onOpenThreadUsage,
+  onArchiveThread,
   onRestoreThread,
   onOpenExtensions,
   onOpenTaskSearch,
@@ -195,6 +196,7 @@ export function Sidebar({
   onNewThreadForProject?(project: Project): void;
   onRenameThread(thread: Thread): void;
   onOpenThreadUsage(thread: Thread): void;
+  onArchiveThread(thread: Thread): void;
   onRestoreThread(thread: Thread): void;
   onOpenExtensions(): void;
   onOpenTaskSearch(): void;
@@ -236,16 +238,14 @@ export function Sidebar({
     onSelect,
     onRenameThread,
     onOpenThreadUsage,
-    onRemoveProject,
-    onToggleProjectPinned,
+    onArchiveThread,
     onRestoreThread,
   });
   threadRowActionsRef.current = {
     onSelect,
     onRenameThread,
     onOpenThreadUsage,
-    onRemoveProject,
-    onToggleProjectPinned,
+    onArchiveThread,
     onRestoreThread,
   };
   const selectThreadRow = useCallback(
@@ -260,13 +260,8 @@ export function Sidebar({
     (thread: Thread) => threadRowActionsRef.current.onOpenThreadUsage(thread),
     [],
   );
-  const removeThreadProject = useCallback(
-    (project: Project) => threadRowActionsRef.current.onRemoveProject(project),
-    [],
-  );
-  const toggleThreadProjectPinned = useCallback(
-    (project: Project) =>
-      threadRowActionsRef.current.onToggleProjectPinned(project),
+  const archiveThreadRow = useCallback(
+    (thread: Thread) => threadRowActionsRef.current.onArchiveThread(thread),
     [],
   );
   const restoreThreadRow = useCallback(
@@ -612,11 +607,24 @@ export function Sidebar({
                                 <Pencil size={14} />
                                 <span>重命名</span>
                               </button>
+                              <button
+                                role="menuitem"
+                                onClick={() => {
+                                  onToggleProjectPinned(project);
+                                  setMoreMenuProjectId(null);
+                                }}
+                              >
+                                <Pin size={14} />
+                                <span>
+                                  {project.pinned ? "取消固定项目" : "固定项目"}
+                                </span>
+                              </button>
                               <button disabled title="Git 工作树管理尚未实现">
                                 <GitFork size={14} />
                                 <span>创建工作树</span>
                                 <small>未实现</small>
                               </button>
+                              <div className="tool-popover-separator" />
                               <button
                                 role="menuitem"
                                 onClick={() => {
@@ -625,7 +633,7 @@ export function Sidebar({
                                 }}
                               >
                                 <Archive size={14} />
-                                <span>归档</span>
+                                <span>归档项目</span>
                               </button>
                             </div>
                           )}
@@ -649,13 +657,11 @@ export function Sidebar({
                             active={thread.id === activeThreadId}
                             activityStore={threadActivityStore}
                             key={thread.id}
-                            project={project}
                             thread={thread}
                             onSelect={selectThreadRow}
                             onRename={renameThreadRow}
                             onOpenUsage={openThreadUsage}
-                            onRemoveProject={removeThreadProject}
-                            onToggleProjectPinned={toggleThreadProjectPinned}
+                            onArchive={archiveThreadRow}
                           />
                         ))}
                         {projectThreads.length > threadDisplayLimit && (
@@ -712,13 +718,11 @@ export function Sidebar({
                           active={thread.id === activeThreadId}
                           activityStore={threadActivityStore}
                           key={thread.id}
-                          project={null}
                           thread={thread}
                           onSelect={selectThreadRow}
                           onRename={renameThreadRow}
                           onOpenUsage={openThreadUsage}
-                          onRemoveProject={removeThreadProject}
-                          onToggleProjectPinned={toggleThreadProjectPinned}
+                          onArchive={archiveThreadRow}
                         />
                       ))}
                     </div>
@@ -745,17 +749,10 @@ export function Sidebar({
                           active={false}
                           activityStore={threadActivityStore}
                           key={thread.id}
-                          project={
-                            projects.find(
-                              (project) => project.id === thread.projectId,
-                            ) ?? null
-                          }
                           thread={thread}
                           onSelect={restoreThreadRow}
                           onRename={renameThreadRow}
                           onOpenUsage={openThreadUsage}
-                          onRemoveProject={removeThreadProject}
-                          onToggleProjectPinned={toggleThreadProjectPinned}
                           onRestore={restoreThreadRow}
                         />
                       ))}

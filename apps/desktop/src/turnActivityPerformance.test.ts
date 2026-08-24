@@ -94,9 +94,14 @@ test("tracks task lifecycle events at the conversation registry boundary", () =>
     /conversationRegistry\?\.subscribeToEvents\(forwardConversationEvent\)/,
   );
   assert.match(appSource, /resolveThreadActivityEventStatus\(event\)/);
+  assert.match(conversationControllerSource, /openThreadActivityStream\(/);
   assert.match(
     conversationControllerSource,
-    /activityStore\?\.applyEvent\(event\)/,
+    /activityStore\.applyEvent\(event\)/,
+  );
+  assert.doesNotMatch(
+    conversationControllerSource,
+    /activityRetentionReleases/,
   );
   assert.match(activityStoreSource, /incomingTurnId !== current\.turnId/);
 });
@@ -130,4 +135,17 @@ test("subscribes event-heavy surfaces at their own render boundaries", () => {
 test("memoizes the composer during urgent tool-event passes", () => {
   assert.match(composerSource, /const MemoizedComposer = memo\(/);
   assert.match(liveComposerSource, /<Composer/);
+});
+
+test("keeps the submitted composer draft until the server accepts it", () => {
+  const submitDraft = composerSource.slice(
+    composerSource.indexOf("const submitDraft = async"),
+    composerSource.indexOf("function executeComposerEnterCommand"),
+  );
+  const acceptedAt = submitDraft.indexOf("const accepted = await onSubmit");
+  const rejectedAt = submitDraft.indexOf("if (!accepted) return");
+  const clearedAt = submitDraft.indexOf('onChange("")');
+  assert.ok(acceptedAt >= 0);
+  assert.ok(rejectedAt > acceptedAt);
+  assert.ok(clearedAt > rejectedAt);
 });

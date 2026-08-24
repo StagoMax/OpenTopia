@@ -1,14 +1,13 @@
 import { memo, useEffect, useRef, useState, type CSSProperties } from "react";
 import {
   Activity,
+  Archive,
   Circle,
   CircleAlert,
   Loader2,
   MoreHorizontal,
   Pencil,
-  Pin,
   RotateCcw,
-  X,
 } from "lucide-react";
 import { useDismissiblePopover } from "../../hooks/useDismissiblePopover";
 import {
@@ -18,8 +17,28 @@ import {
 } from "../../threadActivityStatus";
 import type { ThreadActivityStore } from "../../threadActivityStore";
 import { threadTitleScrollDurationMs } from "../../threadTitleScroll";
-import type { Project, Thread } from "../../types";
+import type { Thread } from "../../types";
 import { useThreadActivityStatus } from "../../useThreadActivityStore";
+
+type SidebarThreadRowProps = {
+  thread: Thread;
+  active: boolean;
+  activityStore: ThreadActivityStore;
+  onSelect(thread: Thread): void;
+  onRename(thread: Thread): void;
+  onOpenUsage(thread: Thread): void;
+} & (
+  | {
+      archived: true;
+      onArchive?: never;
+      onRestore(thread: Thread): void;
+    }
+  | {
+      archived?: false;
+      onArchive(thread: Thread): void;
+      onRestore?: never;
+    }
+);
 
 function ThreadStatusIndicator({ status }: { status?: ThreadActivityStatus }) {
   if (!status) return null;
@@ -49,29 +68,15 @@ function ThreadStatusIndicator({ status }: { status?: ThreadActivityStatus }) {
 
 export const SidebarThreadRow = memo(function SidebarThreadRow({
   thread,
-  project,
   active,
   activityStore,
   archived = false,
   onSelect,
   onRename,
   onOpenUsage,
-  onRemoveProject,
-  onToggleProjectPinned,
+  onArchive,
   onRestore,
-}: {
-  thread: Thread;
-  project: Project | null;
-  active: boolean;
-  activityStore: ThreadActivityStore;
-  archived?: boolean;
-  onSelect(thread: Thread): void;
-  onRename(thread: Thread): void;
-  onOpenUsage(thread: Thread): void;
-  onRemoveProject(project: Project): void;
-  onToggleProjectPinned(project: Project): void;
-  onRestore?(thread: Thread): void;
-}) {
+}: SidebarThreadRowProps) {
   const activityStatus = useThreadActivityStatus(activityStore, thread.id);
   const [menuOpen, setMenuOpen] = useState(false);
   const [titleOverflow, setTitleOverflow] = useState({
@@ -185,43 +190,7 @@ export const SidebarThreadRow = memo(function SidebarThreadRow({
               <Activity size={14} />
               <span>使用日志看板</span>
             </button>
-            {project ? (
-              <>
-                <button
-                  role="menuitem"
-                  onClick={() => {
-                    onToggleProjectPinned(project);
-                    setMenuOpen(false);
-                  }}
-                >
-                  <Pin size={14} />
-                  <span>{project.pinned ? "取消固定项目" : "固定项目"}</span>
-                </button>
-                <div className="tool-popover-separator" />
-                <button
-                  role="menuitem"
-                  onClick={() => {
-                    onRemoveProject(project);
-                    setMenuOpen(false);
-                  }}
-                >
-                  <X size={14} />
-                  <span>从最近项目移除</span>
-                </button>
-              </>
-            ) : (
-              <>
-                <button disabled title="此对话尚未归属到项目">
-                  <Pin size={14} />
-                  <span>固定项目</span>
-                </button>
-                <div className="tool-popover-separator" />
-                <button disabled title="此对话尚未归属到项目">
-                  <X size={14} />
-                  <span>从最近项目移除</span>
-                </button>
-              </>
-            )}
+            <div className="tool-popover-separator" />
             {archived && onRestore ? (
               <button
                 role="menuitem"
@@ -232,6 +201,17 @@ export const SidebarThreadRow = memo(function SidebarThreadRow({
               >
                 <RotateCcw size={14} />
                 <span>恢复到项目</span>
+              </button>
+            ) : onArchive ? (
+              <button
+                role="menuitem"
+                onClick={() => {
+                  onArchive(thread);
+                  setMenuOpen(false);
+                }}
+              >
+                <Archive size={14} />
+                <span>归档任务</span>
               </button>
             ) : null}
           </div>

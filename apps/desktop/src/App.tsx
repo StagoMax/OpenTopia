@@ -2870,6 +2870,7 @@ export function App() {
     input: string,
     imageAttachments: InlineImageAttachment[] = [],
     contentParts: InlineMessageContentPart[] = [],
+    collaborationModeOverride?: CollaborationMode,
   ): Promise<boolean> {
     const messageText = input.trim();
     if (
@@ -2901,8 +2902,12 @@ export function App() {
     const threadId = activeThread.id;
     const submittedContextPaths = contextSources.map((source) => source.path);
     const submittedSkillIds = [...selectedSkillIds];
-    const submittedCollaborationMode = collaborationMode;
-    const submittedGoalId = reusableGoalId(collaborationMode, goalSnapshot);
+    const submittedCollaborationMode =
+      collaborationModeOverride ?? collaborationMode;
+    const submittedGoalId = reusableGoalId(
+      submittedCollaborationMode,
+      goalSnapshot,
+    );
     setActionError(null);
     activeConversationController?.clearCommandError();
     try {
@@ -2934,9 +2939,20 @@ export function App() {
       }
       markThreadActivityRead(threadId);
       if (activeThreadIdRef.current === threadId) {
-        setComposer("");
-        setContextSources([]);
-        setSelectedSkillIds([]);
+        setContextSources((current) =>
+          current.length === submittedContextPaths.length &&
+          current.every(
+            (source, index) => source.path === submittedContextPaths[index],
+          )
+            ? []
+            : current,
+        );
+        setSelectedSkillIds((current) =>
+          current.length === submittedSkillIds.length &&
+          current.every((skillId, index) => skillId === submittedSkillIds[index])
+            ? []
+            : current,
+        );
       }
       return activeThreadIdRef.current === threadId;
     } catch (error) {
@@ -3869,6 +3885,7 @@ export function App() {
               selectThread(thread.id);
               openToolTab("usage");
             }}
+            onArchiveThread={(thread) => void archiveThread(thread)}
             onRestoreThread={(thread) => void restoreThread(thread)}
             onOpenThreadWorkspace={(workspaceRoot) =>
               void openWorkspaceRoot(workspaceRoot)
@@ -4045,6 +4062,21 @@ export function App() {
                       )
                     }
                     onOpenMarkdownLink={openMarkdownLink}
+                    onImplementProposedPlan={() => {
+                      setCollaborationMode("default");
+                      void submitMessage(
+                        "请按上面的方案开始实施。",
+                        [],
+                        [],
+                        "default",
+                      );
+                    }}
+                    isProposedPlanActionDisabled={
+                      isSending ||
+                      Boolean(conversationActiveTurnId) ||
+                      Boolean(activeApproval) ||
+                      Boolean(activeUserInput)
+                    }
                     onUndoTurn={(turnId) => void openTurnUndo(turnId)}
                     onReviewChanges={() => {
                       openToolTab("diff");

@@ -370,6 +370,29 @@ declare global {
         textLength: number;
         visible: boolean;
       }): void;
+      recordConversationSendTrace?(trace: {
+        stage:
+          | "controller_started"
+          | "state_dispatched"
+          | "fetch_started"
+          | "response_headers"
+          | "response_parsed"
+          | "state_confirmed"
+          | "failed";
+        requestId: string;
+        threadId: string;
+        rendererAt: string;
+        rendererClockMs: number;
+        elapsedMs: number;
+        clientStartedAtMs: number;
+        turnId?: string | null;
+        messageId?: string;
+        queued?: boolean;
+        httpStatus?: number;
+        serverDurationMs?: number;
+        clientToServerMs?: number;
+        errorName?: string;
+      }): void;
       browserHost?: {
         createSession(input: {
           sessionId: string;

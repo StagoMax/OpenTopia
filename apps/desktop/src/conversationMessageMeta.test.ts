@@ -42,6 +42,16 @@ test("keeps message indentation while removing blank outer lines", () => {
   );
 });
 
+test("copies a proposed plan as visible message text", () => {
+  assert.equal(
+    conversationMessageCopyText([
+      { type: "text", text: "方案如下：" },
+      { type: "proposed_plan", text: "1. 调查\n2. 实施" },
+    ]),
+    "方案如下：\n\n1. 调查\n2. 实施",
+  );
+});
+
 test("formats a local message timestamp with weekday and minute", () => {
   const localDate = new Date(2026, 7, 10, 18, 37, 12);
   const timestamp = formatConversationMessageTimestamp(localDate.toISOString());

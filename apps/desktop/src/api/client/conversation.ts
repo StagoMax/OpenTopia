@@ -25,6 +25,11 @@ import type {
   TurnCancelResult,
   TurnStatus,
 } from "../../types";
+import {
+  conversationSendTrace,
+  type ConversationSendTraceContext,
+} from "../../conversationSendTrace";
+import { recordConversationSendTrace } from "../../platform";
 import { ExtensionsApi } from "./extensions";
 import { parseResponse, queryString } from "./transport";
 
@@ -194,16 +199,32 @@ export class ConversationApi extends ExtensionsApi {
     imageAttachments: InlineImageAttachment[] = [],
     contentParts: InlineMessageContentPart[] = [],
     libraryProvider?: LibraryProviderId,
+    trace?: ConversationSendTraceContext,
   ): Promise<{
     message: Message;
     turnId: string | null;
     queued: boolean;
   }> {
+    if (trace) {
+      recordConversationSendTrace(
+        conversationSendTrace(trace, "fetch_started"),
+      );
+    }
     const response = await fetch(
       `${this.baseUrl}/api/threads/${threadId}/messages`,
       {
         method: "POST",
-        headers: this.authHeaders(true),
+        headers: {
+          ...this.authHeaders(true),
+          ...(trace
+            ? {
+                "x-opentopia-request-id": trace.requestId,
+                "x-opentopia-client-started-at-ms": String(
+                  trace.clientStartedAtMs,
+                ),
+              }
+            : {}),
+        },
         body: JSON.stringify({
           content,
           sourcePaths,
@@ -216,10 +237,36 @@ export class ConversationApi extends ExtensionsApi {
         }),
       },
     );
+    if (trace) {
+      recordConversationSendTrace(
+        conversationSendTrace(trace, "response_headers", {
+          httpStatus: response.status,
+          serverDurationMs: numericHeader(
+            response,
+            "x-opentopia-server-duration-ms",
+          ),
+          clientToServerMs: numericHeader(
+            response,
+            "x-opentopia-client-to-server-ms",
+          ),
+        }),
+      );
+    }
     const turnId = response.headers.get("x-opentopia-turn-id");
     const queued = response.headers.get("x-opentopia-queued") === "true";
+    const message = await parseResponse<Message>(response, "sendMessage");
+    if (trace) {
+      recordConversationSendTrace(
+        conversationSendTrace(trace, "response_parsed", {
+          turnId,
+          messageId: message.id,
+          queued,
+          httpStatus: response.status,
+        }),
+      );
+    }
     return {
-      message: await parseResponse<Message>(response, "sendMessage"),
+      message,
       turnId,
       queued,
     };
@@ -414,4 +461,11 @@ export class ConversationApi extends ExtensionsApi {
       signal,
     );
   }
+}
+
+function numericHeader(response: Response, name: string): number | undefined {
+  const value = response.headers.get(name);
+  if (value === null) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
 }

@@ -718,6 +718,7 @@ const MemoizedComposer = memo(function ComposerView({
       editor ? readComposerContentParts(editor) : [],
       sourceKeys,
     );
+    const submittedDraft = draftRef.current;
     const usedIds = referencedImageIds(parts);
     const currentAttachments = imageAttachmentsRef.current;
     const submittedAttachments = currentAttachments
@@ -743,6 +744,15 @@ const MemoizedComposer = memo(function ComposerView({
       submittedContentParts,
     );
     if (!accepted) return;
+    if (
+      draftRef.current !== submittedDraft ||
+      imageAttachmentsRef.current.length !== currentAttachments.length ||
+      imageAttachmentsRef.current.some(
+        (attachment, index) => attachment.id !== currentAttachments[index]?.id,
+      )
+    ) {
+      return;
+    }
     currentAttachments.forEach((attachment) =>
       URL.revokeObjectURL(attachment.previewUrl),
     );

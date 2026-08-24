@@ -1,8 +1,17 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { Check, Copy, ExternalLink, Loader2, Plug } from "lucide-react";
+import {
+  Check,
+  ClipboardList,
+  Copy,
+  ExternalLink,
+  Loader2,
+  Play,
+  Plug,
+} from "lucide-react";
 import { FileTypeIcon } from "../../components/FileTypeIcon";
 import { MarkdownContent } from "../../components/MarkdownContent";
+import { Button } from "../../components/ui";
 import {
   artifactReferencesFromText,
   type ArtifactReference,
@@ -29,6 +38,8 @@ export function MessagePartView({
   onOpenArtifact,
   onOpenAttachmentPreview,
   onOpenMarkdownLink,
+  onImplementProposedPlan,
+  isProposedPlanActionDisabled,
 }: {
   attachmentSources: ContextSourceRef[];
   messageId: string;
@@ -42,6 +53,8 @@ export function MessagePartView({
   onOpenArtifact(artifactId: string): void;
   onOpenAttachmentPreview(source: ContextSourceRef): void;
   onOpenMarkdownLink(href: string): void;
+  onImplementProposedPlan?(): void;
+  isProposedPlanActionDisabled: boolean;
 }) {
   if (part.type === "image") {
     return (
@@ -90,6 +103,41 @@ export function MessagePartView({
           onOpenArtifact={onOpenArtifact}
         />
       </>
+    );
+  }
+  if (part.type === "proposed_plan") {
+    return (
+      <section className="message-proposed-plan" aria-label="建议方案">
+        <header className="message-proposed-plan-header">
+          <ClipboardList size={16} aria-hidden="true" />
+          <span>建议方案</span>
+        </header>
+        <MarkdownContent
+          attachmentSources={attachmentSources}
+          className="message-markdown message-proposed-plan-body"
+          onOpenAttachment={onOpenAttachmentPreview}
+          onOpenLink={onOpenMarkdownLink}
+          renderTrace={{
+            channel: "assistant",
+            threadId,
+            messageId,
+          }}
+          text={part.text}
+        />
+        {onImplementProposedPlan ? (
+          <footer className="message-proposed-plan-footer">
+            <Button
+              size="compact"
+              variant="primary"
+              disabled={isProposedPlanActionDisabled}
+              onClick={onImplementProposedPlan}
+            >
+              <Play size={14} aria-hidden="true" />
+              开始实施
+            </Button>
+          </footer>
+        ) : null}
+      </section>
     );
   }
   if (part.type === "error") {

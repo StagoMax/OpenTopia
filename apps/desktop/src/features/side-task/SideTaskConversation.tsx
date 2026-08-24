@@ -203,6 +203,7 @@ export function SideTaskConversation({
     input: string,
     imageAttachments: InlineImageAttachment[],
     contentParts: InlineMessageContentPart[],
+    collaborationModeOverride?: CollaborationMode,
   ): Promise<boolean> {
     const messageText = input.trim();
     if (
@@ -220,20 +221,33 @@ export function SideTaskConversation({
     }
 
     const isFirstPrompt = !messages.some((message) => message.role === "user");
+    const submittedContextPaths = contextSources.map((source) => source.path);
+    const submittedSkillIds = [...selectedSkillIds];
     setActionError(null);
     sessionController.clearCommandError();
     const result = await sessionController.send({
       content: messageText,
-      sourcePaths: contextSources.map((source) => source.path),
-      skillIds: selectedSkillIds,
-      collaborationMode,
+      sourcePaths: submittedContextPaths,
+      skillIds: submittedSkillIds,
+      collaborationMode: collaborationModeOverride ?? collaborationMode,
       imageAttachments,
       contentParts,
     });
     if (!result) return false;
-    setComposer("");
-    setContextSources([]);
-    setSelectedSkillIds([]);
+    setContextSources((current) =>
+      current.length === submittedContextPaths.length &&
+      current.every(
+        (source, index) => source.path === submittedContextPaths[index],
+      )
+        ? []
+        : current,
+    );
+    setSelectedSkillIds((current) =>
+      current.length === submittedSkillIds.length &&
+      current.every((skillId, index) => skillId === submittedSkillIds[index])
+        ? []
+        : current,
+    );
     if (isFirstPrompt && messageText) void updateThreadTitle(messageText);
     return true;
   }
@@ -352,6 +366,21 @@ export function SideTaskConversation({
             )
           }
           onOpenMarkdownLink={onOpenMarkdownLink}
+          onImplementProposedPlan={() => {
+            setCollaborationMode("default");
+            void submitSideTaskMessage(
+              "请按上面的方案开始实施。",
+              [],
+              [],
+              "default",
+            );
+          }}
+          isProposedPlanActionDisabled={
+            isSending ||
+            Boolean(activeTurnId) ||
+            Boolean(activeApproval) ||
+            Boolean(activeUserInput)
+          }
           onUndoTurn={(turnId) => void undoSideTaskTurn(turnId)}
           onReviewChanges={() => onOpenToolTab("diff")}
           onOpenFileReview={(path) => onOpenFileReview(path)}

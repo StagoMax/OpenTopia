@@ -52,6 +52,13 @@ function turnStatus(status: TurnStatus["status"]): TurnStatus {
   };
 }
 
+function registryClient(methods: Record<string, unknown> = {}): ApiClient {
+  return {
+    openThreadActivityStream: () => ({ close() {} }),
+    ...methods,
+  } as unknown as ApiClient;
+}
+
 test("keeps a terminal Turn status authoritative when stale history loads later", () => {
   let state = conversationSessionReducer(
     createConversationSessionState("thread-1"),
@@ -231,7 +238,7 @@ test("preserves a cancellation request until send resolves a turn id", async () 
 });
 
 test("registry returns one controller per thread", () => {
-  const registry = new ConversationSessionRegistry({} as ApiClient);
+  const registry = new ConversationSessionRegistry(registryClient());
   assert.equal(registry.get("thread-1"), registry.get("thread-1"));
   registry.dispose();
 });
@@ -280,7 +287,7 @@ test("publishes durable messages before event history finishes loading", async (
   controller.dispose();
 });
 
-test("registry forwards lifecycle events after the active view switches away", async () => {
+test("registry forwards detailed events while the conversation view is active", async () => {
   let onStreamEvent: ((event: AgentEvent) => void) | undefined;
   const client = {
     listMessages: () => Promise.resolve([message("user")]),
@@ -302,17 +309,16 @@ test("registry forwards lifecycle events after the active view switches away", a
       onStreamEvent = onEvent;
       return { close() {} };
     },
-  } as unknown as ApiClient;
-  const registry = new ConversationSessionRegistry(client);
+  };
+  const registry = new ConversationSessionRegistry(registryClient(client));
   const forwarded: AgentEvent[] = [];
   registry.subscribeToEvents((nextEvent) => forwarded.push(nextEvent));
   const controller = registry.get("thread-1");
 
   const release = controller.retain();
   await new Promise((resolve) => setTimeout(resolve, 0));
-  release();
   onStreamEvent?.(
-    event("background-finished", 2, {
+    event("visible-finished", 2, {
       type: "turn_finished",
       summary: "done",
     }),
@@ -320,46 +326,54 @@ test("registry forwards lifecycle events after the active view switches away", a
 
   assert.deepEqual(
     forwarded.map((nextEvent) => nextEvent.id),
-    ["background-finished"],
+    ["visible-finished"],
   );
+  release();
   registry.dispose();
 });
 
-test("registry keeps an activity-owned stream across navigation until terminal", async () => {
-  let closeCalls = 0;
-  let onStreamEvent: ((event: AgentEvent) => void) | undefined;
+test("registry tracks background activity without retaining detailed streams", async () => {
+  let detailedCloseCalls = 0;
+  let activityCloseCalls = 0;
+  let onActivityEvent: ((event: AgentEvent) => void) | undefined;
   const client = {
     listMessages: () => Promise.resolve([]),
     listConversationEvents: () => Promise.resolve([]),
     getTurnStatus: () => Promise.resolve(null),
     listPendingApprovals: () => Promise.resolve([]),
     listPendingUserInput: () => Promise.resolve([]),
-    openEventStream: (
-      _threadId: string,
-      _since: number | undefined,
-      onEvent: (event: AgentEvent) => void,
-    ) => {
-      onStreamEvent = onEvent;
+    openEventStream: () => {
       return {
         close() {
-          closeCalls += 1;
+          detailedCloseCalls += 1;
+        },
+      };
+    },
+    openThreadActivityStream: (onEvent: (event: AgentEvent) => void) => {
+      onActivityEvent = onEvent;
+      return {
+        close() {
+          activityCloseCalls += 1;
         },
       };
     },
   } as unknown as ApiClient;
   const registry = new ConversationSessionRegistry(client);
+  const controller = registry.get("thread-1");
 
   registry.activityStore.startOptimistic("thread-1");
   registry.activityStore.confirmTurn("thread-1", "turn-1");
+  const release = controller.retain();
   await new Promise((resolve) => setTimeout(resolve, 0));
+  release();
   registry.activityStore.markRead("thread-1");
   assert.equal(
     registry.activityStore.getVisibleStatus("thread-1"),
     "processing",
   );
-  assert.equal(closeCalls, 0);
+  assert.equal(detailedCloseCalls, 1);
 
-  onStreamEvent?.({
+  onActivityEvent?.({
     ...event("finished", 2, { type: "turn_finished", summary: "done" }),
     createdAt: "2099-08-23T00:00:02Z",
   });
@@ -368,7 +382,76 @@ test("registry keeps an activity-owned stream across navigation until terminal",
     registry.activityStore.getRecord("thread-1")?.phase,
     "succeeded",
   );
-  assert.equal(closeCalls, 1);
+  assert.equal(detailedCloseCalls, 1);
+  registry.dispose();
+  assert.equal(activityCloseCalls, 1);
+});
+
+test("registry reconciles live activity whenever the global stream reconnects", async () => {
+  let onConnected: (() => void) | undefined;
+  const registry = new ConversationSessionRegistry(
+    registryClient({
+      openThreadActivityStream: (
+        _onEvent: (event: AgentEvent) => void,
+        connected: () => void,
+      ) => {
+        onConnected = connected;
+        return { close() {} };
+      },
+      getTurnStatus: () => Promise.resolve(turnStatus("succeeded")),
+    }),
+  );
+  registry.activityStore.startOptimistic("thread-1");
+  registry.activityStore.confirmTurn("thread-1", "turn-1");
+
+  onConnected?.();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(
+    registry.activityStore.getRecord("thread-1")?.phase,
+    "succeeded",
+  );
+  registry.dispose();
+});
+
+test("many background tasks share one activity stream without opening detail streams", async () => {
+  let activityOpenCalls = 0;
+  let detailOpenCalls = 0;
+  let detailCloseCalls = 0;
+  const registry = new ConversationSessionRegistry(
+    registryClient({
+      openThreadActivityStream: () => {
+        activityOpenCalls += 1;
+        return { close() {} };
+      },
+      listMessages: () => Promise.resolve([]),
+      listConversationEvents: () => Promise.resolve([]),
+      getTurnStatus: () => Promise.resolve(null),
+      listPendingApprovals: () => Promise.resolve([]),
+      listPendingUserInput: () => Promise.resolve([]),
+      openEventStream: () => {
+        detailOpenCalls += 1;
+        return {
+          close() {
+            detailCloseCalls += 1;
+          },
+        };
+      },
+    }),
+  );
+
+  for (let index = 0; index < 20; index += 1) {
+    registry.activityStore.startOptimistic(`thread-${index}`);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(activityOpenCalls, 1);
+  assert.equal(detailOpenCalls, 0);
+
+  const release = registry.get("thread-0").retain();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(detailOpenCalls, 1);
+  release();
+  assert.equal(detailCloseCalls, 1);
   registry.dispose();
 });
 
@@ -443,10 +526,9 @@ test("shares one stream and keeps auxiliary failures independent", async () => {
   controller.dispose();
 });
 
-test("keeps a warm stream while switching away and reuses it on return", async () => {
+test("closes detailed streams while away and reconnects when returning", async () => {
   let openCalls = 0;
   let closeCalls = 0;
-  let onStreamEvent: ((event: AgentEvent) => void) | undefined;
   const client = {
     listMessages: () => Promise.resolve([message("user")]),
     listConversationEvents: () =>
@@ -462,10 +544,9 @@ test("keeps a warm stream while switching away and reuses it on return", async (
     openEventStream: (
       _threadId: string,
       _since: number | undefined,
-      onEvent: (event: AgentEvent) => void,
+      _onEvent: (event: AgentEvent) => void,
     ) => {
       openCalls += 1;
-      onStreamEvent = onEvent;
       return {
         close() {
           closeCalls += 1;
@@ -479,34 +560,15 @@ test("keeps a warm stream while switching away and reuses it on return", async (
   await new Promise((resolve) => setTimeout(resolve, 0));
   release();
   await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.equal(closeCalls, 0);
-  onStreamEvent?.(
-    event("background-progress", 2, {
-      type: "model_delta",
-      text: "still working",
-    }),
-  );
-  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(closeCalls, 1);
 
   const releaseAgain = controller.retain();
-  assert.equal(openCalls, 1);
-  assert.equal(closeCalls, 0);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(openCalls, 2);
+  assert.equal(closeCalls, 1);
   assert.equal(controller.getSnapshot().loadState.status, "ready");
-  assert.ok(
-    controller
-      .getSnapshot()
-      .events.some((item) => item.id === "background-progress"),
-  );
 
   releaseAgain();
-  onStreamEvent?.(
-    event("finished", 3, { type: "turn_finished", summary: "done" }),
-  );
-  await new Promise((resolve) => setTimeout(resolve, 40));
-  assert.equal(controller.getSnapshot().activeTurnId, null);
-  assert.ok(
-    controller.getSnapshot().events.some((item) => item.id === "finished"),
-  );
-  assert.equal(closeCalls, 1);
+  assert.equal(closeCalls, 2);
   controller.dispose();
 });

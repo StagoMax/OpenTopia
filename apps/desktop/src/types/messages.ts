@@ -13,6 +13,7 @@ export type Message = {
 
 export type MessagePart =
   | { type: "text"; text: string }
+  | { type: "proposed_plan"; text: string }
   | ({ type: "image" } & Omit<InlineImageAttachment, "id"> & { id?: string })
   | { type: "image_ref"; image_id: string }
   | { type: "tool_call"; call: ToolCall }

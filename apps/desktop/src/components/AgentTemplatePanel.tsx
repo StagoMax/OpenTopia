@@ -35,6 +35,7 @@ import {
   AgentTemplateConnectionGrantsField,
   normalizeConnectionBindings,
 } from "./agentTemplateConnectionGrants";
+import { AgentTemplateKnowledgeBindingField } from "./AgentTemplateKnowledgeBindingField";
 import "../styles/agent-template-panel.css";
 
 type AgentTemplatePanelProps = {
@@ -57,6 +58,8 @@ type DraftForm = {
   legacyAllowAllMcpServers: boolean;
   mcpServers: string;
   connectionBindings: AgentConnectionBinding[];
+  knowledgeEnabled: boolean;
+  knowledgeNamespaces: string;
   workspaceRoots: string;
   models: string;
   resourceGrants: string;
@@ -197,6 +200,14 @@ export function AgentTemplatePanel({
       }
       const stateSchema = parseJson<unknown>(form.stateSchema, "状态 Schema");
       const outputSchema = parseJson<unknown>(form.outputSchema, "输出 Schema");
+      const knowledgeNamespaces = parseList(form.knowledgeNamespaces);
+      if (form.knowledgeEnabled && knowledgeNamespaces.length === 0) {
+        throw new Error("启用 SAG 知识绑定后，至少需要一个 namespace");
+      }
+      const tools = parseList(form.tools);
+      if (form.knowledgeEnabled && !tools.includes("library_search")) {
+        tools.push("library_search");
+      }
       const created = await client.createAgentTemplateVersion({
         templateId: form.templateId.trim(),
         name: form.name.trim(),
@@ -206,7 +217,7 @@ export function AgentTemplatePanel({
           instructions: form.instructions.trim(),
           capabilities: {
             allowAllTools: false,
-            tools: parseList(form.tools),
+            tools,
             allowAllSkills: false,
             skills: parseList(form.skills),
             allowAllPlugins: false,
@@ -217,6 +228,9 @@ export function AgentTemplatePanel({
             workspaceRoots: parseList(form.workspaceRoots),
           },
           connectionBindings: form.connectionBindings,
+          knowledgeBinding: form.knowledgeEnabled
+            ? { namespaces: knowledgeNamespaces }
+            : undefined,
           resourceGrants,
           modelPolicy: {
             allowAllModels: false,
@@ -488,6 +502,21 @@ export function AgentTemplatePanel({
                 }))
               }
             />
+            <AgentTemplateKnowledgeBindingField
+              disabled={Boolean(busy)}
+              enabled={form.knowledgeEnabled}
+              namespaces={form.knowledgeNamespaces}
+              onEnabledChange={(knowledgeEnabled) =>
+                setFormValue(setForm, "knowledgeEnabled", knowledgeEnabled)
+              }
+              onNamespacesChange={(knowledgeNamespaces) =>
+                setFormValue(
+                  setForm,
+                  "knowledgeNamespaces",
+                  knowledgeNamespaces,
+                )
+              }
+            />
             <SelectField
               fieldClassName="agent-template-panel__field"
               label="风险等级"
@@ -643,6 +672,14 @@ export function AgentTemplatePanel({
                   : selected.template.spec.capabilities.mcpServers.length
                     ? `${selected.template.spec.capabilities.mcpServers.length} 个 Legacy MCP 绑定`
                     : "无"}
+              </dd>
+            </div>
+            <div>
+              <dt>SAG 知识</dt>
+              <dd>
+                {selected.template.spec.knowledgeBinding?.namespaces.join(
+                  ", ",
+                ) || "无"}
               </dd>
             </div>
             <div>
@@ -864,6 +901,8 @@ function blankDraft(
     legacyAllowAllMcpServers: false,
     mcpServers: "",
     connectionBindings: [],
+    knowledgeEnabled: false,
+    knowledgeNamespaces: "",
     workspaceRoots: workspaceRoot ?? "",
     models: provider ? `${provider.id}:${provider.model}` : "",
     resourceGrants: "[]",
@@ -897,6 +936,9 @@ function draftFromTemplate(
     connectionBindings: normalizeConnectionBindings(
       template.spec.connectionBindings,
     ),
+    knowledgeEnabled: Boolean(template.spec.knowledgeBinding),
+    knowledgeNamespaces:
+      template.spec.knowledgeBinding?.namespaces.join(", ") ?? "",
     workspaceRoots: template.spec.capabilities.workspaceRoots.join(", "),
     models: template.spec.modelPolicy.allowedModels
       .map((model) => `${model.providerId}:${model.modelId}`)

@@ -107,6 +107,7 @@ export class ApiTransport {
     decode: (data: string) => T,
     onData: (event: T) => void,
     sequencePolicy: EventSequencePolicy = "contiguous",
+    onConnected?: () => void,
   ): StreamHandle {
     const controller = new AbortController();
     let lastSequence = readSince(path);
@@ -132,6 +133,7 @@ export class ApiTransport {
           }
           if (!response.body)
             throw new Error("Event stream response has no body");
+          onConnected?.();
 
           await consumeSse(
             response.body,

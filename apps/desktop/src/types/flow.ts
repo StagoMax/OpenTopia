@@ -44,6 +44,10 @@ export type AgentConnectionBinding = {
   operationGrants: AgentConnectionOperationGrant[];
 };
 
+export type SagKnowledgeBinding = {
+  namespaces: string[];
+};
+
 export type ExecutionConnectionOperation = {
   connectionId: string;
   capabilityRevision: number;
@@ -72,6 +76,7 @@ export type AgentTemplateSpec = {
    * the legacy `capabilities.mcpServers` projection instead.
    */
   connectionBindings?: AgentConnectionBinding[];
+  knowledgeBinding?: SagKnowledgeBinding;
   resourceGrants: ExecutionResourceGrant[];
   modelPolicy: AgentModelPolicy;
   stateSchema: unknown;
@@ -131,6 +136,7 @@ export type EnterpriseExecutionContext = {
   capabilities: CapabilityProjection;
   connectionBindings?: AgentConnectionBinding[];
   connectionOperations?: ExecutionConnectionOperation[];
+  knowledgeBinding?: SagKnowledgeBinding;
   resourceGrants: ExecutionResourceGrant[];
   modelPolicy: AgentModelPolicy;
 };
@@ -304,6 +310,7 @@ export type WorkflowAgentSpec = {
   outputSchema: unknown;
   riskClass: "low" | "medium" | "high" | "critical";
   connectionBindings: AgentConnectionBinding[];
+  knowledgeBinding?: SagKnowledgeBinding;
   connectionAuthority: RuntimeConnectionAuthority;
 };
 

@@ -2325,6 +2325,23 @@ function registerIpc() {
     writeLog("info", `conversation.render.${stage}`, trace);
   });
 
+  ipcMain.on("logs:conversation-send-trace", (event, trace) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return;
+    if (!trace || typeof trace !== "object" || Array.isArray(trace)) return;
+    const stage = [
+      "controller_started",
+      "state_dispatched",
+      "fetch_started",
+      "response_headers",
+      "response_parsed",
+      "state_confirmed",
+      "failed",
+    ].includes(trace.stage)
+      ? trace.stage
+      : "unknown";
+    writeLog("info", `conversation.send.${stage}`, trace);
+  });
+
   ipcMain.handle("platform:open-external", async (_event, rawUrl) => {
     const url = new URL(rawUrl);
     if (!["http:", "https:", "mailto:"].includes(url.protocol)) {

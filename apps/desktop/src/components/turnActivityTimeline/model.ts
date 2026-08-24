@@ -423,8 +423,12 @@ function findFinalResponseDeltaSeqs(events: AgentEvent[]): Set<number> {
   const assistantEvent = events[assistantIndex];
   if (assistantEvent.payload.type !== "assistant_message") return new Set();
   const finalText = assistantEvent.payload.message.parts
-    .filter((part) => part.type === "text")
-    .map((part) => (part.type === "text" ? part.text : ""))
+    .filter(
+      (part) => part.type === "text" || part.type === "proposed_plan",
+    )
+    .map((part) =>
+      part.type === "text" || part.type === "proposed_plan" ? part.text : "",
+    )
     .join("");
   if (!finalText) return new Set();
 

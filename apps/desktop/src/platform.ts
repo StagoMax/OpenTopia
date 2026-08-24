@@ -1,4 +1,5 @@
 import type { ConversationRenderTrace } from "./conversationRenderTrace";
+import type { ConversationSendTrace } from "./conversationSendTrace";
 import type { BackendStartupStatus } from "./types/platform";
 import type {
   ContextSourcePickResult,
@@ -300,6 +301,13 @@ export function recordConversationRenderTrace(
   trace: ConversationRenderTrace,
 ): void {
   window.opentopia?.recordConversationRenderTrace?.(trace);
+}
+
+export function recordConversationSendTrace(
+  trace: ConversationSendTrace,
+): void {
+  if (typeof window === "undefined") return;
+  window.opentopia?.recordConversationSendTrace?.(trace);
 }
 
 function readBrowserRecentWorkspaces(): RecentWorkspace[] {

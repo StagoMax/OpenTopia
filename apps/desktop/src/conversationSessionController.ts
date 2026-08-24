@@ -9,6 +9,11 @@ import {
   inactiveTurnIdsFromEvents,
   resolveActiveTurnId,
 } from "./turnActivityStatus.ts";
+import {
+  conversationSendTrace,
+  createConversationSendTraceContext,
+} from "./conversationSendTrace.ts";
+import { recordConversationSendTrace } from "./platform.ts";
 import type {
   AgentEvent,
   CollaborationMode,
@@ -16,6 +21,7 @@ import type {
   InlineMessageContentPart,
   LibraryProviderId,
   Message,
+  TurnStatus,
   UserInputResponse,
 } from "./types";
 import { ThreadActivityStore } from "./threadActivityStore.ts";
@@ -84,14 +90,12 @@ export class ConversationSessionController {
     if (this.retainCount === 1) this.connect();
     return () => {
       this.retainCount = Math.max(0, this.retainCount - 1);
-      if (this.retainCount === 0 && !this.hasLiveActivity()) {
-        this.disconnect();
-      }
+      if (this.retainCount === 0) this.disconnect();
     };
   }
 
   isRetained(): boolean {
-    return this.retainCount > 0 || this.hasLiveActivity();
+    return this.retainCount > 0 || this.state.sending;
   }
 
   retry(): void {
@@ -110,9 +114,16 @@ export class ConversationSessionController {
       return null;
     }
 
+    const trace = createConversationSendTraceContext(this.threadId);
+    recordConversationSendTrace(
+      conversationSendTrace(trace, "controller_started"),
+    );
     const startedAt = new Date().toISOString();
     this.activityStore?.startOptimistic(this.threadId);
     this.dispatch({ type: "sendStarted", startedAt });
+    recordConversationSendTrace(
+      conversationSendTrace(trace, "state_dispatched"),
+    );
     try {
       const result = await this.client.sendMessage(
         this.threadId,
@@ -124,18 +135,31 @@ export class ConversationSessionController {
         request.imageAttachments ?? [],
         request.contentParts ?? [],
         request.libraryProvider,
+        trace,
       );
       this.dispatch({
         type: "sendSucceeded",
         ...result,
         startedAt,
       });
+      recordConversationSendTrace(
+        conversationSendTrace(trace, "state_confirmed", {
+          turnId: result.turnId,
+          messageId: result.message.id,
+          queued: result.queued,
+        }),
+      );
       this.activityStore?.confirmTurn(this.threadId, result.turnId);
       if (this.state.cancellationRequested && result.turnId) {
         await this.issueCancel(result.turnId);
       }
       return result;
     } catch (error) {
+      recordConversationSendTrace(
+        conversationSendTrace(trace, "failed", {
+          errorName: error instanceof Error ? error.name : typeof error,
+        }),
+      );
       this.activityStore?.clearOptimistic(this.threadId);
       this.dispatch({
         type: "sendFailed",
@@ -310,17 +334,6 @@ export class ConversationSessionController {
     this.flushPendingEvents();
   }
 
-  private hasLiveActivity(): boolean {
-    return (
-      this.activityStore?.isLive(this.threadId) === true ||
-      this.state.sending ||
-      this.state.pendingTurnFeedback !== null ||
-      this.state.activeTurnId !== null ||
-      this.state.turnStatus?.status === "running" ||
-      this.state.turnStatus?.status === "cancelling"
-    );
-  }
-
   private isCurrentLoad(
     generation: number,
     controller: AbortController,
@@ -402,9 +415,7 @@ export class ConversationSessionController {
     if (next === this.state) return;
     this.state = next;
     this.stateListeners.forEach((listener) => listener());
-    if (this.retainCount === 0 && !this.hasLiveActivity() && this.stream) {
-      this.disconnect();
-    }
+    if (this.retainCount === 0 && this.stream) this.disconnect();
   }
 }
 
@@ -418,8 +429,8 @@ export class ConversationSessionRegistry {
     ConversationSessionController
   >();
   private readonly controllerEventReleases = new Map<string, () => void>();
-  private readonly activityRetentionReleases = new Map<string, () => void>();
-  private readonly activityStoreRelease: () => void;
+  private readonly activityStream: StreamHandle;
+  private activityReconcileGeneration = 0;
 
   constructor(
     client: ApiClient,
@@ -429,12 +440,10 @@ export class ConversationSessionRegistry {
     this.client = client;
     this.cacheLimit = cacheLimit;
     this.activityStore = activityStore;
-    this.activityStoreRelease = activityStore.subscribeToChanges((threadId) =>
-      this.syncActivityRetention(threadId),
+    this.activityStream = client.openThreadActivityStream(
+      (event) => this.activityStore.applyEvent(event),
+      () => this.reconcileLiveActivity(),
     );
-    activityStore
-      .liveThreadIds()
-      .forEach((threadId) => this.syncActivityRetention(threadId));
   }
 
   get(threadId: string): ConversationSessionController {
@@ -464,9 +473,8 @@ export class ConversationSessionRegistry {
   }
 
   dispose(): void {
-    this.activityStoreRelease();
-    this.activityRetentionReleases.forEach((release) => release());
-    this.activityRetentionReleases.clear();
+    this.activityReconcileGeneration += 1;
+    this.activityStream.close();
     this.controllerEventReleases.forEach((release) => release());
     this.controllerEventReleases.clear();
     this.controllers.forEach((controller) => controller.dispose());
@@ -474,17 +482,24 @@ export class ConversationSessionRegistry {
     this.eventListeners.clear();
   }
 
-  private syncActivityRetention(threadId: string): void {
-    const retained = this.activityRetentionReleases.get(threadId);
-    if (this.activityStore.isLive(threadId)) {
-      if (retained) return;
-      const release = this.get(threadId).retain();
-      this.activityRetentionReleases.set(threadId, release);
-      return;
-    }
-    if (!retained) return;
-    this.activityRetentionReleases.delete(threadId);
-    retained();
+  private reconcileLiveActivity(): void {
+    const threadIds = this.activityStore.liveThreadIds();
+    if (threadIds.length === 0) return;
+    const generation = ++this.activityReconcileGeneration;
+    void Promise.all(
+      threadIds.map(async (threadId) => {
+        try {
+          return await this.client.getTurnStatus(threadId);
+        } catch {
+          return null;
+        }
+      }),
+    ).then((statuses) => {
+      if (generation !== this.activityReconcileGeneration) return;
+      this.activityStore.reconcileTurnStatuses(
+        statuses.filter((status): status is TurnStatus => status !== null),
+      );
+    });
   }
 
   private prune(protectedThreadId: string): void {

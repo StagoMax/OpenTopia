@@ -68,6 +68,8 @@ export type MessageListProps = {
   onOpenImagePreview(sourceId: string, image: ImagePreviewSource): void;
   onOpenAttachmentPreview(source: ContextSourceRef): void;
   onOpenMarkdownLink(href: string, baseWorkspacePath?: string | null): void;
+  onImplementProposedPlan(): void;
+  isProposedPlanActionDisabled: boolean;
   onUndoTurn(turnId: string): void;
   onReviewChanges(): void;
   onOpenFileReview(path: string, file: TurnFileChange): void;
@@ -90,6 +92,8 @@ export function MessageList({
   onOpenImagePreview,
   onOpenAttachmentPreview,
   onOpenMarkdownLink,
+  onImplementProposedPlan,
+  isProposedPlanActionDisabled,
   onUndoTurn,
   onReviewChanges,
   onOpenFileReview,
@@ -120,6 +124,12 @@ export function MessageList({
   const conversationPinnedToEndRef = useRef(true);
   const [showScrollToEnd, setShowScrollToEnd] = useState(false);
   const renderedMessages = visibleMessages.slice(-renderedMessageCount);
+  const actionableProposedPlanMessageId = useMemo(() => {
+    const latestMessage = visibleMessages[visibleMessages.length - 1];
+    return latestMessage?.parts.some((part) => part.type === "proposed_plan")
+      ? latestMessage.id
+      : null;
+  }, [visibleMessages]);
   const hasPendingMessages = renderedMessages.length < visibleMessages.length;
   const {
     eventsByTurn,
@@ -398,6 +408,12 @@ export function MessageList({
                     onOpenImagePreview={onOpenImagePreview}
                     onOpenAttachmentPreview={onOpenAttachmentPreview}
                     onOpenMarkdownLink={onOpenMarkdownLink}
+                    onImplementProposedPlan={
+                      message.id === actionableProposedPlanMessageId
+                        ? onImplementProposedPlan
+                        : undefined
+                    }
+                    isProposedPlanActionDisabled={isProposedPlanActionDisabled}
                   />
                   {turnIds.map((turnId) => (
                     <Fragment key={turnId}>
@@ -525,6 +541,8 @@ const MessageBubble = memo(function MessageBubble({
   onOpenImagePreview,
   onOpenAttachmentPreview,
   onOpenMarkdownLink,
+  onImplementProposedPlan,
+  isProposedPlanActionDisabled,
 }: {
   attachmentSources: ContextSourceRef[];
   message: Message;
@@ -534,6 +552,8 @@ const MessageBubble = memo(function MessageBubble({
   onOpenImagePreview(sourceId: string, image: ImagePreviewSource): void;
   onOpenAttachmentPreview(source: ContextSourceRef): void;
   onOpenMarkdownLink(href: string): void;
+  onImplementProposedPlan?(): void;
+  isProposedPlanActionDisabled: boolean;
 }) {
   const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "error">(
     "idle",
@@ -650,6 +670,8 @@ const MessageBubble = memo(function MessageBubble({
                 onOpenArtifact={onOpenArtifact}
                 onOpenAttachmentPreview={onOpenAttachmentPreview}
                 onOpenMarkdownLink={onOpenMarkdownLink}
+                onImplementProposedPlan={onImplementProposedPlan}
+                isProposedPlanActionDisabled={isProposedPlanActionDisabled}
               />
             ),
           )}
