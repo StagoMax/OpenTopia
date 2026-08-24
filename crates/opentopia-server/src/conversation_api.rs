@@ -286,13 +286,38 @@ fn project_name_for_workspace(workspace_root: &FsPath) -> String {
 async fn list_messages(
     State(state): State<AppState>,
     Path(thread_id): Path<Uuid>,
+    Query(query): Query<MessageListQuery>,
 ) -> Result<Json<Vec<Message>>, ApiError> {
     ensure_thread(&state, thread_id)?;
     let store = state.store.clone();
-    let messages = tokio::task::spawn_blocking(move || store.list_messages(thread_id))
-        .await
-        .map_err(|error| ApiError::internal(format!("message history task failed: {error}")))??;
+    let after = message_cursor(query.after_created_at, query.after_id, "after")?;
+    let before = message_cursor(query.before_created_at, query.before_id, "before")?;
+    if after.is_some() && before.is_some() {
+        return Err(ApiError::bad_request(
+            "message history cannot use after and before cursors together",
+        ));
+    }
+    let messages = tokio::task::spawn_blocking(move || match query.limit {
+        Some(limit) => store.list_conversation_message_page(thread_id, after, before, limit),
+        None => store.list_messages(thread_id),
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("message history task failed: {error}")))??;
     Ok(Json(messages))
+}
+
+fn message_cursor(
+    created_at: Option<DateTime<Utc>>,
+    id: Option<Uuid>,
+    name: &str,
+) -> Result<Option<(DateTime<Utc>, Uuid)>, ApiError> {
+    match (created_at, id) {
+        (Some(created_at), Some(id)) => Ok(Some((created_at, id))),
+        (None, None) => Ok(None),
+        _ => Err(ApiError::bad_request(format!(
+            "{name}CreatedAt and {name}Id must be provided together"
+        ))),
+    }
 }
 
 async fn get_thread_goal(
@@ -392,6 +417,16 @@ struct ThreadListQuery {
     #[serde(default)]
     include_archived: bool,
     experience_mode: Option<ExperienceMode>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageListQuery {
+    after_created_at: Option<DateTime<Utc>>,
+    after_id: Option<Uuid>,
+    before_created_at: Option<DateTime<Utc>>,
+    before_id: Option<Uuid>,
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]

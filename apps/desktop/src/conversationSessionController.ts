@@ -6,10 +6,6 @@ import {
   type ConversationSessionState,
 } from "./conversationSession.ts";
 import {
-  inactiveTurnIdsFromEvents,
-  resolveActiveTurnId,
-} from "./turnActivityStatus.ts";
-import {
   conversationSendTrace,
   createConversationSendTraceContext,
 } from "./conversationSendTrace.ts";
@@ -21,10 +17,10 @@ import type {
   InlineMessageContentPart,
   LibraryProviderId,
   Message,
-  TurnStatus,
   UserInputResponse,
 } from "./types";
 import { ThreadActivityStore } from "./threadActivityStore.ts";
+import { ConversationHistoryLoader } from "./conversationHistoryLoader.ts";
 
 export type ConversationSendRequest = {
   content: string;
@@ -57,19 +53,23 @@ export class ConversationSessionController {
   private eventBatchTimer: ReturnType<typeof setTimeout> | null = null;
   private stream: StreamHandle | null = null;
   private loadController: AbortController | null = null;
+  private olderLoadController: AbortController | null = null;
+  private catchUpController: AbortController | null = null;
   private retainCount = 0;
   private loadGeneration = 0;
   private cancelRequestInFlight = false;
-  private readonly activityStore?: ThreadActivityStore;
+  private readonly activityStore: ThreadActivityStore;
+  private readonly historyLoader: ConversationHistoryLoader;
 
   constructor(
     client: ApiClient,
     threadId: string,
-    activityStore?: ThreadActivityStore,
+    activityStore = new ThreadActivityStore(),
   ) {
     this.client = client;
     this.threadId = threadId;
     this.activityStore = activityStore;
+    this.historyLoader = new ConversationHistoryLoader(client, threadId);
     this.state = createConversationSessionState(threadId);
   }
 
@@ -95,7 +95,10 @@ export class ConversationSessionController {
   }
 
   isRetained(): boolean {
-    return this.retainCount > 0 || this.state.sending;
+    return (
+      this.retainCount > 0 ||
+      this.activityStore.getRunState(this.threadId).sending
+    );
   }
 
   retry(): void {
@@ -103,11 +106,58 @@ export class ConversationSessionController {
     if (this.retainCount > 0) this.connect();
   }
 
+  async loadOlderMessages(): Promise<void> {
+    if (
+      this.olderLoadController ||
+      this.state.loadingOlderMessages ||
+      !this.state.hasOlderMessages
+    ) {
+      return;
+    }
+    const firstMessage = this.state.messages[0];
+    if (!firstMessage) return;
+
+    const controller = new AbortController();
+    this.olderLoadController = controller;
+    this.dispatch({ type: "olderMessagesLoadStarted" });
+    try {
+      const page = await this.historyLoader.loadOlderMessages(
+        firstMessage,
+        controller.signal,
+      );
+      if (controller.signal.aborted) return;
+      const events = await this.historyLoader.loadEventsForOlderMessages(
+        page.messages,
+        this.state.events[0]?.seq,
+        controller.signal,
+      );
+      if (controller.signal.aborted) return;
+      events.forEach((event) => this.rememberEventId(event.id));
+      this.dispatch({
+        type: "olderMessagesLoaded",
+        messages: page.messages,
+        events,
+        hasOlderMessages: page.hasOlderMessages,
+      });
+    } catch (error) {
+      if (!isAbortError(error)) {
+        this.dispatch({
+          type: "olderMessagesLoadFailed",
+          error: errorMessage(error),
+        });
+      }
+    } finally {
+      if (this.olderLoadController === controller) {
+        this.olderLoadController = null;
+      }
+    }
+  }
+
   async send(
     request: ConversationSendRequest,
   ): Promise<ConversationSendResult | null> {
     if (
-      this.state.sending ||
+      this.activityStore.getRunState(this.threadId).sending ||
       this.state.pendingApprovalIds.length > 0 ||
       this.state.pendingUserInput.length > 0
     ) {
@@ -119,8 +169,8 @@ export class ConversationSessionController {
       conversationSendTrace(trace, "controller_started"),
     );
     const startedAt = new Date().toISOString();
-    this.activityStore?.startOptimistic(this.threadId);
-    this.dispatch({ type: "sendStarted", startedAt });
+    this.activityStore.beginSend(this.threadId);
+    this.dispatch({ type: "commandStarted" });
     recordConversationSendTrace(
       conversationSendTrace(trace, "state_dispatched"),
     );
@@ -139,8 +189,8 @@ export class ConversationSessionController {
       );
       this.dispatch({
         type: "sendSucceeded",
-        ...result,
-        startedAt,
+        message: result.message,
+        queued: result.queued,
       });
       recordConversationSendTrace(
         conversationSendTrace(trace, "state_confirmed", {
@@ -149,8 +199,16 @@ export class ConversationSessionController {
           queued: result.queued,
         }),
       );
-      this.activityStore?.confirmTurn(this.threadId, result.turnId);
-      if (this.state.cancellationRequested && result.turnId) {
+      this.activityStore.confirmSend(this.threadId, {
+        threadId: this.threadId,
+        turnId: result.turnId,
+        userMessageId: result.message.id,
+        startedAt,
+      });
+      if (
+        this.activityStore.getRunState(this.threadId).cancellationRequested &&
+        result.turnId
+      ) {
         await this.issueCancel(result.turnId);
       }
       return result;
@@ -160,27 +218,28 @@ export class ConversationSessionController {
           errorName: error instanceof Error ? error.name : typeof error,
         }),
       );
-      this.activityStore?.clearOptimistic(this.threadId);
+      this.activityStore.failSend(this.threadId);
       this.dispatch({
         type: "sendFailed",
         error: errorMessage(error),
-        startedAt,
       });
       return null;
     }
   }
 
   async cancel(): Promise<void> {
-    if (this.state.cancelling) return;
+    const runState = this.activityStore.getRunState(this.threadId);
+    if (runState.cancelling) return;
     if (
-      !this.state.activeTurnId &&
-      !this.state.sending &&
-      !this.state.pendingTurnFeedback
+      !runState.activeTurnId &&
+      !runState.sending &&
+      !runState.pendingTurnFeedback
     ) {
       return;
     }
-    this.dispatch({ type: "cancelRequested" });
-    await this.issueCancel(this.state.activeTurnId ?? undefined);
+    this.activityStore.requestCancellation(this.threadId);
+    this.dispatch({ type: "commandStarted" });
+    await this.issueCancel(runState.activeTurnId ?? undefined);
   }
 
   async decideApproval(
@@ -244,11 +303,23 @@ export class ConversationSessionController {
     const since = latestPersistedEventSeq(this.state.events);
     this.receiveEvent(event);
     if (!isTerminalActivityEvent(event)) return;
-    void this.client
-      .listConversationEvents(this.threadId, since)
-      .then((events) => events.forEach((nextEvent) => this.receiveEvent(nextEvent)))
+    this.catchUpController?.abort();
+    const controller = new AbortController();
+    this.catchUpController = controller;
+    void this.historyLoader
+      .loadForwardEvents(since, controller.signal)
+      .then((events) => {
+        if (controller.signal.aborted || this.retainCount === 0) return;
+        events.forEach((nextEvent) => this.receiveEvent(nextEvent));
+      })
       .catch((error) => {
+        if (isAbortError(error)) return;
         console.warn("OpenTopia conversation catch-up failed", error);
+      })
+      .finally(() => {
+        if (this.catchUpController === controller) {
+          this.catchUpController = null;
+        }
       });
   }
 
@@ -272,6 +343,7 @@ export class ConversationSessionController {
 
   private connect(): void {
     if (this.loadController || this.stream) return;
+    const hasSnapshot = this.state.loadState.status === "ready";
     const generation = ++this.loadGeneration;
     const controller = new AbortController();
     this.loadController = controller;
@@ -280,25 +352,56 @@ export class ConversationSessionController {
     const since = latestPersistedEventSeq(this.state.events);
     void (async () => {
       try {
-        // Durable messages are the primary conversation content and are much
-        // cheaper to load than the diagnostic event history. Publish them
-        // first so a large trace cannot hold the whole conversation blank.
-        const messages = await this.client.listMessages(
-          this.threadId,
-          controller.signal,
-        );
-        if (!this.isCurrentLoad(generation, controller)) return;
-        this.dispatch({ type: "historyLoaded", messages, events: [] });
+        const messagesPromise = hasSnapshot
+          ? this.historyLoader.loadMessageDelta(
+              this.state.messages,
+              this.state.hasOlderMessages,
+              controller.signal,
+            )
+          : this.historyLoader.loadInitialMessages(controller.signal);
+        const eventsPromise = hasSnapshot
+          ? this.historyLoader.loadForwardEvents(since, controller.signal)
+          : null;
+        const auxiliaryPromise = Promise.allSettled([
+          this.client.getTurnStatus(this.threadId, controller.signal),
+          this.client.listPendingApprovals(this.threadId, controller.signal),
+          this.client.listPendingUserInput(this.threadId, controller.signal),
+        ]);
 
-        const events = await this.client.listConversationEvents(
-          this.threadId,
-          since,
-          controller.signal,
-        );
+        const messagePage = await messagesPromise;
+        const events = eventsPromise
+          ? await eventsPromise
+          : await this.historyLoader.loadInitialEvents(
+              messagePage.messages,
+              controller.signal,
+            );
+        const [turnStatus, approvals, userInput] = await auxiliaryPromise;
         if (!this.isCurrentLoad(generation, controller)) return;
         events.forEach((event) => this.rememberEventId(event.id));
-        this.activityStore?.applyEvents(events);
-        this.dispatch({ type: "historyLoaded", messages: [], events });
+        this.activityStore.applyEvents(events);
+        if (turnStatus.status === "fulfilled") {
+          this.activityStore.reconcileTurnStatus(turnStatus.value);
+        }
+        // Cached content remains visible behind the refresh affordance, but
+        // messages, events and decision state become visible in one commit.
+        this.dispatch({
+          type: "syncCompleted",
+          messages: messagePage.messages,
+          events,
+          hasOlderMessages: messagePage.hasOlderMessages,
+          pendingApprovalIds:
+            approvals.status === "fulfilled"
+              ? approvals.value.map((approval) => approval.approvalId)
+              : undefined,
+          pendingUserInput:
+            userInput.status === "fulfilled" ? userInput.value : undefined,
+        });
+        if (
+          !this.isCurrentLoad(generation, controller) ||
+          this.retainCount === 0
+        ) {
+          return;
+        }
         this.stream = this.client.openEventStream(
           this.threadId,
           latestPersistedEventSeq(this.state.events),
@@ -314,34 +417,16 @@ export class ConversationSessionController {
         this.dispatch({ type: "loadFailed", error: errorMessage(error) });
       }
     })();
-
-    void Promise.allSettled([
-      this.client.getTurnStatus(this.threadId, controller.signal),
-      this.client.listPendingApprovals(this.threadId, controller.signal),
-      this.client.listPendingUserInput(this.threadId, controller.signal),
-    ]).then(([turnStatus, approvals, userInput]) => {
-      if (!this.isCurrentLoad(generation, controller)) return;
-      if (turnStatus.status === "fulfilled") {
-        this.activityStore?.reconcileTurnStatus(turnStatus.value);
-      }
-      this.dispatch({
-        type: "auxiliaryLoaded",
-        turnStatus:
-          turnStatus.status === "fulfilled" ? turnStatus.value : undefined,
-        pendingApprovalIds:
-          approvals.status === "fulfilled"
-            ? approvals.value.map((approval) => approval.approvalId)
-            : undefined,
-        pendingUserInput:
-          userInput.status === "fulfilled" ? userInput.value : undefined,
-      });
-    });
   }
 
   private disconnect(): void {
     this.loadGeneration += 1;
     this.loadController?.abort();
     this.loadController = null;
+    this.olderLoadController?.abort();
+    this.olderLoadController = null;
+    this.catchUpController?.abort();
+    this.catchUpController = null;
     this.stream?.close();
     this.stream = null;
     this.flushPendingEvents();
@@ -361,7 +446,7 @@ export class ConversationSessionController {
   private receiveEvent(event: AgentEvent): void {
     if (event.threadId !== this.threadId || this.eventIds.has(event.id)) return;
     this.rememberEventId(event.id);
-    this.activityStore?.applyEvent(event);
+    this.activityStore.applyEvent(event);
     this.eventListeners.forEach((listener) => listener(event));
     this.pendingEvents.push(event);
     if (!this.eventBatchTimer) {
@@ -370,7 +455,7 @@ export class ConversationSessionController {
     if (
       event.payload.type === "turn_started" &&
       event.turnId &&
-      this.state.cancellationRequested
+      this.activityStore.getRunState(this.threadId).cancellationRequested
     ) {
       void this.issueCancel(event.turnId);
     }
@@ -399,21 +484,28 @@ export class ConversationSessionController {
       const result = await this.client.cancelTurn(this.threadId, turnId);
       if (result.cancelled) return;
       let activeTurnId = turnId ?? null;
+      let turnStatusResolved = false;
       try {
         const turnStatus = await this.client.getTurnStatus(this.threadId);
-        activeTurnId = resolveActiveTurnId(
-          turnStatus,
-          inactiveTurnIdsFromEvents(this.state.events),
-        );
+        this.activityStore.reconcileTurnStatus(turnStatus);
+        activeTurnId = this.activityStore.getRunState(
+          this.threadId,
+        ).activeTurnId;
+        turnStatusResolved = turnStatus !== null;
       } catch {
         // Preserve the cancellation response when reconciliation is unavailable.
       }
+      this.activityStore.reconcileCancellation(
+        this.threadId,
+        activeTurnId,
+        turnStatusResolved,
+      );
       this.dispatch({
         type: "cancelReconciled",
-        activeTurnId,
         error: activeTurnId && turnId ? result.message : undefined,
       });
     } catch (error) {
+      this.activityStore.failCancellation(this.threadId);
       this.dispatch({
         type: "cancelFailed",
         error: `中断执行失败：${errorMessage(error)}`,
@@ -499,23 +591,15 @@ export class ConversationSessionRegistry {
   }
 
   private reconcileLiveActivity(): void {
-    const threadIds = this.activityStore.liveThreadIds();
-    if (threadIds.length === 0) return;
     const generation = ++this.activityReconcileGeneration;
-    void Promise.all(
-      threadIds.map(async (threadId) => {
-        try {
-          return await this.client.getTurnStatus(threadId);
-        } catch {
-          return null;
-        }
-      }),
-    ).then((statuses) => {
-      if (generation !== this.activityReconcileGeneration) return;
-      this.activityStore.reconcileTurnStatuses(
-        statuses.filter((status): status is TurnStatus => status !== null),
-      );
-    });
+    const baseline = this.activityStore.captureLiveReconciliationBaseline();
+    void this.client
+      .listActivityStatuses()
+      .then((statuses) => {
+        if (generation !== this.activityReconcileGeneration) return;
+        this.activityStore.reconcileLiveTurnStatuses(statuses, baseline);
+      })
+      .catch(() => undefined);
   }
 
   private prune(protectedThreadId: string): void {

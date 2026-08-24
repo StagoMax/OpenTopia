@@ -4,6 +4,7 @@ import test from "node:test";
 import type { ApiClient } from "./api/client";
 import type * as ConversationSessionModule from "./conversationSession";
 import type * as ControllerModule from "./conversationSessionController";
+import type * as ThreadActivityStoreModule from "./threadActivityStore";
 import type { AgentEvent, Message, TurnStatus } from "./types";
 
 const { conversationSessionReducer, createConversationSessionState } =
@@ -14,6 +15,9 @@ const { ConversationSessionController, ConversationSessionRegistry } =
   (await import(
     "./conversationSessionController" + ".ts"
   )) as typeof ControllerModule;
+const { ThreadActivityStore } = (await import(
+  "./threadActivityStore" + ".ts"
+)) as typeof ThreadActivityStoreModule;
 
 function event(
   id: string,
@@ -52,69 +56,81 @@ function turnStatus(status: TurnStatus["status"]): TurnStatus {
   };
 }
 
+function beginActivityTurn(
+  store: ThreadActivityStoreModule.ThreadActivityStore,
+  threadId: string,
+  turnId: string,
+): void {
+  store.beginSend(threadId);
+  store.confirmSend(threadId, {
+    threadId,
+    turnId,
+    userMessageId: `message-${turnId}`,
+    startedAt: "2026-08-17T00:00:00Z",
+  });
+}
+
 function registryClient(methods: Record<string, unknown> = {}): ApiClient {
   return {
     openThreadActivityStream: () => ({ close() {} }),
+    listActivityStatuses: () => Promise.resolve([]),
     ...methods,
   } as unknown as ApiClient;
 }
 
-test("keeps a terminal Turn status authoritative when stale history loads later", () => {
-  let state = conversationSessionReducer(
-    createConversationSessionState("thread-1"),
-    { type: "loadStarted" },
-  );
-  state = conversationSessionReducer(state, {
-    type: "auxiliaryLoaded",
-    turnStatus: turnStatus("interrupted"),
-  });
-  state = conversationSessionReducer(state, {
-    type: "historyLoaded",
-    messages: [message("user")],
-    events: [
-      event("started", 1, {
-        type: "turn_started",
-        user_message_id: "user",
-      }),
-      event("request", 2, {
-        type: "provider_request_sent",
-        request_id: "request-1",
-        round: 1,
-        attempt: 1,
-        adapter: "openai_chat",
-        method: "POST",
-        endpoint: "https://provider.example/v1/chat/completions",
-        body: {},
-      }),
-    ],
-  });
-
-  assert.equal(state.activeTurnId, null);
-  assert.equal(state.turnStatus?.status, "interrupted");
+test("conversation snapshots do not duplicate canonical run state", () => {
+  const state = createConversationSessionState("thread-1") as unknown as Record<
+    string,
+    unknown
+  >;
+  assert.equal("activeTurnId" in state, false);
+  assert.equal("sending" in state, false);
+  assert.equal("pendingTurnFeedback" in state, false);
+  assert.equal("cancellationRequested" in state, false);
+  assert.equal("cancelling" in state, false);
+  assert.equal("turnStatus" in state, false);
 });
 
-test("clears a stale history-derived active Turn when terminal status loads later", () => {
+test("keeps a cached snapshot unchanged until its delta sync commits", () => {
   let state = conversationSessionReducer(
     createConversationSessionState("thread-1"),
-    { type: "loadStarted" },
+    {
+      type: "historyLoaded",
+      messages: [message("cached")],
+      events: [
+        event("cached-event", 1, { type: "reasoning_delta", text: "a" }),
+      ],
+    },
   );
-  state = conversationSessionReducer(state, {
-    type: "historyLoaded",
-    messages: [message("user")],
-    events: [
-      event("started", 1, {
-        type: "turn_started",
-        user_message_id: "user",
-      }),
-    ],
-  });
-  assert.equal(state.activeTurnId, "turn-1");
+
+  state = conversationSessionReducer(state, { type: "loadStarted" });
+  assert.equal(state.loadState.status, "ready");
+  assert.equal(state.syncing, true);
+  assert.deepEqual(
+    state.messages.map((item) => item.id),
+    ["cached"],
+  );
+  assert.deepEqual(
+    state.events.map((item) => item.id),
+    ["cached-event"],
+  );
 
   state = conversationSessionReducer(state, {
-    type: "auxiliaryLoaded",
-    turnStatus: turnStatus("interrupted"),
+    type: "syncCompleted",
+    messages: [message("delta")],
+    events: [event("delta-event", 2, { type: "model_delta", text: "b" })],
+    hasOlderMessages: true,
   });
-  assert.equal(state.activeTurnId, null);
+  assert.equal(state.syncing, false);
+  assert.deepEqual(
+    state.messages.map((item) => item.id),
+    ["cached", "delta"],
+  );
+  assert.deepEqual(
+    state.events.map((item) => item.id),
+    ["cached-event", "delta-event"],
+  );
+  assert.equal(state.hasOlderMessages, true);
 });
 
 test("reduces history and streamed lifecycle events deterministically", () => {
@@ -141,7 +157,6 @@ test("reduces history and streamed lifecycle events deterministically", () => {
   });
 
   assert.equal(state.loadState.status, "ready");
-  assert.equal(state.activeTurnId, null);
   assert.deepEqual(
     state.messages.map((item) => item.id),
     ["assistant-message", "user"],
@@ -150,62 +165,6 @@ test("reduces history and streamed lifecycle events deterministically", () => {
     state.events.map((item) => item.id),
     ["started", "assistant", "finished"],
   );
-});
-
-test("anchors pending feedback to the server-confirmed user message", () => {
-  const startedAt = "2026-08-22T00:00:00.000Z";
-  const userMessage = message("confirmed-user");
-  let state = createConversationSessionState("thread-1");
-
-  state = conversationSessionReducer(state, {
-    type: "sendStarted",
-    startedAt,
-  });
-  assert.equal(state.pendingTurnFeedback, null);
-  assert.deepEqual(state.messages, []);
-
-  state = conversationSessionReducer(state, {
-    type: "sendSucceeded",
-    message: userMessage,
-    turnId: "turn-1",
-    queued: false,
-    startedAt,
-  });
-
-  assert.equal(state.pendingTurnFeedback?.userMessageId, userMessage.id);
-  assert.equal(state.pendingTurnFeedback?.turnId, "turn-1");
-  assert.deepEqual(
-    state.messages.map((item) => item.id),
-    [userMessage.id],
-  );
-});
-
-test("resolves a queued message when its matching turn starts", () => {
-  const startedAt = "2026-08-22T00:00:00.000Z";
-  const userMessage = message("queued-user");
-  let state = conversationSessionReducer(
-    createConversationSessionState("thread-1"),
-    { type: "sendStarted", startedAt },
-  );
-  state = conversationSessionReducer(state, {
-    type: "sendSucceeded",
-    message: userMessage,
-    turnId: null,
-    queued: true,
-    startedAt,
-  });
-  assert.equal(state.pendingTurnFeedback?.turnId, null);
-
-  state = conversationSessionReducer(state, {
-    type: "eventsReceived",
-    events: [
-      event("queued-started", 1, {
-        type: "turn_started",
-        user_message_id: userMessage.id,
-      }),
-    ],
-  });
-  assert.equal(state.pendingTurnFeedback, null);
 });
 
 test("preserves a cancellation request until send resolves a turn id", async () => {
@@ -226,15 +185,46 @@ test("preserves a cancellation request until send resolves a turn id", async () 
     },
     getTurnStatus: () => Promise.resolve(null),
   } as unknown as ApiClient;
-  const controller = new ConversationSessionController(client, "thread-1");
+  const activityStore = new ThreadActivityStore({ persistReadAt: () => {} });
+  const controller = new ConversationSessionController(
+    client,
+    "thread-1",
+    activityStore,
+  );
 
   const sending = controller.send({ content: "hello" });
   await controller.cancel();
-  assert.equal(controller.getSnapshot().cancellationRequested, true);
+  assert.equal(
+    activityStore.getRunState("thread-1").cancellationRequested,
+    true,
+  );
   resolveSend({ message: message("user"), turnId: "turn-1", queued: false });
   await sending;
 
   assert.deepEqual(cancelCalls, [undefined, "turn-1"]);
+});
+
+test("terminal cancellation reconciliation settles the canonical run state", async () => {
+  const activityStore = new ThreadActivityStore({ persistReadAt: () => {} });
+  beginActivityTurn(activityStore, "thread-1", "turn-1");
+  const client = {
+    cancelTurn: () =>
+      Promise.resolve({ cancelled: false, message: "already finished" }),
+    getTurnStatus: () => Promise.resolve(turnStatus("succeeded")),
+  } as unknown as ApiClient;
+  const controller = new ConversationSessionController(
+    client,
+    "thread-1",
+    activityStore,
+  );
+
+  await controller.cancel();
+
+  const runState = activityStore.getRunState("thread-1");
+  assert.equal(runState.activeTurnId, null);
+  assert.equal(runState.pendingTurnFeedback, null);
+  assert.equal(runState.cancelling, false);
+  assert.equal(activityStore.getRecord("thread-1")?.phase, "succeeded");
 });
 
 test("registry returns one controller per thread", () => {
@@ -243,7 +233,7 @@ test("registry returns one controller per thread", () => {
   registry.dispose();
 });
 
-test("publishes durable messages before event history finishes loading", async () => {
+test("publishes conversation history atomically after the complete sync finishes", async () => {
   let resolveEvents!: (events: AgentEvent[]) => void;
   let openCalls = 0;
   const client = {
@@ -265,11 +255,9 @@ test("publishes durable messages before event history finishes loading", async (
   const release = controller.retain();
   await new Promise((resolve) => setTimeout(resolve, 0));
 
-  assert.equal(controller.getSnapshot().loadState.status, "ready");
-  assert.deepEqual(
-    controller.getSnapshot().messages.map((item) => item.id),
-    ["user"],
-  );
+  assert.equal(controller.getSnapshot().loadState.status, "loading");
+  assert.equal(controller.getSnapshot().syncing, true);
+  assert.deepEqual(controller.getSnapshot().messages, []);
   assert.deepEqual(controller.getSnapshot().events, []);
   assert.equal(openCalls, 0);
 
@@ -278,6 +266,12 @@ test("publishes durable messages before event history finishes loading", async (
   ]);
   await new Promise((resolve) => setTimeout(resolve, 0));
 
+  assert.equal(controller.getSnapshot().loadState.status, "ready");
+  assert.equal(controller.getSnapshot().syncing, false);
+  assert.deepEqual(
+    controller.getSnapshot().messages.map((item) => item.id),
+    ["user"],
+  );
   assert.deepEqual(
     controller.getSnapshot().events.map((item) => item.id),
     ["finished"],
@@ -361,8 +355,7 @@ test("registry tracks background activity without retaining detailed streams", a
   const registry = new ConversationSessionRegistry(client);
   const controller = registry.get("thread-1");
 
-  registry.activityStore.startOptimistic("thread-1");
-  registry.activityStore.confirmTurn("thread-1", "turn-1");
+  beginActivityTurn(registry.activityStore, "thread-1", "turn-1");
   const release = controller.retain();
   await new Promise((resolve) => setTimeout(resolve, 0));
   release();
@@ -406,7 +399,9 @@ test("a terminal activity event immediately reconciles the retained detail view"
     listMessages: () => Promise.resolve([message("user")]),
     listConversationEvents: (_threadId: string, since?: number) => {
       historySince.push(since);
-      return Promise.resolve(since === undefined ? [started] : [commentary, finished]);
+      return Promise.resolve(
+        since === undefined ? [started] : [commentary, finished],
+      );
     },
     getTurnStatus: () => Promise.resolve(null),
     listPendingApprovals: () => Promise.resolve([]),
@@ -430,12 +425,15 @@ test("a terminal activity event immediately reconciles the retained detail view"
     controller.getSnapshot().events.map((item) => item.id),
     ["started", "commentary", "finished"],
   );
-  assert.equal(controller.getSnapshot().activeTurnId, null);
+  assert.equal(
+    registry.activityStore.getRunState("thread-1").activeTurnId,
+    null,
+  );
   release();
   registry.dispose();
 });
 
-test("registry reconciles live activity whenever the global stream reconnects", async () => {
+test("registry reconciles live activity with one batch snapshot on reconnect", async () => {
   let onConnected: (() => void) | undefined;
   const registry = new ConversationSessionRegistry(
     registryClient({
@@ -446,11 +444,10 @@ test("registry reconciles live activity whenever the global stream reconnects", 
         onConnected = connected;
         return { close() {} };
       },
-      getTurnStatus: () => Promise.resolve(turnStatus("succeeded")),
+      listActivityStatuses: () => Promise.resolve([turnStatus("succeeded")]),
     }),
   );
-  registry.activityStore.startOptimistic("thread-1");
-  registry.activityStore.confirmTurn("thread-1", "turn-1");
+  beginActivityTurn(registry.activityStore, "thread-1", "turn-1");
 
   onConnected?.();
   await new Promise((resolve) => setTimeout(resolve, 0));
@@ -489,7 +486,7 @@ test("many background tasks share one activity stream without opening detail str
   );
 
   for (let index = 0; index < 20; index += 1) {
-    registry.activityStore.startOptimistic(`thread-${index}`);
+    registry.activityStore.beginSend(`thread-${index}`);
   }
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(activityOpenCalls, 1);

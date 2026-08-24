@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useState } from "react";
+import { memo, useEffect, useId, useMemo, useState } from "react";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import type { AgentEvent } from "../types";
 import { shouldShowRecordedTurnChanges } from "../turnChangeOwnership";
@@ -24,7 +24,7 @@ import {
 export { TurnChangeCard } from "./turnActivityTimeline/TurnChangeCard";
 import "./TurnActivityTimeline.css";
 
-export function TurnActivityTimeline({
+export const TurnActivityTimeline = memo(function TurnActivityTimeline({
   events,
   isActive,
   standalone = false,
@@ -166,7 +166,7 @@ export function TurnActivityTimeline({
       )}
     </section>
   );
-}
+});
 
 function TurnTimingText({
   range,

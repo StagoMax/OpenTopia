@@ -5,6 +5,7 @@ import { resolveComposerWorkForm } from "../../conversationWorkForm";
 import { resolveThreadModelContextWindow } from "../../modelCapabilities";
 import type { AgentEvent, GoalSnapshot } from "../../types";
 import { useConversationSession } from "../../useConversationSession";
+import { useThreadRunState } from "../../useThreadActivityStore";
 import { Composer, type ComposerProps } from "./Composer";
 
 const emptyEvents: AgentEvent[] = [];
@@ -33,6 +34,10 @@ export function LiveConversationComposer({
   ...props
 }: LiveConversationComposerProps) {
   const { state } = useConversationSession(conversationRegistry, threadId);
+  const runState = useThreadRunState(
+    conversationRegistry.activityStore,
+    threadId,
+  );
   const events =
     state?.loadState.status === "ready" ? state.events : emptyEvents;
   const deferredEvents = useDeferredValue(events);
@@ -41,9 +46,9 @@ export function LiveConversationComposer({
       resolveComposerWorkForm(
         deferredEvents,
         goalSnapshot,
-        state?.activeTurnId ?? null,
+        runState.activeTurnId,
       ),
-    [deferredEvents, goalSnapshot, state?.activeTurnId],
+    [deferredEvents, goalSnapshot, runState.activeTurnId],
   );
   const metrics = useMemo(() => {
     const contextWindow = resolveThreadModelContextWindow(

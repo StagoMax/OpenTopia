@@ -29,6 +29,7 @@ import { getDroppedContextFiles, selectContextFiles } from "../../platform";
 import { friendlyProviderError } from "../../providerErrors";
 import { resolveThreadModelContextWindow } from "../../modelCapabilities";
 import { resolveThreadActivityEventStatus } from "../../threadActivityStatus";
+import { canCancelTurn } from "../../threadRunState";
 import { threadTitleFromPrompt } from "../../threadTitle";
 import type { ToolTabKind } from "../../toolTabs";
 import type {
@@ -47,6 +48,7 @@ import type {
 } from "../../types";
 import { useComposerDraft } from "../../useComposerDraft";
 import { useConversationSession } from "../../useConversationSession";
+import { useThreadRunState } from "../../useThreadActivityStore";
 import { workspaceRootKey } from "../../workspaceRootKey";
 
 export function SideTaskConversation({
@@ -132,6 +134,10 @@ export function SideTaskConversation({
 
   const { controller: sessionController, state: sessionState } =
     useConversationSession(conversationRegistry, threadId, handleSideTaskEvent);
+  const runState = useThreadRunState(
+    conversationRegistry?.activityStore ?? null,
+    threadId,
+  );
   const messages = sessionState?.messages ?? [];
   const events = sessionState?.events ?? [];
   const loadState = sessionState?.loadState ?? {
@@ -139,9 +145,9 @@ export function SideTaskConversation({
     status: "idle" as const,
     error: null,
   };
-  const isSending = sessionState?.sending ?? false;
-  const activeTurnId = sessionState?.activeTurnId ?? null;
-  const pendingTurnFeedback = sessionState?.pendingTurnFeedback ?? null;
+  const isSending = runState.sending;
+  const activeTurnId = runState.activeTurnId;
+  const pendingTurnFeedback = runState.pendingTurnFeedback;
   const queuedMessageCount = sessionState?.queuedMessageCount ?? 0;
   const pendingApprovalIds = sessionState?.pendingApprovalIds ?? [];
   const pendingUserInput = sessionState?.pendingUserInput ?? [];
@@ -445,8 +451,8 @@ export function SideTaskConversation({
           value={composer}
           workForm={workForm}
           isSending={isSending}
-          isRunning={Boolean(activeTurnId)}
-          isCancelling={sessionState?.cancelling ?? false}
+          isRunning={canCancelTurn(runState)}
+          isCancelling={runState.cancelling}
           queuedMessageCount={queuedMessageCount}
           metrics={activityMetrics}
           showContextWindowUsage={showContextWindowUsage}

@@ -52,6 +52,26 @@ export function attachmentsByAssistantMessage(
   return result;
 }
 
+/**
+ * Preserves per-message array identity across unrelated tool events. React
+ * memoization depends on this boundary: rebuilding equivalent arrays would
+ * otherwise make every historical Markdown message render again.
+ */
+export function stabilizeAttachmentReferences(
+  previous: ReadonlyMap<string, ContextSourceRef[]>,
+  next: ReadonlyMap<string, ContextSourceRef[]>,
+): Map<string, ContextSourceRef[]> {
+  const stable = new Map<string, ContextSourceRef[]>();
+  for (const [messageId, sources] of next) {
+    const existing = previous.get(messageId);
+    stable.set(
+      messageId,
+      existing && sameSources(existing, sources) ? existing : sources,
+    );
+  }
+  return stable;
+}
+
 function messageSources(message: Message): ContextSourceRef[] {
   return message.parts.flatMap((part) =>
     part.type === "source_ref" ? [part.source] : [],
@@ -70,4 +90,26 @@ function mergeSources(
     ]),
   );
   result.set(messageId, [...merged.values()]);
+}
+
+function sameSources(
+  left: readonly ContextSourceRef[],
+  right: readonly ContextSourceRef[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((source, index) => {
+      const other = right[index];
+      return (
+        other !== undefined &&
+        source.id === other.id &&
+        source.path === other.path &&
+        source.name === other.name &&
+        source.kind === other.kind &&
+        source.contentType === other.contentType &&
+        source.bytes === other.bytes &&
+        source.truncated === other.truncated
+      );
+    })
+  );
 }

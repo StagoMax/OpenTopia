@@ -8,18 +8,15 @@ export type PendingApprovalEvent = AgentEvent & {
 export type AppConversationState = Pick<
   ConversationSessionState,
   | "loadState"
-  | "sending"
-  | "activeTurnId"
+  | "syncing"
+  | "syncError"
   | "queuedMessageCount"
-  | "pendingTurnFeedback"
   | "pendingApprovalIds"
   | "decidingApprovalId"
   | "approvalError"
   | "pendingUserInput"
   | "submittingUserInputId"
   | "userInputError"
-  | "cancelling"
-  | "turnStatus"
 > & {
   pendingApprovalQueue: PendingApprovalEvent[];
 };
@@ -31,18 +28,15 @@ export function selectAppConversationState(
   const pendingApprovalIds = new Set(state.pendingApprovalIds);
   return {
     loadState: state.loadState,
-    sending: state.sending,
-    activeTurnId: state.activeTurnId,
+    syncing: state.syncing,
+    syncError: state.syncError,
     queuedMessageCount: state.queuedMessageCount,
-    pendingTurnFeedback: state.pendingTurnFeedback,
     pendingApprovalIds: state.pendingApprovalIds,
     decidingApprovalId: state.decidingApprovalId,
     approvalError: state.approvalError,
     pendingUserInput: state.pendingUserInput,
     submittingUserInputId: state.submittingUserInputId,
     userInputError: state.userInputError,
-    cancelling: state.cancelling,
-    turnStatus: state.turnStatus,
     pendingApprovalQueue: state.events
       .filter(
         (event): event is PendingApprovalEvent =>
@@ -55,7 +49,7 @@ export function selectAppConversationState(
 
 /**
  * Event history may get a new array for every tool batch. Ignore it when the
- * lifecycle fields and pending approval event identities did not change.
+ * application-shell fields and pending approval identities did not change.
  */
 export function appConversationStateEqual(
   left: AppConversationState,
@@ -63,18 +57,15 @@ export function appConversationStateEqual(
 ): boolean {
   return (
     left.loadState === right.loadState &&
-    left.sending === right.sending &&
-    left.activeTurnId === right.activeTurnId &&
+    left.syncing === right.syncing &&
+    left.syncError === right.syncError &&
     left.queuedMessageCount === right.queuedMessageCount &&
-    left.pendingTurnFeedback === right.pendingTurnFeedback &&
     left.pendingApprovalIds === right.pendingApprovalIds &&
     left.decidingApprovalId === right.decidingApprovalId &&
     left.approvalError === right.approvalError &&
     left.pendingUserInput === right.pendingUserInput &&
     left.submittingUserInputId === right.submittingUserInputId &&
     left.userInputError === right.userInputError &&
-    left.cancelling === right.cancelling &&
-    left.turnStatus === right.turnStatus &&
     sameEventReferences(left.pendingApprovalQueue, right.pendingApprovalQueue)
   );
 }

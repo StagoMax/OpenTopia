@@ -9,6 +9,20 @@ import {
   resolveThreadActivityStatus,
   type ThreadActivityStatus,
 } from "./threadActivityStatus.ts";
+import {
+  beginThreadSend,
+  confirmThreadSend,
+  failThreadCancellation,
+  failThreadSend,
+  idleThreadRunState,
+  reconcileThreadCancellation,
+  reconcileThreadRunStatus,
+  reduceThreadRunEvent,
+  requestThreadCancellation,
+  threadRunStatesEqual,
+  type PendingTurnFeedback,
+  type ThreadRunState,
+} from "./threadRunState.ts";
 import type { AgentEvent, TurnStatus } from "./types";
 
 export type ThreadActivityPhase = ThreadActivityStatus | "cancelled";
@@ -21,6 +35,7 @@ export type ThreadActivityRecord = Readonly<{
   updatedAt: string;
   unread: boolean;
   optimistic: boolean;
+  run: ThreadRunState;
 }>;
 
 type Listener = () => void;
@@ -55,7 +70,6 @@ export class ThreadActivityStore {
     string,
     ThreadActivityRecord | null
   >();
-  private readonly pendingVisibleThreads = new Set<string>();
   private visibleSnapshotChanged = false;
 
   constructor(options: ThreadActivityStoreOptions = {}) {
@@ -74,6 +88,12 @@ export class ThreadActivityStore {
 
   getRecord(threadId: string): ThreadActivityRecord | null {
     return this.records.get(threadId) ?? null;
+  }
+
+  getRunState(threadId: string | null): ThreadRunState {
+    return threadId
+      ? (this.records.get(threadId)?.run ?? idleThreadRunState)
+      : idleThreadRunState;
   }
 
   isLive(threadId: string): boolean {
@@ -108,8 +128,15 @@ export class ThreadActivityStore {
     return () => this.changeListeners.delete(listener);
   }
 
-  startOptimistic(threadId: string): void {
+  beginSend(threadId: string): void {
     const current = this.records.get(threadId);
+    if (current && livePhases.has(current.phase)) {
+      this.setRecord({
+        ...current,
+        run: beginThreadSend(current.run),
+      });
+      return;
+    }
     this.setRecord({
       threadId,
       turnId: null,
@@ -118,21 +145,79 @@ export class ThreadActivityStore {
       updatedAt: this.now(),
       unread: false,
       optimistic: true,
+      run: beginThreadSend(current?.run ?? idleThreadRunState),
     });
   }
 
-  confirmTurn(threadId: string, turnId: string | null): void {
-    if (!turnId) return;
+  confirmSend(threadId: string, feedback: PendingTurnFeedback): void {
     const current = this.records.get(threadId);
-    if (!current || !livePhases.has(current.phase)) return;
-    if (current.turnId && current.turnId !== turnId) return;
-    this.setRecord({ ...current, turnId, optimistic: false });
+    if (!current) {
+      this.setRecord({
+        threadId,
+        turnId: feedback.turnId,
+        phase: "processing",
+        lastEventSeq: null,
+        updatedAt: feedback.startedAt,
+        unread: false,
+        optimistic: feedback.turnId === null,
+        run: confirmThreadSend(idleThreadRunState, feedback),
+      });
+      return;
+    }
+    this.setRecord({
+      ...current,
+      turnId: feedback.turnId ?? current.turnId,
+      phase: livePhases.has(current.phase) ? current.phase : "processing",
+      unread: false,
+      optimistic: feedback.turnId ? false : current.optimistic,
+      run: confirmThreadSend(current.run, feedback),
+    });
   }
 
-  clearOptimistic(threadId: string): void {
+  failSend(threadId: string): void {
     const current = this.records.get(threadId);
-    if (!current?.optimistic) return;
-    this.deleteRecord(threadId);
+    if (!current) return;
+    const run = failThreadSend(current.run);
+    if (current.optimistic && run.activeTurnId === null) {
+      this.deleteRecord(threadId);
+      return;
+    }
+    this.setRecord({ ...current, run });
+  }
+
+  requestCancellation(threadId: string): void {
+    const current = this.records.get(threadId);
+    if (!current) return;
+    this.setRecord({
+      ...current,
+      run: requestThreadCancellation(current.run),
+    });
+  }
+
+  reconcileCancellation(
+    threadId: string,
+    activeTurnId: string | null,
+    statusResolved: boolean,
+  ): void {
+    const current = this.records.get(threadId);
+    if (!current) return;
+    this.setRecord({
+      ...current,
+      run: reconcileThreadCancellation(
+        current.run,
+        activeTurnId,
+        statusResolved,
+      ),
+    });
+  }
+
+  failCancellation(threadId: string): void {
+    const current = this.records.get(threadId);
+    if (!current) return;
+    this.setRecord({
+      ...current,
+      run: failThreadCancellation(current.run),
+    });
   }
 
   markRead(threadId: string): void {
@@ -193,6 +278,7 @@ export class ThreadActivityStore {
       updatedAt: event.createdAt,
       unread,
       optimistic: false,
+      run: reduceThreadRunEvent(current?.run ?? idleThreadRunState, event),
     });
   }
 
@@ -207,11 +293,25 @@ export class ThreadActivityStore {
   reconcileTurnStatus(turnStatus: TurnStatus | null): void {
     if (!turnStatus) return;
     const current = this.records.get(turnStatus.threadId);
+    const run = reconcileThreadRunStatus(
+      current?.run ?? idleThreadRunState,
+      turnStatus,
+    );
     const projectedStatus = resolveThreadActivityStatus(turnStatus);
     const phase: ThreadActivityPhase =
       projectedStatus ??
       (turnStatus.status === "cancelled" ? "cancelled" : "failed");
     const incomingIsLive = livePhases.has(phase);
+
+    if (
+      current &&
+      !current.optimistic &&
+      current.turnId === turnStatus.turnId &&
+      (!livePhases.has(current.phase) || incomingIsLive) &&
+      !isAfter(turnStatus.updatedAt, current.updatedAt)
+    ) {
+      return;
+    }
 
     if (current && livePhases.has(current.phase)) {
       if (
@@ -250,11 +350,45 @@ export class ThreadActivityStore {
             turnStatus.updatedAt,
           ),
       optimistic: false,
+      run,
     });
   }
 
   reconcileTurnStatuses(turnStatuses: readonly TurnStatus[]): void {
     this.batch(() => {
+      turnStatuses.forEach((turnStatus) =>
+        this.reconcileTurnStatus(turnStatus),
+      );
+    });
+  }
+
+  captureLiveReconciliationBaseline(): ReadonlyMap<
+    string,
+    ThreadActivityRecord
+  > {
+    return new Map(
+      [...this.records].filter(([, record]) => livePhases.has(record.phase)),
+    );
+  }
+
+  reconcileLiveTurnStatuses(
+    turnStatuses: readonly TurnStatus[],
+    baseline?: ReadonlyMap<string, ThreadActivityRecord>,
+  ): void {
+    const liveThreadIds = new Set(
+      turnStatuses.map((turnStatus) => turnStatus.threadId),
+    );
+    this.batch(() => {
+      for (const [threadId, record] of this.records) {
+        if (
+          livePhases.has(record.phase) &&
+          !record.run.sending &&
+          !liveThreadIds.has(threadId) &&
+          (!baseline || baseline.get(threadId) === record)
+        ) {
+          this.deleteRecord(threadId);
+        }
+      }
       turnStatuses.forEach((turnStatus) =>
         this.reconcileTurnStatus(turnStatus),
       );
@@ -298,14 +432,15 @@ export class ThreadActivityStore {
     const previousVisibleStatus = this.visibleStatuses[next.threadId];
     const nextVisibleStatus = visibleStatus(next);
     this.records.set(next.threadId, next);
+    const visibleChanged = previousVisibleStatus !== nextVisibleStatus;
+    if (visibleChanged) {
+      const visibleStatuses = { ...this.visibleStatuses };
+      if (nextVisibleStatus) visibleStatuses[next.threadId] = nextVisibleStatus;
+      else delete visibleStatuses[next.threadId];
+      this.visibleStatuses = visibleStatuses;
+    }
     this.emitRecordChange(next.threadId, next);
-    if (previousVisibleStatus === nextVisibleStatus) return;
-
-    const visibleStatuses = { ...this.visibleStatuses };
-    if (nextVisibleStatus) visibleStatuses[next.threadId] = nextVisibleStatus;
-    else delete visibleStatuses[next.threadId];
-    this.visibleStatuses = visibleStatuses;
-    this.emitVisibleChange(next.threadId);
+    if (visibleChanged) this.emitVisibleChange(next.threadId);
   }
 
   private deleteRecord(threadId: string): void {
@@ -339,31 +474,27 @@ export class ThreadActivityStore {
       return;
     }
     this.changeListeners.forEach((listener) => listener(threadId, record));
+    this.threadListeners.get(threadId)?.forEach((listener) => listener());
   }
 
-  private emitVisibleChange(threadId: string): void {
+  private emitVisibleChange(_threadId: string): void {
     if (this.batchDepth > 0) {
       this.visibleSnapshotChanged = true;
-      this.pendingVisibleThreads.add(threadId);
       return;
     }
     this.listeners.forEach((listener) => listener());
-    this.threadListeners.get(threadId)?.forEach((listener) => listener());
   }
 
   private flushPendingNotifications(): void {
     this.pendingChanges.forEach((record, threadId) => {
       this.changeListeners.forEach((listener) => listener(threadId, record));
+      this.threadListeners.get(threadId)?.forEach((listener) => listener());
     });
     this.pendingChanges.clear();
     if (this.visibleSnapshotChanged) {
       this.listeners.forEach((listener) => listener());
       this.visibleSnapshotChanged = false;
     }
-    this.pendingVisibleThreads.forEach((threadId) => {
-      this.threadListeners.get(threadId)?.forEach((listener) => listener());
-    });
-    this.pendingVisibleThreads.clear();
   }
 }
 
@@ -390,7 +521,8 @@ function recordsEqual(
     left.lastEventSeq === right.lastEventSeq &&
     left.updatedAt === right.updatedAt &&
     left.unread === right.unread &&
-    left.optimistic === right.optimistic
+    left.optimistic === right.optimistic &&
+    threadRunStatesEqual(left.run, right.run)
   );
 }
 

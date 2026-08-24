@@ -100,13 +100,9 @@ import {
   shouldDeliverTaskNotification,
   writeTaskNotificationPreferences,
 } from "./taskNotifications";
-import {
-  isThreadActivityProcessing,
-  resolveThreadActivityEventStatus,
-} from "./threadActivityStatus";
+import { resolveThreadActivityEventStatus } from "./threadActivityStatus";
 import { ThreadActivityStore } from "./threadActivityStore";
 import { promoteThreadByActivity } from "./threadRecency";
-import { useThreadActivityStatus } from "./useThreadActivityStore";
 import { errorMessage, isAbortError } from "./errorMessage";
 import { threadTitleFromPrompt } from "./threadTitle";
 import { workspaceRootKey } from "./workspaceRootKey";
@@ -124,7 +120,7 @@ import {
   readPersonalizationSettings,
   writePersonalizationSettings,
 } from "./personalization";
-import { canCancelTurn } from "./turnActivityStatus";
+import { canCancelTurn } from "./threadRunState";
 import {
   readEditorPreferences,
   writeEditorPreferences,
@@ -180,7 +176,6 @@ import type {
   Thread,
   ThreadMcpServerView,
   ThreadModelSelection,
-  TurnStatus,
   TurnFileChange,
   UserInputResponse,
   WorkspaceDiff,
@@ -195,6 +190,7 @@ import { reuseUnchangedAgentList } from "./agentListState";
 import { PreviewSessionStore } from "./previewSessionStore";
 import { ConversationSessionRegistry } from "./conversationSessionController";
 import { useConversationSessionSelector } from "./useConversationSession";
+import { useThreadRunState } from "./useThreadActivityStore";
 import {
   appConversationStateEqual,
   selectAppConversationState,
@@ -241,24 +237,6 @@ type ServerStatus = "checking" | "online" | "offline";
 
 const emptyConversationMessages: Message[] = [];
 const emptyConversationEvents: AgentEvent[] = [];
-
-async function loadThreadActivityTurnStatuses(
-  client: ApiClient,
-  threadList: Thread[],
-): Promise<TurnStatus[]> {
-  const turnStatuses = await Promise.all(
-    threadList.map(async (thread) => {
-      try {
-        return await client.getTurnStatus(thread.id);
-      } catch {
-        return null;
-      }
-    }),
-  );
-  return turnStatuses.filter(
-    (turnStatus): turnStatus is TurnStatus => turnStatus !== null,
-  );
-}
 
 type DirectToolCommand =
   { kind: "run"; command: string } | { kind: "read"; path: string };
@@ -539,6 +517,10 @@ export function App() {
     selectAppConversationState,
     appConversationStateEqual,
   );
+  const activeThreadRunState = useThreadRunState(
+    threadActivityStore,
+    activeThreadId,
+  );
   const [draftProjectId, setDraftProjectId] = useState<string | null>(null);
   // Model picked on the new-task screen, before a thread exists to pin it to.
   // Carried into the thread the draft creates.
@@ -600,11 +582,7 @@ export function App() {
   const [skills, setSkills] = useState<SkillDescriptor[]>([]);
   const [skillsRevision, setSkillsRevision] = useState(0);
   const [isCreatingThread, setIsCreatingThread] = useState(false);
-  const activeTurnId = activeConversationState?.activeTurnId ?? null;
-  const activeThreadActivityStatus = useThreadActivityStatus(
-    threadActivityStore,
-    activeThreadId,
-  );
+  const activeTurnId = activeThreadRunState.activeTurnId;
   const queuedMessageCount = activeConversationState?.queuedMessageCount ?? 0;
   const pendingApprovalIds = activeConversationState?.pendingApprovalIds ?? [];
   const decidingApprovalId =
@@ -891,10 +869,8 @@ export function App() {
     writeLastActiveThreadId(activeThread.experienceMode, activeThread.id);
   }, [activeThread]);
   const isSending = activeThreadId
-    ? (activeConversationState?.sending ?? false)
+    ? activeThreadRunState.sending
     : isCreatingThread;
-  const pendingTurnFeedback =
-    activeConversationState?.pendingTurnFeedback ?? null;
   const isConversationReady =
     activeThreadId !== null &&
     conversationLoadState.threadId === activeThreadId &&
@@ -911,13 +887,8 @@ export function App() {
     conversationLoadError === null;
   const conversationGoalSnapshot = isConversationReady ? goalSnapshot : null;
   const conversationActiveTurnId = isConversationReady ? activeTurnId : null;
-  const conversationTurnCanBeCancelled = canCancelTurn(
-    conversationActiveTurnId,
-    isSending || pendingTurnFeedback?.threadId === activeThreadId,
-    isThreadActivityProcessing(activeThreadActivityStatus),
-  );
-  const conversationTurnIsCancelling =
-    activeConversationState?.cancelling ?? false;
+  const conversationTurnCanBeCancelled = canCancelTurn(activeThreadRunState);
+  const conversationTurnIsCancelling = activeThreadRunState.cancelling;
   const draftProject = useMemo(
     () => projects.find((project) => project.id === draftProjectId) ?? null,
     [draftProjectId, projects],
@@ -1545,15 +1516,21 @@ export function App() {
         if (cancelled) return;
         setProjects(sortProjects(loadedProjects));
         setThreads(loadedThreads);
-        void loadThreadActivityTurnStatuses(nextClient, loadedThreads).then(
-          (turnStatuses) => {
+        const activityBaseline =
+          threadActivityStore.captureLiveReconciliationBaseline();
+        void nextClient
+          .listActivityStatuses()
+          .then((turnStatuses) => {
             if (cancelled) return;
             threadActivityStore.retainKnownThreads(
               new Set(loadedThreads.map((thread) => thread.id)),
             );
-            threadActivityStore.reconcileTurnStatuses(turnStatuses);
-          },
-        );
+            threadActivityStore.reconcileLiveTurnStatuses(
+              turnStatuses,
+              activityBaseline,
+            );
+          })
+          .catch(() => undefined);
         setSettings(loadedSettings);
         setProviderHealth(loadedHealth);
         setMcpServers(loadedMcp);

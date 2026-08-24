@@ -2,12 +2,7 @@ import {
   mergeConversationEvents,
   mergeConversationMessages,
 } from "./conversationMerge.ts";
-import {
-  activeTurnIdFromEvents,
-  inactiveTurnIdsFromEvents,
-  resolveActiveTurnId,
-} from "./turnActivityStatus.ts";
-import type { AgentEvent, Message, TurnStatus, UserInputRecord } from "./types";
+import type { AgentEvent, Message, UserInputRecord } from "./types";
 
 export type ConversationLoadState = {
   threadId: string | null;
@@ -15,28 +10,19 @@ export type ConversationLoadState = {
   error: string | null;
 };
 
-export type PendingTurnFeedback = {
-  threadId: string;
-  turnId: string | null;
-  userMessageId: string;
-  startedAt: string;
-};
-
 export type ConversationSessionState = {
   threadId: string;
   loadState: ConversationLoadState;
+  syncing: boolean;
+  syncError: string | null;
+  hasOlderMessages: boolean;
+  loadingOlderMessages: boolean;
+  olderMessagesError: string | null;
   messages: Message[];
   events: AgentEvent[];
-  turnStatus: TurnStatus | null;
-  turnStatusResolved: boolean;
-  activeTurnId: string | null;
   pendingApprovalIds: string[];
   pendingUserInput: UserInputRecord[];
   queuedMessageCount: number;
-  pendingTurnFeedback: PendingTurnFeedback | null;
-  sending: boolean;
-  cancellationRequested: boolean;
-  cancelling: boolean;
   decidingApprovalId: string | null;
   approvalError: string | null;
   submittingUserInputId: string | null;
@@ -48,25 +34,37 @@ export type ConversationSessionAction =
   | { type: "loadStarted" }
   | { type: "historyLoaded"; messages: Message[]; events: AgentEvent[] }
   | {
+      type: "syncCompleted";
+      messages: Message[];
+      events: AgentEvent[];
+      hasOlderMessages: boolean;
+      pendingApprovalIds?: string[];
+      pendingUserInput?: UserInputRecord[];
+    }
+  | { type: "olderMessagesLoadStarted" }
+  | {
+      type: "olderMessagesLoaded";
+      messages: Message[];
+      events: AgentEvent[];
+      hasOlderMessages: boolean;
+    }
+  | { type: "olderMessagesLoadFailed"; error: string }
+  | {
       type: "auxiliaryLoaded";
-      turnStatus?: TurnStatus | null;
       pendingApprovalIds?: string[];
       pendingUserInput?: UserInputRecord[];
     }
   | { type: "loadFailed"; error: string }
   | { type: "eventsReceived"; events: AgentEvent[] }
   | { type: "eventsReplaced"; events: AgentEvent[] }
-  | { type: "sendStarted"; startedAt: string }
+  | { type: "commandStarted" }
   | {
       type: "sendSucceeded";
       message: Message;
-      turnId: string | null;
       queued: boolean;
-      startedAt: string;
     }
-  | { type: "sendFailed"; error: string; startedAt: string }
-  | { type: "cancelRequested" }
-  | { type: "cancelReconciled"; activeTurnId: string | null; error?: string }
+  | { type: "sendFailed"; error: string }
+  | { type: "cancelReconciled"; error?: string }
   | { type: "cancelFailed"; error: string }
   | { type: "approvalStarted"; approvalId: string }
   | { type: "approvalSucceeded"; approvalId: string }
@@ -82,18 +80,16 @@ export function createConversationSessionState(
   return {
     threadId,
     loadState: { threadId, status: "idle", error: null },
+    syncing: false,
+    syncError: null,
+    hasOlderMessages: false,
+    loadingOlderMessages: false,
+    olderMessagesError: null,
     messages: [],
     events: [],
-    turnStatus: null,
-    turnStatusResolved: false,
-    activeTurnId: null,
     pendingApprovalIds: [],
     pendingUserInput: [],
     queuedMessageCount: 0,
-    pendingTurnFeedback: null,
-    sending: false,
-    cancellationRequested: false,
-    cancelling: false,
     decidingApprovalId: null,
     approvalError: null,
     submittingUserInputId: null,
@@ -110,7 +106,8 @@ export function conversationSessionReducer(
     case "loadStarted":
       return {
         ...state,
-        turnStatusResolved: false,
+        syncing: true,
+        syncError: null,
         loadState: {
           threadId: state.threadId,
           status: state.loadState.status === "ready" ? "ready" : "loading",
@@ -123,56 +120,62 @@ export function conversationSessionReducer(
         action.messages,
       );
       const events = mergeConversationEvents(state.events, action.events);
-      const inactiveTurnIds = inactiveTurnIdsFromEvents(events);
-      const restoredActiveTurnId = activeTurnIdFromEvents(events);
-      // History can end at `turn_started` after a process crash. Once the
-      // projection endpoint has returned a concrete Turn, its terminal status
-      // is authoritative regardless of which concurrent load finished first.
-      const statusActiveTurnId =
-        state.turnStatusResolved && state.turnStatus !== null
-          ? resolveActiveTurnId(state.turnStatus, inactiveTurnIds)
-          : undefined;
       return {
         ...state,
+        syncing: false,
+        syncError: null,
         messages,
         events,
-        activeTurnId:
-          statusActiveTurnId !== undefined
-            ? statusActiveTurnId
-            : restoredActiveTurnId ??
-              (state.activeTurnId && !inactiveTurnIds.has(state.activeTurnId)
-                ? state.activeTurnId
-                : null),
         loadState: { threadId: state.threadId, status: "ready", error: null },
       };
     }
+    case "syncCompleted": {
+      const history = conversationSessionReducer(state, {
+        type: "historyLoaded",
+        messages: action.messages,
+        events: action.events,
+      });
+      const reconciled = conversationSessionReducer(history, {
+        type: "auxiliaryLoaded",
+        pendingApprovalIds: action.pendingApprovalIds,
+        pendingUserInput: action.pendingUserInput,
+      });
+      return {
+        ...reconciled,
+        syncing: false,
+        syncError: null,
+        hasOlderMessages: action.hasOlderMessages,
+      };
+    }
+    case "olderMessagesLoadStarted":
+      return {
+        ...state,
+        loadingOlderMessages: true,
+        olderMessagesError: null,
+      };
+    case "olderMessagesLoaded": {
+      const history = conversationSessionReducer(state, {
+        type: "historyLoaded",
+        messages: action.messages,
+        events: action.events,
+      });
+      return {
+        ...history,
+        syncing: state.syncing,
+        hasOlderMessages: action.hasOlderMessages,
+        loadingOlderMessages: false,
+        olderMessagesError: null,
+      };
+    }
+    case "olderMessagesLoadFailed":
+      return {
+        ...state,
+        loadingOlderMessages: false,
+        olderMessagesError: action.error,
+      };
     case "auxiliaryLoaded":
       return {
         ...state,
-        turnStatusResolved:
-          action.turnStatus === undefined
-            ? state.turnStatusResolved
-            : true,
-        activeTurnId:
-          action.turnStatus === undefined ||
-          (action.turnStatus === null && state.activeTurnId !== null)
-            ? state.activeTurnId
-            : resolveActiveTurnId(
-                action.turnStatus,
-                inactiveTurnIdsFromEvents(state.events),
-              ),
-        turnStatus:
-          action.turnStatus === undefined
-            ? state.turnStatus
-            : action.turnStatus,
-        cancellationRequested:
-          action.turnStatus === undefined
-            ? state.cancellationRequested
-            : action.turnStatus?.status === "cancelling",
-        cancelling:
-          action.turnStatus === undefined
-            ? state.cancelling
-            : action.turnStatus?.status === "cancelling",
         pendingApprovalIds:
           action.pendingApprovalIds ?? state.pendingApprovalIds,
         pendingUserInput: action.pendingUserInput ?? state.pendingUserInput,
@@ -180,6 +183,8 @@ export function conversationSessionReducer(
     case "loadFailed":
       return {
         ...state,
+        syncing: false,
+        syncError: errorForReadyState(state, action.error),
         loadState:
           state.loadState.status === "ready"
             ? state.loadState
@@ -193,66 +198,30 @@ export function conversationSessionReducer(
       return reduceConversationEvents(state, action.events);
     case "eventsReplaced":
       return { ...state, events: action.events };
-    case "sendStarted":
+    case "commandStarted":
       return {
         ...state,
-        sending: true,
         commandError: null,
       };
-    case "sendSucceeded": {
-      const inactiveTurnIds = inactiveTurnIdsFromEvents(state.events);
+    case "sendSucceeded":
       return {
         ...state,
-        sending: false,
         messages: mergeConversationMessages(state.messages, [action.message]),
-        activeTurnId:
-          action.turnId && !inactiveTurnIds.has(action.turnId)
-            ? action.turnId
-            : state.activeTurnId,
         queuedMessageCount: state.queuedMessageCount + (action.queued ? 1 : 0),
-        pendingTurnFeedback: {
-          threadId: state.threadId,
-          turnId: action.turnId,
-          userMessageId: action.message.id,
-          startedAt: action.startedAt,
-        },
       };
-    }
     case "sendFailed":
       return {
         ...state,
-        sending: false,
-        cancellationRequested: false,
-        cancelling: false,
         commandError: action.error,
-        pendingTurnFeedback: null,
-      };
-    case "cancelRequested":
-      return {
-        ...state,
-        cancellationRequested: true,
-        cancelling: true,
-        commandError: null,
       };
     case "cancelReconciled":
       return {
         ...state,
-        activeTurnId: action.activeTurnId,
-        cancellationRequested:
-          action.activeTurnId !== null ||
-          state.sending ||
-          state.pendingTurnFeedback !== null,
-        cancelling:
-          action.activeTurnId !== null ||
-          state.sending ||
-          state.pendingTurnFeedback !== null,
         commandError: action.error ?? null,
       };
     case "cancelFailed":
       return {
         ...state,
-        cancellationRequested: false,
-        cancelling: false,
         commandError: action.error,
       };
     case "approvalStarted":
@@ -298,6 +267,13 @@ export function conversationSessionReducer(
     case "clearCommandError":
       return { ...state, commandError: null };
   }
+}
+
+function errorForReadyState(
+  state: ConversationSessionState,
+  error: string,
+): string | null {
+  return state.loadState.status === "ready" ? error : null;
 }
 
 function reduceConversationEvents(
@@ -359,59 +335,13 @@ function reduceConversationEvents(
     if (event.payload.type === "turn_started" && event.turnId) {
       next = {
         ...next,
-        activeTurnId: event.turnId,
         queuedMessageCount: Math.max(0, next.queuedMessageCount - 1),
-      };
-    } else if (isInactiveTurnEvent(event)) {
-      next = {
-        ...next,
-        activeTurnId:
-          !event.turnId || next.activeTurnId === event.turnId
-            ? null
-            : next.activeTurnId,
-        cancellationRequested: false,
-        cancelling: false,
       };
     }
 
     if (event.payload.type === "error") {
       next = { ...next, commandError: event.payload.message };
     }
-
-    if (pendingFeedbackResolved(next.pendingTurnFeedback, event)) {
-      next = { ...next, pendingTurnFeedback: null };
-    }
   }
   return next;
-}
-
-function isInactiveTurnEvent(event: AgentEvent): boolean {
-  return (
-    event.payload.type === "turn_finished" ||
-    event.payload.type === "turn_suspended" ||
-    event.payload.type === "turn_cancelled" ||
-    event.payload.type === "turn_awaiting_input" ||
-    event.payload.type === "browser_handoff_required" ||
-    event.payload.type === "error"
-  );
-}
-
-function pendingFeedbackResolved(
-  feedback: PendingTurnFeedback | null,
-  event: AgentEvent,
-): boolean {
-  if (!feedback) return false;
-  const resolvesFeedback =
-    event.payload.type === "turn_started" ||
-    event.payload.type === "turn_finished" ||
-    event.payload.type === "turn_suspended" ||
-    event.payload.type === "turn_cancelled" ||
-    event.payload.type === "turn_awaiting_input" ||
-    event.payload.type === "error";
-  if (!resolvesFeedback) return false;
-  return feedback.turnId
-    ? event.turnId === feedback.turnId
-    : event.payload.type === "turn_started"
-      ? event.payload.user_message_id === feedback.userMessageId
-      : event.createdAt >= feedback.startedAt;
 }

@@ -145,6 +145,7 @@ struct DesktopHttpResponsesV1 {
     observe_computer_window: opentopia_core::ComputerObservation,
     close_computer_session: DeleteResponse,
     get_turn_status: Option<opentopia_core::TurnRecord>,
+    list_activity_statuses: Vec<opentopia_core::TurnRecord>,
     list_agents: Vec<AgentListItem>,
     interrupt_agent: DeleteResponse,
     cancel_turn: TurnCancelResult,

@@ -7,19 +7,16 @@ const sidebarStyles = readFileSync(
   "utf8",
 );
 
-test("keeps the processing indicator visible on the selected task row", () => {
-  const selectedProcessingStyles = sidebarStyles.slice(
-    sidebarStyles.indexOf(
-      ".thread-row-wrap.active.is-processing:is(:hover, :focus-within)",
-    ),
+test("replaces the selected processing indicator with the task menu on hover", () => {
+  const hoverStyles = sidebarStyles.slice(
+    sidebarStyles.indexOf(".thread-row-wrap:hover .thread-row-status"),
     sidebarStyles.indexOf(".thread-row-wrap:focus-within .thread-row-more"),
   );
-  assert.ok(
-    selectedProcessingStyles.startsWith(
-      ".thread-row-wrap.active.is-processing:is(:hover, :focus-within)",
-    ),
+
+  assert.match(hoverStyles, /visibility:\s*hidden/);
+  assert.match(hoverStyles, /grid-column:\s*2/);
+  assert.doesNotMatch(
+    sidebarStyles,
+    /\.thread-row-wrap\.active\.is-processing:is\(:hover, :focus-within\)/,
   );
-  assert.match(selectedProcessingStyles, /grid-template-columns:/);
-  assert.match(selectedProcessingStyles, /visibility:\s*visible/);
-  assert.match(selectedProcessingStyles, /grid-column:\s*3/);
 });

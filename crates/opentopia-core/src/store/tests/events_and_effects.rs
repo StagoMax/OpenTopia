@@ -101,6 +101,152 @@ fn sqlite_store_commits_messages_and_events_in_one_conversation_batch() {
 }
 
 #[test]
+fn conversation_history_pages_keep_stable_message_and_event_order() {
+    let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+    let thread = store
+        .create_thread(None, PathBuf::from("C:/workspace/history-pages"))
+        .expect("create thread");
+    let base = Utc::now() - chrono::Duration::minutes(10);
+    let mut messages = Vec::new();
+    for index in 0..5 {
+        let mut message = Message::text(thread.id, MessageRole::User, index.to_string());
+        message.created_at = base + chrono::Duration::seconds(index);
+        messages.push(store.append_message(message).expect("append message"));
+    }
+    let events = store
+        .append_events(
+            (0..5)
+                .map(|index| {
+                    AgentEvent::new(
+                        thread.id,
+                        Some(Uuid::new_v4()),
+                        0,
+                        AgentEventPayload::ModelDelta {
+                            text: index.to_string(),
+                        },
+                    )
+                })
+                .collect(),
+        )
+        .expect("append events");
+
+    let recent_messages = store
+        .list_conversation_message_page(thread.id, None, None, 2)
+        .expect("list recent messages");
+    assert_eq!(
+        recent_messages.iter().map(|message| message.id).collect::<Vec<_>>(),
+        messages[3..].iter().map(|message| message.id).collect::<Vec<_>>()
+    );
+    let older_messages = store
+        .list_conversation_message_page(
+            thread.id,
+            None,
+            Some((messages[3].created_at, messages[3].id)),
+            2,
+        )
+        .expect("list older messages");
+    assert_eq!(
+        older_messages.iter().map(|message| message.id).collect::<Vec<_>>(),
+        messages[1..3].iter().map(|message| message.id).collect::<Vec<_>>()
+    );
+    let message_delta = store
+        .list_conversation_message_page(
+            thread.id,
+            Some((messages[1].created_at, messages[1].id)),
+            None,
+            2,
+        )
+        .expect("list message delta");
+    assert_eq!(
+        message_delta.iter().map(|message| message.id).collect::<Vec<_>>(),
+        messages[2..4].iter().map(|message| message.id).collect::<Vec<_>>()
+    );
+
+    let recent_events = store
+        .list_conversation_event_page(thread.id, None, None, 2)
+        .expect("list recent events");
+    assert_eq!(
+        recent_events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+        [events[3].seq, events[4].seq]
+    );
+    let older_events = store
+        .list_conversation_event_page(thread.id, None, Some(events[3].seq), 2)
+        .expect("list older events");
+    assert_eq!(
+        older_events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+        [events[1].seq, events[2].seq]
+    );
+    let event_delta = store
+        .list_conversation_event_page(thread.id, Some(events[1].seq), None, 2)
+        .expect("list event delta");
+    assert_eq!(
+        event_delta.iter().map(|event| event.seq).collect::<Vec<_>>(),
+        [events[2].seq, events[3].seq]
+    );
+
+    for index in 0..3 {
+        let mut tool_message =
+            Message::text(thread.id, MessageRole::Tool, format!("tool-{index}"));
+        tool_message.created_at = base + chrono::Duration::minutes(index + 1);
+        store
+            .append_message(tool_message)
+            .expect("append tool message");
+    }
+    let recent_visible_messages = store
+        .list_conversation_message_page(thread.id, None, None, 2)
+        .expect("list recent visible messages");
+    assert_eq!(
+        recent_visible_messages
+            .iter()
+            .map(|message| message.id)
+            .collect::<Vec<_>>(),
+        messages[3..]
+            .iter()
+            .map(|message| message.id)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn live_turn_status_snapshot_excludes_terminal_turns() {
+    let store = SqliteSessionStore::open(":memory:").expect("open memory store");
+    let running_thread = store
+        .create_thread(None, PathBuf::from("C:/workspace/live-running"))
+        .expect("create running thread");
+    let waiting_thread = store
+        .create_thread(None, PathBuf::from("C:/workspace/live-waiting"))
+        .expect("create waiting thread");
+    let completed_thread = store
+        .create_thread(None, PathBuf::from("C:/workspace/live-completed"))
+        .expect("create completed thread");
+    let running = store
+        .insert_turn(TurnRecord::running(running_thread.id, Uuid::new_v4()))
+        .expect("insert running turn");
+    let waiting = store
+        .insert_turn(TurnRecord::running(waiting_thread.id, Uuid::new_v4()))
+        .expect("insert waiting turn");
+    store
+        .update_turn_status(waiting.turn_id, TurnStatus::WaitingUserInput, None)
+        .expect("update waiting turn");
+    let completed = store
+        .insert_turn(TurnRecord::running(completed_thread.id, Uuid::new_v4()))
+        .expect("insert completed turn");
+    store
+        .update_turn_status(completed.turn_id, TurnStatus::Succeeded, None)
+        .expect("complete turn");
+
+    let statuses = store
+        .list_live_turn_statuses()
+        .expect("list live turn statuses");
+    let turn_ids = statuses
+        .iter()
+        .map(|turn| turn.turn_id)
+        .collect::<HashSet<_>>();
+
+    assert_eq!(turn_ids, HashSet::from([running.turn_id, waiting.turn_id]));
+}
+
+#[test]
 fn completed_assistant_message_replaces_historical_stream_in_conversation_view() {
     let store = SqliteSessionStore::open(":memory:").expect("open memory store");
     let thread = store

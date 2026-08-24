@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { AgentEvent, ContextSourceRef, Message } from "./types";
-import { attachmentsByAssistantMessage } from "./conversationAttachmentReferences.ts";
+import {
+  attachmentsByAssistantMessage,
+  stabilizeAttachmentReferences,
+} from "./conversationAttachmentReferences.ts";
 
 const source: ContextSourceRef = {
   id: "attachment-1",
@@ -98,4 +101,35 @@ test("falls back to message order when a lifecycle event lost its user message",
     attachmentsByAssistantMessage([user, assistant], events).get(assistant.id),
     [source],
   );
+});
+
+test("keeps attachment arrays stable across unrelated event updates", () => {
+  const user = message("user-1", "user", [{ type: "source_ref", source }]);
+  const assistant = message("assistant-1", "assistant", [
+    { type: "text", text: "report.pdf" },
+  ]);
+  const messages = [user, assistant];
+  const events = [
+    event("event-1", "turn-1", {
+      type: "turn_started",
+      user_message_id: user.id,
+    }),
+    event("event-2", "turn-1", {
+      type: "assistant_message",
+      message: assistant,
+    }),
+  ];
+  const first = attachmentsByAssistantMessage(messages, events);
+  const second = stabilizeAttachmentReferences(
+    first,
+    attachmentsByAssistantMessage(messages, [
+      ...events,
+      event("event-3", "turn-2", {
+        type: "turn_started",
+        user_message_id: "user-2",
+      }),
+    ]),
+  );
+
+  assert.equal(second.get(assistant.id), first.get(assistant.id));
 });

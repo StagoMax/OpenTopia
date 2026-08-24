@@ -38,6 +38,7 @@ use sqlite_rows::*;
 mod agent_flow_repository;
 mod agent_repository;
 mod connection_repository;
+mod conversation_history;
 mod flow_runtime_repository;
 mod goal_event_repository;
 mod legacy_schema;

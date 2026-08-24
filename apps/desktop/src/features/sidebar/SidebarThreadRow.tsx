@@ -54,6 +54,7 @@ function ThreadStatusIndicator({ status }: { status?: ThreadActivityStatus }) {
       {status === "processing" ? (
         <Loader2
           size={14}
+          strokeWidth={2.5}
           className="thread-status-spinner"
           aria-hidden="true"
         />

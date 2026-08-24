@@ -17,27 +17,31 @@ import {
   Check,
   CircleAlert,
   Copy,
+  Loader2,
 } from "lucide-react";
 import {
   PendingTurnStatus,
   TurnActivityTimeline,
   TurnChangeCard,
 } from "../../components/TurnActivityTimeline";
-import { IconButton } from "../../components/ui";
+import { Button, IconButton } from "../../components/ui";
 import type { ImagePreviewSource } from "../../components/PreviewHost";
 import { normalizeCopiedText } from "../../clipboardText";
-import { attachmentsByAssistantMessage } from "../../conversationAttachmentReferences";
+import {
+  attachmentsByAssistantMessage,
+  stabilizeAttachmentReferences,
+} from "../../conversationAttachmentReferences";
 import {
   conversationMessageCopyText,
   formatConversationMessageTimestamp,
 } from "../../conversationMessageMeta";
 import { isConversationScrollNearEnd } from "../../conversationScroll";
-import type { PendingTurnFeedback } from "../../conversationSession";
-import { friendlyProviderError } from "../../providerErrors";
 import {
-  isTurnChangeDisplaySettled,
-  shouldShowRecordedTurnChanges,
-} from "../../turnChangeOwnership";
+  projectConversationEvents,
+  type ConversationEventProjection,
+} from "../../conversationEventProjection";
+import type { PendingTurnFeedback } from "../../threadRunState";
+import { friendlyProviderError } from "../../providerErrors";
 import {
   hasPendingProviderRequest,
   hasPendingToolCall,
@@ -47,20 +51,23 @@ import type {
   ArtifactDescriptor,
   ContextSourceRef,
   Message,
-  TurnChangeSet,
   TurnFileChange,
   TurnFileDiffPreview,
 } from "../../types";
 import { MessagePartView } from "./MessagePartView";
 
-const initialRenderedMessageCount = 12;
-const messageRenderBatchSize = 12;
+const emptyAttachmentSources: ContextSourceRef[] = [];
 
 export type MessageListProps = {
   messages: Message[];
   events: AgentEvent[];
   activeTurnId: string | null;
   pendingTurnFeedback: PendingTurnFeedback | null;
+  syncing?: boolean;
+  syncError?: string | null;
+  hasOlderMessages?: boolean;
+  loadingOlderMessages?: boolean;
+  olderMessagesError?: string | null;
   undoingTurnId: string | null;
   threadId: string;
   artifacts: ArtifactDescriptor[];
@@ -78,6 +85,8 @@ export type MessageListProps = {
     path: string,
     offset?: number,
   ): Promise<TurnFileDiffPreview>;
+  onLoadOlderMessages?(): Promise<void>;
+  onRetrySync?(): void;
 };
 
 export function MessageList({
@@ -85,6 +94,11 @@ export function MessageList({
   events: latestEvents,
   activeTurnId,
   pendingTurnFeedback,
+  syncing = false,
+  syncError = null,
+  hasOlderMessages = false,
+  loadingOlderMessages = false,
+  olderMessagesError = null,
   undoingTurnId,
   threadId,
   artifacts,
@@ -98,6 +112,8 @@ export function MessageList({
   onReviewChanges,
   onOpenFileReview,
   onLoadTurnFilePreview,
+  onLoadOlderMessages,
+  onRetrySync,
 }: MessageListProps) {
   // Tool events originate in an external store, whose updates React must
   // process synchronously. Keep the previous timeline during that urgent pass
@@ -111,26 +127,33 @@ export function MessageList({
       ),
     [messages],
   );
-  const attachmentSourcesByAssistantMessage = useMemo(
-    () => attachmentsByAssistantMessage(messages, events),
-    [events, messages],
+  const attachmentSourcesCacheRef = useRef<Map<string, ContextSourceRef[]>>(
+    new Map(),
   );
-  const [renderedMessageCount, setRenderedMessageCount] = useState(
-    initialRenderedMessageCount,
-  );
+  const attachmentSourcesByAssistantMessage = useMemo(() => {
+    const next = stabilizeAttachmentReferences(
+      attachmentSourcesCacheRef.current,
+      attachmentsByAssistantMessage(messages, events),
+    );
+    attachmentSourcesCacheRef.current = next;
+    return next;
+  }, [events, messages]);
   const messageListRef = useRef<HTMLDivElement>(null);
   const messageListContentRef = useRef<HTMLDivElement>(null);
   const previousScrollHeightRef = useRef<number | null>(null);
+  const olderLoadMessageCountRef = useRef<number | null>(null);
+  const suppressNextPinnedScrollRef = useRef(false);
   const conversationPinnedToEndRef = useRef(true);
   const [showScrollToEnd, setShowScrollToEnd] = useState(false);
-  const renderedMessages = visibleMessages.slice(-renderedMessageCount);
   const actionableProposedPlanMessageId = useMemo(() => {
     const latestMessage = visibleMessages[visibleMessages.length - 1];
     return latestMessage?.parts.some((part) => part.type === "proposed_plan")
       ? latestMessage.id
       : null;
   }, [visibleMessages]);
-  const hasPendingMessages = renderedMessages.length < visibleMessages.length;
+  const eventProjectionCacheRef = useRef<ConversationEventProjection | null>(
+    null,
+  );
   const {
     eventsByTurn,
     turnIdsByUserMessage,
@@ -140,76 +163,14 @@ export function MessageList({
     orphanContextActivityTurnIds,
     orphanTurnErrors,
     turnsWithAssistantCards,
+    settledTurnIds,
   } = useMemo(() => {
-    const eventsByTurn = new Map<string, AgentEvent[]>();
-    const turnIdsByUserMessage = new Map<string, string[]>();
-    const turnIdsByAssistantMessage = new Map<string, string[]>();
-    const changeSetsByTurn = new Map<string, TurnChangeSet>();
-    const revertedTurnIds = new Set<string>();
-    for (const event of events) {
-      if (event.turnId) {
-        const current = eventsByTurn.get(event.turnId) ?? [];
-        current.push(event);
-        eventsByTurn.set(event.turnId, current);
-      }
-      if (event.turnId && event.payload.type === "turn_started") {
-        const turnIds =
-          turnIdsByUserMessage.get(event.payload.user_message_id) ?? [];
-        if (!turnIds.includes(event.turnId)) turnIds.push(event.turnId);
-        turnIdsByUserMessage.set(event.payload.user_message_id, turnIds);
-      }
-      if (event.turnId && event.payload.type === "assistant_message") {
-        const turnIds =
-          turnIdsByAssistantMessage.get(event.payload.message.id) ?? [];
-        if (!turnIds.includes(event.turnId)) turnIds.push(event.turnId);
-        turnIdsByAssistantMessage.set(event.payload.message.id, turnIds);
-      }
-      if (
-        event.turnId &&
-        event.payload.type === "turn_changes_recorded" &&
-        shouldShowRecordedTurnChanges(events, event.turnId)
-      ) {
-        changeSetsByTurn.set(event.turnId, event.payload.change_set);
-        if (event.payload.change_set.revertedAt) {
-          revertedTurnIds.add(event.turnId);
-        }
-      }
-      if (event.payload.type === "turn_undo_completed") {
-        revertedTurnIds.add(event.payload.target_turn_id);
-      }
-    }
-    const anchoredTurnIds = new Set(
-      [...turnIdsByUserMessage.values()].flatMap((turnIds) => turnIds),
+    const next = projectConversationEvents(
+      events,
+      eventProjectionCacheRef.current ?? undefined,
     );
-    const orphanTurnErrors = events.filter(
-      (event) =>
-        event.payload.type === "error" &&
-        (!event.turnId || !anchoredTurnIds.has(event.turnId)),
-    );
-    const orphanContextActivityTurnIds = [...eventsByTurn.entries()]
-      .filter(
-        ([turnId, turnEvents]) =>
-          !anchoredTurnIds.has(turnId) &&
-          turnEvents.some(isContextCompactionActivityEvent),
-      )
-      .sort(
-        ([, leftEvents], [, rightEvents]) =>
-          (leftEvents[0]?.seq ?? 0) - (rightEvents[0]?.seq ?? 0),
-      )
-      .map(([turnId]) => turnId);
-    const turnsWithAssistantCards = new Set(
-      [...turnIdsByAssistantMessage.values()].flatMap((turnIds) => turnIds),
-    );
-    return {
-      eventsByTurn,
-      turnIdsByUserMessage,
-      turnIdsByAssistantMessage,
-      changeSetsByTurn,
-      revertedTurnIds,
-      orphanContextActivityTurnIds,
-      orphanTurnErrors,
-      turnsWithAssistantCards,
-    };
+    eventProjectionCacheRef.current = next;
+    return next;
   }, [events]);
   const visibleMessageIds = useMemo(
     () => new Set(visibleMessages.map((message) => message.id)),
@@ -254,25 +215,26 @@ export function MessageList({
     !hasPendingToolCall(activeTurnEvents);
   const showTrailingTurnStatus = showPendingTurnStatus;
 
-  useEffect(() => {
-    if (!hasPendingMessages) return;
-    const frame = window.requestAnimationFrame(() => {
-      previousScrollHeightRef.current =
-        messageListRef.current?.scrollHeight ?? null;
-      setRenderedMessageCount((current) =>
-        Math.min(current + messageRenderBatchSize, visibleMessages.length),
-      );
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [hasPendingMessages, visibleMessages.length]);
-
   useLayoutEffect(() => {
+    if (loadingOlderMessages) return;
     const previousScrollHeight = previousScrollHeightRef.current;
     const list = messageListRef.current;
     if (previousScrollHeight === null || !list) return;
     list.scrollTop += list.scrollHeight - previousScrollHeight;
+    suppressNextPinnedScrollRef.current =
+      olderLoadMessageCountRef.current !== null &&
+      messages.length > olderLoadMessageCountRef.current;
     previousScrollHeightRef.current = null;
-  }, [renderedMessageCount]);
+    olderLoadMessageCountRef.current = null;
+  }, [loadingOlderMessages, messages.length]);
+
+  const loadOlderMessages = useCallback(() => {
+    if (!onLoadOlderMessages) return;
+    previousScrollHeightRef.current =
+      messageListRef.current?.scrollHeight ?? null;
+    olderLoadMessageCountRef.current = messages.length;
+    void onLoadOlderMessages();
+  }, [messages.length, onLoadOlderMessages]);
 
   const updateScrollToEndVisibility = useCallback(() => {
     const list = messageListRef.current;
@@ -298,11 +260,13 @@ export function MessageList({
 
   useLayoutEffect(() => {
     const list = messageListRef.current;
-    if (list && conversationPinnedToEndRef.current) {
+    if (suppressNextPinnedScrollRef.current) {
+      suppressNextPinnedScrollRef.current = false;
+    } else if (list && conversationPinnedToEndRef.current) {
       list.scrollTop = list.scrollHeight;
     }
     updateScrollToEndVisibility();
-  }, [messages, renderedMessageCount, updateScrollToEndVisibility]);
+  }, [messages, updateScrollToEndVisibility]);
 
   useEffect(() => {
     const content = messageListContentRef.current;
@@ -336,10 +300,7 @@ export function MessageList({
 
   const renderTurnChangeCard = (turnId: string) => {
     const changeSet = changeSetsByTurn.get(turnId);
-    if (
-      !changeSet ||
-      !isTurnChangeDisplaySettled(events, turnId, activeTurnId)
-    ) {
+    if (!changeSet || activeTurnId === turnId || !settledTurnIds.has(turnId)) {
       return null;
     }
     return (
@@ -361,11 +322,23 @@ export function MessageList({
   return (
     <div className="conversation-scroll-shell">
       <div
-        className="message-list"
+        className={`message-list ${syncing ? "is-syncing" : ""}`.trim()}
         ref={messageListRef}
-        aria-busy={hasPendingMessages || showTrailingTurnStatus}
+        aria-busy={syncing || loadingOlderMessages || showTrailingTurnStatus}
         onCopy={trimCopiedSelection}
       >
+        {syncing ? (
+          <div
+            className="conversation-refresh-overlay"
+            role="status"
+            aria-live="polite"
+          >
+            <div className="conversation-refresh-overlay__status">
+              <Loader2 aria-hidden="true" size={16} className="spin" />
+              <span>正在同步最新内容</span>
+            </div>
+          </div>
+        ) : null}
         <div
           className={`message-list-content ${
             visibleMessages.length === 0 && !showTrailingTurnStatus
@@ -379,6 +352,36 @@ export function MessageList({
           }
           ref={messageListContentRef}
         >
+          {syncError ? (
+            <div className="conversation-sync-error" role="alert">
+              <span>同步失败，当前显示的是上次快照：{syncError}</span>
+              {onRetrySync ? (
+                <Button size="compact" variant="quiet" onClick={onRetrySync}>
+                  重试
+                </Button>
+              ) : null}
+            </div>
+          ) : null}
+          {hasOlderMessages || olderMessagesError ? (
+            <div className="conversation-history-pagination">
+              {hasOlderMessages ? (
+                <Button
+                  size="compact"
+                  variant="quiet"
+                  disabled={loadingOlderMessages || syncing}
+                  onClick={loadOlderMessages}
+                >
+                  {loadingOlderMessages ? (
+                    <Loader2 aria-hidden="true" size={14} className="spin" />
+                  ) : null}
+                  加载更早消息
+                </Button>
+              ) : null}
+              {olderMessagesError ? (
+                <span role="alert">{olderMessagesError}</span>
+              ) : null}
+            </div>
+          ) : null}
           {visibleMessages.length === 0 && !showTrailingTurnStatus ? (
             <div className="empty-thread">
               <Bot size={42} />
@@ -386,7 +389,7 @@ export function MessageList({
               <p>当前任务尚未产生消息。</p>
             </div>
           ) : (
-            renderedMessages.map((message) => {
+            visibleMessages.map((message) => {
               const turnIds =
                 message.role === "user"
                   ? (turnIdsByUserMessage.get(message.id) ?? [])
@@ -399,7 +402,8 @@ export function MessageList({
                 <Fragment key={message.id}>
                   <MessageBubble
                     attachmentSources={
-                      attachmentSourcesByAssistantMessage.get(message.id) ?? []
+                      attachmentSourcesByAssistantMessage.get(message.id) ??
+                      emptyAttachmentSources
                     }
                     message={message}
                     threadId={threadId}
@@ -495,16 +499,6 @@ export function MessageList({
         </IconButton>
       ) : null}
     </div>
-  );
-}
-
-function isContextCompactionActivityEvent(event: AgentEvent) {
-  const payload = event.payload;
-  return (
-    (payload.type === "model_context_built" &&
-      payload.purpose === "context_compaction") ||
-    payload.type === "context_compacted" ||
-    (payload.type === "context_warning" && payload.stage.includes("compaction"))
   );
 }
 

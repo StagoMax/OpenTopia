@@ -33,6 +33,19 @@ import { recordConversationSendTrace } from "../../platform";
 import { ExtensionsApi } from "./extensions";
 import { parseResponse, queryString } from "./transport";
 
+export type MessageHistoryCursor = Pick<Message, "createdAt" | "id">;
+
+export type MessageHistoryPage = {
+  after?: MessageHistoryCursor;
+  before?: MessageHistoryCursor;
+  limit: number;
+};
+
+export type ConversationEventPage = {
+  before?: number;
+  limit: number;
+};
+
 export class ConversationApi extends ExtensionsApi {
   async executeLocalGit(
     threadId: string,
@@ -181,10 +194,17 @@ export class ConversationApi extends ExtensionsApi {
   async listMessages(
     threadId: string,
     signal?: AbortSignal,
+    page?: MessageHistoryPage,
   ): Promise<Message[]> {
     return this.get(
       "listMessages",
-      `/api/threads/${threadId}/messages`,
+      `/api/threads/${threadId}/messages${queryString({
+        afterCreatedAt: page?.after?.createdAt,
+        afterId: page?.after?.id,
+        beforeCreatedAt: page?.before?.createdAt,
+        beforeId: page?.before?.id,
+        limit: page?.limit,
+      })}`,
       signal,
     );
   }
@@ -411,6 +431,10 @@ export class ConversationApi extends ExtensionsApi {
     return this.get("getTurnStatus", `/api/threads/${threadId}/turn`, signal);
   }
 
+  async listActivityStatuses(signal?: AbortSignal): Promise<TurnStatus[]> {
+    return this.get("listActivityStatuses", "/api/activity/statuses", signal);
+  }
+
   async listAgents(
     threadId: string,
     signal?: AbortSignal,
@@ -451,11 +475,14 @@ export class ConversationApi extends ExtensionsApi {
     threadId: string,
     since?: number,
     signal?: AbortSignal,
+    page?: ConversationEventPage,
   ): Promise<AgentEvent[]> {
     return this.get(
       "listConversationEvents",
       `/api/threads/${threadId}/events${queryString({
         since,
+        before: page?.before,
+        limit: page?.limit,
         view: "conversation",
       })}`,
       signal,

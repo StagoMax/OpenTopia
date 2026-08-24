@@ -659,28 +659,6 @@
   grid-row: 1;
 }
 
-/* A selected processing task keeps its lifecycle signal even while its row
- * actions are exposed. Give the action its own column instead of replacing
- * the spinner in the shared trailing slot. */
-.thread-row-wrap.active.is-processing:is(:hover, :focus-within),
-.thread-row-wrap.active.is-processing.menu-open {
-  grid-template-columns: minmax(0, 1fr) var(--control-height-sm) var(
-      --control-height-sm
-    );
-}
-
-.thread-row-wrap.active.is-processing:is(:hover, :focus-within)
-  .thread-row-status,
-.thread-row-wrap.active.is-processing.menu-open .thread-row-status {
-  visibility: visible;
-}
-
-.thread-row-wrap.active.is-processing:is(:hover, :focus-within)
-  .thread-row-menu-wrap,
-.thread-row-wrap.active.is-processing.menu-open .thread-row-menu-wrap {
-  grid-column: 3;
-}
-
 .thread-row-wrap:focus-within .thread-row-more {
   visibility: visible;
   opacity: 1;
@@ -712,19 +690,24 @@
   color: var(--text-muted);
 }
 
-.thread-row-status.is-processing,
+.thread-row-status.is-processing {
+  color: var(--text-secondary);
+}
+
 .thread-row-status.is-succeeded {
   color: var(--accent);
 }
 
 .thread-status-spinner {
   display: block;
+  inline-size: calc(var(--icon-size-xs) - var(--space-1));
+  block-size: calc(var(--icon-size-xs) - var(--space-1));
   transform: translate3d(0, 0, 0) rotate(0deg);
   transform-box: fill-box;
   transform-origin: center;
   backface-visibility: hidden;
   will-change: transform;
-  animation: thread-status-spin calc(var(--motion-standard) * 5) linear infinite;
+  animation: thread-status-spin 2s linear infinite;
 }
 
 @keyframes thread-status-spin {
@@ -929,6 +912,57 @@
 
 .conversation-scroll-shell > .message-list {
   height: 100%;
+}
+
+.conversation-refresh-overlay {
+  position: sticky;
+  z-index: var(--z-sticky);
+  inset-block-start: var(--space-0);
+  display: grid;
+  height: 100%;
+  margin-block-end: -100%;
+  place-items: center;
+  background: color-mix(in srgb, var(--app-bg) 76%, transparent);
+  pointer-events: auto;
+}
+
+.conversation-refresh-overlay__status {
+  display: inline-flex;
+  min-height: var(--control-height-md);
+  align-items: center;
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-6);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text-secondary);
+  box-shadow: var(--shadow-float);
+  font-size: var(--font-size-sm);
+}
+
+.conversation-history-pagination {
+  display: flex;
+  min-height: var(--control-height-md);
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-4);
+  margin-block-end: var(--space-6);
+  color: var(--danger);
+  font-size: var(--font-size-sm);
+}
+
+.conversation-history-pagination .ot-button {
+  gap: var(--space-3);
+}
+
+.conversation-sync-error {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-4);
+  margin-block-end: var(--space-6);
+  color: var(--danger);
+  font-size: var(--font-size-sm);
 }
 
 .message-list-content {

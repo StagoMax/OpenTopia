@@ -10,7 +10,7 @@ use opentopia_core::collaboration::{
 };
 use opentopia_core::{
     AgentActivityNotification, AgentEvent, AgentEventPayload, DesktopStreamEnvelope,
-    DesktopStreamKind, SessionStore,
+    DesktopStreamKind, SessionStore, TurnRecord,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -25,6 +25,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/api/threads/:thread_id/events", get(list_events))
         .route("/api/threads/:thread_id/events/stream", get(stream_events))
         .route("/api/activity/events/stream", get(stream_activity_events))
+        .route("/api/activity/statuses", get(list_activity_statuses))
         .route("/api/threads/:thread_id/agents", get(list_agent_threads))
         .route(
             "/api/threads/:thread_id/agents/:agent_thread_id/interrupt",
@@ -34,6 +35,16 @@ pub(super) fn router() -> Router<AppState> {
             "/api/threads/:thread_id/agents/events/stream",
             get(stream_agent_events),
         )
+}
+
+async fn list_activity_statuses(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<TurnRecord>>, ApiError> {
+    let store = state.store.clone();
+    let statuses = tokio::task::spawn_blocking(move || store.list_live_turn_statuses())
+        .await
+        .map_err(|error| ApiError::internal(format!("activity status task failed: {error}")))??;
+    Ok(Json(statuses))
 }
 
 async fn stream_activity_events(
@@ -66,6 +77,13 @@ async fn list_events(
     ensure_thread(&state, thread_id)?;
     let store = state.store.clone();
     let events = tokio::task::spawn_blocking(move || match query.view {
+        Some(EventView::Conversation) if query.limit.is_some() || query.before.is_some() => store
+            .list_conversation_event_page(
+                thread_id,
+                query.since,
+                query.before,
+                query.limit.unwrap_or(250),
+            ),
         Some(EventView::Conversation) => store.list_conversation_events(thread_id, query.since),
         None => store.list_events(thread_id, query.since),
     })
@@ -298,5 +316,7 @@ enum EventView {
 #[derive(Debug, Deserialize)]
 struct EventQuery {
     since: Option<i64>,
+    before: Option<i64>,
+    limit: Option<usize>,
     view: Option<EventView>,
 }

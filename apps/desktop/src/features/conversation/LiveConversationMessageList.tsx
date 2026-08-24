@@ -1,10 +1,21 @@
 import type { ConversationSessionRegistry } from "../../conversationSessionController";
 import { useConversationSession } from "../../useConversationSession";
+import { useThreadRunState } from "../../useThreadActivityStore";
 import { MessageList, type MessageListProps } from "./MessageList";
 
 type LiveConversationMessageListProps = Omit<
   MessageListProps,
-  "messages" | "events" | "activeTurnId" | "pendingTurnFeedback"
+  | "messages"
+  | "events"
+  | "activeTurnId"
+  | "pendingTurnFeedback"
+  | "syncing"
+  | "syncError"
+  | "hasOlderMessages"
+  | "loadingOlderMessages"
+  | "olderMessagesError"
+  | "onLoadOlderMessages"
+  | "onRetrySync"
 > & {
   conversationRegistry: ConversationSessionRegistry;
   onEventsCommitted?(events: AgentEvent[]): void;
@@ -21,7 +32,14 @@ export function LiveConversationMessageList({
   threadId,
   ...props
 }: LiveConversationMessageListProps) {
-  const { state } = useConversationSession(conversationRegistry, threadId);
+  const { controller, state } = useConversationSession(
+    conversationRegistry,
+    threadId,
+  );
+  const runState = useThreadRunState(
+    conversationRegistry.activityStore,
+    threadId,
+  );
   const events = state?.events;
   useLayoutEffect(() => {
     if (events) onEventsCommitted?.(events);
@@ -34,8 +52,17 @@ export function LiveConversationMessageList({
       threadId={threadId}
       messages={state.messages}
       events={state.events}
-      activeTurnId={state.activeTurnId}
-      pendingTurnFeedback={state.pendingTurnFeedback}
+      activeTurnId={runState.activeTurnId}
+      pendingTurnFeedback={runState.pendingTurnFeedback}
+      syncing={state.syncing}
+      syncError={state.syncError}
+      hasOlderMessages={state.hasOlderMessages}
+      loadingOlderMessages={state.loadingOlderMessages}
+      olderMessagesError={state.olderMessagesError}
+      onLoadOlderMessages={() =>
+        controller?.loadOlderMessages() ?? Promise.resolve()
+      }
+      onRetrySync={() => controller?.retry()}
     />
   );
 }

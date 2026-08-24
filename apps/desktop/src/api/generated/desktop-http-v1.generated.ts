@@ -1060,6 +1060,7 @@ export interface DesktopHttpResponsesV1 {
   interruptAgent: DeleteResponse;
   invokeMediaHandler: MediaHandlerInvocationResponse;
   invokeWorkflowRelease: WorkflowInvocationResult;
+  listActivityStatuses: TurnRecord[];
   listAgentInstances: AgentInstanceV1[];
   listAgentTemplates: AgentTemplateVersionView[];
   listAgents: AgentListItem[];

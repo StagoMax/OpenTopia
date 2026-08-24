@@ -53,10 +53,11 @@ const rightPanelSource = readFileSync(
 
 test("keeps the one-second clock out of the full activity timeline render", () => {
   const timelineRender = timelineSource.slice(
-    timelineSource.indexOf("export function TurnActivityTimeline"),
+    timelineSource.indexOf("export const TurnActivityTimeline"),
     timelineSource.indexOf("function TurnTimingText"),
   );
 
+  assert.match(timelineRender, /memo\(function TurnActivityTimeline/);
   assert.match(timelineRender, /<TurnTimingText/);
   assert.doesNotMatch(timelineRender, /useTimelineClock\(/);
 });
