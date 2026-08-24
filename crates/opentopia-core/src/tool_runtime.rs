@@ -35,7 +35,10 @@ use crate::provider::{
 use crate::sandbox::LocalSandboxConfig;
 #[cfg(test)]
 use crate::store::SessionStore;
-use crate::tool_error::{insert_classified_anyhow_error_record, insert_tool_error_record};
+use crate::tool_error::{
+    insert_classified_anyhow_error_record, insert_preserved_tool_error_record,
+    insert_tool_error_record,
+};
 use crate::tool_result_ingress::{
     normalize_tool_result_at_ingress, provider_tool_result_content, provider_tool_result_metadata,
     provider_tool_result_output, tool_result_is_error,
@@ -193,7 +196,9 @@ impl AsyncToolResult {
             "droppedBytes": chunk.dropped_bytes,
             "untrusted": true,
         });
-        if !job.success {
+        if let Some(error_record) = job.error_record.as_ref() {
+            insert_preserved_tool_error_record(&mut metadata, error_record);
+        } else if !job.success {
             let (code, message) = job
                 .exit_code
                 .filter(|exit_code| *exit_code != 0)
@@ -1601,8 +1606,10 @@ fn scheduling_conflicts(
 mod tests {
     use super::*;
     use crate::background::{BackgroundJobSnapshot, BackgroundJobStatus};
+    use crate::execution::{ExecutionFailure, ExecutionStage};
     use crate::model::TurnRecord;
     use crate::store::SqliteSessionStore;
+    use crate::tool_error::classify_anyhow_error;
     use crate::turn_inbox::BufferedTurnInbox;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -1644,6 +1651,54 @@ mod tests {
         assert_eq!(accepted.job_id, job_id);
         assert_ne!(terminal.call_id, accepted.provider_call_id);
         assert_eq!(terminal.metadata["jobId"], json!(job_id));
+    }
+
+    #[test]
+    fn async_background_result_preserves_structured_execution_failure() {
+        let job_id = Uuid::new_v4();
+        let error = anyhow::Error::new(ExecutionFailure::without_os_error(
+            ExecutionStage::PrepareSandbox,
+            "dedicated-user runner did not become ready",
+        ));
+        let record = classify_anyhow_error(&error);
+        let result = AsyncToolResult::from_background_chunk_for_tool(
+            &BackgroundOutputChunk {
+                job: BackgroundJobSnapshot {
+                    job_id,
+                    agent_path: "/root".to_string(),
+                    command: "build".to_string(),
+                    interactive: false,
+                    status: BackgroundJobStatus::Failed,
+                    exit_code: None,
+                    success: false,
+                    started_at: Utc::now(),
+                    finished_at: Some(Utc::now()),
+                    error: Some(error.to_string()),
+                    error_record: Some(record),
+                    approval_required: None,
+                    truncated: false,
+                    sandbox: None,
+                    stdout_bytes: 0,
+                    stderr_bytes: 0,
+                    dropped_bytes: 0,
+                    unread_bytes: 0,
+                },
+                stdout: String::new(),
+                stderr: String::new(),
+                dropped_bytes: 0,
+            },
+            "shell",
+        );
+
+        assert!(result.is_error);
+        assert_eq!(
+            result.metadata["errorRecord"]["code"],
+            "sandbox_preparation_failed"
+        );
+        assert_eq!(result.metadata["errorRecord"]["phase"], "preflight");
+        assert_eq!(result.metadata["errorRecord"]["executed"], false);
+        assert_eq!(result.metadata["errorRecord"]["retryable"], true);
+        assert_eq!(result.metadata["executionStage"], "prepare_sandbox");
     }
 
     struct DelayedTool {
@@ -1919,6 +1974,7 @@ mod tests {
                 started_at: Utc::now(),
                 finished_at: Some(Utc::now()),
                 error: None,
+                error_record: None,
                 approval_required: None,
                 truncated: false,
                 sandbox: None,

@@ -257,6 +257,22 @@ fn shell_intent_requests_network_for_nested_powershell_calls() {
     assert_eq!(intent.network, NetworkAccess::Required);
 }
 
+#[test]
+fn shell_intent_inherits_session_network_for_dynamic_programs() {
+    let analysis = analyze_shell_command("node electron/browser-host-smoke.cjs");
+    let intent = shell_execution_intent(&analysis);
+
+    assert_eq!(intent.network, NetworkAccess::InheritSession);
+}
+
+#[test]
+fn shell_intent_prefers_offline_for_proven_file_observations() {
+    let analysis = analyze_shell_command("rg --files crates/opentopia-core/src");
+    let intent = shell_execution_intent(&analysis);
+
+    assert_eq!(intent.network, NetworkAccess::PreferDeny);
+}
+
 #[tokio::test]
 async fn shell_honors_workspace_relative_workdir() {
     let workspace_root =

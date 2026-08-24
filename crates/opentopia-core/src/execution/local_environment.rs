@@ -18,7 +18,7 @@ use crate::sandbox::{
     build_local_sandbox_command_with_options, is_protected_metadata_path,
     sandbox_permission_profile, ExecutionEnvironmentKind, LocalSandboxConfig, NetworkPolicy,
     OsSandboxPlatform, SandboxBackendCapabilities, SandboxCommandStatus, SandboxLaunchOptions,
-    SandboxMode, SandboxPreparationPlan,
+    SandboxMode, SandboxPreparationPlan, WindowsSandboxBackend,
 };
 use crate::workspace_execution_capsule::WorkspaceExecutionCapsule;
 use anyhow::Context;
@@ -175,6 +175,33 @@ impl LocalExecutionEnvironment {
 
     pub fn sandbox_config(&self) -> &LocalSandboxConfig {
         &self.sandbox_config
+    }
+
+    fn persistent_stdio_sandbox_config(&self) -> anyhow::Result<LocalSandboxConfig> {
+        let mut config = self.sandbox_config.clone();
+        if OsSandboxPlatform::current() == OsSandboxPlatform::Windows
+            && config.is_enabled()
+            && config.effective_windows_backend() == WindowsSandboxBackend::DedicatedUser
+        {
+            anyhow::ensure!(
+                config.network != NetworkPolicy::Deny,
+                "persistent stdio cannot use the Windows dedicated-user backend, and the streaming restricted-token backend cannot authoritatively enforce offline networking"
+            );
+
+            // CreateProcessWithLogonW cannot inherit the caller's stdio handles. The
+            // dedicated-user helper therefore captures one-shot output in files and
+            // attaches NUL as stdin, which is incompatible with MCP and other
+            // bidirectional persistent services. Keep this downgrade local to the
+            // stdio process: the WRITE_RESTRICTED backend preserves workspace write
+            // containment and native stdio while the session's online network policy
+            // remains unchanged. One-shot commands continue to use strict isolation.
+            config.windows_backend = WindowsSandboxBackend::Unelevated;
+            tracing::warn!(
+                workspace = %self.workspace_root.display(),
+                "using the Windows streaming restricted-token sandbox for persistent stdio"
+            );
+        }
+        Ok(config)
     }
 
     fn workspace_root_canonical(&self) -> anyhow::Result<PathBuf> {
@@ -408,6 +435,10 @@ impl LocalExecutionEnvironment {
     }
 }
 
+fn sandbox_command_timeout_ms(context: &ExecutionContext) -> u64 {
+    context.timeout.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
 #[async_trait]
 impl ExecutionEnvironment for LocalExecutionEnvironment {
     fn id(&self) -> &str {
@@ -469,16 +500,16 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             &effective_config,
             &SandboxLaunchOptions {
                 interactive: false,
+                persistent_stdio: false,
                 runtime_read_roots: runtime.read_roots.clone(),
                 managed_runtime_roots: runtime.managed_runtime_roots.clone(),
                 environment_keys: environment_keys(&runtime),
                 additional_denied_read_paths: request.requirements.deny_read_paths.clone(),
                 additional_protected_paths: request.requirements.deny_write_paths.clone(),
-                // A stdio session is a long-lived transport (for example an MCP
-                // server), so the caller's timeout applies to startup/handshake
-                // work, not to the lifetime of the spawned process. The session
-                // owner closes or kills it explicitly.
-                timeout_ms: None,
+                // Keep the inner sandbox lifecycle aligned with the tool's command
+                // timeout. Otherwise the wrapper falls back to its 30-second default
+                // and can terminate a command even though the caller granted longer.
+                timeout_ms: Some(sandbox_command_timeout_ms(&context)),
                 termination_timeout_ms: Some(
                     context
                         .termination_timeout
@@ -749,11 +780,13 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             .transpose()?
             .unwrap_or(self.workspace_root_canonical()?);
 
+        let sandbox_config = self.persistent_stdio_sandbox_config()?;
+
         let runtime = resolve_runtime(
             &request,
             &cwd,
             &self.workspace_root,
-            &self.sandbox_config,
+            &sandbox_config,
             &self.execution_capsule,
         )?;
         let program = runtime.program.to_string_lossy().into_owned();
@@ -763,9 +796,10 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             &request.args,
             &cwd,
             &self.workspace_root,
-            &self.sandbox_config,
+            &sandbox_config,
             &SandboxLaunchOptions {
                 interactive: false,
+                persistent_stdio: true,
                 runtime_read_roots: runtime.read_roots.clone(),
                 managed_runtime_roots: runtime.managed_runtime_roots.clone(),
                 environment_keys: environment_keys(&runtime),
@@ -796,10 +830,10 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             status: command_plan.status.clone(),
             permission_profile: sandbox_permission_profile(
                 OsSandboxPlatform::current(),
-                &self.sandbox_config,
+                &sandbox_config,
             ),
-            sandbox_mode: self.sandbox_config.sandbox_mode,
-            network: self.sandbox_config.network,
+            sandbox_mode: sandbox_config.sandbox_mode,
+            network: sandbox_config.network,
         });
         let outer_wait_timeout = sandbox_outer_wait_timeout(
             &command_plan.status,
@@ -813,7 +847,7 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
         )
         .await?;
         let mut process = Command::new(&command_plan.program);
-        configure_command_environment(&mut process, &request, &runtime, &self.sandbox_config);
+        configure_command_environment(&mut process, &request, &runtime, &sandbox_config);
         process
             .args(&command_plan.args)
             .envs(command_plan.env.iter().cloned())
@@ -955,5 +989,49 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             .await
             .with_context(|| format!("failed to delete {}", path.display()))?;
         Ok(DeleteResult { path })
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_shot_sandbox_preserves_the_requested_command_timeout() {
+        let context = ExecutionContext::with_timeout(Duration::from_secs(180));
+
+        assert_eq!(sandbox_command_timeout_ms(&context), 180_000);
+    }
+
+    #[test]
+    fn persistent_stdio_uses_streaming_windows_backend_for_online_sessions() {
+        let mut config = LocalSandboxConfig::enforce();
+        config.network = NetworkPolicy::Allow;
+        config.windows_backend = WindowsSandboxBackend::DedicatedUser;
+        let environment = LocalExecutionEnvironment::with_sandbox_config("C:\\", config);
+
+        let effective = environment
+            .persistent_stdio_sandbox_config()
+            .expect("online persistent stdio should have a streaming sandbox backend");
+
+        assert_eq!(effective.mode, crate::sandbox::OsSandboxMode::Enforce);
+        assert_eq!(effective.windows_backend, WindowsSandboxBackend::Unelevated);
+        assert_eq!(effective.network, NetworkPolicy::Allow);
+    }
+
+    #[test]
+    fn persistent_stdio_does_not_weaken_offline_network_policy() {
+        let mut config = LocalSandboxConfig::enforce();
+        config.network = NetworkPolicy::Deny;
+        config.windows_backend = WindowsSandboxBackend::DedicatedUser;
+        let environment = LocalExecutionEnvironment::with_sandbox_config("C:\\", config);
+
+        let error = environment
+            .persistent_stdio_sandbox_config()
+            .expect_err("offline persistent stdio must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("cannot authoritatively enforce offline networking"));
     }
 }

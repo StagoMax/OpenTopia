@@ -87,15 +87,27 @@ pub(super) fn run(request: SandboxRequest) -> Result<i32> {
         ),
     );
     match request.backend {
+        BackendMode::DedicatedUser if request.persistent_stdio => anyhow::bail!(
+            "stage=validate_policy persistent stdio requires the unelevated streaming backend"
+        ),
+        BackendMode::Auto if request.persistent_stdio && crate::setup::credentials_present() => {
+            anyhow::bail!(
+                "stage=validate_policy persistent stdio requires the unelevated streaming backend"
+            )
+        }
         BackendMode::DedicatedUser if request.interactive => anyhow::bail!(
             "stage=validate_policy interactive PTY sessions currently require the unelevated Windows sandbox backend"
         ),
         BackendMode::Auto if request.interactive && crate::setup::credentials_present() => anyhow::bail!(
             "stage=validate_policy interactive PTY sessions currently require the unelevated Windows sandbox backend"
         ),
-        BackendMode::Unelevated if crate::setup::credentials_present() => anyhow::bail!(
+        BackendMode::Unelevated
+            if crate::setup::credentials_present() && !request.persistent_stdio =>
+        {
+            anyhow::bail!(
             "stage=validate_policy unelevated execution is disabled while dedicated-user credentials are installed because it shares the host identity; use auto/dedicated-user, or remove the dedicated-user sandbox first"
-        ),
+            )
+        }
         BackendMode::Unelevated if !request.filesystem.deny_read.is_empty() => anyhow::bail!(
             "stage=validate_policy unelevated backend cannot enforce deny-read requirements"
         ),
@@ -114,15 +126,27 @@ pub(super) fn provision(request: SandboxRequest) -> Result<i32> {
     validate_managed_runtime_home(&request)?;
     recover_acl_transactions().context("stage=apply_acl recover interrupted ACL transaction")?;
     match request.backend {
+        BackendMode::DedicatedUser if request.persistent_stdio => anyhow::bail!(
+            "stage=validate_policy persistent stdio requires the unelevated streaming backend"
+        ),
+        BackendMode::Auto if request.persistent_stdio && crate::setup::credentials_present() => {
+            anyhow::bail!(
+                "stage=validate_policy persistent stdio requires the unelevated streaming backend"
+            )
+        }
         BackendMode::DedicatedUser if request.interactive => anyhow::bail!(
             "stage=validate_policy interactive PTY sessions currently require the unelevated Windows sandbox backend"
         ),
         BackendMode::Auto if request.interactive && crate::setup::credentials_present() => anyhow::bail!(
             "stage=validate_policy interactive PTY sessions currently require the unelevated Windows sandbox backend"
         ),
-        BackendMode::Unelevated if crate::setup::credentials_present() => anyhow::bail!(
+        BackendMode::Unelevated
+            if crate::setup::credentials_present() && !request.persistent_stdio =>
+        {
+            anyhow::bail!(
             "stage=validate_policy unelevated execution is disabled while dedicated-user credentials are installed because it shares the host identity; use auto/dedicated-user, or remove the dedicated-user sandbox first"
-        ),
+            )
+        }
         BackendMode::Unelevated => {
             let principal = capability_principal(&request);
             let mut capability = acl_principal_sid(&principal)?;
@@ -311,6 +335,7 @@ fn setup_canary_request(network: NetworkMode) -> Result<SandboxRequest> {
     );
     Ok(SandboxRequest {
         interactive: false,
+        persistent_stdio: false,
         cwd: workspace.clone(),
         filesystem: FilesystemCapabilities {
             read_execute: vec![
@@ -1151,6 +1176,7 @@ mod tests {
     fn dedicated_user_runner_envelopes_are_explicitly_versioned() {
         let request = SandboxRequest {
             interactive: false,
+            persistent_stdio: false,
             cwd: Path::new(r"C:\workspace").to_path_buf(),
             filesystem: Default::default(),
             network: NetworkMode::Deny,

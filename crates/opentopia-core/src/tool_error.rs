@@ -1,16 +1,43 @@
 use crate::execution::{ExecutionFailure, ExecutionStage};
 use crate::model::ToolResult;
 use crate::tool_result_ingress::tool_result_is_error;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-pub(crate) fn insert_tool_error_record(
-    metadata: &mut Value,
-    code: &str,
-    phase: &str,
-    executed: bool,
-    retryable: bool,
-    message: &str,
-) {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ToolErrorRecord {
+    pub(crate) recorded: bool,
+    pub(crate) code: String,
+    pub(crate) phase: String,
+    pub(crate) executed: bool,
+    pub(crate) retryable: bool,
+    pub(crate) message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) causes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) execution_stage: Option<ExecutionStage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) os_error: Option<i32>,
+}
+
+impl ToolErrorRecord {
+    fn new(code: &str, phase: &str, executed: bool, retryable: bool, message: &str) -> Self {
+        Self {
+            recorded: true,
+            code: code.to_string(),
+            phase: phase.to_string(),
+            executed,
+            retryable,
+            message: message.to_string(),
+            causes: Vec::new(),
+            execution_stage: None,
+            os_error: None,
+        }
+    }
+}
+
+pub(crate) fn insert_preserved_tool_error_record(metadata: &mut Value, record: &ToolErrorRecord) {
     if !metadata.is_object() {
         *metadata = json!({});
     }
@@ -20,41 +47,35 @@ pub(crate) fn insert_tool_error_record(
     object.insert("success".to_string(), json!(false));
     object
         .entry("error".to_string())
-        .or_insert_with(|| json!(message));
+        .or_insert_with(|| json!(&record.message));
     object.insert(
         "errorRecord".to_string(),
-        json!({
-            "recorded": true,
-            "code": code,
-            "phase": phase,
-            "executed": executed,
-            "retryable": retryable,
-            "message": message,
-        }),
+        serde_json::to_value(record).expect("ToolErrorRecord must serialize"),
     );
+    if !record.causes.is_empty() {
+        object.insert("errorChain".to_string(), json!(&record.causes));
+    }
+    if let Some(stage) = record.execution_stage {
+        object.insert("executionStage".to_string(), json!(stage));
+    }
+    if let Some(os_error) = record.os_error {
+        object.insert("osError".to_string(), json!(os_error));
+    }
 }
 
-pub(crate) fn insert_anyhow_error_record(
+pub(crate) fn insert_tool_error_record(
     metadata: &mut Value,
     code: &str,
     phase: &str,
     executed: bool,
     retryable: bool,
-    error: &anyhow::Error,
+    message: &str,
 ) {
-    let message = format!("{error:#}");
-    insert_tool_error_record(metadata, code, phase, executed, retryable, &message);
-    let chain = error.chain().map(ToString::to_string).collect::<Vec<_>>();
-    let Some(object) = metadata.as_object_mut() else {
-        return;
-    };
-    object.insert("errorChain".to_string(), json!(&chain));
-    if let Some(record) = object.get_mut("errorRecord").and_then(Value::as_object_mut) {
-        record.insert("causes".to_string(), json!(chain));
-    }
+    let record = ToolErrorRecord::new(code, phase, executed, retryable, message);
+    insert_preserved_tool_error_record(metadata, &record);
 }
 
-pub(crate) fn insert_classified_anyhow_error_record(metadata: &mut Value, error: &anyhow::Error) {
+pub(crate) fn classify_anyhow_error(error: &anyhow::Error) -> ToolErrorRecord {
     let execution_failure = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<ExecutionFailure>());
@@ -86,27 +107,25 @@ pub(crate) fn insert_classified_anyhow_error_record(metadata: &mut Value, error:
         None if transient_file_conflict => ("filesystem_temporarily_busy", "execution", true, true),
         None => ("tool_execution_failed", "execution", true, false),
     };
-    insert_anyhow_error_record(metadata, code, phase, executed, retryable, error);
-    let Some(object) = metadata.as_object_mut() else {
-        return;
-    };
     let os_error = execution_failure
         .and_then(|failure| failure.os_error)
         .or_else(|| io_error.and_then(std::io::Error::raw_os_error));
-    if let Some(failure) = execution_failure {
-        object.insert("executionStage".to_string(), json!(failure.stage));
+    ToolErrorRecord {
+        recorded: true,
+        code: code.to_string(),
+        phase: phase.to_string(),
+        executed,
+        retryable,
+        message: format!("{error:#}"),
+        causes: error.chain().map(ToString::to_string).collect(),
+        execution_stage: execution_failure.map(|failure| failure.stage),
+        os_error,
     }
-    if let Some(os_error) = os_error {
-        object.insert("osError".to_string(), json!(os_error));
-    }
-    if let Some(record) = object.get_mut("errorRecord").and_then(Value::as_object_mut) {
-        if let Some(failure) = execution_failure {
-            record.insert("executionStage".to_string(), json!(failure.stage));
-        }
-        if let Some(os_error) = os_error {
-            record.insert("osError".to_string(), json!(os_error));
-        }
-    }
+}
+
+pub(crate) fn insert_classified_anyhow_error_record(metadata: &mut Value, error: &anyhow::Error) {
+    let record = classify_anyhow_error(error);
+    insert_preserved_tool_error_record(metadata, &record);
 }
 
 pub(crate) fn ensure_tool_error_record(result: &mut ToolResult) {

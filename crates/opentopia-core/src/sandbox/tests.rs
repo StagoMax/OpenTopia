@@ -588,6 +588,69 @@ fn windows_enforce_rejects_the_partial_restricted_token_backend() {
 }
 
 #[test]
+fn windows_enforce_uses_explicit_streaming_backend_for_persistent_stdio() {
+    let root =
+        std::env::temp_dir().join(format!("opentopia-windows-plan-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("create workspace");
+    let mut config = LocalSandboxConfig::enforce();
+    config.network = NetworkPolicy::Allow;
+
+    let plan = build_windows_sandbox_command_with_binary(
+        std::env::current_exe().expect("current executable"),
+        "cmd.exe",
+        &["/c".to_string(), "echo ok".to_string()],
+        &root,
+        &root,
+        &config,
+        &SandboxLaunchOptions {
+            persistent_stdio: true,
+            ..Default::default()
+        },
+    )
+    .expect("persistent stdio should select the streaming sandbox backend");
+
+    assert!(plan.args.iter().any(|arg| arg == "--persistent-stdio"));
+    assert!(plan
+        .args
+        .windows(2)
+        .any(|args| args == ["--backend", "unelevated"]));
+    assert!(matches!(
+        plan.status,
+        SandboxCommandStatus::Wrapped {
+            platform: OsSandboxPlatform::Windows,
+            ref backend,
+        } if backend == "opentopia-windows-restricted-token"
+    ));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn windows_persistent_stdio_does_not_downgrade_offline_networking() {
+    let root =
+        std::env::temp_dir().join(format!("opentopia-windows-plan-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("create workspace");
+
+    let error = build_windows_sandbox_command_with_binary(
+        std::env::current_exe().expect("current executable"),
+        "cmd.exe",
+        &["/c".to_string(), "echo ok".to_string()],
+        &root,
+        &root,
+        &LocalSandboxConfig::enforce(),
+        &SandboxLaunchOptions {
+            persistent_stdio: true,
+            ..Default::default()
+        },
+    )
+    .expect_err("offline persistent stdio must fail closed");
+
+    assert!(error
+        .to_string()
+        .contains("cannot authoritatively enforce offline networking"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn windows_backend_capabilities_report_subprocess_ipc_truthfully() {
     assert!(
         SandboxBackendCapabilities::for_platform(

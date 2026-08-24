@@ -280,8 +280,22 @@ pub(super) fn build_windows_sandbox_command_with_binary(
     const ERROR_NONCE_ENV: &str = "OPENTOPIA_SANDBOX_ERROR_NONCE";
     let workspace_root = absolute_path(workspace_root);
     let error_nonce = Uuid::new_v4().simple().to_string();
-    let backend = config.effective_windows_backend();
-    if config.mode == OsSandboxMode::Enforce && backend != WindowsSandboxBackend::DedicatedUser {
+    let configured_backend = config.effective_windows_backend();
+    let backend = if options.persistent_stdio
+        && configured_backend == WindowsSandboxBackend::DedicatedUser
+    {
+        anyhow::ensure!(
+            config.network != NetworkPolicy::Deny,
+            "Windows persistent stdio requires the streaming restricted-token backend, which cannot authoritatively enforce offline networking"
+        );
+        WindowsSandboxBackend::Unelevated
+    } else {
+        configured_backend
+    };
+    if config.mode == OsSandboxMode::Enforce
+        && backend != WindowsSandboxBackend::DedicatedUser
+        && !options.persistent_stdio
+    {
         anyhow::bail!(
             "Windows enforce mode requires the dedicated-user sandbox backend because the restricted-token backend cannot preserve arbitrary child-process IPC; choose auto/dedicated_user and complete `opentopia-sandbox setup`, or explicitly use best-effort mode"
         );
@@ -300,6 +314,9 @@ pub(super) fn build_windows_sandbox_command_with_binary(
     ];
     if options.interactive {
         sandbox_args.push("--interactive".to_string());
+    }
+    if options.persistent_stdio {
+        sandbox_args.push("--persistent-stdio".to_string());
     }
     if let Some(timeout_ms) = options.timeout_ms {
         sandbox_args.extend(["--timeout-ms".to_string(), timeout_ms.to_string()]);

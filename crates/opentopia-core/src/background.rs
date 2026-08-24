@@ -16,6 +16,7 @@ use crate::execution::{
     ExecutionSandboxMetadata, OutputStream, StdioSession,
 };
 use crate::policy::approval_required;
+use crate::tool_error::{classify_anyhow_error, ToolErrorRecord};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -83,6 +84,9 @@ pub struct BackgroundJobSnapshot {
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
+    /// Structured runtime failure captured before the anyhow chain is flattened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) error_record: Option<ToolErrorRecord>,
     /// Typed authorization boundary preserved across detached execution.
     pub approval_required: Option<String>,
     /// True when the execution backend had to truncate process output.
@@ -201,6 +205,7 @@ struct JobState {
     success: bool,
     finished_at: Option<DateTime<Utc>>,
     error: Option<String>,
+    error_record: Option<ToolErrorRecord>,
     approval_required: Option<String>,
     truncated: bool,
     sandbox: Option<ExecutionSandboxMetadata>,
@@ -254,6 +259,7 @@ impl Job {
             started_at: self.started_at,
             finished_at: state.finished_at,
             error: state.error.clone(),
+            error_record: state.error_record.clone(),
             approval_required: state.approval_required.clone(),
             truncated: state.truncated,
             sandbox: state.sandbox.clone(),
@@ -446,6 +452,7 @@ impl BackgroundProcessRegistry {
                 success: false,
                 finished_at: None,
                 error: None,
+                error_record: None,
                 approval_required: None,
                 truncated: false,
                 sandbox: None,
@@ -524,6 +531,7 @@ impl BackgroundProcessRegistry {
                 Err(error) => {
                     state.approval_required =
                         approval_required(&error).map(|required| required.reason().to_string());
+                    state.error_record = Some(classify_anyhow_error(&error));
                     let message = error.to_string();
                     state.status = if job.cancel.is_cancelled() || message.contains("cancelled") {
                         BackgroundJobStatus::Cancelled
@@ -579,6 +587,7 @@ impl BackgroundProcessRegistry {
                     state.approval_required =
                         approval_required(&error).map(|required| required.reason().to_string());
                     state.status = BackgroundJobStatus::Failed;
+                    state.error_record = Some(classify_anyhow_error(&error));
                     state.error = Some(error.to_string());
                 }
                 None => {
@@ -668,6 +677,7 @@ impl BackgroundProcessRegistry {
                 success: false,
                 finished_at: None,
                 error: None,
+                error_record: None,
                 approval_required: None,
                 truncated: false,
                 sandbox: None,
@@ -770,6 +780,7 @@ impl BackgroundProcessRegistry {
                 Err(error) => {
                     state.approval_required =
                         approval_required(&error).map(|required| required.reason().to_string());
+                    state.error_record = Some(classify_anyhow_error(&error));
                     let message = error.to_string();
                     state.status = if timed_out.load(Ordering::Acquire) {
                         BackgroundJobStatus::TimedOut
@@ -984,7 +995,7 @@ impl BackgroundProcessRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::LocalExecutionEnvironment;
+    use crate::execution::{ExecutionFailure, ExecutionStage, LocalExecutionEnvironment};
     use crate::sandbox::LocalSandboxConfig;
 
     #[derive(Default)]
@@ -1299,6 +1310,35 @@ mod tests {
         assert!(output.job.success);
         assert!(output.stdout.contains("fixture.zip"));
         assert!(registry.pending_completions(&scope).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_background_failure_preserves_its_structured_execution_stage() {
+        let registry = BackgroundProcessRegistry::default();
+        let scope = scope();
+        let snapshot = registry
+            .spawn_task(scope.clone(), "sandbox failure".to_string(), None, async {
+                Err::<String, _>(anyhow::Error::new(ExecutionFailure::without_os_error(
+                    ExecutionStage::PrepareSandbox,
+                    "dedicated-user runner did not become ready",
+                )))
+            })
+            .expect("task starts");
+
+        let output = registry
+            .wait_for_output(&scope, snapshot.job_id, Duration::from_secs(1))
+            .await
+            .expect("wait succeeds")
+            .expect("task finishes inline");
+        let record = output
+            .job
+            .error_record
+            .expect("structured failure is preserved");
+        assert_eq!(record.code, "sandbox_preparation_failed");
+        assert_eq!(record.phase, "preflight");
+        assert!(!record.executed);
+        assert!(record.retryable);
+        assert_eq!(record.execution_stage, Some(ExecutionStage::PrepareSandbox));
     }
 
     #[tokio::test]

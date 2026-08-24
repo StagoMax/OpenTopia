@@ -590,6 +590,10 @@ pub struct SandboxPreparationPlan {
 #[derive(Debug, Clone, Default)]
 pub struct SandboxLaunchOptions {
     pub interactive: bool,
+    /// The child must retain bidirectional stdio for its full lifetime. On
+    /// Windows this selects the streaming restricted-token backend because the
+    /// dedicated-user broker currently supports one-shot file capture only.
+    pub persistent_stdio: bool,
     pub runtime_read_roots: Vec<PathBuf>,
     pub managed_runtime_roots: Vec<PathBuf>,
     pub environment_keys: Vec<String>,

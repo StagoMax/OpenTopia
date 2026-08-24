@@ -36,6 +36,8 @@ enum BackendMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SandboxRequest {
     interactive: bool,
+    #[serde(default)]
+    persistent_stdio: bool,
     cwd: PathBuf,
     filesystem: FilesystemCapabilities,
     network: NetworkMode,
@@ -129,11 +131,12 @@ fn parse_request(args: impl IntoIterator<Item = String>) -> Result<SandboxReques
             std::process::exit(0);
         }
         _ => anyhow::bail!(
-            "usage: opentopia-sandbox run --cwd <absolute-path> [--interactive] [--read-root <absolute-path>] [--managed-runtime-root <absolute-path>] [--runtime-root <absolute-path>] [--write-root <absolute-path>] [--runtime-home <absolute-path>] [--protect <absolute-path>] [--timeout-ms <milliseconds>] [--termination-timeout-ms <milliseconds>] --network <deny|internet> -- <program> [args...]"
+            "usage: opentopia-sandbox run --cwd <absolute-path> [--interactive] [--persistent-stdio] [--read-root <absolute-path>] [--managed-runtime-root <absolute-path>] [--runtime-root <absolute-path>] [--write-root <absolute-path>] [--runtime-home <absolute-path>] [--protect <absolute-path>] [--timeout-ms <milliseconds>] [--termination-timeout-ms <milliseconds>] --network <deny|internet> -- <program> [args...]"
         ),
     }
 
     let mut interactive = false;
+    let mut persistent_stdio = false;
     let mut cwd = None;
     let mut read_roots = Vec::new();
     let mut managed_runtime_roots = Vec::new();
@@ -159,6 +162,7 @@ fn parse_request(args: impl IntoIterator<Item = String>) -> Result<SandboxReques
         }
         match arg.as_str() {
             "--interactive" => interactive = true,
+            "--persistent-stdio" => persistent_stdio = true,
             "--cwd" => cwd = Some(absolute_path(next_value("--cwd", &mut args)?)?),
             "--read-root" => read_roots.push(absolute_path(next_value("--read-root", &mut args)?)?),
             "--managed-runtime-root" => managed_runtime_roots.push(absolute_path(next_value(
@@ -282,6 +286,7 @@ fn parse_request(args: impl IntoIterator<Item = String>) -> Result<SandboxReques
     }
     Ok(SandboxRequest {
         interactive,
+        persistent_stdio,
         cwd,
         filesystem: FilesystemCapabilities {
             read_execute,
@@ -373,6 +378,7 @@ mod tests {
                 "--cwd",
                 &cwd,
                 "--interactive",
+                "--persistent-stdio",
                 "--read-root",
                 &cwd,
                 "--write-root",
@@ -412,6 +418,7 @@ mod tests {
 
         assert_eq!(request.network, NetworkMode::Deny);
         assert!(request.interactive);
+        assert!(request.persistent_stdio);
         assert_eq!(request.timeout_ms, Some(2_500));
         assert_eq!(
             request

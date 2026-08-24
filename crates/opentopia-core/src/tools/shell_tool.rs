@@ -12,6 +12,7 @@ use crate::execution_authorization::{
 use crate::model::{ModelContentPart, ToolCall, ToolResult};
 use crate::policy::{ApprovalRequired, PolicyDecision};
 use crate::shell_analysis::{analyze_shell_command, ShellCapability, ShellCommandAnalysis};
+use crate::tool_error::insert_preserved_tool_error_record;
 use crate::tool_output_truncation::{truncate_tool_result_at_source, ToolOutputSourceKind};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -534,7 +535,7 @@ impl TypedTool for ShellTool {
                     ))
                     .into());
                 }
-                let result = shell_completed_result(
+                let mut result = shell_completed_result(
                     call_id,
                     command,
                     &workdir,
@@ -546,6 +547,9 @@ impl TypedTool for ShellTool {
                     chunk.job.truncated,
                     chunk.job.sandbox,
                 )?;
+                if let Some(error_record) = chunk.job.error_record.as_ref() {
+                    insert_preserved_tool_error_record(&mut result.metadata, error_record);
+                }
                 return Ok(truncate_tool_result_at_source(
                     "shell",
                     result,
@@ -696,6 +700,12 @@ pub(super) fn shell_execution_intent(analysis: &ShellCommandAnalysis) -> ToolExe
         )
     });
     let needs_network = analysis.capabilities.contains(&ShellCapability::Network);
+    let network_is_unknown = analysis.capabilities.iter().any(|capability| {
+        matches!(
+            capability,
+            ShellCapability::DynamicExecution | ShellCapability::Unknown
+        )
+    });
     let command_scoped = analysis.capabilities.iter().any(|capability| {
         matches!(
             capability,
@@ -721,6 +731,11 @@ pub(super) fn shell_execution_intent(analysis: &ShellCommandAnalysis) -> ToolExe
     intent.process_lifetime = ProcessLifetime::Background;
     intent.network = if needs_network {
         NetworkAccess::Required
+    } else if network_is_unknown {
+        // A script or arbitrary executable may open sockets internally even when
+        // its command line contains no URL. Absence of a recognized network verb
+        // is not proof that dynamic code is offline, so honor the session policy.
+        NetworkAccess::InheritSession
     } else {
         NetworkAccess::PreferDeny
     };

@@ -1329,6 +1329,7 @@ mod tests {
     fn capability_request(write_roots: &[&str]) -> SandboxRequest {
         SandboxRequest {
             interactive: false,
+            persistent_stdio: false,
             cwd: Path::new(r"C:\workspace").to_path_buf(),
             filesystem: opentopia_sandbox_protocol::FilesystemCapabilities {
                 write: write_roots.iter().map(std::path::PathBuf::from).collect(),
