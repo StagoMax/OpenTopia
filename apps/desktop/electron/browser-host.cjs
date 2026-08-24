@@ -827,6 +827,7 @@ function createDesktopBrowserHost(options) {
       activeDownloadItem: null,
       lastError: null,
       observations: new Map(),
+      navigationGeneration: 0,
       networkPolicyEnforced: false,
       allowedHosts: new Set(),
       queue: Promise.resolve(),
@@ -936,7 +937,21 @@ function createDesktopBrowserHost(options) {
     const entry = requireSession(sessionId);
     return runExclusive(entry, () => {
       beginUserControl(entry);
-      return navigate(entry, url, null);
+      const targetUrl = normalizeUrl(url);
+      const navigationGeneration = (entry.navigationGeneration += 1);
+      entry.lastError = null;
+      const webContents = entry.view.webContents;
+      void webContents.loadURL(targetUrl).catch((error) => {
+        if (
+          entry.destroyed ||
+          entry.navigationGeneration !== navigationGeneration
+        ) {
+          return;
+        }
+        entry.lastError = serializeError(error);
+        emitState(entry);
+      });
+      return sessionState(entry);
     });
   }
 
@@ -1932,10 +1947,15 @@ function createDesktopBrowserHost(options) {
   function setBounds(entry, rawBounds) {
     const window = getMainWindow();
     const bounds = normalizeBounds(rawBounds, window);
+    const changed =
+      entry.bounds.x !== bounds.x ||
+      entry.bounds.y !== bounds.y ||
+      entry.bounds.width !== bounds.width ||
+      entry.bounds.height !== bounds.height;
     entry.bounds = bounds;
-    entry.view.setBounds(bounds);
+    if (changed) entry.view.setBounds(bounds);
     setActualVisibility(entry);
-    return emitState(entry);
+    return changed ? emitState(entry) : sessionState(entry);
   }
 
   function setVisibility(entry, visible) {
@@ -1945,10 +1965,14 @@ function createDesktopBrowserHost(options) {
         "visible must be a boolean.",
       );
     }
+    const requestedVisibilityChanged = entry.requestedVisible !== visible;
+    const attachedBefore = entry.attached;
     entry.requestedVisible = visible;
     if (visible) attachEntry(entry);
     setActualVisibility(entry);
-    return emitState(entry);
+    const changed =
+      requestedVisibilityChanged || attachedBefore !== entry.attached;
+    return changed ? emitState(entry) : sessionState(entry);
   }
 
   function destroySession(sessionId) {

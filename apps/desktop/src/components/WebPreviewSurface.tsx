@@ -13,7 +13,12 @@ import {
   activeBrowserHandoffTurnId,
   type BrowserHandoff,
 } from "../browserHandoff";
-import { browserSessionId, navigateBrowserAddress } from "../browserNavigation";
+import { syncBrowserAddress } from "../browserAddressState";
+import {
+  browserSessionId,
+  navigateBrowserAddress,
+  resolveAddressBarInput,
+} from "../browserNavigation";
 import { openExternal } from "../platform";
 import type {
   AgentEvent,
@@ -96,6 +101,14 @@ function NativeWebPreview({
   const visibleRef = useRef(true);
   const hasUrlRef = useRef(false);
   const handledNavigationIdRef = useRef<string | null>(null);
+  const addressValueRef = useRef("");
+  const addressEditingRef = useRef(false);
+  const addressDirtyRef = useRef(false);
+  const browserUrlRef = useRef("");
+  const pendingNavigationOriginRef = useRef("");
+  const pendingAddressRef = useRef<string | null>(null);
+  const lastReportedBoundsRef = useRef<string | null>(null);
+  const lastReportedVisibilityRef = useRef<boolean | null>(null);
 
   useEffect(() => {
     if (!handoff) return;
@@ -121,10 +134,34 @@ function NativeWebPreview({
       width: Math.max(0, Math.round(rect.width)),
       height: Math.max(0, Math.round(rect.height)),
     };
+    const boundsKey = `${bounds.x}:${bounds.y}:${bounds.width}:${bounds.height}`;
+    const shouldUpdateBounds = lastReportedBoundsRef.current !== boundsKey;
+    const shouldUpdateVisibility =
+      lastReportedVisibilityRef.current !== visible;
+    if (!shouldUpdateBounds && !shouldUpdateVisibility) return;
+
+    // Mark values before crossing IPC. The resulting state event must not
+    // immediately schedule the same update again.
+    if (shouldUpdateBounds) lastReportedBoundsRef.current = boundsKey;
+    if (shouldUpdateVisibility) lastReportedVisibilityRef.current = visible;
+
     void Promise.all([
-      api.setBounds(sessionId, bounds),
-      api.setVisibility(sessionId, visible),
-    ]).catch((cause) => setError(errorMessage(cause)));
+      shouldUpdateBounds ? api.setBounds(sessionId, bounds) : Promise.resolve(),
+      shouldUpdateVisibility
+        ? api.setVisibility(sessionId, visible)
+        : Promise.resolve(),
+    ]).catch((cause) => {
+      if (shouldUpdateBounds && lastReportedBoundsRef.current === boundsKey) {
+        lastReportedBoundsRef.current = null;
+      }
+      if (
+        shouldUpdateVisibility &&
+        lastReportedVisibilityRef.current === visible
+      ) {
+        lastReportedVisibilityRef.current = null;
+      }
+      setError(errorMessage(cause));
+    });
   }, [api, sessionId]);
 
   useEffect(() => {
@@ -140,13 +177,21 @@ function NativeWebPreview({
       canGoForward: false,
     });
     hasUrlRef.current = false;
+    addressValueRef.current = "";
+    addressEditingRef.current = false;
+    addressDirtyRef.current = false;
+    browserUrlRef.current = "";
+    pendingNavigationOriginRef.current = "";
+    pendingAddressRef.current = null;
+    lastReportedBoundsRef.current = null;
+    lastReportedVisibilityRef.current = null;
     void api
       .createSession({ sessionId, visible: false })
       .then((next) => {
         if (disposed) return;
         hasUrlRef.current = Boolean(next.url);
         setState(next);
-        setAddress(next.url);
+        syncAddress(next);
         window.requestAnimationFrame(reportBounds);
       })
       .catch((cause) => {
@@ -156,7 +201,7 @@ function NativeWebPreview({
       if (next.sessionId !== sessionId || disposed) return;
       hasUrlRef.current = Boolean(next.url);
       setState(next);
-      setAddress(next.url);
+      syncAddress(next);
       setError(next.error ?? null);
       window.requestAnimationFrame(reportBounds);
     });
@@ -176,13 +221,20 @@ function NativeWebPreview({
     }
     handledNavigationIdRef.current = navigationRequest.id;
     let disposed = false;
-    setAddress(navigationRequest.url);
+    pendingAddressRef.current = navigationRequest.url;
+    pendingNavigationOriginRef.current = browserUrlRef.current;
+    addressDirtyRef.current = false;
+    setAddressValue(navigationRequest.url);
     setError(null);
     void api
       .createSession({ sessionId, visible: false })
-      .then(() => api.navigate(sessionId, navigationRequest.url))
+      .then(() => api.navigateFromAddressBar(sessionId, navigationRequest.url))
       .catch((cause) => {
-        if (!disposed) setError(errorMessage(cause));
+        if (!disposed) {
+          pendingAddressRef.current = null;
+          pendingNavigationOriginRef.current = "";
+          setError(errorMessage(cause));
+        }
       });
     return () => {
       disposed = true;
@@ -218,12 +270,52 @@ function NativeWebPreview({
 
   async function navigate() {
     setError(null);
+    let requestedUrl: string;
     try {
-      const url = await navigateBrowserAddress(api, sessionId, address);
-      setAddress(url);
+      requestedUrl = resolveAddressBarInput(addressValueRef.current);
     } catch (cause) {
       setError(errorMessage(cause));
+      return;
     }
+    pendingAddressRef.current = requestedUrl;
+    pendingNavigationOriginRef.current = browserUrlRef.current;
+    addressDirtyRef.current = false;
+    setAddressValue(requestedUrl);
+    try {
+      const url = await navigateBrowserAddress(api, sessionId, requestedUrl);
+      setAddressValue(url);
+    } catch (cause) {
+      pendingAddressRef.current = null;
+      pendingNavigationOriginRef.current = "";
+      setError(errorMessage(cause));
+    }
+  }
+
+  function setAddressValue(value: string) {
+    addressValueRef.current = value;
+    setAddress(value);
+  }
+
+  function syncAddress(next: WebPreviewState) {
+    const hadPendingAddress = pendingAddressRef.current !== null;
+    const result = syncBrowserAddress({
+      currentValue: addressValueRef.current,
+      browserUrl: next.url,
+      loading: next.loading,
+      error: next.error,
+      editing: addressEditingRef.current,
+      dirty: addressDirtyRef.current,
+      previousBrowserUrl:
+        pendingNavigationOriginRef.current || browserUrlRef.current,
+      pendingUrl: pendingAddressRef.current,
+    });
+    if (!result.pendingUrl && hadPendingAddress) {
+      addressDirtyRef.current = false;
+      pendingNavigationOriginRef.current = "";
+    }
+    pendingAddressRef.current = result.pendingUrl;
+    browserUrlRef.current = next.url;
+    setAddressValue(result.value);
   }
 
   async function run(action: "back" | "forward" | "reload") {
@@ -314,9 +406,20 @@ function NativeWebPreview({
           autoCapitalize="none"
           autoCorrect="off"
           spellCheck={false}
+          onBlur={() => {
+            addressEditingRef.current = false;
+            addressDirtyRef.current = false;
+          }}
+          onFocus={() => {
+            addressEditingRef.current = true;
+          }}
           value={address}
           placeholder="输入网址或搜索内容"
-          onChange={(event) => setAddress(event.target.value)}
+          onChange={(event) => {
+            pendingAddressRef.current = null;
+            addressDirtyRef.current = true;
+            setAddressValue(event.target.value);
+          }}
           onKeyDown={(event) => {
             if (event.key === "Enter") void navigate();
           }}
