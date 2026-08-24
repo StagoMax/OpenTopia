@@ -342,7 +342,7 @@ fn default_mode_exposes_work_memory_without_plan_only_input() {
     assert!(!tools.contains("read_files"));
     assert!(!tools.contains("search"));
     assert!(!tools.contains("git_diff"));
-    assert!(!tools.contains("request_user_input"));
+    assert!(tools.contains("request_user_input"));
     assert!(tools.contains("set_plan"));
     assert!(tools.contains("update_plan"));
     assert!(!tools.contains("complete_task"));
@@ -353,18 +353,23 @@ fn default_mode_exposes_work_memory_without_plan_only_input() {
     assert!(!tools.contains("spawn_agent"));
 }
 
-/// Structured user input is a Plan-mode interaction boundary. Default and
-/// Goal turns must not expose it, and child agents never own that boundary.
+/// Structured user input is a Plan-mode interaction boundary. Its schema stays
+/// stable across root modes for prompt caching, while runtime capability and
+/// execution checks reject it outside Plan. Children never see the schema.
 #[test]
 fn request_user_input_is_available_only_to_the_root_plan_agent() {
     let default_agent = AgentCore::default();
     assert_eq!(default_agent.collaboration_mode, CollaborationMode::Default);
+    assert!(default_agent
+        .lineage_instructions()
+        .expect("default mode instructions")
+        .contains("Collaboration Mode: Default"));
     let default_tools = default_agent
         .provider_tool_catalog()
         .into_iter()
         .map(|tool| tool.name)
         .collect::<HashSet<_>>();
-    assert!(!default_tools.contains("request_user_input"));
+    assert!(default_tools.contains("request_user_input"));
     assert!(
         !default_agent
             .prompt_runtime_capabilities(RuntimeSurface::Desktop)
@@ -375,16 +380,22 @@ fn request_user_input_is_available_only_to_the_root_plan_agent() {
     plan_agent
         .apply_collaboration_mode(CollaborationMode::Plan, None)
         .expect("apply plan interaction profile");
-    let plan_instructions = plan_agent
-        .additional_developer_instructions
-        .as_deref()
-        .expect("plan instructions");
-    assert!(plan_instructions.contains("ordinary executable Agent loop"));
-    assert!(plan_instructions.contains("does not create, require, or imply a WorkForm"));
+    let plan_instructions = plan_agent.lineage_instructions().expect("plan instructions");
+    assert!(plan_instructions.contains("If the user asks for execution"));
+    assert!(plan_instructions.contains("must not edit or write files"));
+    assert!(plan_instructions.contains("<proposed_plan>"));
     assert!(plan_agent
         .provider_tool_catalog()
         .iter()
         .any(|tool| tool.name == "request_user_input"));
+    assert!(plan_agent
+        .provider_tool_catalog()
+        .iter()
+        .any(|tool| tool.name == "set_plan"));
+    assert!(plan_agent
+        .provider_tool_catalog()
+        .iter()
+        .any(|tool| tool.name == "update_plan"));
     assert!(
         plan_agent
             .prompt_runtime_capabilities(RuntimeSurface::Desktop)
@@ -420,7 +431,7 @@ fn request_user_input_is_available_only_to_the_root_plan_agent() {
     goal_agent
         .apply_collaboration_mode(CollaborationMode::Goal, Some(goal))
         .expect("Goal mode");
-    assert!(!goal_agent
+    assert!(goal_agent
         .provider_tool_catalog()
         .iter()
         .any(|tool| tool.name == "request_user_input"));
@@ -434,6 +445,25 @@ fn request_user_input_is_available_only_to_the_root_plan_agent() {
         .provider_tool_catalog()
         .iter()
         .any(|tool| tool.name == "request_user_input"));
+}
+
+#[test]
+fn changing_collaboration_mode_replaces_stale_mode_instructions() {
+    let mut agent = AgentCore::default();
+    agent
+        .apply_collaboration_mode(CollaborationMode::Plan, None)
+        .expect("Plan mode");
+    assert!(agent
+        .lineage_instructions()
+        .expect("plan instructions")
+        .contains("must not edit or write files"));
+
+    agent
+        .apply_collaboration_mode(CollaborationMode::Default, None)
+        .expect("Default mode");
+    let instructions = agent.lineage_instructions().expect("default instructions");
+    assert!(instructions.contains("Collaboration Mode: Default"));
+    assert!(!instructions.contains("must not edit or write files"));
 }
 
 #[test]

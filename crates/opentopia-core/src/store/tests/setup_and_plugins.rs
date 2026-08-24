@@ -196,6 +196,7 @@ fn enterprise_template_spec(tools: &[&str]) -> AgentTemplateSpecV1 {
         budget: AgentBudgetV1::default(),
         risk_class: AgentRiskClassV1::Medium,
         connection_bindings: Vec::new(),
+        knowledge_binding: None,
     }
 }
 

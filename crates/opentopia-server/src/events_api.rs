@@ -24,6 +24,7 @@ pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/api/threads/:thread_id/events", get(list_events))
         .route("/api/threads/:thread_id/events/stream", get(stream_events))
+        .route("/api/activity/events/stream", get(stream_activity_events))
         .route("/api/threads/:thread_id/agents", get(list_agent_threads))
         .route(
             "/api/threads/:thread_id/agents/:agent_thread_id/interrupt",
@@ -33,6 +34,28 @@ pub(super) fn router() -> Router<AppState> {
             "/api/threads/:thread_id/agents/events/stream",
             get(stream_agent_events),
         )
+}
+
+async fn stream_activity_events(
+    State(state): State<AppState>,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+    let rx = state.events.subscribe_activity();
+    let event_stream = BroadcastStream::new(rx)
+        .filter_map(|result| async move { result.ok() })
+        .map(|agent_event| {
+            let event_name = sse_event_name(agent_event.kind());
+            let seq = agent_event.seq;
+            let envelope =
+                DesktopStreamEnvelope::new(DesktopStreamKind::AgentEvent, seq, agent_event);
+            let sse = Event::default()
+                .id(seq.to_string())
+                .event(event_name)
+                .json_data(envelope)
+                .expect("thread activity event should serialize");
+            Ok(sse)
+        });
+
+    Sse::new(event_stream).keep_alive(KeepAlive::default())
 }
 
 async fn list_events(

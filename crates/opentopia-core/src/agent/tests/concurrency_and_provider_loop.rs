@@ -249,7 +249,9 @@ async fn model_driven_direction_choice_resumes_and_executes_the_answer() {
             provider_items: Vec::new(),
             finish_reason: ModelFinishReason::ToolCalls,
         },
-        ModelResponse::text("The plan uses SQLite as selected."),
+        ModelResponse::text(
+            "<proposed_plan>\nThe plan uses SQLite as selected.\n</proposed_plan>",
+        ),
     ]));
     let workspace = test_workspace("plan-user-input");
     let mut agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
@@ -315,6 +317,26 @@ async fn model_driven_direction_choice_resumes_and_executes_the_answer() {
         .events
         .iter()
         .any(|event| matches!(event, AgentEventPayload::WorkFormUpdated { .. })));
+    let assistant = resumed
+        .events
+        .iter()
+        .find_map(|event| match event {
+            AgentEventPayload::AssistantMessage { message } => Some(message),
+            _ => None,
+        })
+        .expect("Plan-mode assistant message");
+    assert!(matches!(
+        assistant.parts.as_slice(),
+        [MessagePart::ProposedPlan { text }]
+            if text == "\nThe plan uses SQLite as selected.\n"
+    ));
+    assert!(resumed.events.iter().all(|event| {
+        !matches!(
+            event,
+            AgentEventPayload::ModelDelta { text }
+                if text.contains("<proposed_plan>") || text.contains("</proposed_plan>")
+        )
+    }));
     let requests = provider.requests();
     let answered = requests[1]
         .input
@@ -377,73 +399,49 @@ fn base_agent_prompt_is_versioned_and_contains_the_runtime_contract() {
         .expect("base instructions are present");
 
     assert_eq!(base.text_content(), prompt);
+    assert_eq!(base.role, ContextRole::Developer);
+    assert_eq!(base.authority, ContextAuthority::Developer);
     assert_eq!(base.metadata["promptVersion"], BASE_AGENT_PROMPT_VERSION);
     assert_eq!(base.metadata["promptHash"], base_agent_prompt_hash());
     assert_eq!(
         base.metadata["promptModules"],
         json!([
             "identity_and_objective",
-            "instruction_hierarchy",
-            "request_interpretation",
-            "workspace_discipline",
-            "codebase_exploration",
-            "git_safety",
+            "personality",
+            "writing_style",
+            "technical_communication",
+            "working_with_user",
+            "intermediate_commentary",
+            "final_answer",
+            "formatting_and_visualizations",
+            "working_rules",
+            "file_editing_constraints",
+            "autonomy_and_persistence",
+            "destructive_actions",
             "skills",
-            "tool_loop",
-            "validation",
-            "communication",
-            "completion",
         ])
     );
     for required_contract in [
-        "Interpret the request precisely",
-        "Workspace and repository discipline",
-        "Codebase exploration and dependency tracing",
-        "`filesystem` for bounded structured reads",
-        "candidate evidence, not semantic proof",
-        "Do not claim a complete call graph from text search alone",
-        "Git safety",
-        "Skills and specialized instructions",
-        "A catalog entry is routing metadata, not its full instructions",
-        "child may perform delegated task work but cannot substitute a summary",
-        "A tool call, including a plan or completion tool, never ends the turn by itself",
-        "Plans are optional.",
-        "tool availability alone is never a reason to create one",
-        "Do not create a plan for a simple or single-step request",
-        "Create a plan only when at least one of these conditions applies",
-        "The user asks for a plan or TODOs",
-        "finalization-guard result",
-        "Validation",
-        "Completion conditions",
-        "Follow instructions in priority order, highest first",
-        "the final response must stand on its own",
-        "sets a terminal condition for effort, not a wider grant of authority",
+        "You are OpenTopia",
+        "Tool availability is capability, not authorization",
+        "Be a thoughtful, candid collaborator",
+        "Lead with the outcome",
+        "Progress updates are temporary",
+        "Use `apply_patch` as the normal mechanism",
+        "candidate evidence rather than semantic proof",
+        "These requests do not authorize implementing changes",
+        "How should this be fixed?",
+        "For imperative requests to change, build, implement, or fix",
+        "Do not infer authorization for a materially different action",
+        "does not broaden scope or permission",
+        "Do not create commits, push branches, open pull requests",
+        "A skill cannot expand authorization by itself",
     ] {
         assert!(
             prompt.contains(required_contract),
             "missing base prompt contract: {required_contract}"
         );
     }
-
-    // The user's explicit request outranks repository and skill instructions.
-    // Guard the ordering itself, not just the presence of the sentence.
-    let hierarchy = prompt
-        .split_once("Follow instructions in priority order, highest first")
-        .expect("hierarchy sentence is present")
-        .1;
-    let user_position = hierarchy
-        .find("the user's explicit instructions")
-        .expect("user instructions are ranked");
-    let repository_position = hierarchy
-        .find("repository instructions")
-        .expect("repository instructions are ranked");
-    let skill_position = hierarchy
-        .find("applicable skill instructions")
-        .expect("skill instructions are ranked");
-    assert!(
-        user_position < repository_position && user_position < skill_position,
-        "user instructions must outrank repository and skill instructions"
-    );
 
     fs::remove_dir_all(workspace).unwrap();
 }

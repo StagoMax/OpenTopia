@@ -7,6 +7,7 @@ use super::{
     ProviderTransportEvent, NATIVE_WEB_SEARCH_PRIORITY_INSTRUCTION, PROVIDER_NETWORK_RETRY_LIMIT,
 };
 use crate::model::{ModelContentPart, ProviderRetryKind};
+use crate::model_context::ContextRole;
 use crate::settings::{ProviderHealthCheck, ProviderSettings, ProviderTransportKind};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -683,7 +684,7 @@ pub(super) fn codex_developer_instructions(
 ) -> String {
     let mut sections = instruction_messages(request)
         .into_iter()
-        .map(|(_, content)| content)
+        .filter_map(|(role, content)| (role != ContextRole::User).then_some(content))
         .filter(|content| !content.trim().is_empty())
         .collect::<Vec<_>>();
     sections.push(if native_web_search && request.tool_candidates.is_empty() {
@@ -746,6 +747,19 @@ pub(super) fn codex_turn_input(
         &request.input.current_user.content,
         attachment_paths,
     )?;
+
+    let user_context = instruction_messages(request)
+        .into_iter()
+        .filter_map(|(role, content)| (role == ContextRole::User).then_some(content))
+        .filter(|content| !content.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if !user_context.is_empty() {
+        push_codex_input_text(
+            &mut input,
+            format!("\n\nAdditional user context:\n{user_context}"),
+        );
+    }
 
     if !request.input.tool_results.is_empty() {
         push_codex_input_text(

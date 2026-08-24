@@ -604,6 +604,17 @@ pub struct EnterpriseExecutionContextV1 {
     pub connection_bindings: Vec<ConnectionBindingV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub connection_operations: Vec<ExecutionConnectionOperationV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge_binding: Option<SagKnowledgeBindingV1>,
+}
+
+/// Immutable, server-enforced SAG scope available to an Agent. Namespaces are
+/// intentionally absent from the model-facing tool schema so the model cannot
+/// widen the template's knowledge boundary at invocation time.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SagKnowledgeBindingV1 {
+    pub namespaces: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
@@ -713,6 +724,8 @@ pub struct AgentTemplateSpecV1 {
     pub risk_class: AgentRiskClassV1,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub connection_bindings: Vec<ConnectionBindingV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge_binding: Option<SagKnowledgeBindingV1>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -801,6 +814,10 @@ impl AgentTemplateVersionV1 {
         }
         validate_projection_shape(&self.spec.capabilities)?;
         validate_connection_bindings_shape(&self.spec.connection_bindings)?;
+        validate_knowledge_binding_shape(
+            self.spec.knowledge_binding.as_ref(),
+            &self.spec.capabilities,
+        )?;
         if !self.spec.connection_bindings.is_empty()
             && (self.spec.capabilities.allow_all_mcp_servers
                 || !self.spec.capabilities.mcp_servers.is_empty())
@@ -958,6 +975,11 @@ impl AgentTemplateDiffV1 {
                     &next.spec.connection_bindings,
                     &mut changes,
                 );
+                knowledge_binding_changes(
+                    previous.spec.knowledge_binding.as_ref(),
+                    next.spec.knowledge_binding.as_ref(),
+                    &mut changes,
+                );
             }
             None => {
                 projection_additions(&next.spec.capabilities, &mut changes);
@@ -985,6 +1007,7 @@ impl AgentTemplateDiffV1 {
                     }
                 }
                 connection_grant_changes(&[], &next.spec.connection_bindings, &mut changes);
+                knowledge_binding_changes(None, next.spec.knowledge_binding.as_ref(), &mut changes);
             }
         }
         let widens_capabilities = changes.iter().any(|change| {
@@ -1237,6 +1260,7 @@ impl AgentInstanceV1 {
                 model_policy,
                 connection_bindings,
                 connection_operations,
+                knowledge_binding: template.spec.knowledge_binding.clone(),
             },
             state: initial_state,
             state_revision: 1,
@@ -1356,6 +1380,9 @@ impl AgentInstanceV1 {
         if self.execution_context.connection_operations != expected_operations {
             return Err(AgentTemplateError::InstanceCapabilityViolation);
         }
+        if self.execution_context.knowledge_binding != template.spec.knowledge_binding {
+            return Err(AgentTemplateError::InstanceCapabilityViolation);
+        }
         let effective_template_boundary =
             mode_capabilities.intersect(&capabilities_with_connection_operations(
                 &template.spec.capabilities,
@@ -1405,6 +1432,12 @@ pub enum AgentTemplateError {
     InvalidInstructions,
     #[error("Agent template description cannot exceed 4000 characters")]
     InvalidDescription,
+    #[error("SAG knowledge binding requires between 1 and 12 namespaces")]
+    InvalidKnowledgeNamespaceCount,
+    #[error("invalid SAG knowledge namespace: {0}")]
+    InvalidKnowledgeNamespace(String),
+    #[error("SAG knowledge binding requires the library_search tool capability")]
+    MissingLibrarySearchCapability,
     #[error("{0} must be a JSON Schema object or boolean")]
     InvalidSchema(String),
     #[error("capability projection contains entries under an allow-all scope: {0}")]
@@ -1459,6 +1492,36 @@ fn valid_template_id(value: &str) -> bool {
         && value.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
         })
+}
+
+fn validate_knowledge_binding_shape(
+    binding: Option<&SagKnowledgeBindingV1>,
+    capabilities: &CapabilityProjection,
+) -> Result<(), AgentTemplateError> {
+    let Some(binding) = binding else {
+        return Ok(());
+    };
+    if binding.namespaces.is_empty() || binding.namespaces.len() > 12 {
+        return Err(AgentTemplateError::InvalidKnowledgeNamespaceCount);
+    }
+    for namespace in &binding.namespaces {
+        if namespace.is_empty()
+            || namespace.len() > 120
+            || !namespace.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'_' | b'-' | b'/')
+            })
+        {
+            return Err(AgentTemplateError::InvalidKnowledgeNamespace(
+                namespace.clone(),
+            ));
+        }
+    }
+    if !capabilities.allows_tool("library_search") {
+        return Err(AgentTemplateError::MissingLibrarySearchCapability);
+    }
+    Ok(())
 }
 
 fn validate_schema_shape(schema: &Value, field: &str) -> Result<(), AgentTemplateError> {
@@ -1821,6 +1884,24 @@ fn connection_grant_changes(
     );
 }
 
+fn knowledge_binding_changes(
+    previous: Option<&SagKnowledgeBindingV1>,
+    next: Option<&SagKnowledgeBindingV1>,
+    changes: &mut Vec<CapabilityChangeV1>,
+) {
+    let empty = BTreeSet::new();
+    diff_scope(
+        "knowledge_namespace",
+        false,
+        previous
+            .map(|binding| &binding.namespaces)
+            .unwrap_or(&empty),
+        false,
+        next.map(|binding| &binding.namespaces).unwrap_or(&empty),
+        changes,
+    );
+}
+
 fn diff_scope(
     scope: &str,
     previous_all: bool,
@@ -2035,6 +2116,7 @@ mod tests {
             budget: AgentBudgetV1::default(),
             risk_class: AgentRiskClassV1::Medium,
             connection_bindings: Vec::new(),
+            knowledge_binding: None,
         }
     }
 
@@ -2048,6 +2130,41 @@ mod tests {
             .publish("owner", None, true)
             .unwrap()
             .0
+    }
+
+    #[test]
+    fn sag_knowledge_binding_requires_library_tool_and_is_a_capability_diff() {
+        let namespace = "opentopia.audit.work-injury.v1".to_string();
+        let mut invalid = template_spec(&[], &[("provider", "model")]);
+        invalid.knowledge_binding = Some(SagKnowledgeBindingV1 {
+            namespaces: BTreeSet::from([namespace.clone()]),
+        });
+        assert_eq!(
+            AgentTemplateVersionV1::new_draft("audit", 1, "Audit", "owner", invalid).unwrap_err(),
+            AgentTemplateError::MissingLibrarySearchCapability
+        );
+
+        let mut first_spec = template_spec(&["library_search"], &[("provider", "model")]);
+        first_spec.knowledge_binding = Some(SagKnowledgeBindingV1 {
+            namespaces: BTreeSet::from([namespace.clone()]),
+        });
+        let first = published_template("audit", 1, first_spec);
+        let mut next_spec = first.spec.clone();
+        next_spec
+            .knowledge_binding
+            .as_mut()
+            .unwrap()
+            .namespaces
+            .insert("opentopia.audit.shared.v1".to_string());
+        let next =
+            AgentTemplateVersionV1::new_draft("audit", 2, "audit", "owner", next_spec).unwrap();
+        let diff = AgentTemplateDiffV1::between(Some(&first), &next);
+        assert!(diff.widens_capabilities);
+        assert!(diff.changes.iter().any(|change| {
+            change.scope == "knowledge_namespace"
+                && change.value == "opentopia.audit.shared.v1"
+                && change.kind == CapabilityChangeKindV1::Added
+        }));
     }
 
     #[test]

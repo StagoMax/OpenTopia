@@ -184,7 +184,11 @@ async fn opening_round_uses_the_same_context_pressure_admission_boundary() {
                 context_summary: None,
                 conversation,
                 permission_mode: PermissionMode::FullAccess,
-                context_budget: Some(ContextBudget::new(4_096)),
+                context_budget: Some({
+                    let mut budget = ContextBudget::new(4_096);
+                    budget.set_last_provider_total_tokens(3_500);
+                    budget
+                }),
                 provider_cursor: None,
                 store: None,
                 cancellation: None,
@@ -204,6 +208,139 @@ async fn opening_round_uses_the_same_context_pressure_admission_boundary() {
         .items
         .iter()
         .any(|item| item.kind == ContextItemKind::Checkpoint));
+
+    let _ = fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
+async fn opening_round_ignores_local_estimates_below_the_last_provider_total_threshold() {
+    let workspace = test_workspace("opening-round-authoritative-usage");
+    let provider = Arc::new(ScriptedProvider::new(vec![ModelResponse::text(
+        "The provider round ran without premature compaction.",
+    )]));
+    let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
+    let mut budget = ContextBudget::new(4_096);
+    budget.set_last_provider_total_tokens(2_300);
+
+    let result = agent
+        .run_turn_detailed_streaming(
+            AgentTurnInput {
+                thread_id: Uuid::new_v4(),
+                user_message_id: Uuid::new_v4(),
+                workspace_root: workspace.clone(),
+                content: "Continue from the large history.".to_string(),
+                user_content: Vec::new(),
+                context_summary: None,
+                conversation: vec![ModelConversationMessage {
+                    role: ModelConversationRole::User,
+                    content: "large locally estimated history ".repeat(2_000),
+                    content_parts: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_results: Vec::new(),
+                }],
+                permission_mode: PermissionMode::FullAccess,
+                context_budget: Some(budget),
+                provider_cursor: None,
+                store: None,
+                cancellation: None,
+            },
+            None,
+        )
+        .await
+        .expect("a 56% provider total must not trigger local-estimate compaction");
+
+    assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
+    assert_eq!(provider.requests().len(), 1);
+    assert!(!result
+        .events
+        .iter()
+        .any(|event| matches!(event, AgentEventPayload::ContextCompacted { .. })));
+
+    let _ = fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
+async fn failed_context_compaction_blocks_the_provider_round() {
+    #[derive(Debug)]
+    struct FailingCompactor {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::round_compaction::RoundContextCompactor for FailingCompactor {
+        async fn compact(
+            &self,
+            request: crate::round_compaction::RoundContextCompactionRequest,
+        ) -> anyhow::Result<crate::round_compaction::RoundContextCompactionResult> {
+            assert!(
+                request.event_sender.is_some(),
+                "a live turn must give the compactor its ordered event channel"
+            );
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("checkpoint response is not JSON")
+        }
+    }
+
+    let workspace = test_workspace("failed-context-compaction-barrier");
+    let provider = Arc::new(ScriptedProvider::new(vec![ModelResponse::text(
+        "This response must never be requested.",
+    )]));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins())
+        .with_round_context_compactor(Arc::new(FailingCompactor {
+            attempts: Arc::clone(&attempts),
+        }));
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+    let error = agent
+        .run_turn_detailed_streaming(
+            AgentTurnInput {
+                thread_id: Uuid::new_v4(),
+                user_message_id: Uuid::new_v4(),
+                workspace_root: workspace.clone(),
+                content: "Continue only after durable context admission.".to_string(),
+                user_content: Vec::new(),
+                context_summary: None,
+                conversation: vec![ModelConversationMessage {
+                    role: ModelConversationRole::User,
+                    content: "uncompressed durable history ".repeat(2_000),
+                    content_parts: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_results: Vec::new(),
+                }],
+                permission_mode: PermissionMode::FullAccess,
+                context_budget: Some({
+                    let mut budget = ContextBudget::new(4_096);
+                    budget.set_last_provider_total_tokens(3_500);
+                    budget
+                }),
+                provider_cursor: None,
+                store: None,
+                cancellation: None,
+            },
+            Some(sender),
+        )
+        .await
+        .expect_err("a failed compaction must stop before the provider round");
+
+    assert!(error
+        .to_string()
+        .contains("Durable round context compaction failed"));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert!(
+        provider.requests().is_empty(),
+        "the uncompressed request must never reach the normal provider"
+    );
+    let mut streamed = Vec::new();
+    while let Ok(payload) = receiver.try_recv() {
+        streamed.push(payload);
+    }
+    assert!(streamed.iter().any(|payload| matches!(
+        payload,
+        AgentEventPayload::ContextWarning { stage, message }
+            if stage == "round_context_compaction"
+                && message.contains("checkpoint response is not JSON")
+    )));
 
     let _ = fs::remove_dir_all(workspace);
 }
@@ -358,9 +495,13 @@ fn context_pressure_counts_typed_tool_content_and_preserves_sub_threshold_histor
     assert!(budget.as_ref().unwrap().used_tokens > 1_000);
 
     let mut below_threshold = ContextBudget::new(10_000);
-    below_threshold.used_tokens = 7_999;
+    below_threshold.used_tokens = 99_999;
     assert!(!below_threshold.requires_compaction(80));
-    below_threshold.set_round_pressure(500);
+    below_threshold.set_last_provider_total_tokens(7_999);
+    assert!(!below_threshold.requires_compaction(80));
+    below_threshold.set_round_pressure(9_999);
+    assert!(!below_threshold.requires_compaction(80));
+    below_threshold.set_last_provider_total_tokens(8_000);
     assert!(below_threshold.requires_compaction(80));
 }
 

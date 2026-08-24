@@ -392,6 +392,91 @@ fn responses_split_system_instructions_from_developer_input() {
 }
 
 #[test]
+fn codex_instruction_roles_survive_native_transports_and_degrade_safely() {
+    let mut request = layered_model_request();
+    request.instructions.items[0] = ModelContextItem::text(
+        ContextItemKind::BaseInstructions,
+        ContextRole::Developer,
+        "opentopia:base",
+        "developer base contract",
+        ContextCacheScope::Stable,
+        crate::model_context::ContextSensitivity::Public,
+    );
+    request.instructions.items.push(ModelContextItem::text(
+        ContextItemKind::RepositoryInstructions,
+        ContextRole::User,
+        "AGENTS.md",
+        "repository user context",
+        ContextCacheScope::Turn,
+        crate::model_context::ContextSensitivity::Workspace,
+    ));
+    request.instructions.items.push(ModelContextItem::text(
+        ContextItemKind::SkillInstructions,
+        ContextRole::User,
+        "skills/review/SKILL.md",
+        "selected skill user context",
+        ContextCacheScope::Turn,
+        crate::model_context::ContextSensitivity::Workspace,
+    ));
+
+    let chat = openai_messages(&request);
+    assert_eq!(chat[0]["role"], "developer");
+    assert!(chat[0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("developer base contract"));
+    assert!(chat.iter().any(|message| {
+        message["role"] == "user"
+            && message.to_string().contains("repository user context")
+    }));
+    assert!(chat.iter().any(|message| {
+        message["role"] == "user"
+            && message.to_string().contains("selected skill user context")
+    }));
+
+    let responses = OpenAiResponsesProvider::new(
+        "https://api.openai.com/v1",
+        "test-key",
+        "gpt-test",
+    )
+    .prepare(Uuid::nil(), request.clone())
+    .unwrap();
+    assert!(!responses.body["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("developer base contract"));
+    let responses_input = responses.body["input"].as_array().unwrap();
+    assert_eq!(responses_input[0]["role"], "developer");
+    assert!(responses_input.iter().any(|message| {
+        message["role"] == "user"
+            && message.to_string().contains("repository user context")
+    }));
+
+    let anthropic = AnthropicMessagesProvider::new(
+        "https://api.anthropic.com",
+        "test-key",
+        "claude-test",
+    )
+    .prepare(Uuid::nil(), request.clone())
+    .unwrap();
+    let anthropic_system = anthropic.body["system"].as_str().unwrap();
+    assert!(anthropic_system.contains("developer base contract"));
+    assert!(!anthropic_system.contains("repository user context"));
+    assert!(anthropic.body["messages"]
+        .to_string()
+        .contains("repository user context"));
+
+    let codex_developer = codex_developer_instructions(&request, false);
+    assert!(codex_developer.contains("developer base contract"));
+    assert!(!codex_developer.contains("repository user context"));
+    let mut attachment_paths = Vec::new();
+    let codex_input = codex_turn_input(&request, &mut attachment_paths).unwrap();
+    let codex_input = serde_json::to_string(&codex_input).unwrap();
+    assert!(codex_input.contains("repository user context"));
+    assert!(codex_input.contains("selected skill user context"));
+}
+
+#[test]
 fn responses_keeps_harness_labels_out_of_wire_messages_and_tools_separate() {
     let provider =
         OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-test");

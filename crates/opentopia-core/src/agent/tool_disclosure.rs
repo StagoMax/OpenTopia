@@ -5,11 +5,12 @@ use super::{
     AtomicOrdering, BTreeMap, CancellationToken, CanonicalModelRequest, CollaborationMode,
     CompiledModelContext, ContextAssemblyInput, HashSet, ModelCallPurpose, ModelContentPart,
     ModelConversationMessage, ModelGatewayMetricEvent, ModelResponse, ModelStreamDelta,
-    MultiAgentMode, PromptCacheBreakpointPolicy, ProviderFeatureSupport, ProviderToolCall,
-    ProviderToolCandidate, ProviderToolDisclosure, ProviderToolNamespace, ProviderToolResult,
-    ProviderTransportEvent, ToolClass, ToolExposurePolicy, ToolSource, TurnEvents, Uuid, Value,
-    AUTOMATIC_TOOL_DISCLOSURE_COUNT_THRESHOLD, AUTOMATIC_TOOL_DISCLOSURE_TOKEN_THRESHOLD,
-    DEFAULT_EAGER_OFFICE_TOOLS, MAX_TOOL_SEARCH_RESULTS, TOOL_SEARCH_NAME,
+    MultiAgentMode, PromptCacheBreakpointPolicy, ProviderFeatureSupport, ProviderRequestCheckpoint,
+    ProviderToolCall, ProviderToolCandidate, ProviderToolDisclosure, ProviderToolNamespace,
+    ProviderToolResult, ProviderTransportEvent, ToolClass, ToolExposurePolicy, ToolSource,
+    TurnEvents, Uuid, Value, AUTOMATIC_TOOL_DISCLOSURE_COUNT_THRESHOLD,
+    AUTOMATIC_TOOL_DISCLOSURE_TOKEN_THRESHOLD, DEFAULT_EAGER_OFFICE_TOOLS, MAX_TOOL_SEARCH_RESULTS,
+    TOOL_SEARCH_NAME,
 };
 
 impl AgentCore {
@@ -49,6 +50,7 @@ impl AgentCore {
         &self,
         request: CanonicalModelRequest,
         round: usize,
+        provider_compatibility_hash: &str,
         events: &mut TurnEvents,
         cancellation: Option<&CancellationToken>,
     ) -> anyhow::Result<ModelResponse> {
@@ -82,6 +84,14 @@ impl AgentCore {
             request: request_snapshot,
         });
         let prepared = self.kernel.model_gateway.prepare(request_id, request)?;
+        let checkpoint =
+            prepared
+                .wire_transcript
+                .clone()
+                .map(|transcript| ProviderRequestCheckpoint {
+                    compatibility_hash: provider_compatibility_hash.to_string(),
+                    transcript,
+                });
         events.push(AgentEventPayload::ProviderRequestSent {
             request_id,
             round,
@@ -91,6 +101,7 @@ impl AgentCore {
             endpoint: prepared.endpoint.clone(),
             cache_trace: prepared.cache_trace.clone(),
             body: prepared.observation_body.clone(),
+            checkpoint,
         });
         let live_event_sender = events.sender.clone();
         let mut transport_events = Vec::new();
@@ -152,6 +163,8 @@ impl AgentCore {
             Ok(())
         };
         let mut latest_usage = None;
+        let mut proposed_plan_parser = (self.collaboration_mode == CollaborationMode::Plan)
+            .then(super::proposed_plan::ProposedPlanStreamParser::default);
         let first_token_pending = Arc::new(AtomicBool::new(false));
         let metric_pending = Arc::clone(&first_token_pending);
         let metric_event_sender = events.sender.clone();
@@ -177,7 +190,13 @@ impl AgentCore {
             }
             match delta {
                 ModelStreamDelta::Text { text } => {
-                    events.push(AgentEventPayload::ModelDelta { text });
+                    let visible = proposed_plan_parser
+                        .as_mut()
+                        .map(|parser| parser.push_str(&text))
+                        .unwrap_or(text);
+                    if !visible.is_empty() {
+                        events.push(AgentEventPayload::ModelDelta { text: visible });
+                    }
                 }
                 ModelStreamDelta::Reasoning { text } => {
                     events.push(AgentEventPayload::ReasoningDelta { text });
@@ -208,6 +227,12 @@ impl AgentCore {
         };
         drop(on_delta);
         drop(on_transport);
+        if let Some(parser) = proposed_plan_parser {
+            let visible = parser.finish();
+            if !visible.is_empty() {
+                events.push(AgentEventPayload::ModelDelta { text: visible });
+            }
+        }
         if first_token_pending.swap(false, AtomicOrdering::SeqCst) {
             events.record(AgentEventPayload::ProviderFirstTokenReceived { request_id });
         }
@@ -274,7 +299,7 @@ impl AgentCore {
     pub(super) fn eligible_provider_tool_candidates(&self) -> Vec<ProviderToolCandidate> {
         let agents_available = self.collaboration.is_some()
             && self.agent_runtime_settings.multi_agent != MultiAgentMode::Off;
-        let structured_input_available = self.request_user_input_is_available();
+        let structured_input_exposable = self.agent_depth == 0;
         self.tool_host
             .catalog
             .list()
@@ -283,7 +308,7 @@ impl AgentCore {
                 agents_available || self.tool_host.catalog.class(name) != Some(ToolClass::Agent)
             })
             .filter(|name| {
-                structured_input_available
+                structured_input_exposable
                     || self.tool_host.catalog.class(name) != Some(ToolClass::StructuredInput)
             })
             // The root agent owns the shared task plan. Children report results

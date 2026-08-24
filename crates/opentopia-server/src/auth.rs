@@ -1,3 +1,6 @@
+use crate::send_trace::{
+    CLIENT_STARTED_AT_HEADER, CLIENT_TO_SERVER_HEADER, REQUEST_ID_HEADER, SERVER_DURATION_HEADER,
+};
 use crate::AppState;
 use anyhow::{bail, Context};
 use axum::extract::{Request, State};
@@ -79,8 +82,19 @@ impl ApiAuth {
                 Method::PUT,
                 Method::DELETE,
             ])
-            .allow_headers([AUTHORIZATION, CONTENT_TYPE, ACCEPT])
-            .expose_headers([TURN_ID_HEADER])
+            .allow_headers([
+                AUTHORIZATION,
+                CONTENT_TYPE,
+                ACCEPT,
+                REQUEST_ID_HEADER,
+                CLIENT_STARTED_AT_HEADER,
+            ])
+            .expose_headers([
+                TURN_ID_HEADER,
+                REQUEST_ID_HEADER,
+                SERVER_DURATION_HEADER,
+                CLIENT_TO_SERVER_HEADER,
+            ])
             .max_age(Duration::from_secs(600))
     }
 

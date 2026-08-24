@@ -108,6 +108,7 @@ mod routes;
 mod runtime_api;
 mod runtime_shutdown;
 mod scm_api;
+mod send_trace;
 mod terminal_api;
 mod thread_runtime;
 mod turn_changes;
@@ -176,6 +177,7 @@ use resource_api::{
 use resource_registry::{
     parse_resource_preview_id, resource_preview_id, ResourceLease, ResourceLocator,
 };
+use send_trace::ConversationSendTrace;
 use terminal_api::{PtyManager, TerminalBus};
 #[cfg(test)]
 use thread_runtime::{attachment_preloaded_tools, computer_allowed_applications};
@@ -240,7 +242,7 @@ fn agent_result_text(events: &[AgentEventPayload]) -> String {
         })
         .flat_map(|message| message.parts.iter())
         .filter_map(|part| match part {
-            MessagePart::Text { text } => Some(text.as_str()),
+            MessagePart::Text { text } | MessagePart::ProposedPlan { text } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -1254,9 +1256,13 @@ async fn run_new_agent_turn(
     collaboration_mode: CollaborationMode,
     goal: Option<GoalRecord>,
     library_provider: Option<library_api::LibraryProviderId>,
+    send_trace: Option<ConversationSendTrace>,
 ) {
     let thread_id = thread.id;
     let turn_id = turn.turn_id;
+    if let Some(trace) = send_trace {
+        trace.phase("agent_task_started", thread_id, Some(turn_id));
+    }
     let settings = current_settings(&state);
     if let Err(error) = ensure_experience_mode_enabled(&settings, thread.experience_mode) {
         let message = error.message;
@@ -1419,6 +1425,9 @@ async fn run_new_agent_turn(
         .turn_changes
         .lock_workspace_shared(&workspace_root)
         .await;
+    if let Some(trace) = send_trace {
+        trace.phase("workspace_lock_acquired", thread_id, Some(turn_id));
+    }
     begin_turn_change_capture(&state, thread_id, turn_id, &workspace_root).await;
     let surface_profile = ExperienceSurfaceProfile::for_mode(thread.experience_mode);
     let effective_capabilities = if thread.experience_mode == ExperienceMode::Flow {
@@ -1432,7 +1441,7 @@ async fn run_new_agent_turn(
             flow_capabilities
                 .tools
                 .extend(ExperienceSurfaceProfile::flow_control_tools());
-            if library_provider.is_some() {
+            if library_provider.is_some() && bound_agent_instance.is_none() {
                 flow_capabilities.tools.insert("library_search".to_string());
             }
         }
@@ -1545,7 +1554,17 @@ async fn run_new_agent_turn(
         );
         return;
     }
-    if let Some(provider) = library_provider {
+    if let Some(binding) = bound_agent_instance
+        .as_ref()
+        .and_then(|instance| instance.execution_context.knowledge_binding.as_ref())
+    {
+        let namespaces = binding.namespaces.iter().cloned().collect::<Vec<_>>();
+        agent.set_library_namespaces(namespaces.clone());
+        agent.register_runtime_tool(Arc::new(library_api::LibrarySearchTool::scoped(
+            state.library_providers.clone(),
+            namespaces,
+        )));
+    } else if let Some(provider) = library_provider {
         agent.register_runtime_tool(Arc::new(library_api::LibrarySearchTool::new(
             state.library_providers.clone(),
             provider,
@@ -1605,6 +1624,9 @@ async fn run_new_agent_turn(
             return;
         }
     };
+    if let Some(trace) = send_trace {
+        trace.phase("agent_runtime_prepared", thread_id, Some(turn_id));
+    }
     let built_context = build_turn_model_context(
         &state,
         &settings,
@@ -1618,6 +1640,10 @@ async fn run_new_agent_turn(
         bound_agent_template.as_ref(),
     )
     .await;
+    if let Some(trace) = send_trace {
+        trace.phase("model_context_built", thread_id, Some(turn_id));
+        trace.phase("history_preparation_started", thread_id, Some(turn_id));
+    }
     let tool_schema_tokens = agent.provider_tool_token_estimate();
     let context_reservation = turn_context_reservation(
         &selected_provider,
@@ -1692,6 +1718,14 @@ async fn run_new_agent_turn(
             return;
         }
     };
+    if let Some(trace) = send_trace {
+        trace.phase_with_count(
+            "history_prepared",
+            thread_id,
+            Some(turn_id),
+            prepared.conversation.len(),
+        );
+    }
     publish_payload(
         &state,
         thread_id,
@@ -1782,6 +1816,9 @@ async fn run_new_agent_turn(
         },
     );
     let (sender, mut receiver) = mpsc::unbounded_channel();
+    if let Some(trace) = send_trace {
+        trace.phase("agent_drive_started", thread_id, Some(turn_id));
+    }
     let future = drive_agent_turn(&agent, input, Some(built_context.context), Some(sender));
     tokio::pin!(future);
     let mut deferred_wait_events = Vec::new();
@@ -1806,6 +1843,7 @@ async fn run_new_agent_turn(
                     }
                     persist_received_payload_batch(
                         &state,
+                        &selected_provider,
                         thread_id,
                         turn_id,
                         payloads,
@@ -1832,12 +1870,18 @@ async fn run_new_agent_turn(
                 );
                 return;
             }
-            result = &mut future => break result,
+            result = &mut future => {
+                if let Some(trace) = send_trace {
+                    trace.phase("agent_drive_finished", thread_id, Some(turn_id));
+                }
+                break result;
+            },
             payload = receiver.recv() => {
                 if let Some(payload) = payload {
                     let payloads = take_available_payload_batch(&mut receiver, Some(payload));
                     persist_received_payload_batch(
                         &state,
+                        &selected_provider,
                         thread_id,
                         turn_id,
                         payloads,
@@ -1856,6 +1900,7 @@ async fn run_new_agent_turn(
         }
         persist_received_payload_batch(
             &state,
+            &selected_provider,
             thread_id,
             turn_id,
             payloads,
@@ -2124,7 +2169,87 @@ async fn run_resumed_agent_turn(
         })
         .as_ref()
         .and_then(message_library_provider);
-    if let Some(provider) = library_provider {
+    let resumed_thread = match state.store.get_thread(thread_id) {
+        Ok(Some(thread)) => thread,
+        Ok(None) => {
+            let message =
+                "failed to restore bound Agent knowledge scope: task no longer exists".to_string();
+            publish_payload(
+                &state,
+                thread_id,
+                Some(turn_id),
+                AgentEventPayload::Error {
+                    message: message.clone(),
+                },
+            );
+            finalize_turn_change_capture(&state, thread_id, turn_id, TurnStatus::Failed).await;
+            finish_turn(
+                &state,
+                thread_id,
+                turn_id,
+                TurnStatus::Failed,
+                Some(message),
+            );
+            return;
+        }
+        Err(error) => {
+            let message = format!("failed to restore bound Agent knowledge scope: {error}");
+            publish_payload(
+                &state,
+                thread_id,
+                Some(turn_id),
+                AgentEventPayload::Error {
+                    message: message.clone(),
+                },
+            );
+            finalize_turn_change_capture(&state, thread_id, turn_id, TurnStatus::Failed).await;
+            finish_turn(
+                &state,
+                thread_id,
+                turn_id,
+                TurnStatus::Failed,
+                Some(message),
+            );
+            return;
+        }
+    };
+    let resumed_bound_agent = match load_bound_agent_context(&state, &resumed_thread) {
+        Ok((instance, _)) => instance,
+        Err(error) => {
+            let message = format!(
+                "failed to restore bound Agent knowledge scope: {}",
+                error.message
+            );
+            publish_payload(
+                &state,
+                thread_id,
+                Some(turn_id),
+                AgentEventPayload::Error {
+                    message: message.clone(),
+                },
+            );
+            finalize_turn_change_capture(&state, thread_id, turn_id, TurnStatus::Failed).await;
+            finish_turn(
+                &state,
+                thread_id,
+                turn_id,
+                TurnStatus::Failed,
+                Some(message),
+            );
+            return;
+        }
+    };
+    if let Some(binding) = resumed_bound_agent
+        .as_ref()
+        .and_then(|instance| instance.execution_context.knowledge_binding.as_ref())
+    {
+        let namespaces = binding.namespaces.iter().cloned().collect::<Vec<_>>();
+        agent.set_library_namespaces(namespaces.clone());
+        agent.register_runtime_tool(Arc::new(library_api::LibrarySearchTool::scoped(
+            state.library_providers.clone(),
+            namespaces,
+        )));
+    } else if let Some(provider) = library_provider {
         agent.register_runtime_tool(Arc::new(library_api::LibrarySearchTool::new(
             state.library_providers.clone(),
             provider,
@@ -2211,6 +2336,7 @@ async fn run_resumed_agent_turn(
                     }
                     persist_received_payload_batch(
                         &state,
+                        &selected_provider,
                         thread_id,
                         turn_id,
                         payloads,
@@ -2243,6 +2369,7 @@ async fn run_resumed_agent_turn(
                     let payloads = take_available_payload_batch(&mut receiver, Some(payload));
                     persist_received_payload_batch(
                         &state,
+                        &selected_provider,
                         thread_id,
                         turn_id,
                         payloads,
@@ -2261,6 +2388,7 @@ async fn run_resumed_agent_turn(
         }
         persist_received_payload_batch(
             &state,
+            &selected_provider,
             thread_id,
             turn_id,
             payloads,
@@ -2466,6 +2594,52 @@ fn load_provider_cursor(
         }),
         invalidation: None,
     })
+}
+
+fn persist_provider_request_checkpoints(
+    store: &SqliteSessionStore,
+    provider: &ProviderSettings,
+    thread_id: Uuid,
+    agent_path: &str,
+    payloads: &mut [AgentEventPayload],
+) -> anyhow::Result<()> {
+    for payload in payloads {
+        if !matches!(payload, AgentEventPayload::ProviderRequestSent { .. }) {
+            continue;
+        }
+        let Some(checkpoint) = payload.take_provider_request_checkpoint() else {
+            continue;
+        };
+        if !provider_state_enabled(provider) {
+            continue;
+        }
+        let cursor = ProviderConversationCursor::from_request_checkpoint(checkpoint);
+        let adapter_identity = provider.resolved_route().adapter_identity();
+        let checkpoint_id = store
+            .get_provider_conversation_state(thread_id, agent_path)?
+            .filter(|state| {
+                state.provider_id == provider.id
+                    && state.model == provider.model
+                    && (state.adapter_identity.is_empty()
+                        || state.adapter_identity == adapter_identity)
+            })
+            .and_then(|state| state.checkpoint_id);
+        store.save_provider_conversation_state(&ProviderConversationState {
+            thread_id,
+            agent_path: agent_path.to_string(),
+            provider_id: provider.id.clone(),
+            model: provider.model.clone(),
+            adapter_identity: adapter_identity.clone(),
+            response_id: cursor.response_id,
+            compatibility_hash: cursor.compatibility_hash,
+            response_items: cursor.response_items,
+            state_kind: cursor.state_kind,
+            compaction_item_count: cursor.compaction_item_count,
+            checkpoint_id,
+            updated_at: Utc::now(),
+        })?;
+    }
+    Ok(())
 }
 
 fn persist_provider_cursor(
@@ -3016,6 +3190,7 @@ fn take_available_payload_batch(
 
 async fn persist_received_payload_batch(
     state: &AppState,
+    provider: &ProviderSettings,
     thread_id: Uuid,
     turn_id: Uuid,
     payloads: Vec<AgentEventPayload>,
@@ -3038,12 +3213,22 @@ async fn persist_received_payload_batch(
             durable_payloads.push(payload);
         }
     }
-    let durable_payloads = compact_stream_payload_batch(durable_payloads);
+    let mut durable_payloads = compact_stream_payload_batch(durable_payloads);
     if durable_payloads.is_empty() {
         return;
     }
     let state = state.clone();
+    let provider = provider.clone();
     if let Err(error) = tokio::task::spawn_blocking(move || {
+        if let Err(error) = persist_provider_request_checkpoints(
+            &state.store,
+            &provider,
+            thread_id,
+            "/root",
+            &mut durable_payloads,
+        ) {
+            error!(?error, %thread_id, %turn_id, "failed to persist provider request checkpoint");
+        }
         persist_and_publish_payloads(&state, thread_id, turn_id, durable_payloads);
     })
     .await

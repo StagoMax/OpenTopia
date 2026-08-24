@@ -350,6 +350,14 @@ impl LibraryProviderId {
 pub(crate) struct LibrarySearchTool {
     providers: Arc<LibraryProviderRegistry>,
     provider: LibraryProviderId,
+    namespace_scope: LibraryNamespaceScope,
+}
+
+#[derive(Clone)]
+enum LibraryNamespaceScope {
+    Unrestricted,
+    Fixed(Vec<String>),
+    RuntimeBound,
 }
 
 impl LibrarySearchTool {
@@ -360,8 +368,57 @@ impl LibrarySearchTool {
         Self {
             providers,
             provider,
+            namespace_scope: LibraryNamespaceScope::Unrestricted,
         }
     }
+
+    pub(crate) fn scoped(
+        providers: Arc<LibraryProviderRegistry>,
+        namespaces: impl IntoIterator<Item = String>,
+    ) -> Self {
+        Self {
+            providers,
+            provider: LibraryProviderId::Sag,
+            namespace_scope: LibraryNamespaceScope::Fixed(normalize_namespaces(namespaces)),
+        }
+    }
+
+    pub(crate) fn runtime_scoped(providers: Arc<LibraryProviderRegistry>) -> Self {
+        Self {
+            providers,
+            provider: LibraryProviderId::Sag,
+            namespace_scope: LibraryNamespaceScope::RuntimeBound,
+        }
+    }
+
+    fn namespaces(&self, context: &ToolInvocationContext) -> anyhow::Result<Vec<String>> {
+        match &self.namespace_scope {
+            LibraryNamespaceScope::Unrestricted => Ok(Vec::new()),
+            LibraryNamespaceScope::Fixed(namespaces) if !namespaces.is_empty() => {
+                Ok(namespaces.clone())
+            }
+            LibraryNamespaceScope::Fixed(_) => {
+                anyhow::bail!("library_search has an empty fixed SAG namespace binding")
+            }
+            LibraryNamespaceScope::RuntimeBound if !context.library_namespaces.is_empty() => {
+                Ok(normalize_namespaces(context.library_namespaces.clone()))
+            }
+            LibraryNamespaceScope::RuntimeBound => {
+                anyhow::bail!("library_search requires a runtime SAG namespace binding")
+            }
+        }
+    }
+}
+
+fn normalize_namespaces(namespaces: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut namespaces = namespaces
+        .into_iter()
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>();
+    namespaces.sort();
+    namespaces.dedup();
+    namespaces
 }
 
 #[derive(Debug, Deserialize)]
@@ -434,10 +491,11 @@ impl Tool for LibrarySearchTool {
     async fn execute(
         &self,
         call: ToolCall,
-        _ctx: ToolInvocationContext,
+        ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let input: LibraryToolInput = serde_json::from_value(call.input)
             .map_err(|error| anyhow::anyhow!("invalid library_search arguments: {error}"))?;
+        let namespaces = self.namespaces(&ctx)?;
         let request = LibrarySearchRequest {
             query: input.query,
             purpose: default_search_purpose(),
@@ -445,7 +503,7 @@ impl Tool for LibrarySearchTool {
             maximum_tokens: input.maximum_tokens.unwrap_or_else(default_maximum_tokens),
             use_deepseek: true,
             subject_refs: Vec::new(),
-            namespaces: Vec::new(),
+            namespaces: namespaces.clone(),
             retrieval_mode: input.retrieval_mode.unwrap_or_else(default_retrieval_mode),
         };
         let value = self
@@ -465,6 +523,7 @@ impl Tool for LibrarySearchTool {
                 "providerName": self.provider.display_name(),
                 "success": true,
                 "reviewOnly": true,
+                "namespaces": namespaces,
                 "promptInjection": false,
             }),
         })
@@ -1141,6 +1200,26 @@ mod tests {
         assert_eq!(providers[1].id, "graph-rag");
         assert!(providers[1].capabilities.graph_paths);
         assert!(providers[0].capabilities.temporal_memory);
+    }
+
+    #[test]
+    fn runtime_scoped_library_tool_fails_closed_without_namespaces() {
+        let tool =
+            LibrarySearchTool::runtime_scoped(Arc::new(LibraryProviderRegistry::for_tests()));
+        let authority = opentopia_core::ExecutionAuthority::new(
+            std::env::current_dir().unwrap(),
+            opentopia_core::PermissionMode::ReadOnly,
+            opentopia_core::LocalSandboxConfig::default(),
+            opentopia_core::CapabilityProjection::unrestricted(),
+        )
+        .unwrap();
+        let mut context = authority.local_tool_context();
+        assert!(tool.namespaces(&context).is_err());
+        context.library_namespaces = vec!["opentopia.audit.credit-review.v1".to_string()];
+        assert_eq!(
+            tool.namespaces(&context).unwrap(),
+            vec!["opentopia.audit.credit-review.v1"]
+        );
     }
 
     #[test]

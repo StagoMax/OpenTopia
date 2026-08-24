@@ -1831,6 +1831,16 @@
         "instructions": {
           "type": "string"
         },
+        "knowledgeBinding": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SagKnowledgeBindingV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "modelPolicy": {
           "$ref": "#/definitions/AgentModelPolicyV1"
         },
@@ -5226,6 +5236,16 @@
           },
           "type": "array"
         },
+        "knowledgeBinding": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SagKnowledgeBindingV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "mode": {
           "$ref": "#/definitions/ExperienceMode"
         },
@@ -8205,6 +8225,25 @@
           "type": "object"
         },
         {
+          "description": "A Plan-mode proposal extracted from the model's `<proposed_plan>` block. This is presentation content, not the executable WorkForm maintained by the Default/Goal `update_plan` tool.",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "proposed_plan"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "text",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
           "properties": {
             "contentType": {
               "type": "string"
@@ -11050,6 +11089,22 @@
       ],
       "type": "object"
     },
+    "SagKnowledgeBindingV1": {
+      "description": "Immutable, server-enforced SAG scope available to an Agent. Namespaces are intentionally absent from the model-facing tool schema so the model cannot widen the template's knowledge boundary at invocation time.",
+      "properties": {
+        "namespaces": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "namespaces"
+      ],
+      "type": "object"
+    },
     "SagStatus": {
       "properties": {
         "agent_loop_integration": {
@@ -13772,6 +13827,16 @@
         },
         "instructions": {
           "type": "string"
+        },
+        "knowledgeBinding": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SagKnowledgeBindingV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "modelPolicy": {
           "$ref": "#/definitions/AgentModelPolicyV1"

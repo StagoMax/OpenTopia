@@ -4,11 +4,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextBudget {
     pub max_tokens: usize,
+    /// Provider-reported `total_tokens` from the most recently completed
+    /// agent round. This is the sole proactive compaction admission signal.
+    #[serde(default)]
+    pub last_provider_total_tokens: Option<usize>,
+    /// Local estimates are retained for diagnostics only. They must not gate
+    /// a provider round because provider tokenization is authoritative.
     pub used_tokens: usize,
     pub warnings: Vec<String>,
-    /// Output, reasoning, and provider-framing headroom reserved before every
-    /// provider round. It participates in pressure admission but is not part of
-    /// the logical input estimate reported as `used_tokens`.
+    /// Legacy diagnostic field retained for continuation compatibility. The
+    /// configured compaction threshold itself provides generation headroom.
     #[serde(default)]
     pub reserved_generation_tokens: usize,
 }
@@ -17,6 +22,7 @@ impl ContextBudget {
     pub fn new(max_tokens: usize) -> Self {
         Self {
             max_tokens,
+            last_provider_total_tokens: None,
             used_tokens: 0,
             warnings: Vec::new(),
             reserved_generation_tokens: 0,
@@ -28,8 +34,7 @@ impl ContextBudget {
     }
 
     pub fn pressure_tokens(&self) -> usize {
-        self.used_tokens
-            .saturating_add(self.reserved_generation_tokens)
+        self.last_provider_total_tokens.unwrap_or_default()
     }
 
     pub fn pressure_percent(&self) -> usize {
@@ -37,12 +42,24 @@ impl ContextBudget {
     }
 
     pub fn requires_compaction(&self, threshold_percent: usize) -> bool {
-        self.pressure_tokens().saturating_mul(100)
-            >= self.max_tokens.saturating_mul(threshold_percent)
+        self.last_provider_total_tokens.is_some_and(|total_tokens| {
+            total_tokens.saturating_mul(100) >= self.max_tokens.saturating_mul(threshold_percent)
+        })
     }
 
     pub fn record_tokens(&mut self, tokens: usize) {
-        self.used_tokens += tokens;
+        self.used_tokens = self.used_tokens.saturating_add(tokens);
+    }
+
+    pub fn record_provider_usage(&mut self, usage: &ModelUsage) {
+        self.set_last_provider_total_tokens(
+            usize::try_from(usage.total_tokens).unwrap_or(usize::MAX),
+        );
+    }
+
+    pub fn set_last_provider_total_tokens(&mut self, total_tokens: usize) {
+        self.last_provider_total_tokens = Some(total_tokens);
+        self.warnings.clear();
         let pressure_tokens = self.pressure_tokens();
         let usage_pct = pressure_tokens as f64 / self.max_tokens as f64;
         if usage_pct >= 0.90 && usage_pct < 0.95 {
@@ -68,8 +85,17 @@ impl ContextBudget {
         }
     }
 
+    pub fn force_compaction(&mut self) {
+        self.set_last_provider_total_tokens(self.max_tokens);
+    }
+
+    pub fn clear_provider_usage(&mut self) {
+        self.last_provider_total_tokens = None;
+        self.warnings.clear();
+    }
+
     pub fn is_exceeded(&self) -> bool {
-        self.used_tokens >= self.max_tokens
+        self.pressure_tokens() >= self.max_tokens
     }
 
     pub fn estimate_tokens(text: &str) -> usize {

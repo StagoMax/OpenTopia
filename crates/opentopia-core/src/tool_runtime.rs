@@ -74,6 +74,7 @@ pub struct ToolRuntimeHost {
     pub(crate) mcp_host: Option<McpExtensionHost>,
     pub(crate) active_mcp_tools: Vec<McpToolDescriptor>,
     pub(crate) active_connection_operations: BTreeMap<String, ConnectionOperationRuntimeRoute>,
+    pub(crate) library_namespaces: Vec<String>,
     pub(crate) model_supports_vision: bool,
     pub(crate) sandbox_config: LocalSandboxConfig,
     pub(crate) browser: Arc<dyn BrowserRuntime>,
@@ -93,6 +94,7 @@ impl ToolRuntimeHost {
             mcp_host: None,
             active_mcp_tools: Vec::new(),
             active_connection_operations: BTreeMap::new(),
+            library_namespaces: Vec::new(),
             model_supports_vision,
             sandbox_config,
             browser: Arc::new(LocalBrowserRuntime::new(BrowserRuntimeConfig::default())),
@@ -180,21 +182,45 @@ impl AsyncToolResult {
         if !chunk.stderr.trim().is_empty() {
             lines.push(format!("stderr:\n{}", chunk.stderr.trim()));
         }
+        let output = lines.join("\n");
+        let mut metadata = json!({
+            "asyncToolResult": true,
+            "jobId": job.job_id,
+            "command": job.command,
+            "status": job.status,
+            "exitCode": job.exit_code,
+            "success": job.success,
+            "droppedBytes": chunk.dropped_bytes,
+            "untrusted": true,
+        });
+        if !job.success {
+            let (code, message) = job
+                .exit_code
+                .filter(|exit_code| *exit_code != 0)
+                .map_or_else(
+                    || {
+                        (
+                            "background_job_failed",
+                            job.error.clone().unwrap_or_else(|| {
+                                "Background job failed before returning an exit code".into()
+                            }),
+                        )
+                    },
+                    |exit_code| {
+                        (
+                            "command_exit_nonzero",
+                            format!("Command exited with code {exit_code}"),
+                        )
+                    },
+                );
+            insert_tool_error_record(&mut metadata, code, "command", true, false, &message);
+        }
         Self {
             job_id: job.job_id,
             tool_name: tool_name.into(),
-            output: lines.join("\n"),
+            output,
             is_error: !job.success,
-            metadata: json!({
-                "asyncToolResult": true,
-                "jobId": job.job_id,
-                "command": job.command,
-                "status": job.status,
-                "exitCode": job.exit_code,
-                "success": job.success,
-                "droppedBytes": chunk.dropped_bytes,
-                "untrusted": true,
-            }),
+            metadata,
         }
     }
 

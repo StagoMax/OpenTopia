@@ -248,7 +248,14 @@ async fn long_turn_replaces_covered_tool_history_with_a_durable_checkpoint() {
                     }),
                 })
                 .collect(),
-            usage: None,
+            usage: Some(ModelUsage {
+                input_tokens: 3_400,
+                output_tokens: 100,
+                total_tokens: 3_500,
+                cached_input_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+            }),
             response_id: None,
             provider_items: Vec::new(),
             finish_reason: ModelFinishReason::Stop,

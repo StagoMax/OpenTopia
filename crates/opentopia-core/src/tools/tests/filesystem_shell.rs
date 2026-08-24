@@ -1,4 +1,5 @@
 use super::*;
+use crate::NetworkAccess;
 
 #[cfg(windows)]
 #[tokio::test]
@@ -244,6 +245,16 @@ fn shell_intent_projects_known_external_reads_through_unknown_pipeline_segments(
     assert!(grant.sandbox.is_within_approved_read_scope(&requested));
     assert!(!grant.sandbox.is_within_approved_read_scope(&sibling));
     assert!(grant.sandbox.approved_write_paths.is_empty());
+}
+
+#[test]
+fn shell_intent_requests_network_for_nested_powershell_calls() {
+    let analysis = analyze_shell_command(
+        "$uri = 'https://example.test'; try { Invoke-WebRequest -Uri $uri } catch { exit 1 }",
+    );
+    let intent = shell_execution_intent(&analysis);
+
+    assert_eq!(intent.network, NetworkAccess::Required);
 }
 
 #[tokio::test]

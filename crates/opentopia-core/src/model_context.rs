@@ -315,18 +315,39 @@ impl ModelContextItem {
         }
 
         let expected = match self.kind {
-            ContextItemKind::BaseInstructions => {
-                Some((ContextAuthority::System, ContextLifecycle::Build))
-            }
-            ContextItemKind::DeveloperInstructions | ContextItemKind::RepositoryInstructions => {
+            // New contexts use developer authority for the base contract, like
+            // Codex. System authority remains valid for serialized legacy
+            // contexts so old checkpoints can still be replayed.
+            ContextItemKind::BaseInstructions => Some((
+                match self.role {
+                    ContextRole::System => ContextAuthority::System,
+                    _ => ContextAuthority::Developer,
+                },
+                ContextLifecycle::Build,
+            )),
+            ContextItemKind::DeveloperInstructions => {
                 Some((ContextAuthority::Developer, self.lifecycle))
             }
+            // Repository and selected Skill documents are contextual user
+            // instructions. Accept the former developer transport for replay
+            // compatibility, while new assembly uses the user role.
+            ContextItemKind::RepositoryInstructions => Some((
+                match self.role {
+                    ContextRole::Developer => ContextAuthority::Developer,
+                    _ => ContextAuthority::User,
+                },
+                self.lifecycle,
+            )),
             ContextItemKind::WorldState | ContextItemKind::CapabilityCatalog => {
                 Some((ContextAuthority::Data, self.lifecycle))
             }
-            ContextItemKind::SkillInstructions => {
-                Some((ContextAuthority::Developer, ContextLifecycle::Turn))
-            }
+            ContextItemKind::SkillInstructions => Some((
+                match self.role {
+                    ContextRole::Developer => ContextAuthority::Developer,
+                    _ => ContextAuthority::User,
+                },
+                ContextLifecycle::Turn,
+            )),
             ContextItemKind::Summary | ContextItemKind::Checkpoint => {
                 Some((ContextAuthority::Data, ContextLifecycle::Epoch))
             }
@@ -405,11 +426,11 @@ fn inferred_semantics(
         ContextCacheScope::Round => ContextLifecycle::Round,
     };
     match kind {
-        ContextItemKind::BaseInstructions => (ContextAuthority::System, ContextLifecycle::Build),
+        ContextItemKind::BaseInstructions => (role_authority, ContextLifecycle::Build),
         ContextItemKind::WorldState => (ContextAuthority::Data, ContextLifecycle::Turn),
         ContextItemKind::CapabilityCatalog => (ContextAuthority::Data, placement_lifecycle),
         ContextItemKind::SkillInstructions | ContextItemKind::Skill => {
-            (ContextAuthority::Developer, ContextLifecycle::Turn)
+            (role_authority, ContextLifecycle::Turn)
         }
         ContextItemKind::Summary | ContextItemKind::Checkpoint => {
             (ContextAuthority::Data, ContextLifecycle::Epoch)
@@ -460,8 +481,15 @@ impl CompiledModelContext {
             .into_iter()
             .filter(|item| {
                 matches!(item.role, ContextRole::System | ContextRole::Developer)
-                    && item.kind != ContextItemKind::Summary
+                    || (item.role == ContextRole::User
+                        && matches!(
+                            item.kind,
+                            ContextItemKind::RepositoryInstructions
+                                | ContextItemKind::SkillInstructions
+                                | ContextItemKind::Skill
+                        ))
             })
+            .filter(|item| item.kind != ContextItemKind::Summary)
             .filter_map(|item| {
                 let content = item.text_content();
                 if content.trim().is_empty() {
@@ -1011,7 +1039,7 @@ mod tests {
     }
 
     #[test]
-    fn instruction_messages_preserve_system_and_developer_roles() {
+    fn instruction_messages_preserve_instruction_roles_without_duplicating_user_messages() {
         let context = CompiledModelContext {
             items: vec![
                 ModelContextItem::text(
@@ -1031,10 +1059,18 @@ mod tests {
                     ContextSensitivity::Workspace,
                 ),
                 ModelContextItem::text(
+                    ContextItemKind::RepositoryInstructions,
+                    ContextRole::User,
+                    "AGENTS.md",
+                    "repository text",
+                    ContextCacheScope::Turn,
+                    ContextSensitivity::Workspace,
+                ),
+                ModelContextItem::text(
                     ContextItemKind::User,
                     ContextRole::User,
                     "user",
-                    "user text",
+                    "current user text",
                     ContextCacheScope::Turn,
                     ContextSensitivity::Workspace,
                 ),
@@ -1044,17 +1080,23 @@ mod tests {
 
         let messages = context.instruction_messages();
 
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 3);
         assert_eq!(messages[0], (ContextRole::System, "base text".to_string()));
         assert_eq!(messages[1].0, ContextRole::Developer);
         assert!(messages[1].1.contains("developer text"));
+        assert_eq!(messages[2].0, ContextRole::User);
+        assert!(messages[2].1.contains("repository text"));
+        assert!(!messages[2].1.contains("current user text"));
         assert_eq!(
             context.instructions_for_role(ContextRole::System),
             "base text"
         );
         assert!(!context
             .instructions_for_role(ContextRole::Developer)
-            .contains("user text"));
+            .contains("repository text"));
+        assert!(context
+            .instructions_for_role(ContextRole::User)
+            .contains("repository text"));
     }
 
     #[test]
@@ -1136,14 +1178,14 @@ mod tests {
     fn selected_skill_is_turn_lived_and_placed_in_the_dynamic_tail() {
         let skill = ModelContextItem::text(
             ContextItemKind::SkillInstructions,
-            ContextRole::Developer,
+            ContextRole::User,
             "skills/review/SKILL.md",
             "Review the requested artifact.",
             ContextCacheScope::Turn,
             ContextSensitivity::Workspace,
         );
 
-        assert_eq!(skill.authority, ContextAuthority::Developer);
+        assert_eq!(skill.authority, ContextAuthority::User);
         assert_eq!(skill.lifecycle, ContextLifecycle::Turn);
         assert_eq!(skill.cache_scope, ContextCacheScope::Turn);
         assert!(skill.classification_errors().is_empty());

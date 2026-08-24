@@ -58,9 +58,10 @@ use crate::provider::{
     normalize_tool_argument_keys, provider_transcript_state_item, provider_wire_transcript,
     redact_model_observation, tool_input_schema_error, IncompleteReason, ModelConversationMessage,
     ModelConversationRole, ModelDecision, ModelProvider, ModelRequest, ModelResponse,
-    ModelStreamDelta, ModelUsage, PromptCacheBreakpointPolicy, ProviderToolCall,
-    ProviderToolCandidate, ProviderToolDisclosure, ProviderToolNamespace, ProviderToolResult,
-    ProviderTransportEvent, PROVIDER_TRANSCRIPT_CANDIDATE_TYPE, PROVIDER_TRANSCRIPT_STATE_TYPE,
+    ModelStreamDelta, ModelUsage, PromptCacheBreakpointPolicy, ProviderRequestCheckpoint,
+    ProviderToolCall, ProviderToolCandidate, ProviderToolDisclosure, ProviderToolNamespace,
+    ProviderToolResult, ProviderTransportEvent, PROVIDER_TRANSCRIPT_CANDIDATE_TYPE,
+    PROVIDER_TRANSCRIPT_STATE_TYPE,
 };
 #[cfg(test)]
 use crate::provider::{
@@ -113,6 +114,7 @@ mod budget;
 mod completion_guard;
 mod context_pressure;
 mod continuation;
+mod proposed_plan;
 mod provider_round;
 mod provider_turn_loop;
 mod run_config;
@@ -203,6 +205,18 @@ pub struct ProviderConversationCursor {
     pub state_kind: ProviderContextStateKind,
     #[serde(default)]
     pub compaction_item_count: usize,
+}
+
+impl ProviderConversationCursor {
+    pub fn from_request_checkpoint(checkpoint: ProviderRequestCheckpoint) -> Self {
+        Self {
+            response_id: String::new(),
+            compatibility_hash: checkpoint.compatibility_hash,
+            response_items: vec![provider_transcript_state_item(&checkpoint.transcript)],
+            state_kind: ProviderContextStateKind::TranscriptItems,
+            compaction_item_count: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -305,7 +319,7 @@ pub struct TurnRuntimeState {
     #[serde(default)]
     invalid_tool_argument_json_rounds: usize,
     /// Number of durable compaction passes attempted by this turn. A bounded
-    /// counter prevents a failing summarizer from stalling every later round.
+    /// counter limits repeated maintenance passes in exceptionally long turns.
     #[serde(default)]
     context_compaction_attempts: usize,
     /// Last round that attempted compaction. Overflow recovery in the same
@@ -407,6 +421,7 @@ pub struct AgentCore {
     invocation_id: u64,
     agent_path: String,
     additional_developer_instructions: Option<String>,
+    collaboration_mode_instructions: Option<String>,
     capability_projection: CapabilityProjection,
     allowed_tools: Option<HashSet<String>>,
     denied_tools: HashSet<String>,
@@ -450,6 +465,11 @@ impl AgentCore {
             invocation_id: 1,
             agent_path: "/root".to_string(),
             additional_developer_instructions: None,
+            collaboration_mode_instructions: Some(
+                include_str!("prompts/collaboration/default.md")
+                    .trim()
+                    .to_string(),
+            ),
             capability_projection: CapabilityProjection::unrestricted(),
             allowed_tools: None,
             denied_tools: HashSet::new(),
@@ -853,40 +873,45 @@ impl AgentCore {
             });
     }
 
+    fn lineage_instructions(&self) -> Option<String> {
+        let sections = [
+            self.additional_developer_instructions.as_deref(),
+            self.collaboration_mode_instructions.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|section| !section.is_empty())
+        .collect::<Vec<_>>();
+        (!sections.is_empty()).then(|| sections.join("\n\n"))
+    }
+
     pub fn apply_collaboration_mode(
         &mut self,
         mode: CollaborationMode,
         goal: Option<GoalRecord>,
     ) -> anyhow::Result<()> {
         let mode_instructions = match mode {
-            CollaborationMode::Default => None,
-            CollaborationMode::Plan => Some(
-                r#"[Plan interaction mode]
-Use the ordinary executable Agent loop. When several materially different directions remain and workspace evidence cannot choose between them, call request_user_input so the user can select an option. After the answer, continue executing the original task in the same Turn. Plan mode is an interaction preference only: it does not create, require, or imply a WorkForm."#
-                    .to_string(),
-            ),
+            CollaborationMode::Default => include_str!("prompts/collaboration/default.md")
+                .trim()
+                .to_string(),
+            CollaborationMode::Plan => include_str!("prompts/collaboration/plan.md")
+                .trim()
+                .to_string(),
             CollaborationMode::Goal => {
                 let goal = goal
                     .as_ref()
                     .context("goal mode requires a server-assigned goal")?;
-                Some(format!(
+                format!(
                     r#"[Goal collaboration mode]
 You are executing persistent goal {goal_id}: {objective}
-The server owns this exact goal id and its durable Goal WorkForm. The WorkForm tools automatically target this active Goal; never pass runtime control IDs in their arguments. If no work items exist, call set_plan to initialize the form. Keep committed work current with set_plan/update_plan, respect explicit dependencies, and revise stale work when evidence changes the approach. A blocking active item prevents Goal completion; advisory items and long-running background jobs may remain while the current invocation ends. Mark work completed, blocked, paused/deferred, or cancelled explicitly. No separate complete_task call is required."#,
+Goal mode manages durable execution state but does not broaden what the user's request authorizes. The server owns this exact goal id and its durable Goal WorkForm. The WorkForm tools automatically target this active Goal; never pass runtime control IDs in their arguments. If the authorized work needs tracked steps and none exist, call set_plan to initialize the form. Keep committed work current with set_plan/update_plan, respect explicit dependencies, and revise stale work when evidence changes the approach. A blocking active item prevents Goal completion; advisory items and long-running background jobs may remain while the current invocation ends. Mark work completed, blocked, paused/deferred, or cancelled explicitly. No separate complete_task call is required."#,
                     goal_id = goal.id,
                     objective = goal.objective,
-                ))
+                )
             }
         };
-        if let Some(mode_instructions) = mode_instructions {
-            self.additional_developer_instructions =
-                Some(match self.additional_developer_instructions.take() {
-                    Some(existing) if !existing.trim().is_empty() => {
-                        format!("{}\n\n{}", existing.trim(), mode_instructions)
-                    }
-                    _ => mode_instructions,
-                });
-        }
+        self.collaboration_mode_instructions = Some(mode_instructions);
         self.collaboration_mode = mode;
         self.goal = if mode == CollaborationMode::Goal {
             goal
@@ -921,6 +946,7 @@ The server owns this exact goal id and its durable Goal WorkForm. The WorkForm t
         context.mcp_host = self.tool_host.mcp_host.clone();
         context.mcp_tools = self.tool_host.active_mcp_tools.clone();
         context.connection_operations = self.tool_host.active_connection_operations.clone();
+        context.library_namespaces = self.tool_host.library_namespaces.clone();
         context.model_supports_vision = self.tool_host.model_supports_vision;
         context.collaboration_mode = self.collaboration_mode;
         context.goal_id = self.goal.as_ref().map(|goal| goal.id);
@@ -934,6 +960,7 @@ The server owns this exact goal id and its durable Goal WorkForm. The WorkForm t
         context.mcp_host = self.tool_host.mcp_host.clone();
         context.mcp_tools = self.tool_host.active_mcp_tools.clone();
         context.connection_operations = self.tool_host.active_connection_operations.clone();
+        context.library_namespaces = self.tool_host.library_namespaces.clone();
         context.model_supports_vision = self.tool_host.model_supports_vision;
     }
 
@@ -944,6 +971,17 @@ The server owns this exact goal id and its durable Goal WorkForm. The WorkForm t
 
     pub fn set_mcp_host(&mut self, host: McpExtensionHost) {
         self.tool_host.mcp_host = Some(host);
+    }
+
+    pub fn set_library_namespaces(&mut self, namespaces: impl IntoIterator<Item = String>) {
+        let mut namespaces = namespaces
+            .into_iter()
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect::<Vec<_>>();
+        namespaces.sort();
+        namespaces.dedup();
+        self.tool_host.library_namespaces = namespaces;
     }
 
     pub fn clear_mcp_host(&mut self) {
@@ -1680,6 +1718,12 @@ impl AgentCore {
             agent.restrict_capabilities(&spec.capabilities);
             agent.align_execution_authority_with_capabilities()?;
             agent.retain_external_tools_for_projection();
+            agent.set_library_namespaces(
+                spec.knowledge_binding
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|binding| binding.namespaces.iter().cloned()),
+            );
             agent.append_additional_developer_instructions(&format!(
                 "[DeploymentSnapshot Agent identity]\nTemplate: {}@{}\nTemplate content hash: {}\nName: {}\nOwner: {}\nRisk class: {:?}\nInstructions:\n{}",
                 spec.template_id,
@@ -1871,7 +1915,9 @@ impl AgentCore {
                         .parts
                         .iter()
                         .filter_map(|part| match part {
-                            MessagePart::Text { text } => Some(text.as_str()),
+                            MessagePart::Text { text } | MessagePart::ProposedPlan { text } => {
+                                Some(text.as_str())
+                            }
                             _ => None,
                         })
                         .collect::<Vec<_>>()
@@ -1957,6 +2003,7 @@ fn flow_transcript_from_events(events: &[AgentEventPayload]) -> Vec<FlowTranscri
 
 fn finalize_provider_turn(
     thread_id: Uuid,
+    collaboration_mode: CollaborationMode,
     response: ModelResponse,
     mut prior_provider_items: Vec<Value>,
     provider_tool_results: Vec<ProviderToolResult>,
@@ -1997,7 +2044,20 @@ fn finalize_provider_turn(
         }
     });
     debug_assert!(matches!(response.decision(), ModelDecision::Final(_)));
-    let assistant_message = Message::text(thread_id, MessageRole::Assistant, response.text);
+    let assistant_parts = if collaboration_mode == CollaborationMode::Plan {
+        proposed_plan::proposed_plan_message_parts(response.text)
+    } else {
+        vec![MessagePart::Text {
+            text: response.text,
+        }]
+    };
+    let assistant_message = Message {
+        id: Uuid::new_v4(),
+        thread_id,
+        role: MessageRole::Assistant,
+        parts: assistant_parts,
+        created_at: chrono::Utc::now(),
+    };
     events.push(AgentEventPayload::AssistantMessage {
         message: assistant_message,
     });
@@ -2386,7 +2446,6 @@ fn synchronize_context_budget(budget: &mut Option<ContextBudget>, request: &Mode
     };
     let estimate = request.token_estimate_breakdown().total;
     budget.used_tokens = 0;
-    budget.warnings.clear();
     budget.record_tokens(estimate);
 }
 
@@ -2426,7 +2485,7 @@ pub fn agent_model_context_with_runtime(
     let workspace_scope = workspace_scope_instruction(workspace_root, sandbox_config);
     let mut items = vec![ModelContextItem::text(
         ContextItemKind::BaseInstructions,
-        ContextRole::System,
+        ContextRole::Developer,
         "opentopia:base",
         base_agent_instructions(),
         ContextCacheScope::Stable,
@@ -2464,7 +2523,7 @@ pub fn agent_model_context_with_runtime(
     }
 }
 
-pub const BASE_AGENT_PROMPT_VERSION: &str = "2026-08-22.1";
+pub const BASE_AGENT_PROMPT_VERSION: &str = "2026-08-23.1";
 
 pub fn base_agent_prompt_hash() -> String {
     crate::model_context::content_fingerprint(base_agent_prompt().as_bytes())

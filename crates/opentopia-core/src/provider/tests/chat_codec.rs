@@ -178,6 +178,53 @@ fn chat_cross_turn_transcript_is_extended_without_reclassifying_history() {
 }
 
 #[test]
+fn failed_chat_request_transcript_is_the_next_turns_strict_prefix() {
+    for (format, encode) in [
+        (
+            OPENAI_CHAT_NATIVE_TRANSCRIPT_FORMAT,
+            openai_messages as fn(&ModelRequest) -> Vec<Value>,
+        ),
+        (
+            OPENAI_CHAT_PORTABLE_TRANSCRIPT_FORMAT,
+            openai_portable_messages as fn(&ModelRequest) -> Vec<Value>,
+        ),
+    ] {
+        let mut failed = layered_model_request();
+        failed.input.current_user.message = "request that failed".to_string();
+        let failed_request = encode(&failed);
+
+        let mut next = layered_model_request();
+        next.input.current_user.message = "continue after failure".to_string();
+        next.input.conversation = vec![ModelConversationMessage {
+            role: ModelConversationRole::User,
+            content: "reconstructed failed turn".to_string(),
+            content_parts: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+        }];
+        next.provider_transcript = Some(ProviderWireTranscript {
+            format: format.to_string(),
+            items: failed_request.clone(),
+        });
+
+        let next_request = encode(&next);
+        assert_eq!(
+            next_request[..failed_request.len()],
+            failed_request,
+            "a failed provider request must remain the exact next-request prefix"
+        );
+        assert_eq!(next_request[failed_request.len()]["role"], "user");
+        assert_eq!(
+            next_request[failed_request.len()]["content"],
+            "continue after failure"
+        );
+        assert!(!next_request
+            .iter()
+            .any(|message| message["content"] == "reconstructed failed turn"));
+    }
+}
+
+#[test]
 fn portable_chat_envelope_preserves_structured_cross_turn_tool_history() {
     let mut request = model_request();
     request.input.conversation = vec![

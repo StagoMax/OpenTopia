@@ -41,6 +41,33 @@ pub(crate) async fn resume_agent_turn(
 }
 
 impl AgentTurnCoordinator {
+    fn persist_provider_request_checkpoint(
+        &self,
+        agent_thread_id: AgentThreadId,
+        provider: &ProviderSettings,
+        payload: &mut AgentEventPayload,
+    ) -> anyhow::Result<()> {
+        if !matches!(payload, AgentEventPayload::ProviderRequestSent { .. }) {
+            return Ok(());
+        }
+        let Some(checkpoint) = payload.take_provider_request_checkpoint() else {
+            return Ok(());
+        };
+        if !crate::provider_state_enabled(provider) {
+            return Ok(());
+        }
+        let cursor = ProviderConversationCursor::from_request_checkpoint(checkpoint);
+        self.repository.save_provider_state(
+            agent_thread_id,
+            &provider.id,
+            &provider.model,
+            "",
+            &cursor.compatibility_hash,
+            &serde_json::to_value(&cursor)?,
+        )?;
+        Ok(())
+    }
+
     pub(super) async fn execute_start(
         &self,
         agent_thread_id: AgentThreadId,
@@ -227,9 +254,20 @@ impl AgentTurnCoordinator {
         let sink = self.clone();
         let sink_thread = thread.clone();
         let sink_turn = turn.clone();
+        let sink_provider = provider.clone();
         let user_task_id = session.user_task_id;
         let event_task = tokio::spawn(async move {
-            while let Some(payload) = receiver.recv().await {
+            while let Some(mut payload) = receiver.recv().await {
+                if let Err(error) = sink.persist_provider_request_checkpoint(
+                    sink_thread.id,
+                    &sink_provider,
+                    &mut payload,
+                ) {
+                    tracing::error!(
+                        ?error,
+                        "failed to persist Agent provider request checkpoint"
+                    );
+                }
                 if let Err(error) =
                     sink.record_event(user_task_id, &sink_thread, &sink_turn, payload)
                 {
@@ -477,9 +515,20 @@ impl AgentTurnCoordinator {
         let sink = self.clone();
         let sink_thread = thread.clone();
         let sink_turn = turn.clone();
+        let sink_provider = provider.clone();
         let user_task_id = session.user_task_id;
         let event_task = tokio::spawn(async move {
-            while let Some(payload) = receiver.recv().await {
+            while let Some(mut payload) = receiver.recv().await {
+                if let Err(error) = sink.persist_provider_request_checkpoint(
+                    sink_thread.id,
+                    &sink_provider,
+                    &mut payload,
+                ) {
+                    tracing::error!(
+                        ?error,
+                        "failed to persist resumed Agent provider request checkpoint"
+                    );
+                }
                 if let Err(error) =
                     sink.record_event(user_task_id, &sink_thread, &sink_turn, payload)
                 {

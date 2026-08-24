@@ -160,6 +160,7 @@ impl AgentCore {
             .complete_model(
                 request,
                 model_rounds.saturating_add(1),
+                compatibility_hash,
                 events,
                 cancellation,
             )
@@ -206,6 +207,7 @@ impl AgentCore {
                     .complete_model(
                         retry_request,
                         model_rounds.saturating_add(1),
+                        compatibility_hash,
                         events,
                         cancellation,
                     )
@@ -233,6 +235,9 @@ impl AgentCore {
         }
         if let Some(budget) = budget.as_mut() {
             budget.record_tokens(ContextBudget::estimate_tokens(&response.text));
+            if let Some(usage) = response.usage.as_ref() {
+                budget.record_provider_usage(usage);
+            }
         }
         record_rollout_usage(rollout_budget, response.usage.as_ref())?;
 
@@ -294,6 +299,7 @@ impl AgentCore {
                 )?;
                 return Ok(ProviderRoundOutcome::Finished(finalize_provider_turn(
                     thread_id,
+                    self.collaboration_mode,
                     response,
                     std::mem::take(provider_response_items),
                     std::mem::take(provider_tool_results),

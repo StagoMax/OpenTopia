@@ -598,6 +598,14 @@ pub(crate) async fn flow_runtime_context(
     )
     .await
     .map_err(flow_runtime_context_error)?;
+    if workflow_agent_specs
+        .iter()
+        .any(|spec| spec.knowledge_binding.is_some())
+    {
+        agent.register_runtime_tool(Arc::new(
+            crate::library_api::LibrarySearchTool::runtime_scoped(state.library_providers.clone()),
+        ));
+    }
     let agent = agent.finalize().map_err(ApiError::from)?;
     let sandbox = authority.sandbox_config().clone();
     let mut context = authority.local_tool_context();

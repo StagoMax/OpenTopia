@@ -26,7 +26,8 @@ pub(in crate::provider) fn openai_instruction_messages(request: &ModelRequest) -
                 "role": match role {
                     ContextRole::System => "system",
                     ContextRole::Developer => "developer",
-                    _ => unreachable!("instruction messages contain only system/developer roles"),
+                    ContextRole::User => "user",
+                    _ => unreachable!("unsupported instruction message role"),
                 },
                 "content": content,
             })
@@ -62,20 +63,19 @@ pub(in crate::provider) fn openai_messages_with_reasoning(
         "content": openai_message_content(&request.input.current_user.message, &request.input.current_user.content)
     }));
 
-    messages.extend(
-        scoped_instruction_messages(request, false)
-            .into_iter()
-            .map(|(role, content)| {
-                json!({
-                    "role": match role {
-                        ContextRole::System => "system",
-                        ContextRole::Developer => "developer",
-                        _ => unreachable!("instruction messages contain only system/developer roles"),
-                    },
-                    "content": content,
-                })
-            }),
-    );
+    messages.extend(scoped_instruction_messages(request, false).into_iter().map(
+        |(role, content)| {
+            json!({
+                "role": match role {
+                    ContextRole::System => "system",
+                    ContextRole::Developer => "developer",
+                    ContextRole::User => "user",
+                    _ => unreachable!("unsupported instruction message role"),
+                },
+                "content": content,
+            })
+        },
+    ));
 
     append_openai_tool_history(&mut messages, request, replay_chat_reasoning);
 

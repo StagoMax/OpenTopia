@@ -197,6 +197,7 @@ async fn compact_context(
             previous_summary.as_ref(),
             Some(&active_provider),
             &current_model_request,
+            None,
         )
         .await
         {

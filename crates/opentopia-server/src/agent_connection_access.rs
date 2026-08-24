@@ -531,6 +531,7 @@ mod tests {
             budget: AgentBudgetV1::default(),
             risk_class: AgentRiskClassV1::Low,
             connection_bindings: vec![binding],
+            knowledge_binding: None,
         }
     }
 

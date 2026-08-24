@@ -66,6 +66,7 @@ impl RoundContextCompactor for ServerRoundContextCompactor {
             None,
             Some(&self.provider),
             &request.model_request,
+            request.event_sender.as_ref(),
         )
         .await
         .map_err(|error| anyhow::anyhow!(error.message))?;

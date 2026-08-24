@@ -336,6 +336,94 @@ fn provider_model_change_invalidates_persisted_cursor_with_a_reason() {
 }
 
 #[test]
+fn failed_provider_request_keeps_the_exact_sent_transcript_as_the_next_prefix() {
+    let store = SqliteSessionStore::open(":memory:").expect("open store");
+    let thread = store
+        .create_thread(None, std::env::current_dir().expect("cwd"))
+        .expect("create thread");
+    let mut settings = AppSettings::from_env(PermissionMode::Auto);
+    let provider = settings.active_provider_mut();
+    provider.apply_legacy_kind_preset(ProviderKind::OpenAiCompatible);
+    provider.preferred_adapter = Some(ProviderAdapterKind::OpenAiChat);
+    let provider = settings.active_provider().clone();
+    let request_id = Uuid::new_v4();
+    let transcript = opentopia_core::ProviderWireTranscript {
+        format: "openai_chat_native_messages_v1".to_string(),
+        items: vec![
+            json!({"role": "developer", "content": "stable context"}),
+            json!({"role": "user", "content": "request that failed"}),
+        ],
+    };
+    let mut payloads = vec![AgentEventPayload::ProviderRequestSent {
+        request_id,
+        round: 1,
+        attempt: 1,
+        adapter: "openai_chat".to_string(),
+        method: "POST".to_string(),
+        endpoint: "https://example.invalid/v1/chat/completions".to_string(),
+        cache_trace: None,
+        body: Value::Null,
+        checkpoint: Some(opentopia_core::ProviderRequestCheckpoint {
+            compatibility_hash: "compat-1".to_string(),
+            transcript: transcript.clone(),
+        }),
+    }];
+
+    persist_provider_request_checkpoints(
+        &store,
+        &provider,
+        thread.id,
+        "/root",
+        &mut payloads,
+    )
+    .expect("persist request checkpoint");
+
+    let failed_result: anyhow::Result<opentopia_core::AgentTurnResult> =
+        Err(anyhow::anyhow!("provider returned 403"));
+    assert!(persist_provider_cursor(
+        &store,
+        &provider,
+        thread.id,
+        "/root",
+        &failed_result,
+    )
+    .expect("retain checkpoint after failure")
+    .is_none());
+    let cancelled_result = Ok(opentopia_core::AgentTurnResult {
+        events: Vec::new(),
+        outcome: AgentTurnOutcome::Cancelled {
+            reason: "cancelled while waiting for provider".to_string(),
+        },
+        provider_cursor: None,
+    });
+    assert!(persist_provider_cursor(
+        &store,
+        &provider,
+        thread.id,
+        "/root",
+        &cancelled_result,
+    )
+    .expect("retain checkpoint after cancellation")
+    .is_none());
+
+    let state = store
+        .get_provider_conversation_state(thread.id, "/root")
+        .expect("load state")
+        .expect("request checkpoint state");
+    let (saved_transcript, provider_items) =
+        opentopia_core::split_provider_transcript_state(state.response_items);
+    assert_eq!(saved_transcript, Some(transcript));
+    assert!(provider_items.is_empty());
+    assert!(payloads[0].take_provider_request_checkpoint().is_none());
+
+    let loaded = load_provider_cursor(&store, &provider, thread.id, "/root")
+        .expect("load failed-request cursor")
+        .cursor
+        .expect("failed-request cursor");
+    assert_eq!(loaded.compatibility_hash, "compat-1");
+}
+
+#[test]
 fn provider_adapter_change_invalidates_persisted_cursor() {
     let store = SqliteSessionStore::open(":memory:").expect("open store");
     let thread = store

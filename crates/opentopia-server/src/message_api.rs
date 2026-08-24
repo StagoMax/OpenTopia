@@ -1,6 +1,7 @@
 use super::auth::TURN_ID_HEADER;
 use super::context_api::model_user_message_with_attachment_manifest;
 use super::library_api;
+use super::send_trace::ConversationSendTrace;
 use super::{
     ensure_bound_agent_skills_visible, ensure_mode_skills_visible, ensure_plugin_skills_enabled,
     ensure_thread, finish_turn, publish_payload, run_new_agent_turn, ApiError, AppState,
@@ -32,8 +33,11 @@ pub(super) fn router() -> Router<AppState> {
 async fn send_message(
     State(state): State<AppState>,
     Path(thread_id): Path<Uuid>,
+    headers: HeaderMap,
     Json(request): Json<SendMessageRequest>,
 ) -> Result<(HeaderMap, Json<Message>), ApiError> {
+    let send_trace = ConversationSendTrace::from_headers(&headers);
+    send_trace.phase("request_received", thread_id, None);
     if state.shutdown.is_preparing() {
         return Err(ApiError::conflict(
             "OpenTopia is shutting down and cannot start another Turn",
@@ -95,6 +99,7 @@ async fn send_message(
     } else {
         request.content.clone()
     };
+    send_trace.phase("context_inputs_loaded", thread_id, None);
 
     let steer_turn = if request.delivery == MessageDelivery::SteerCurrent {
         Some(
@@ -151,6 +156,7 @@ async fn send_message(
             },
         );
     }
+    send_trace.phase("admission_checks_completed", thread_id, None);
 
     let mut pending_message = if !content_parts.is_empty() {
         let mut message = Message::text(thread_id, MessageRole::User, "");
@@ -193,7 +199,13 @@ async fn send_message(
             .map(|skill| MessagePart::SkillRef { skill }),
     );
     if let Some(active) = steer_turn {
+        send_trace.phase(
+            "message_persistence_started",
+            thread_id,
+            Some(active.turn_id),
+        );
         let user_message = state.store.append_message(pending_message)?;
+        send_trace.phase("message_persisted", thread_id, Some(active.turn_id));
         let content = model_user_message_with_attachment_manifest(&user_message, &prompt);
         state.turn_inbox.push(
             active.turn_id,
@@ -209,8 +221,11 @@ async fn send_message(
                 .expect("turn IDs are valid header values"),
         );
         headers.insert("x-opentopia-steered", HeaderValue::from_static("true"));
+        send_trace.phase("response_ready", thread_id, Some(active.turn_id));
+        send_trace.apply_response_headers(&mut headers);
         return Ok((headers, Json(user_message)));
     }
+    send_trace.phase("turn_reservation_started", thread_id, None);
     let turn = state
         .turns
         .begin(thread_id, pending_message.id)
@@ -218,17 +233,23 @@ async fn send_message(
     let turn = match turn {
         Ok(turn) => turn,
         Err(_) => {
+            send_trace.phase("message_persistence_started", thread_id, None);
             let user_message = state.store.append_message(pending_message)?;
+            send_trace.phase("message_persisted", thread_id, None);
             state
                 .store
                 .enqueue_turn_message(thread_id, user_message.id)?;
             let _ = state.turn_queue.send(thread_id);
             let mut headers = HeaderMap::new();
             headers.insert("x-opentopia-queued", HeaderValue::from_static("true"));
+            send_trace.phase("response_ready", thread_id, None);
+            send_trace.apply_response_headers(&mut headers);
             return Ok((headers, Json(user_message)));
         }
     };
     let turn_id = turn.turn_id;
+    send_trace.phase("turn_reserved", thread_id, Some(turn_id));
+    send_trace.phase("message_persistence_started", thread_id, Some(turn_id));
     let user_message = match state.store.append_message(pending_message) {
         Ok(message) => message,
         Err(err) => {
@@ -242,6 +263,7 @@ async fn send_message(
             return Err(err.into());
         }
     };
+    send_trace.phase("message_persisted", thread_id, Some(turn_id));
     let run_state = state.clone();
     let run_message = user_message.clone();
     let model_content = model_user_message_with_attachment_manifest(&user_message, &prompt);
@@ -258,15 +280,19 @@ async fn send_message(
             collaboration_mode,
             goal_snapshot.map(|snapshot| snapshot.goal),
             library_provider,
+            Some(send_trace),
         )
         .await;
     });
+    send_trace.phase("agent_scheduled", thread_id, Some(turn_id));
 
     let mut headers = HeaderMap::new();
     headers.insert(
         TURN_ID_HEADER,
         HeaderValue::from_str(&turn_id.to_string()).expect("turn IDs are valid header values"),
     );
+    send_trace.phase("response_ready", thread_id, Some(turn_id));
+    send_trace.apply_response_headers(&mut headers);
     Ok((headers, Json(user_message)))
 }
 
@@ -529,6 +555,7 @@ pub(super) fn launch_next_queued_turn(state: &AppState, thread_id: Uuid) {
             collaboration_mode,
             goal,
             library_provider,
+            None,
         )
         .await;
     });

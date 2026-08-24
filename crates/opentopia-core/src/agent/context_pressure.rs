@@ -75,7 +75,7 @@ impl AgentCore {
                 compatibility_hash,
                 events,
             )
-            .await;
+            .await?;
         if let Some((compacted, dropped_tool_results)) = compacted {
             let rebuilt = self.rebuild_request_after_durable_checkpoint(
                 round_model_context,
@@ -132,7 +132,7 @@ impl AgentCore {
         events: &mut TurnEvents,
     ) -> anyhow::Result<Option<CanonicalModelRequest>> {
         if let Some(context_budget) = budget.as_mut() {
-            context_budget.used_tokens = context_budget.max_tokens;
+            context_budget.force_compaction();
         }
         let compacted = self
             .compact_context_for_round(
@@ -154,7 +154,7 @@ impl AgentCore {
                 compatibility_hash,
                 events,
             )
-            .await;
+            .await?;
         let Some((compacted, dropped_tool_results)) = compacted else {
             return Ok(None);
         };
@@ -248,31 +248,32 @@ impl AgentCore {
         branch_developer_instructions: Option<&str>,
         compatibility_hash: &mut String,
         events: &mut TurnEvents,
-    ) -> Option<(RoundContextCompactionResult, usize)> {
+    ) -> anyhow::Result<Option<(RoundContextCompactionResult, usize)>> {
         let Some(context_budget) = budget.as_ref() else {
-            return None;
+            return Ok(None);
         };
         let threshold = context_compact_threshold_percent();
         if !context_budget.requires_compaction(threshold)
             || !runtime_state.can_attempt_context_compaction(round)
         {
-            return None;
+            return Ok(None);
         }
         if conversation.is_empty() && provider_tool_results.is_empty() {
             // Stable instructions, tool schemas, and the current user input
             // are not compressible history. Avoid an auxiliary model call that
             // cannot lower pressure; a provider overflow will remain explicit.
-            return None;
+            return Ok(None);
         }
         let Some(compactor) = self.round_context_compactor.as_ref() else {
+            let message = format!(
+                "Round {round} reached {threshold}% context pressure, but no durable context compactor is installed."
+            );
             events.push(AgentEventPayload::ContextWarning {
                 stage: "round_context_compaction_unavailable".to_string(),
-                message: format!(
-                    "Round {round} reached {threshold}% context pressure, but no durable context compactor is installed."
-                ),
+                message: message.clone(),
             });
             runtime_state.record_context_compaction_attempt(round);
-            return None;
+            anyhow::bail!(message);
         };
 
         runtime_state.record_context_compaction_attempt(round);
@@ -285,15 +286,17 @@ impl AgentCore {
             reserved_generation_tokens: context_budget.reserved_generation_tokens,
             context_window_tokens: context_budget.max_tokens,
             model_request: current_request.clone(),
+            event_sender: events.sender.clone(),
         };
         let compacted = match compactor.compact(request).await {
             Ok(compacted) => compacted,
             Err(error) => {
+                let message = format!("Durable round context compaction failed: {error:#}");
                 events.push(AgentEventPayload::ContextWarning {
                     stage: "round_context_compaction".to_string(),
-                    message: format!("Durable round context compaction failed: {error:#}"),
+                    message: message.clone(),
                 });
-                return None;
+                anyhow::bail!(message);
             }
         };
 
@@ -315,13 +318,18 @@ impl AgentCore {
         // owners and remain in the rebuilt request.
         conversation.clear();
         compacted_tool_history.clear();
+        if let Some(context_budget) = budget.as_mut() {
+            // The checkpoint starts a new provider request epoch. Its real
+            // token total is unknown until that request completes.
+            context_budget.clear_provider_usage();
+        }
         *compatibility_hash = provider_compatibility_hash(
             model_context,
             context_summary.as_deref(),
             tool_candidates,
             branch_developer_instructions,
         );
-        Some((compacted, dropped_call_ids.len()))
+        Ok(Some((compacted, dropped_call_ids.len())))
     }
 
     fn record_round_context_compaction(
@@ -364,7 +372,7 @@ impl AgentCore {
         events.push(AgentEventPayload::ContextWarning {
             stage: "round_context_compaction".to_string(),
             message: format!(
-                "Durable checkpoint rebuilt round {round}; request context fell from {before_tokens} to {after_tokens} tokens ({token_reduction_percent}% reduction), and {dropped_tool_results} covered completed tool result(s) were removed.",
+                "Durable checkpoint rebuilt round {round}; the local request estimate fell from {before_tokens} to {after_tokens} tokens ({token_reduction_percent}% estimated reduction), and {dropped_tool_results} covered completed tool result(s) were removed. Provider-measured post-compaction usage will arrive with the rebuilt round.",
             ),
         });
     }

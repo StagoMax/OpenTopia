@@ -202,8 +202,8 @@ pub use enterprise::{
     AgentTemplateVersionV1, AuditEventV1, CapabilityChangeKindV1, CapabilityChangeV1,
     CapabilityProjection, DataClassification, EnterpriseExecutionContextV1, EvidenceRecordV1,
     ExecutionBoundaryError, ExecutionIdentityRoute, ExecutionIdentityRouter,
-    ExecutionResourceGrantV1, ExperienceSurfaceProfile, ResourceKind, ENTERPRISE_SCHEMA_VERSION_V1,
-    MAX_AGENT_DELEGATION_DEPTH,
+    ExecutionResourceGrantV1, ExperienceSurfaceProfile, ResourceKind, SagKnowledgeBindingV1,
+    ENTERPRISE_SCHEMA_VERSION_V1, MAX_AGENT_DELEGATION_DEPTH,
 };
 pub use enterprise_connection_grants::{
     connection_bindings_are_subset, connection_model_tool_name, diff_connection_bindings,
@@ -356,8 +356,9 @@ pub use provider::{
     ModelRequest, ModelResponse, ModelStreamDelta, ModelUsage, OpenAiCompatibleProvider,
     OpenAiResponsesProvider, PreparedProviderRequest, PromptCacheBreakpointPolicy,
     ProviderAdapterError, ProviderDriverDescriptor, ProviderDriverRegistry, ProviderDriverTrust,
-    ProviderNegotiationResult, ProviderToolCall, ProviderToolCandidate, ProviderToolDisclosure,
-    ProviderToolNamespace, ProviderToolResult, ProviderTransportEvent, ProviderWireTranscript,
+    ProviderNegotiationResult, ProviderRequestCheckpoint, ProviderToolCall, ProviderToolCandidate,
+    ProviderToolDisclosure, ProviderToolNamespace, ProviderToolResult, ProviderTransportEvent,
+    ProviderWireTranscript,
 };
 pub(crate) use provider_cache_trace::build_provider_cache_trace;
 pub use round_compaction::{

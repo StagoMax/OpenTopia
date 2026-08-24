@@ -217,6 +217,10 @@ const CARGO_WRITE_SUBCOMMANDS: &[&str] = &[
 ];
 
 pub fn analyze_shell_command(command: &str) -> ShellCommandAnalysis {
+    analyze_shell_command_nested(command, 0)
+}
+
+fn analyze_shell_command_nested(command: &str, nesting: usize) -> ShellCommandAnalysis {
     let lexemes = lex(command);
     let mut segments = Vec::<Vec<Word>>::new();
     let mut current = Vec::new();
@@ -260,6 +264,20 @@ pub fn analyze_shell_command(command: &str) -> ShellCommandAnalysis {
             static_values.remove(&name);
         }
         classify_segment(segment, &static_values, &mut aggregate);
+    }
+
+    // PowerShell control flow and expression groups are executable containers,
+    // not opaque arguments. Analyze their bodies compositionally so a known
+    // capability nested under try/if/foreach, a script block, or $() is not
+    // hidden by the outer control keyword.
+    if nesting < 32 {
+        for nested_command in nested_executable_regions(command) {
+            let nested = analyze_shell_command_nested(&nested_command, nesting + 1);
+            has_pipeline |= nested.has_pipeline;
+            has_redirection |= nested.has_redirection;
+            has_background_operator |= nested.has_background_operator;
+            aggregate.merge_nested(&nested);
+        }
     }
 
     if has_redirection {
@@ -405,6 +423,149 @@ impl Aggregate {
             .collect::<Vec<_>>();
         self.add_destructive_targets(resolved.iter());
     }
+
+    fn merge_nested(&mut self, nested: &ShellCommandAnalysis) {
+        let found_known_capability = nested.capabilities.iter().any(|capability| {
+            !matches!(
+                capability,
+                ShellCapability::Observation | ShellCapability::Unknown
+            )
+        });
+        if !found_known_capability && !nested.destructive {
+            return;
+        }
+
+        self.init_if_needed();
+        self.capabilities
+            .extend(nested.capabilities.iter().copied());
+        self.destructive |= nested.destructive;
+        self.dynamic |= nested.dynamic;
+        self.concrete_targets
+            .extend(nested.concrete_targets.iter().cloned());
+        self.targets_concrete &= nested.targets_concrete;
+        self.saw_unknown |= nested.capabilities.contains(&ShellCapability::Unknown);
+        self.all_read_only &= nested.is_strictly_read_only();
+        self.destructive_targets_concrete &= nested.destructive_targets_concrete;
+        self.saw_destructive_target |= nested.has_destructive_target;
+    }
+}
+
+fn nested_executable_regions(command: &str) -> Vec<String> {
+    let chars = command.chars().collect::<Vec<_>>();
+    let mut regions = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        match chars[index] {
+            '\'' => index = skip_single_quoted(&chars, index),
+            '"' => index = scan_double_quoted(&chars, index, &mut regions),
+            '#' => index = skip_line_comment(&chars, index),
+            '<' if chars.get(index + 1) == Some(&'#') => index = skip_block_comment(&chars, index),
+            '{' => {
+                if let Some(end) = find_matching_group(&chars, index, '{', '}') {
+                    regions.push(chars[index + 1..end].iter().collect());
+                    index = end + 1;
+                } else {
+                    index += 1;
+                }
+            }
+            '(' => {
+                if let Some(end) = find_matching_group(&chars, index, '(', ')') {
+                    regions.push(chars[index + 1..end].iter().collect());
+                    index = end + 1;
+                } else {
+                    index += 1;
+                }
+            }
+            '`' => index = (index + 2).min(chars.len()),
+            _ => index += 1,
+        }
+    }
+    regions
+}
+
+fn scan_double_quoted(chars: &[char], start: usize, regions: &mut Vec<String>) -> usize {
+    let mut index = start + 1;
+    while index < chars.len() {
+        match chars[index] {
+            '`' => index = (index + 2).min(chars.len()),
+            '"' => return index + 1,
+            '$' if chars.get(index + 1) == Some(&'(') => {
+                let open = index + 1;
+                if let Some(end) = find_matching_group(chars, open, '(', ')') {
+                    regions.push(chars[open + 1..end].iter().collect());
+                    index = end + 1;
+                } else {
+                    index += 2;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    index
+}
+
+fn find_matching_group(chars: &[char], start: usize, open: char, close: char) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut index = start + 1;
+    while index < chars.len() {
+        match chars[index] {
+            '\'' => index = skip_single_quoted(chars, index),
+            '"' => {
+                let mut ignored_regions = Vec::new();
+                index = scan_double_quoted(chars, index, &mut ignored_regions);
+            }
+            '#' => index = skip_line_comment(chars, index),
+            '<' if chars.get(index + 1) == Some(&'#') => index = skip_block_comment(chars, index),
+            '`' => index = (index + 2).min(chars.len()),
+            current if current == open => {
+                depth += 1;
+                index += 1;
+            }
+            current if current == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn skip_single_quoted(chars: &[char], start: usize) -> usize {
+    let mut index = start + 1;
+    while index < chars.len() {
+        if chars[index] == '\'' {
+            if chars.get(index + 1) == Some(&'\'') {
+                index += 2;
+            } else {
+                return index + 1;
+            }
+        } else {
+            index += 1;
+        }
+    }
+    index
+}
+
+fn skip_line_comment(chars: &[char], start: usize) -> usize {
+    chars[start..]
+        .iter()
+        .position(|ch| matches!(ch, '\r' | '\n'))
+        .map_or(chars.len(), |offset| start + offset + 1)
+}
+
+fn skip_block_comment(chars: &[char], start: usize) -> usize {
+    let mut index = start + 2;
+    while index + 1 < chars.len() {
+        if chars[index] == '#' && chars[index + 1] == '>' {
+            return index + 2;
+        }
+        index += 1;
+    }
+    chars.len()
 }
 
 fn static_string_assignment(words: &[Word]) -> Option<(String, Word)> {
@@ -1561,5 +1722,39 @@ mod tests {
             .contains(&ShellCapability::DynamicExecution));
         assert!(npm.capabilities.contains(&ShellCapability::Network));
         assert!(npm.capabilities.contains(&ShellCapability::WorkspaceWrite));
+    }
+
+    #[test]
+    fn nested_powershell_commands_contribute_their_capabilities() {
+        for command in [
+            "$uri = 'https://example.test'; try { Invoke-WebRequest -Uri $uri } catch { Write-Error $_ }",
+            "if ($ready) { Invoke-RestMethod -Uri 'https://example.test' }",
+            "foreach ($uri in $uris) { curl $uri }",
+            "& { wget 'https://example.test' }",
+            "$response = $(Invoke-WebRequest -Uri 'https://example.test')",
+            "(Invoke-RestMethod -Uri 'https://example.test')",
+            "\"result: $(Invoke-WebRequest -Uri 'https://example.test')\"",
+        ] {
+            let analysis = analyze_shell_command(command);
+            assert!(
+                analysis.capabilities.contains(&ShellCapability::Network),
+                "nested network command was missed: {command}: {analysis:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_or_commented_command_names_are_not_executable_regions() {
+        for command in [
+            "Write-Output 'Invoke-WebRequest https://example.test'",
+            "# $(Invoke-WebRequest -Uri 'https://example.test')",
+            "<# { Invoke-RestMethod -Uri 'https://example.test' } #>",
+        ] {
+            let analysis = analyze_shell_command(command);
+            assert!(
+                !analysis.capabilities.contains(&ShellCapability::Network),
+                "non-executable text was classified as network: {command}: {analysis:?}"
+            );
+        }
     }
 }

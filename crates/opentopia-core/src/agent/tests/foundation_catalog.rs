@@ -786,7 +786,7 @@ fn release_gate_mode_bundles_project_flow_plan_task_and_goal_tools() {
     code.apply_experience_mode(ExperienceMode::Code);
     let code_names = names(&code);
     assert!(!code_names.iter().any(|name| name.starts_with("flow_")));
-    assert!(!code_names.contains("request_user_input"));
+    assert!(code_names.contains("request_user_input"));
     assert!(code_names.contains("set_plan"));
     assert!(code_names.contains("update_plan"));
     assert!(!code_names.contains("complete_task"));
@@ -816,13 +816,22 @@ fn release_gate_mode_bundles_project_flow_plan_task_and_goal_tools() {
     assert!(goal_names.contains("set_plan"));
     assert!(goal_names.contains("update_plan"));
     assert!(!goal_names.contains("complete_task"));
-    assert!(!goal_names.contains("request_user_input"));
+    assert!(goal_names.contains("request_user_input"));
 
     let mut plan_agent = AgentCore::default();
     plan_agent
         .apply_collaboration_mode(CollaborationMode::Plan, None)
         .expect("Plan mode");
-    assert!(names(&plan_agent).contains("request_user_input"));
+    let plan_names = names(&plan_agent);
+    assert!(plan_names.contains("request_user_input"));
+    assert!(plan_names.contains("set_plan"));
+    assert!(plan_names.contains("update_plan"));
+    assert_eq!(plan_names, code_names);
+    assert_eq!(
+        plan_agent.provider_tool_catalog(),
+        code.provider_tool_catalog(),
+        "Default and Plan must keep the exact provider tool prefix stable"
+    );
 }
 
 #[test]

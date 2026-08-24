@@ -71,9 +71,21 @@ impl TurnEvents {
         }
         if publish {
             if let Some(sender) = &self.sender {
-                let _ = sender.send(payload.clone());
+                // Strip the potentially giant transcript before cloning the
+                // durable event, then move the sole checkpoint copy into the
+                // live sink.
+                let checkpoint = payload.take_provider_request_checkpoint();
+                let durable_payload = payload.clone();
+                payload.set_provider_request_checkpoint(checkpoint);
+                let _ = sender.send(payload);
+                self.items.push(durable_payload);
+                return;
             }
         }
+        // Provider request checkpoints can contain the entire prompt. They are
+        // delivered once through the live sink and must not be retained in the
+        // Turn result or duplicated in the append-only event log.
+        payload.take_provider_request_checkpoint();
         self.items.push(payload);
     }
 
@@ -123,5 +135,49 @@ impl TurnEvents {
     pub(super) fn into_vec(mut self) -> Vec<AgentEventPayload> {
         self.flush_pending_stream();
         self.items
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::{ProviderRequestCheckpoint, ProviderWireTranscript};
+    use serde_json::{json, Value};
+    use uuid::Uuid;
+
+    #[test]
+    fn provider_request_checkpoint_is_delivered_live_but_not_retained() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let request_id = Uuid::new_v4();
+        let checkpoint = ProviderRequestCheckpoint {
+            compatibility_hash: "compat-1".to_string(),
+            transcript: ProviderWireTranscript {
+                format: "openai_chat_native_messages_v1".to_string(),
+                items: vec![json!({"role": "user", "content": "sent request"})],
+            },
+        };
+        let mut events = TurnEvents::new(Some(sender));
+
+        events.push(AgentEventPayload::ProviderRequestSent {
+            request_id,
+            round: 1,
+            attempt: 1,
+            adapter: "openai_chat".to_string(),
+            method: "POST".to_string(),
+            endpoint: "https://example.invalid/v1/chat/completions".to_string(),
+            cache_trace: None,
+            body: Value::Null,
+            checkpoint: Some(checkpoint.clone()),
+        });
+
+        let mut live = receiver.try_recv().expect("live request event");
+        assert_eq!(live.take_provider_request_checkpoint(), Some(checkpoint));
+        let mut recorded = events.into_vec();
+        assert_eq!(recorded.len(), 1);
+        assert!(recorded[0].take_provider_request_checkpoint().is_none());
+        assert!(serde_json::to_value(&recorded[0])
+            .expect("serialize event")
+            .get("checkpoint")
+            .is_none());
     }
 }

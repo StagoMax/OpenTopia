@@ -7,7 +7,7 @@
 use crate::enterprise::{
     capabilities_with_connection_operations, AgentModelPolicyV1, AgentRiskClassV1,
     AgentTemplateStatusV1, AgentTemplateVersionV1, CapabilityProjection, ExecutionResourceGrantV1,
-    ENTERPRISE_SCHEMA_VERSION_V1,
+    SagKnowledgeBindingV1, ENTERPRISE_SCHEMA_VERSION_V1,
 };
 use crate::enterprise_connection_grants::{
     resolved_bindings_match, ConnectionBindingV1, ExecutionConnectionOperationV1,
@@ -53,6 +53,8 @@ pub struct WorkflowAgentSpecV1 {
     pub output_schema: Value,
     pub risk_class: AgentRiskClassV1,
     pub connection_bindings: Vec<ConnectionBindingV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge_binding: Option<SagKnowledgeBindingV1>,
     pub connection_authority: RuntimeConnectionAuthorityV1,
 }
 
@@ -130,6 +132,7 @@ impl WorkflowAgentSpecV1 {
             output_schema: template.spec.output_schema.clone(),
             risk_class: template.spec.risk_class,
             connection_bindings: template.spec.connection_bindings.clone(),
+            knowledge_binding: template.spec.knowledge_binding.clone(),
             // Structured(empty) is intentional: a node with no Connection
             // access must not fall back to mutable Thread MCP state.
             connection_authority: RuntimeConnectionAuthorityV1::Structured { operations },

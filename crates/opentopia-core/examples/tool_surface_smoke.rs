@@ -255,13 +255,12 @@ impl ModelProvider for SmokeProvider {
                 9,
                 "set_plan",
                 json!({
-                    "expected_revision": 0,
                     "objective": "Exercise every default model-facing OpenTopia tool.",
                     "explanation": "Create the smoke-test WorkForm.",
                     "acceptance": ["Every default tool is dispatched."],
                     "items": [{
                         "id": "exercise-tools",
-                        "title": "Exercise the default tool surface",
+                        "step": "Exercise the default tool surface",
                         "acceptance": ["All tool calls finish without a structured error."]
                     }]
                 }),
@@ -270,14 +269,12 @@ impl ModelProvider for SmokeProvider {
                 10,
                 "update_plan",
                 json!({
-                    "operation": "update_item",
-                    "expected_revision": 1,
                     "explanation": "Record smoke-test evidence.",
-                    "item_id": "exercise-tools",
-                    "updates": {
+                    "items": [{
+                        "id": "exercise-tools",
                         "status": "completed",
                         "evidence_refs": ["smoke:default-tool-surface"]
-                    }
+                    }]
                 }),
             ),
             11 => Self::one_call(

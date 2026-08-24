@@ -305,6 +305,9 @@ fn structured_model_conversation_message(
             .iter()
             .filter_map(|part| match part {
                 MessagePart::Text { text } => Some(text.clone()),
+                MessagePart::ProposedPlan { text } => {
+                    Some(format!("<proposed_plan>{text}</proposed_plan>"))
+                }
                 MessagePart::Error { message } => Some(message.clone()),
                 _ => None,
             })
@@ -735,6 +738,27 @@ pub(crate) fn estimate_tokens(text: &str) -> usize {
         .div_ceil(4)
         .saturating_add(non_ascii_chars.saturating_mul(2))
         .max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proposed_plan_replays_with_semantic_tags() {
+        let thread_id = Uuid::new_v4();
+        let mut message = Message::text(thread_id, MessageRole::Assistant, "方案如下：");
+        message.parts.push(MessagePart::ProposedPlan {
+            text: "1. 调查\n2. 实施".to_string(),
+        });
+
+        let replay = model_conversation_message(&message).expect("assistant replay");
+
+        assert_eq!(
+            replay.content,
+            "方案如下：\n<proposed_plan>1. 调查\n2. 实施</proposed_plan>"
+        );
+    }
 }
 
 pub(crate) fn model_content_part_token_estimate(part: &ModelContentPart) -> usize {

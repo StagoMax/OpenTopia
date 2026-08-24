@@ -931,6 +931,12 @@ mod tests {
                 policy.inspect_command("curl https://example.test/status"),
                 PolicyDecision::Ask { .. }
             ));
+            assert!(matches!(
+                policy.inspect_command(
+                    "$uri = 'https://example.test/status'; try { Invoke-WebRequest -Uri $uri } catch { exit 1 }"
+                ),
+                PolicyDecision::Ask { .. }
+            ));
         }
 
         let full_access = BasicPolicyEngine::new(workspace.clone(), PermissionMode::FullAccess);

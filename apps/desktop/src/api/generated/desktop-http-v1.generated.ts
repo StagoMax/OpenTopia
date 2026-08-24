@@ -844,6 +844,11 @@ export type MessagePart =
       [k: string]: unknown;
     }
   | {
+      text: string;
+      type: "proposed_plan";
+      [k: string]: unknown;
+    }
+  | {
       contentType: string;
       data: number[];
       id?: string | null;
@@ -1270,6 +1275,7 @@ export interface EnterpriseExecutionContextV1 {
   connectionBindings?: ConnectionBindingV1[];
   connectionOperations?: ExecutionConnectionOperationV1[];
   delegationChain: string[];
+  knowledgeBinding?: SagKnowledgeBindingV1 | null;
   mode: ExperienceMode;
   modelPolicy: AgentModelPolicyV1;
   parentAgentId?: string | null;
@@ -1321,6 +1327,13 @@ export interface ExecutionConnectionOperationV1 {
   operationId: string;
   pinnedOperationFingerprint: string;
   providerToolName: string;
+}
+/**
+ * Immutable, server-enforced SAG scope available to an Agent. Namespaces are intentionally absent from the model-facing tool schema so the model cannot widen the template's knowledge boundary at invocation time.
+ */
+export interface SagKnowledgeBindingV1 {
+  namespaces: string[];
+  [k: string]: unknown;
 }
 export interface AgentModelPolicyV1 {
   allowAllModels?: boolean;
@@ -1568,6 +1581,7 @@ export interface WorkflowAgentSpecV1 {
   connectionAuthority: RuntimeConnectionAuthorityV1;
   connectionBindings: ConnectionBindingV1[];
   instructions: string;
+  knowledgeBinding?: SagKnowledgeBindingV1 | null;
   modelPolicy: AgentModelPolicyV1;
   name: string;
   nodeId: string;
@@ -1821,6 +1835,7 @@ export interface AgentTemplateSpecV1 {
   delegateTemplateIds: string[];
   description: string;
   instructions: string;
+  knowledgeBinding?: SagKnowledgeBindingV1 | null;
   modelPolicy: AgentModelPolicyV1;
   outputSchema: unknown;
   resourceGrants: ExecutionResourceGrantV1[];

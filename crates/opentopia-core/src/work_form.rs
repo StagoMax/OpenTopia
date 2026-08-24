@@ -259,6 +259,7 @@ impl WorkForm {
         let mut ids = HashSet::new();
         let mut titles = HashSet::new();
         let mut in_progress = 0usize;
+        let governed = matches!(self.scope, WorkScope::Goal(_));
         for item in &self.items {
             anyhow::ensure!(!item.id.trim().is_empty(), "work item id cannot be empty");
             anyhow::ensure!(
@@ -276,16 +277,18 @@ impl WorkForm {
                 item.title
             );
             in_progress += usize::from(item.status == WorkItemStatus::InProgress);
-            anyhow::ensure!(
-                !item.status.requires_note()
-                    || item
-                        .note
-                        .as_deref()
-                        .is_some_and(|note| !note.trim().is_empty()),
-                "work item {} requires a note for {:?}",
-                item.id,
-                item.status
-            );
+            if governed {
+                anyhow::ensure!(
+                    !item.status.requires_note()
+                        || item
+                            .note
+                            .as_deref()
+                            .is_some_and(|note| !note.trim().is_empty()),
+                    "work item {} requires a note for {:?}",
+                    item.id,
+                    item.status
+                );
+            }
             for dependency in &item.depends_on {
                 anyhow::ensure!(
                     dependency != &item.id,
@@ -314,7 +317,7 @@ impl WorkForm {
                     );
                 }
             }
-            if item.status == WorkItemStatus::Completed {
+            if governed && item.status == WorkItemStatus::Completed {
                 anyhow::ensure!(
                     !item.acceptance.is_empty(),
                     "completed work item {} requires acceptance criteria",
@@ -445,6 +448,36 @@ mod tests {
         let id = Uuid::new_v4();
         assert_ne!(WorkScope::Turn(id).form_id(), WorkScope::Goal(id).form_id());
         assert_eq!(WorkScope::Goal(id).form_id(), WorkScope::Goal(id).form_id());
+    }
+
+    #[test]
+    fn ordinary_turns_do_not_require_governance_evidence() {
+        let thread_id = Uuid::new_v4();
+        let item = WorkItem {
+            id: "implement".into(),
+            title: "Implement".into(),
+            status: WorkItemStatus::Completed,
+            completion_disposition: CompletionDisposition::Blocking,
+            depends_on: Vec::new(),
+            note: None,
+            acceptance: Vec::new(),
+            evidence_refs: Vec::new(),
+        };
+        let turn = WorkForm::new(
+            thread_id,
+            WorkScope::Turn(Uuid::new_v4()),
+            "ship",
+            vec![item.clone()],
+        );
+        assert!(turn.validate().is_ok());
+
+        let goal = WorkForm::new(
+            thread_id,
+            WorkScope::Goal(Uuid::new_v4()),
+            "ship",
+            vec![item],
+        );
+        assert!(goal.validate().is_err());
     }
 
     #[test]

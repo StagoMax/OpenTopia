@@ -133,17 +133,33 @@ pub struct ModelInputLedger {
     pub tool_results: Vec<ProviderToolResult>,
 }
 
-/// Exact provider-visible transcript retained at a successful turn boundary.
+/// Exact provider-visible transcript retained at a durable cache boundary.
 ///
 /// This is deliberately separate from the provider-neutral conversation
 /// projection. The projection remains the durable recovery source, while this
 /// value preserves byte ordering for adapters whose prompt cache requires the
 /// next request to extend the previous wire transcript without rebuilding it.
+/// A completed turn stores the transcript including its final assistant
+/// message; an in-flight or rejected request may temporarily store the exact
+/// request input so cancellation, failure, or process interruption can resume
+/// from the same prefix.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderWireTranscript {
     pub format: String,
     pub items: Vec<Value>,
+}
+
+/// Transient, in-process checkpoint attached to a provider-request event.
+///
+/// The checkpoint is deliberately skipped by event serialization. Product
+/// runtimes consume it from the live event stream and overwrite their single
+/// provider-state row independently of whether the turn later returns a final
+/// result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderRequestCheckpoint {
+    pub compatibility_hash: String,
+    pub transcript: ProviderWireTranscript,
 }
 
 pub(crate) const PROVIDER_TRANSCRIPT_STATE_TYPE: &str = "opentopia_provider_wire_transcript";

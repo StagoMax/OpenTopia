@@ -2584,6 +2584,7 @@ mod tests {
             output_schema: json!({"type": "object"}),
             risk_class: AgentRiskClassV1::Medium,
             connection_bindings: Vec::new(),
+            knowledge_binding: None,
             connection_authority: RuntimeConnectionAuthorityV1::Structured {
                 operations: Vec::new(),
             },

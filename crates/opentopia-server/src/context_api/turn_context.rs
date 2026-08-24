@@ -13,9 +13,9 @@ use crate::{
     AgentEventPayload, AgentInstanceV1, AgentTemplateVersionV1, ApiError, AppSettings, AppState,
     CompiledModelContext, ContextCacheScope, ContextItemKind, ContextProjection, ContextRole,
     ContextSensitivity, ContributionKind, ExperienceMode, ExperienceSurfaceProfile, FsPath,
-    LoadedSkill, ModelContentPart, ModelContextItem, ModelConversationMessage, PermissionMode,
-    ProviderSettings, RuntimeSurface, SessionStore, ThreadContextSnapshot, TurnContextSnapshot,
-    WorldStateSkill, WorldStateSnapshot,
+    LoadedSkill, ModelCallPurpose, ModelContentPart, ModelContextItem, ModelConversationMessage,
+    PermissionMode, ProviderSettings, RuntimeSurface, SessionStore, ThreadContextSnapshot,
+    TurnContextSnapshot, WorldStateSkill, WorldStateSnapshot,
 };
 #[cfg(test)]
 use axum::http::StatusCode;
@@ -206,7 +206,7 @@ pub(crate) async fn build_turn_model_context(
         .extend(instruction_resolution.documents.iter().map(|document| {
             ModelContextItem::text(
                 ContextItemKind::RepositoryInstructions,
-                ContextRole::Developer,
+                ContextRole::User,
                 document.path.display().to_string(),
                 &document.content,
                 ContextCacheScope::Turn,
@@ -452,7 +452,7 @@ pub(crate) async fn build_turn_model_context(
             .map(|skill| {
                 ModelContextItem::text(
                     ContextItemKind::SkillInstructions,
-                    ContextRole::Developer,
+                    ContextRole::User,
                     skill.descriptor.path.display().to_string(),
                     skill.render_for_model(),
                     // Explicit Skill selection belongs to this Turn. A later
@@ -558,6 +558,129 @@ fn latest_thread_context_snapshot(events: &[AgentEvent]) -> Option<&ThreadContex
     })
 }
 
+fn latest_compatible_agent_total_tokens(
+    events: &[AgentEvent],
+    provider: &ProviderSettings,
+) -> Option<usize> {
+    let (usage_index, total_tokens) =
+        events
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, event)| match &event.payload {
+                AgentEventPayload::TokenUsage {
+                    purpose: ModelCallPurpose::AgentRound,
+                    total_tokens,
+                    ..
+                } if *total_tokens > 0 => Some((index, *total_tokens)),
+                _ => None,
+            })?;
+    let snapshot = events[..=usage_index]
+        .iter()
+        .rev()
+        .find_map(|event| match &event.payload {
+            AgentEventPayload::ThreadContextSnapshot { snapshot } => Some(snapshot),
+            _ => None,
+        })?;
+    let adapter_identity = provider.resolved_route().adapter_identity();
+    (snapshot.provider_id == provider.id
+        && snapshot.model == provider.model
+        && (snapshot.provider_adapter.is_empty() || snapshot.provider_adapter == adapter_identity))
+        .then_some(total_tokens)
+}
+
+#[cfg(test)]
+mod provider_usage_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn provider(id: &str, model: &str) -> ProviderSettings {
+        ProviderSettings {
+            id: id.to_string(),
+            model: model.to_string(),
+            ..ProviderSettings::default()
+        }
+    }
+
+    fn snapshot_event(seq: i64, provider: &ProviderSettings) -> AgentEvent {
+        AgentEvent::new(
+            Uuid::new_v4(),
+            None,
+            seq,
+            AgentEventPayload::ThreadContextSnapshot {
+                snapshot: ThreadContextSnapshot {
+                    captured_at: Utc::now(),
+                    provider_id: provider.id.clone(),
+                    provider_kind: provider.kind.as_str().to_string(),
+                    provider_adapter: provider.resolved_route().adapter_identity(),
+                    model: provider.model.clone(),
+                    workspace_root: PathBuf::from("workspace"),
+                    cwd: PathBuf::from("workspace"),
+                    experience_mode: String::new(),
+                    permission_mode: "full_access".to_string(),
+                    sandbox_mode: "workspace_write".to_string(),
+                    instructions: Vec::new(),
+                    tool_catalog_hash: String::new(),
+                    world_state_hash: String::new(),
+                    context_hash: String::new(),
+                },
+            },
+        )
+    }
+
+    fn usage_event(seq: i64, purpose: ModelCallPurpose, total_tokens: usize) -> AgentEvent {
+        AgentEvent::new(
+            Uuid::new_v4(),
+            None,
+            seq,
+            AgentEventPayload::TokenUsage {
+                request_id: None,
+                round: Some(0),
+                purpose,
+                input_tokens: total_tokens.saturating_sub(10),
+                output_tokens: total_tokens.min(10),
+                total_tokens,
+                cached_input_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                local_input_estimate: None,
+                input_breakdown: None,
+            },
+        )
+    }
+
+    #[test]
+    fn carries_the_latest_agent_round_total_across_turns() {
+        let provider = provider("provider-a", "model-a");
+        let events = vec![
+            snapshot_event(1, &provider),
+            usage_event(2, ModelCallPurpose::AgentRound, 560_000),
+            usage_event(3, ModelCallPurpose::ContextCompaction, 12_000),
+        ];
+
+        assert_eq!(
+            latest_compatible_agent_total_tokens(&events, &provider),
+            Some(560_000)
+        );
+    }
+
+    #[test]
+    fn does_not_reuse_usage_from_a_different_provider_epoch() {
+        let previous = provider("provider-a", "model-a");
+        let current = provider("provider-b", "model-b");
+        let events = vec![
+            snapshot_event(1, &previous),
+            usage_event(2, ModelCallPurpose::AgentRound, 900_000),
+            snapshot_event(3, &current),
+        ];
+
+        assert_eq!(
+            latest_compatible_agent_total_tokens(&events, &current),
+            None
+        );
+    }
+}
+
 pub(crate) fn thread_context_snapshot_changed(
     previous: &ThreadContextSnapshot,
     current: &ThreadContextSnapshot,
@@ -586,20 +709,18 @@ mod experience_mode_tests {
 
     #[test]
     fn experience_modes_bind_prompt_profiles_to_projected_capabilities() {
-        for mode in [
-            ExperienceMode::Work,
-            ExperienceMode::Code,
-            ExperienceMode::Flow,
-        ] {
-            let instruction = experience_mode_module(mode).text_content().to_string();
-            assert!(instruction.contains("ExecutionContext"));
-        }
         assert!(experience_mode_module(ExperienceMode::Work)
             .text_content()
-            .contains("goal, progress, sources, artifacts, and finished outputs"));
+            .contains("user-goal, source, artifact, and deliverable language"));
+        assert!(experience_mode_module(ExperienceMode::Work)
+            .text_content()
+            .contains("never expands authorization"));
         assert!(experience_mode_module(ExperienceMode::Code)
             .text_content()
             .contains("files, commands, diffs, tests, verification"));
+        assert!(experience_mode_module(ExperienceMode::Code)
+            .text_content()
+            .contains("never expands authorization"));
         assert!(experience_mode_module(ExperienceMode::Flow)
             .text_content()
             .contains("enterprise design, run, and review surface"));
@@ -719,6 +840,9 @@ pub(crate) async fn prepare_turn_context(
     let mut budget = AgentContextBudget::new(context_window);
     budget.record_tokens(reservation.fixed_input_tokens.saturating_add(history_used));
     budget.set_round_pressure(reservation.generation_reserve_tokens);
+    if let Some(total_tokens) = latest_compatible_agent_total_tokens(&events, provider) {
+        budget.set_last_provider_total_tokens(total_tokens);
+    }
     let projection = build_context_projection(
         summary.as_ref(),
         prior_messages.len(),

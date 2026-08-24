@@ -448,7 +448,9 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
                 .parts
                 .iter()
                 .map(|part| match part {
-                    MessagePart::Text { text } => crate::model_context::estimate_tokens(text),
+                    MessagePart::Text { text } | MessagePart::ProposedPlan { text } => {
+                        crate::model_context::estimate_tokens(text)
+                    }
                     MessagePart::ToolResult { result } => {
                         crate::model_context::estimate_tokens(&result.output)
                     }

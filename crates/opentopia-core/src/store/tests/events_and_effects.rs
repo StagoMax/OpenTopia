@@ -230,6 +230,7 @@ fn conversation_event_view_removes_diagnostic_bodies_and_hidden_reasoning() {
             endpoint: "http://localhost/model".to_string(),
             cache_trace: None,
             body: serde_json::json!({"input": "y".repeat(32_000)}),
+            checkpoint: None,
         },
         AgentEventPayload::ReasoningDelta {
             text: "hidden historical reasoning".to_string(),

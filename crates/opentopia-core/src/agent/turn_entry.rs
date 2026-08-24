@@ -67,11 +67,7 @@ impl AgentCore {
                 self.prompt_runtime_capabilities(RuntimeSurface::Core),
             )
         });
-        let lineage_instructions = self
-            .additional_developer_instructions
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .map(str::to_string);
+        let lineage_instructions = self.lineage_instructions();
         let tool_candidates = self.provider_tool_candidates();
         let model_context =
             self.kernel
@@ -179,7 +175,13 @@ impl AgentCore {
             .await?;
         let rejected_opening_request = opening_request.logical().clone();
         let response = match self
-            .complete_model(opening_request, 1, &mut events, input.cancellation.as_ref())
+            .complete_model(
+                opening_request,
+                1,
+                &provider_compatibility_hash,
+                &mut events,
+                input.cancellation.as_ref(),
+            )
             .await
         {
             Ok(response) => response,
@@ -220,7 +222,13 @@ impl AgentCore {
                     return Err(error);
                 };
                 let retry = self
-                    .complete_model(retry_request, 1, &mut events, input.cancellation.as_ref())
+                    .complete_model(
+                        retry_request,
+                        1,
+                        &provider_compatibility_hash,
+                        &mut events,
+                        input.cancellation.as_ref(),
+                    )
                     .await;
                 if input
                     .cancellation
@@ -239,6 +247,9 @@ impl AgentCore {
         let rollout_reviews = 0;
         if let Some(ref mut budget) = budget {
             budget.record_tokens(ContextBudget::estimate_tokens(&response.text));
+            if let Some(usage) = response.usage.as_ref() {
+                budget.record_provider_usage(usage);
+            }
         }
         record_rollout_usage(&mut rollout_budget, response.usage.as_ref())?;
         let post_parse_control = self.drain_post_parse_control(input.user_message_id);
@@ -345,6 +356,7 @@ impl AgentCore {
                 )?;
                 return Ok(finalize_provider_turn(
                     input.thread_id,
+                    self.collaboration_mode,
                     response,
                     opening_provider_response_items,
                     provider_tool_results,

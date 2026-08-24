@@ -136,15 +136,33 @@ pub(crate) fn ensure_tool_error_record(result: &mut ToolResult) {
         .unwrap_or(false)
     {
         ("approval_required", "authorization", false, true)
+    } else if result
+        .metadata
+        .get("exitCode")
+        .and_then(Value::as_i64)
+        .is_some_and(|exit_code| exit_code != 0)
+    {
+        ("command_exit_nonzero", "command", true, false)
     } else {
         ("tool_execution_failed", "execution", true, false)
     };
-    let message = result
-        .metadata
-        .get("error")
-        .and_then(Value::as_str)
-        .unwrap_or(&result.output)
-        .to_string();
+    let message = if code == "command_exit_nonzero" {
+        format!(
+            "Command exited with code {}",
+            result
+                .metadata
+                .get("exitCode")
+                .and_then(Value::as_i64)
+                .expect("classified command exit has an exit code")
+        )
+    } else {
+        result
+            .metadata
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or(&result.output)
+            .to_string()
+    };
     insert_tool_error_record(
         &mut result.metadata,
         code,
@@ -157,8 +175,10 @@ pub(crate) fn ensure_tool_error_record(result: &mut ToolResult) {
 
 #[cfg(test)]
 mod tests {
-    use super::insert_classified_anyhow_error_record;
+    use super::{ensure_tool_error_record, insert_classified_anyhow_error_record};
+    use crate::model::ToolResult;
     use serde_json::json;
+    use uuid::Uuid;
 
     #[cfg(windows)]
     #[test]
@@ -177,5 +197,34 @@ mod tests {
             Some(&json!(true))
         );
         assert_eq!(metadata.get("osError"), Some(&json!(1224)));
+    }
+
+    #[test]
+    fn nonzero_process_exit_is_a_command_outcome_not_a_tool_failure() {
+        let mut result = ToolResult {
+            call_id: Uuid::new_v4(),
+            output: "validation reported errors".into(),
+            content: Vec::new(),
+            metadata: json!({
+                "success": false,
+                "exitCode": 1,
+                "stderr": "validation reported errors"
+            }),
+        };
+
+        ensure_tool_error_record(&mut result);
+
+        assert_eq!(
+            result.metadata.pointer("/errorRecord/code"),
+            Some(&json!("command_exit_nonzero"))
+        );
+        assert_eq!(
+            result.metadata.pointer("/errorRecord/phase"),
+            Some(&json!("command"))
+        );
+        assert_eq!(
+            result.metadata.pointer("/errorRecord/executed"),
+            Some(&json!(true))
+        );
     }
 }

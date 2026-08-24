@@ -6,7 +6,7 @@ use crate::guardian::{
 use crate::model_context::{
     ModelContextItem, ThreadContextSnapshot, TokenEstimateBreakdown, TurnContextSnapshot,
 };
-use crate::provider::ModelUsage;
+use crate::provider::{ModelUsage, ProviderRequestCheckpoint};
 use crate::skills::LoadedSkill;
 use crate::work_form::{WorkForm, WorkFormStatus};
 use chrono::{DateTime, Utc};
@@ -229,6 +229,12 @@ impl Message {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MessagePart {
     Text {
+        text: String,
+    },
+    /// A Plan-mode proposal extracted from the model's `<proposed_plan>`
+    /// block. This is presentation content, not the executable WorkForm
+    /// maintained by the Default/Goal `update_plan` tool.
+    ProposedPlan {
         text: String,
     },
     Image {
@@ -837,9 +843,10 @@ pub struct ContextProjection {
 #[serde(rename_all = "camelCase")]
 pub struct ContextCompactionMetrics {
     pub source: String,
-    /// Exact logical agent request before local compaction.
+    /// Local estimate of the logical agent request before compaction.
     pub input_tokens: usize,
-    /// Exact logical agent request after the checkpoint starts a new epoch.
+    /// Local estimate after the checkpoint starts a new request epoch. The
+    /// provider-reported result is only available after that request finishes.
     #[serde(default)]
     pub post_compaction_tokens: usize,
     pub checkpoint_tokens: usize,
@@ -1448,6 +1455,12 @@ pub enum AgentEventPayload {
         cache_trace: Option<ProviderCacheTrace>,
         #[serde(default, skip_serializing_if = "Value::is_null")]
         body: Value,
+        /// Live-only exact wire checkpoint. Durable event JSON intentionally
+        /// excludes the transcript; the runtime consumes it into the single
+        /// provider-state row before persisting this observation.
+        #[serde(skip)]
+        #[schemars(skip)]
+        checkpoint: Option<ProviderRequestCheckpoint>,
     },
     ProviderRequestRetried {
         request_id: Uuid,
@@ -1639,6 +1652,22 @@ pub enum ProviderRetryKind {
 }
 
 impl AgentEventPayload {
+    pub fn take_provider_request_checkpoint(&mut self) -> Option<ProviderRequestCheckpoint> {
+        match self {
+            Self::ProviderRequestSent { checkpoint, .. } => checkpoint.take(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn set_provider_request_checkpoint(
+        &mut self,
+        value: Option<ProviderRequestCheckpoint>,
+    ) {
+        if let Self::ProviderRequestSent { checkpoint, .. } = self {
+            *checkpoint = value;
+        }
+    }
+
     pub fn kind(&self) -> &'static str {
         match self {
             Self::ThreadContextSnapshot { .. } => "thread_context_snapshot",

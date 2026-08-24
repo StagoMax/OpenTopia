@@ -99,6 +99,9 @@ pub struct ToolInvocationContext {
     /// Exact structured Connection routes keyed by the model-facing alias.
     /// Legacy MCP contexts leave this empty.
     pub connection_operations: BTreeMap<String, ConnectionOperationRuntimeRoute>,
+    /// Runtime-owned SAG namespaces. Knowledge tools treat this as an exact,
+    /// fail-closed scope; model arguments cannot add or replace namespaces.
+    pub library_namespaces: Vec<String>,
     /// Whether the provider selected for this thread accepts native image input.
     /// `view_attachment` uses this to choose native image delivery or an explicitly
     /// declared MCP attachment-inspection capability.
@@ -179,6 +182,7 @@ impl ToolInvocationContext {
             mcp_host: None,
             mcp_tools: Vec::new(),
             connection_operations: BTreeMap::new(),
+            library_namespaces: Vec::new(),
             model_supports_vision: true,
             fork_conversation: Vec::new(),
             fork_model_context: None,
@@ -233,6 +237,7 @@ impl ToolInvocationContext {
             mcp_host: None,
             mcp_tools: Vec::new(),
             connection_operations: BTreeMap::new(),
+            library_namespaces: Vec::new(),
             model_supports_vision: true,
             fork_conversation: Vec::new(),
             fork_model_context: None,

@@ -44,6 +44,7 @@ fn template_with_operation() -> (AgentTemplateVersionV1, ResolvedConnectionBindi
             budget: AgentBudgetV1::default(),
             risk_class: AgentRiskClassV1::Medium,
             connection_bindings: vec![binding.clone()],
+            knowledge_binding: None,
         },
     )
     .expect("draft template");

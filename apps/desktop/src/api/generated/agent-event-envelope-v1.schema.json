@@ -2241,6 +2241,25 @@
           "type": "object"
         },
         {
+          "description": "A Plan-mode proposal extracted from the model's `<proposed_plan>` block. This is presentation content, not the executable WorkForm maintained by the Default/Goal `update_plan` tool.",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "proposed_plan"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "text",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
           "properties": {
             "contentType": {
               "type": "string"

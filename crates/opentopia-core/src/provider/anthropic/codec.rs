@@ -7,7 +7,9 @@ use serde_json::{json, Value};
 pub(in crate::provider) fn anthropic_system_instructions(request: &ModelRequest) -> String {
     scoped_instruction_messages(request, true)
         .into_iter()
-        .map(|(_, content)| content)
+        .filter_map(|(role, content)| {
+            (role != crate::model_context::ContextRole::User).then_some(content)
+        })
         .filter(|content| !content.trim().is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")
@@ -15,6 +17,16 @@ pub(in crate::provider) fn anthropic_system_instructions(request: &ModelRequest)
 
 pub(super) fn anthropic_messages(request: &ModelRequest) -> Vec<Value> {
     let mut messages = Vec::new();
+    for (_, content) in scoped_instruction_messages(request, true)
+        .into_iter()
+        .filter(|(role, _)| *role == crate::model_context::ContextRole::User)
+    {
+        push_anthropic_message(
+            &mut messages,
+            "user",
+            vec![json!({ "type": "text", "text": content })],
+        );
+    }
     for (index, message) in request.input.conversation.iter().enumerate() {
         if message.role == ModelConversationRole::System {
             continue;

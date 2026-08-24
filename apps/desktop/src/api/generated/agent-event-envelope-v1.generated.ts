@@ -352,6 +352,11 @@ export type MessagePart =
       [k: string]: unknown;
     }
   | {
+      text: string;
+      type: "proposed_plan";
+      [k: string]: unknown;
+    }
+  | {
       contentType: string;
       data: number[];
       id?: string | null;

@@ -17,9 +17,9 @@ use crate::{
     ProviderTransportKind, SessionStore, CONTEXT_CHECKPOINT_SCHEMA_VERSION,
 };
 use opentopia_core::{
-    ContextAssembler, ContextAssemblyInput, ContextCacheScope, ContextItemKind, ContextRole,
-    ContextSensitivity, DefaultContextAssembler, ModelContextItem, ModelGatewayMetricEvent,
-    ModelRequest,
+    AgentEventSender, ContextAssembler, ContextAssemblyInput, ContextCacheScope, ContextItemKind,
+    ContextRole, ContextSensitivity, DefaultContextAssembler, ModelContextItem,
+    ModelGatewayMetricEvent, ModelRequest,
 };
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -305,7 +305,9 @@ fn context_budget_from_messages(
             .parts
             .iter()
             .map(|part| match part {
-                MessagePart::Text { text } => opentopia_core::estimate_model_context_tokens(text),
+                MessagePart::Text { text } | MessagePart::ProposedPlan { text } => {
+                    opentopia_core::estimate_model_context_tokens(text)
+                }
                 MessagePart::ToolResult { result } => {
                     opentopia_core::estimate_model_context_tokens(&result.output)
                 }
@@ -515,6 +517,30 @@ fn compact_event_time_index(events: &[AgentEvent], after_seq: i64) -> String {
         .join("\n")
 }
 
+fn emit_context_compaction_payload(
+    state: &AppState,
+    thread_id: Uuid,
+    turn_id: Option<Uuid>,
+    event_sender: Option<&AgentEventSender>,
+    payload: AgentEventPayload,
+) {
+    if let Err(payload) = send_context_compaction_payload(event_sender, payload) {
+        // Manual compaction has no turn channel. A closed live channel can also
+        // fall back here during shutdown so its last diagnostic is not lost.
+        publish_payload(state, thread_id, turn_id, payload);
+    }
+}
+
+fn send_context_compaction_payload(
+    event_sender: Option<&AgentEventSender>,
+    payload: AgentEventPayload,
+) -> Result<(), AgentEventPayload> {
+    let Some(sender) = event_sender else {
+        return Err(payload);
+    };
+    sender.send(payload).map_err(|error| error.0)
+}
+
 pub(crate) async fn generate_context_summary(
     state: &AppState,
     thread_id: Uuid,
@@ -526,6 +552,7 @@ pub(crate) async fn generate_context_summary(
     previous_summary_override: Option<&ContextSummary>,
     provider_override: Option<&ProviderSettings>,
     model_request: &ModelRequest,
+    event_sender: Option<&AgentEventSender>,
 ) -> Result<ContextSummary, ApiError> {
     let settings = current_settings(state);
     let active = provider_override
@@ -557,10 +584,11 @@ pub(crate) async fn generate_context_summary(
     .map_err(|error| ApiError::internal(format!("context request assembly failed: {error}")))?;
     let request_id = Uuid::new_v4();
     let input_breakdown = request.logical().token_estimate_breakdown();
-    publish_payload(
+    emit_context_compaction_payload(
         state,
         thread_id,
         turn_id,
+        event_sender,
         AgentEventPayload::ModelContextBuilt {
             request_id,
             round: 0,
@@ -576,10 +604,11 @@ pub(crate) async fn generate_context_summary(
     let request_snapshot = serde_json::to_value(request.logical())
         .map(|value| redact_model_observation(&value))
         .unwrap_or_else(|error| json!({ "serializationError": error.to_string() }));
-    publish_payload(
+    emit_context_compaction_payload(
         state,
         thread_id,
         turn_id,
+        event_sender,
         AgentEventPayload::ModelRequest {
             request_id,
             round: 0,
@@ -590,10 +619,11 @@ pub(crate) async fn generate_context_summary(
     let prepared = gateway.prepare(request_id, request).map_err(|err| {
         ApiError::bad_gateway(format!("context request preparation failed: {err}"))
     })?;
-    publish_payload(
+    emit_context_compaction_payload(
         state,
         thread_id,
         turn_id,
+        event_sender,
         AgentEventPayload::ProviderRequestSent {
             request_id,
             round: 0,
@@ -603,6 +633,7 @@ pub(crate) async fn generate_context_summary(
             endpoint: prepared.endpoint.clone(),
             cache_trace: prepared.cache_trace.clone(),
             body: prepared.observation_body.clone(),
+            checkpoint: None,
         },
     );
     let mut transport_events = Vec::new();
@@ -613,10 +644,11 @@ pub(crate) async fn generate_context_summary(
                 request_id: metric_request_id,
             } => {
                 debug_assert_eq!(metric_request_id, request_id);
-                publish_payload(
+                emit_context_compaction_payload(
                     state,
                     thread_id,
                     turn_id,
+                    event_sender,
                     AgentEventPayload::ProviderFirstTokenReceived { request_id },
                 );
             }
@@ -654,10 +686,11 @@ pub(crate) async fn generate_context_summary(
                 reason,
                 cache_trace,
                 body,
-            } => publish_payload(
+            } => emit_context_compaction_payload(
                 state,
                 thread_id,
                 turn_id,
+                event_sender,
                 AgentEventPayload::ProviderRequestRetried {
                     request_id,
                     round: 0,
@@ -675,10 +708,11 @@ pub(crate) async fn generate_context_summary(
                 status,
                 response_id,
                 body,
-            } => publish_payload(
+            } => emit_context_compaction_payload(
                 state,
                 thread_id,
                 turn_id,
+                event_sender,
                 AgentEventPayload::ProviderResponseReceived {
                     request_id,
                     round: 0,
@@ -695,10 +729,11 @@ pub(crate) async fn generate_context_summary(
         .map_err(|err| ApiError::bad_gateway(format!("context summarization failed: {err}")))?;
     let usage = response.usage.as_ref().or(streamed_usage.as_ref()).cloned();
     if let Some(usage) = usage.as_ref() {
-        publish_payload(
+        emit_context_compaction_payload(
             state,
             thread_id,
             turn_id,
+            event_sender,
             AgentEventPayload::TokenUsage {
                 request_id: Some(request_id),
                 round: Some(0),
@@ -901,6 +936,9 @@ pub(crate) fn render_message_for_summary(message: &Message) -> String {
         .iter()
         .map(|part| match part {
             MessagePart::Text { text } => truncate_chars(text, 12_000),
+            MessagePart::ProposedPlan { text } => {
+                format!("proposed_plan {}", truncate_chars(text, 12_000))
+            }
             MessagePart::Image {
                 content_type, data, ..
             } => format!("image {} ({} bytes)", content_type, data.len()),
@@ -981,9 +1019,13 @@ pub(crate) fn truncate_with_flag(value: &str, max_bytes: usize) -> (String, bool
 
 #[cfg(test)]
 mod tests {
-    use super::{assemble_current_context_compaction_request, historical_context_model_request};
+    use super::{
+        assemble_current_context_compaction_request, historical_context_model_request,
+        send_context_compaction_payload,
+    };
     use crate::{
-        ContextCheckpoint, ContextCheckpointCoverage, ContextSummary, Message, MessageRole,
+        AgentEventPayload, ContextCheckpoint, ContextCheckpointCoverage, ContextSummary, Message,
+        MessageRole,
     };
     use uuid::Uuid;
 
@@ -1025,5 +1067,24 @@ mod tests {
             .items
             .iter()
             .any(|item| item.source == "opentopia:context_compaction"));
+    }
+
+    #[test]
+    fn live_round_compaction_uses_the_turn_event_channel() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let payload = AgentEventPayload::ContextWarning {
+            stage: "round_context_compaction".to_string(),
+            message: "checkpoint started".to_string(),
+        };
+
+        send_context_compaction_payload(Some(&sender), payload)
+            .expect("live compaction event is queued on the turn channel");
+
+        assert!(matches!(
+            receiver.try_recv().expect("queued compaction event"),
+            AgentEventPayload::ContextWarning { stage, message }
+                if stage == "round_context_compaction" && message == "checkpoint started"
+        ));
+        assert!(receiver.try_recv().is_err());
     }
 }

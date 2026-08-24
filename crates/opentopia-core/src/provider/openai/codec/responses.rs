@@ -322,6 +322,7 @@ pub(in crate::provider) fn responses_scoped_instruction_input(
             }
             let role = match role {
                 ContextRole::Developer => "developer",
+                ContextRole::User => "user",
                 // Stable system instructions live in the top-level `instructions`
                 // field. A volatile system item must instead remain behind the
                 // current user cache anchor, alongside volatile developer context.

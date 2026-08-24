@@ -1,5 +1,6 @@
 use crate::model::{ContextCompactionDetails, ContextSummary};
 use crate::provider::ModelRequest;
+use crate::AgentEventSender;
 use async_trait::async_trait;
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -25,6 +26,10 @@ pub struct RoundContextCompactionRequest {
     pub reserved_generation_tokens: usize,
     pub context_window_tokens: usize,
     pub model_request: ModelRequest,
+    /// The owning turn's single ordered event channel. A compactor must use
+    /// this channel for live lifecycle events instead of persisting them on a
+    /// second path, otherwise durable sequence numbers can violate causality.
+    pub event_sender: Option<AgentEventSender>,
 }
 
 /// A durable checkpoint plus the completed tool ledger entries present in the
