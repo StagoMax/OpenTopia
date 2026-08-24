@@ -19,6 +19,9 @@ const net = require("node:net");
 const spreadsheetFormats = require("./spreadsheet-formats.json");
 const updater = require("./updater.cjs");
 const { createDesktopBrowserHost } = require("./browser-host.cjs");
+const {
+  createBackendEventStreamManager,
+} = require("./backend-event-stream.cjs");
 const { createChromeBridge } = require("./chrome-bridge.cjs");
 const { createAppLogger } = require("./logging.cjs");
 const {
@@ -71,6 +74,11 @@ const {
   apiToken: backendApiToken,
   getBackendUrl: () => defaultBackendUrl,
   isDev,
+});
+const backendEventStreamManager = createBackendEventStreamManager({
+  getBackendUrl: () => defaultBackendUrl,
+  getApiToken: () => backendApiToken,
+  logger: (level, event, metadata) => writeLog(level, event, metadata),
 });
 
 /*
@@ -2062,6 +2070,22 @@ function registerIpc() {
       );
     }
   };
+  ipcMain.on("backend-event-stream:open", (event, request) => {
+    try {
+      assertMainRenderer(event);
+      backendEventStreamManager.open(event.sender, request);
+    } catch (error) {
+      backendEventStreamManager.reject(event.sender, request, error);
+    }
+  });
+  ipcMain.on("backend-event-stream:close", (event, streamId) => {
+    try {
+      assertMainRenderer(event);
+      backendEventStreamManager.close(event.sender, streamId);
+    } catch {
+      // A destroyed or navigated renderer already lost its stream consumer.
+    }
+  });
   ipcMain.handle("chrome-bridge:start-pairing", (event, sessionId) => {
     assertMainRenderer(event);
     if (!chromeBridge) throw new Error("Chrome bridge is unavailable.");
@@ -2644,6 +2668,7 @@ app.on("before-quit", (event) => {
     }
     sagServiceManager?.stopSync();
     graphRagServiceManager?.stopSync();
+    backendEventStreamManager.closeAll();
   })().finally(() => {
     appQuitPrepared = true;
     flushLogsSync();

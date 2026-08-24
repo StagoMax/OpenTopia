@@ -1,4 +1,8 @@
-import { getLoadedApiToken } from "../../platform";
+import {
+  getLoadedApiToken,
+  openDesktopBackendEventStream,
+  type DesktopBackendEventStreamHandle,
+} from "../../platform";
 import {
   shouldRecoverEventSequenceGap,
   type EventSequencePolicy,
@@ -111,53 +115,78 @@ export class ApiTransport {
   ): StreamHandle {
     const controller = new AbortController();
     let lastSequence = readSince(path);
+    let activeDesktopStream: DesktopBackendEventStreamHandle | null = null;
 
     const run = async () => {
       while (!controller.signal.aborted) {
         try {
-          const response = await fetch(
-            withSince(`${this.baseUrl}${path}`, lastSequence),
-            {
+          const streamUrl = withSince(
+            `${this.baseUrl}${path}`,
+            lastSequence,
+          );
+          const handleData = (data: string) => {
+            const event = decode(data);
+            const sequence = event.seq;
+            if (
+              shouldRecoverEventSequenceGap(
+                lastSequence,
+                sequence,
+                sequencePolicy,
+              )
+            ) {
+              console.warn(
+                `OpenTopia event stream skipped sequences ${lastSequence! + 1}-${sequence - 1}; reconnecting to replay them`,
+              );
+              return false;
+            }
+            lastSequence = sequence;
+            onData(event);
+            return true;
+          };
+          const frameConsumer = new SseFrameConsumer(handleData);
+          let desktopStream: DesktopBackendEventStreamHandle | null = null;
+          const streamPath = sameOriginPath(this.baseUrl, streamUrl);
+          if (streamPath) {
+            desktopStream = openDesktopBackendEventStream(
+              streamPath,
+              (chunk) => {
+                if (!frameConsumer.push(chunk)) desktopStream?.close();
+              },
+              onConnected,
+            );
+          }
+          if (desktopStream) {
+            activeDesktopStream = desktopStream;
+            try {
+              await desktopStream.completed;
+            } finally {
+              if (activeDesktopStream === desktopStream) {
+                activeDesktopStream = null;
+              }
+            }
+          } else {
+            const response = await fetch(streamUrl, {
               headers: {
                 ...this.authHeaders(),
                 accept: "text/event-stream",
               },
               cache: "no-store",
               signal: controller.signal,
-            },
-          );
-          if (!response.ok) {
-            throw new Error(
-              `Event stream failed: ${response.status} ${response.statusText}`,
+            });
+            if (!response.ok) {
+              throw new Error(
+                `Event stream failed: ${response.status} ${response.statusText}`,
+              );
+            }
+            if (!response.body)
+              throw new Error("Event stream response has no body");
+            onConnected?.();
+            await consumeSse(
+              response.body,
+              frameConsumer,
+              controller.signal,
             );
           }
-          if (!response.body)
-            throw new Error("Event stream response has no body");
-          onConnected?.();
-
-          await consumeSse(
-            response.body,
-            (data) => {
-              const event = decode(data);
-              const sequence = event.seq;
-              if (
-                shouldRecoverEventSequenceGap(
-                  lastSequence,
-                  sequence,
-                  sequencePolicy,
-                )
-              ) {
-                console.warn(
-                  `OpenTopia event stream skipped sequences ${lastSequence! + 1}-${sequence - 1}; reconnecting to replay them`,
-                );
-                return false;
-              }
-              lastSequence = sequence;
-              onData(event);
-              return true;
-            },
-            controller.signal,
-          );
         } catch (error) {
           if (controller.signal.aborted) break;
           console.error("OpenTopia event stream disconnected", error);
@@ -168,41 +197,59 @@ export class ApiTransport {
     };
 
     void run();
-    return { close: () => controller.abort() };
+    return {
+      close: () => {
+        controller.abort();
+        activeDesktopStream?.close();
+        activeDesktopStream = null;
+      },
+    };
   }
 }
 async function consumeSse(
   body: ReadableStream<Uint8Array>,
-  onData: (data: string) => boolean | void,
+  frameConsumer: SseFrameConsumer,
   signal: AbortSignal,
 ): Promise<void> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
-  let buffer = "";
   try {
     while (!signal.aborted) {
       const { done, value } = await reader.read();
       if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      buffer = buffer.replace(/\r\n/g, "\n");
-      let boundary = buffer.indexOf("\n\n");
-      while (boundary >= 0) {
-        const frame = buffer.slice(0, boundary);
-        buffer = buffer.slice(boundary + 2);
-        const data = frame
-          .split("\n")
-          .filter((line) => line.startsWith("data:"))
-          .map((line) => line.slice(5).trimStart())
-          .join("\n");
-        if (data && onData(data) === false) {
-          await reader.cancel("Reconnecting to recover missing events");
-          return;
-        }
-        boundary = buffer.indexOf("\n\n");
+      if (!frameConsumer.push(decoder.decode(value, { stream: true }))) {
+        await reader.cancel("Reconnecting to recover missing events");
+        return;
       }
     }
+    frameConsumer.push(decoder.decode());
   } finally {
     reader.releaseLock();
+  }
+}
+
+class SseFrameConsumer {
+  private buffer = "";
+
+  constructor(
+    private readonly onData: (data: string) => boolean | void,
+  ) {}
+
+  push(chunk: string): boolean {
+    this.buffer = `${this.buffer}${chunk}`.replace(/\r\n/g, "\n");
+    let boundary = this.buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      const frame = this.buffer.slice(0, boundary);
+      this.buffer = this.buffer.slice(boundary + 2);
+      const data = frame
+        .split("\n")
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trimStart())
+        .join("\n");
+      if (data && this.onData(data) === false) return false;
+      boundary = this.buffer.indexOf("\n\n");
+    }
+    return true;
   }
 }
 
@@ -218,6 +265,12 @@ function withSince(url: string, since: number | undefined): string {
   const parsed = new URL(url);
   parsed.searchParams.set("since", String(since));
   return parsed.toString();
+}
+
+function sameOriginPath(baseUrl: string, rawUrl: string): string | null {
+  const base = new URL(baseUrl);
+  const url = new URL(rawUrl);
+  return url.origin === base.origin ? `${url.pathname}${url.search}` : null;
 }
 
 function abortableDelay(

@@ -129,6 +129,19 @@ contextBridge.exposeInMainWorld("opentopia", {
     ipcRenderer.send("logs:conversation-render-trace", trace),
   recordConversationSendTrace: (trace) =>
     ipcRenderer.send("logs:conversation-send-trace", trace),
+  openBackendEventStream: (streamId, path) =>
+    ipcRenderer.send("backend-event-stream:open", { streamId, path }),
+  closeBackendEventStream: (streamId) =>
+    ipcRenderer.send("backend-event-stream:close", streamId),
+  onBackendEventStreamMessage: (listener) => {
+    if (typeof listener !== "function") {
+      throw new TypeError("Backend event stream listener must be a function.");
+    }
+    const wrapped = (_event, message) => listener(message);
+    ipcRenderer.on("backend-event-stream:message", wrapped);
+    return () =>
+      ipcRenderer.removeListener("backend-event-stream:message", wrapped);
+  },
   browserHost,
   chromeBridge,
 });

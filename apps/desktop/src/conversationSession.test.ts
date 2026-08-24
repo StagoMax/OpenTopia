@@ -387,6 +387,54 @@ test("registry tracks background activity without retaining detailed streams", a
   assert.equal(activityCloseCalls, 1);
 });
 
+test("a terminal activity event immediately reconciles the retained detail view", async () => {
+  let onActivityEvent: ((event: AgentEvent) => void) | undefined;
+  const historySince: Array<number | undefined> = [];
+  const started = event("started", 1, {
+    type: "turn_started",
+    user_message_id: "user",
+  });
+  const commentary = event("commentary", 2, {
+    type: "model_delta",
+    text: "working",
+  });
+  const finished = event("finished", 3, {
+    type: "turn_finished",
+    summary: "done",
+  });
+  const client = registryClient({
+    listMessages: () => Promise.resolve([message("user")]),
+    listConversationEvents: (_threadId: string, since?: number) => {
+      historySince.push(since);
+      return Promise.resolve(since === undefined ? [started] : [commentary, finished]);
+    },
+    getTurnStatus: () => Promise.resolve(null),
+    listPendingApprovals: () => Promise.resolve([]),
+    listPendingUserInput: () => Promise.resolve([]),
+    openEventStream: () => ({ close() {} }),
+    openThreadActivityStream: (onEvent: (event: AgentEvent) => void) => {
+      onActivityEvent = onEvent;
+      return { close() {} };
+    },
+  });
+  const registry = new ConversationSessionRegistry(client);
+  const controller = registry.get("thread-1");
+  const release = controller.retain();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  onActivityEvent?.(finished);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  assert.deepEqual(historySince, [undefined, 1]);
+  assert.deepEqual(
+    controller.getSnapshot().events.map((item) => item.id),
+    ["started", "commentary", "finished"],
+  );
+  assert.equal(controller.getSnapshot().activeTurnId, null);
+  release();
+  registry.dispose();
+});
+
 test("registry reconciles live activity whenever the global stream reconnects", async () => {
   let onConnected: (() => void) | undefined;
   const registry = new ConversationSessionRegistry(

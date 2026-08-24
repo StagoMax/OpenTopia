@@ -239,6 +239,19 @@ export class ConversationSessionController {
     this.dispatch({ type: "eventsReceived", events: [event] });
   }
 
+  receiveActivityEvent(event: AgentEvent): void {
+    if (this.retainCount === 0 || event.threadId !== this.threadId) return;
+    const since = latestPersistedEventSeq(this.state.events);
+    this.receiveEvent(event);
+    if (!isTerminalActivityEvent(event)) return;
+    void this.client
+      .listConversationEvents(this.threadId, since)
+      .then((events) => events.forEach((nextEvent) => this.receiveEvent(nextEvent)))
+      .catch((error) => {
+        console.warn("OpenTopia conversation catch-up failed", error);
+      });
+  }
+
   replaceEvents(update: (events: AgentEvent[]) => AgentEvent[]): void {
     this.dispatch({
       type: "eventsReplaced",
@@ -441,7 +454,10 @@ export class ConversationSessionRegistry {
     this.cacheLimit = cacheLimit;
     this.activityStore = activityStore;
     this.activityStream = client.openThreadActivityStream(
-      (event) => this.activityStore.applyEvent(event),
+      (event) => {
+        this.activityStore.applyEvent(event);
+        this.controllers.get(event.threadId)?.receiveActivityEvent(event);
+      },
       () => this.reconcileLiveActivity(),
     );
   }
@@ -522,6 +538,14 @@ function latestPersistedEventSeq(events: AgentEvent[]): number | undefined {
     latest = latest === undefined ? event.seq : Math.max(latest, event.seq);
   }
   return latest;
+}
+
+function isTerminalActivityEvent(event: AgentEvent): boolean {
+  return (
+    event.payload.type === "turn_finished" ||
+    event.payload.type === "turn_cancelled" ||
+    event.payload.type === "error"
+  );
 }
 
 function isAbortError(error: unknown): boolean {

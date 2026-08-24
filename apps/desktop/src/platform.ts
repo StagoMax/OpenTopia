@@ -1,6 +1,9 @@
 import type { ConversationRenderTrace } from "./conversationRenderTrace";
 import type { ConversationSendTrace } from "./conversationSendTrace";
-import type { BackendStartupStatus } from "./types/platform";
+import type {
+  BackendEventStreamMessage,
+  BackendStartupStatus,
+} from "./types/platform";
 import type {
   ContextSourcePickResult,
   FileLinkActionRequest,
@@ -308,6 +311,75 @@ export function recordConversationSendTrace(
 ): void {
   if (typeof window === "undefined") return;
   window.opentopia?.recordConversationSendTrace?.(trace);
+}
+
+export type DesktopBackendEventStreamHandle = {
+  completed: Promise<void>;
+  close(): void;
+};
+
+export function openDesktopBackendEventStream(
+  path: string,
+  onChunk: (chunk: string) => void,
+  onConnected?: () => void,
+): DesktopBackendEventStreamHandle | null {
+  if (typeof window === "undefined") return null;
+  const bridge = window.opentopia;
+  if (
+    !bridge?.openBackendEventStream ||
+    !bridge.closeBackendEventStream ||
+    !bridge.onBackendEventStreamMessage
+  ) {
+    return null;
+  }
+
+  const streamId = globalThis.crypto?.randomUUID?.() ?? fallbackStreamId();
+  let settled = false;
+  let resolveCompleted!: () => void;
+  let rejectCompleted!: (error: Error) => void;
+  const completed = new Promise<void>((resolve, reject) => {
+    resolveCompleted = resolve;
+    rejectCompleted = reject;
+  });
+  const finish = (error?: Error) => {
+    if (settled) return;
+    settled = true;
+    unsubscribe();
+    if (error) rejectCompleted(error);
+    else resolveCompleted();
+  };
+  const onMessage = (message: BackendEventStreamMessage) => {
+    if (message.streamId !== streamId || settled) return;
+    switch (message.type) {
+      case "connected":
+        onConnected?.();
+        break;
+      case "chunk":
+        if (message.chunk) onChunk(message.chunk);
+        break;
+      case "error":
+        finish(new Error(message.error || "Backend event stream failed"));
+        break;
+      case "closed":
+        finish();
+        break;
+    }
+  };
+  const unsubscribe = bridge.onBackendEventStreamMessage(onMessage);
+  bridge.openBackendEventStream(streamId, path);
+
+  return {
+    completed,
+    close() {
+      if (settled) return;
+      bridge.closeBackendEventStream?.(streamId);
+      finish();
+    },
+  };
+}
+
+function fallbackStreamId(): string {
+  return `stream-${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
 }
 
 function readBrowserRecentWorkspaces(): RecentWorkspace[] {

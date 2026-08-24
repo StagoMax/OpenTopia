@@ -25,6 +25,15 @@ export type PlatformInfo = {
   };
 };
 
+export type BackendEventStreamMessage = {
+  streamId: string;
+  type: "connected" | "chunk" | "error" | "closed";
+  status?: number;
+  chunk?: string;
+  error?: string;
+  reason?: string;
+};
+
 /**
  * Startup activity reported by the desktop main process while its managed
  * local backend is being prepared. A build has no reliable total work count,
@@ -393,6 +402,11 @@ declare global {
         clientToServerMs?: number;
         errorName?: string;
       }): void;
+      openBackendEventStream?(streamId: string, path: string): void;
+      closeBackendEventStream?(streamId: string): void;
+      onBackendEventStreamMessage?(
+        listener: (message: BackendEventStreamMessage) => void,
+      ): () => void;
       browserHost?: {
         createSession(input: {
           sessionId: string;
