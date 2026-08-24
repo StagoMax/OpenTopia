@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from datasets import load_dataset
+from huggingface_hub import HfApi
 
 
 def rank(seed: str, value: str) -> str:
@@ -22,12 +23,19 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--count", type=int, default=60)
     parser.add_argument("--seed", default="opentopia-before-after-v1")
+    parser.add_argument(
+        "--revision",
+        default=None,
+        help="Optional Hugging Face dataset revision. Defaults to the current commit, which is recorded.",
+    )
     args = parser.parse_args()
     if args.count < 1:
         raise SystemExit("--count must be positive")
 
     dataset_name = "SWE-bench/SWE-bench_Verified"
-    rows = list(load_dataset(dataset_name, split="test"))
+    dataset_info = HfApi().dataset_info(repo_id=dataset_name, revision=args.revision)
+    dataset_revision = dataset_info.sha
+    rows = list(load_dataset(dataset_name, revision=dataset_revision, split="test"))
     by_repo: dict[str, list[dict]] = defaultdict(list)
     for row in rows:
         by_repo[str(row["repo"])].append(dict(row))
@@ -70,6 +78,8 @@ def main() -> None:
         "schemaVersion": 1,
         "dataset": dataset_name,
         "split": "test",
+        "datasetRevision": dataset_revision,
+        "datasetRevisionUrl": f"https://huggingface.co/datasets/{dataset_name}/tree/{dataset_revision}",
         "datasetRows": len(rows),
         "selectionMethod": "seeded repository round-robin; per-repository instance rank is SHA-256(seed:instance_id)",
         "seed": args.seed,
