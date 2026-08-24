@@ -797,12 +797,12 @@ export interface ContextCompactionMetrics {
   checkpointTokens: number;
   factRetentionPercent: number;
   /**
-   * Exact logical agent request before local compaction.
+   * Local estimate of the logical agent request before compaction.
    */
   inputTokens: number;
   latencyMs: number;
   /**
-   * Exact logical agent request after the checkpoint starts a new epoch.
+   * Local estimate after the checkpoint starts a new request epoch. The provider-reported result is only available after that request finishes.
    */
   postCompactionTokens?: number;
   /**
