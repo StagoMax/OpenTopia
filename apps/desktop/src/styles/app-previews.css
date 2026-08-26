@@ -429,6 +429,12 @@
   padding: 0 var(--space-3);
 }
 
+.web-preview-toolbar .icon-button[data-navigation-state="unavailable"] {
+  cursor: not-allowed;
+  color: var(--text-muted);
+  opacity: 0.48;
+}
+
 .web-preview-toolbar input {
   min-width: 0;
   height: var(--control-height-sm);

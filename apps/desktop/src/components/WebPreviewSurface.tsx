@@ -34,6 +34,7 @@ export function WebPreviewSurface({
   events,
   sessionId: explicitSessionId,
   navigationRequest,
+  onStateChange,
 }: {
   client: ApiClient | null;
   threadId: string | null;
@@ -41,6 +42,7 @@ export function WebPreviewSurface({
   /** An explicit id is a person-created tab, separate from the task browser. */
   sessionId?: string;
   navigationRequest: BrowserNavigationRequest | null;
+  onStateChange?(state: WebPreviewState): void;
 }) {
   const isSharedTaskBrowser = !explicitSessionId;
   const nativeApi = window.opentopia?.browserHost;
@@ -72,6 +74,7 @@ export function WebPreviewSurface({
       handoff={handoff}
       handoffTurnId={handoffTurnId}
       navigationRequest={isSharedTaskBrowser ? navigationRequest : null}
+      onStateChange={onStateChange}
     />
   );
 }
@@ -83,6 +86,7 @@ function NativeWebPreview({
   handoff,
   handoffTurnId,
   navigationRequest,
+  onStateChange,
 }: {
   sessionId: string;
   client: ApiClient | null;
@@ -90,6 +94,7 @@ function NativeWebPreview({
   handoff: BrowserHandoff | null;
   handoffTurnId: string | null;
   navigationRequest: BrowserNavigationRequest | null;
+  onStateChange?(state: WebPreviewState): void;
 }) {
   const api = window.opentopia!.browserHost!;
   const containerRef = useRef<HTMLDivElement>(null);
@@ -121,6 +126,9 @@ function NativeWebPreview({
   const pendingAddressRef = useRef<string | null>(null);
   const lastReportedBoundsRef = useRef<string | null>(null);
   const lastReportedVisibilityRef = useRef<boolean | null>(null);
+  const onStateChangeRef = useRef(onStateChange);
+
+  onStateChangeRef.current = onStateChange;
 
   useEffect(() => {
     if (!handoff) return;
@@ -164,12 +172,18 @@ function NativeWebPreview({
     if (shouldUpdateBounds) lastReportedBoundsRef.current = boundsKey;
     if (shouldUpdateVisibility) lastReportedVisibilityRef.current = visible;
 
-    void Promise.all([
-      shouldUpdateBounds ? api.setBounds(sessionId, bounds) : Promise.resolve(),
-      shouldUpdateVisibility
-        ? api.setVisibility(sessionId, visible)
-        : Promise.resolve(),
-    ]).catch((cause) => {
+    const update = visible
+      ? // Showing and positioning must be one ordered main-process operation.
+        // Otherwise a view can become visible at its previous (often
+        // full-window) bounds before the bounds IPC wins the race.
+        api.show(sessionId, bounds)
+      : Promise.all([
+          shouldUpdateBounds
+            ? api.setBounds(sessionId, bounds)
+            : Promise.resolve(),
+          shouldUpdateVisibility ? api.hide(sessionId) : Promise.resolve(),
+        ]);
+    void update.catch((cause) => {
       if (shouldUpdateBounds && lastReportedBoundsRef.current === boundsKey) {
         lastReportedBoundsRef.current = null;
       }
@@ -213,6 +227,7 @@ function NativeWebPreview({
         hasUrlRef.current = Boolean(next.url);
         setState(next);
         syncAddress(next);
+        onStateChangeRef.current?.(next);
         window.requestAnimationFrame(reportBounds);
       })
       .catch((cause) => {
@@ -223,13 +238,13 @@ function NativeWebPreview({
       hasUrlRef.current = Boolean(next.url);
       setState(next);
       syncAddress(next);
+      onStateChangeRef.current?.(next);
       setError(next.error ?? null);
       window.requestAnimationFrame(reportBounds);
     });
     return () => {
       disposed = true;
       unsubscribe?.();
-      void api.hide(sessionId).catch(() => {});
     };
   }, [api, reportBounds, sessionId]);
 
@@ -357,6 +372,7 @@ function NativeWebPreview({
       hasUrlRef.current = Boolean(next.url);
       setState(next);
       syncAddress(next);
+      onStateChangeRef.current?.(next);
       setError(next.error ?? null);
     } catch (cause) {
       setError(errorMessage(cause));
@@ -365,6 +381,11 @@ function NativeWebPreview({
       setNavigationAction(null);
     }
   }
+
+  const backUnavailable = navigationAction === null && !state.canGoBack;
+  const forwardUnavailable = navigationAction === null && !state.canGoForward;
+  const backLabel = backUnavailable ? "后退（没有可返回的页面）" : "后退";
+  const forwardLabel = forwardUnavailable ? "前进（没有可前进的页面）" : "前进";
 
   async function resumeHandoff() {
     if (!client || !threadId || !handoffTurnId || isResuming || isCancelling)
@@ -407,8 +428,12 @@ function NativeWebPreview({
         <button
           className="icon-button small"
           type="button"
-          title="后退"
-          aria-label="后退"
+          title={backLabel}
+          aria-label={backLabel}
+          aria-description={
+            backUnavailable ? "当前页面没有可返回的浏览记录。" : undefined
+          }
+          data-navigation-state={backUnavailable ? "unavailable" : "available"}
           disabled={navigationAction !== null || !state.canGoBack}
           onClick={() => void run("back")}
         >
@@ -417,8 +442,14 @@ function NativeWebPreview({
         <button
           className="icon-button small"
           type="button"
-          title="前进"
-          aria-label="前进"
+          title={forwardLabel}
+          aria-label={forwardLabel}
+          aria-description={
+            forwardUnavailable ? "当前页面没有可前进的浏览记录。" : undefined
+          }
+          data-navigation-state={
+            forwardUnavailable ? "unavailable" : "available"
+          }
           disabled={navigationAction !== null || !state.canGoForward}
           onClick={() => void run("forward")}
         >

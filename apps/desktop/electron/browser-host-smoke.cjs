@@ -8,13 +8,30 @@ const {
   WebContentsView,
   nativeImage,
 } = require("electron");
-const { createDesktopBrowserHost } = require("./browser-host.cjs");
+const {
+  IPC_CHANNELS,
+  createDesktopBrowserHost,
+} = require("./browser-host.cjs");
 
 const smokeDataRoot = fs.mkdtempSync(
   path.join(os.tmpdir(), "opentopia-browser-host-smoke-"),
 );
 app.setPath("userData", smokeDataRoot);
-app.disableHardwareAcceleration();
+// Chromium's child-token sandbox cannot be nested inside OpenTopia's Windows
+// restricted token. Disable only that inner layer when the smoke itself is
+// already confined by OpenTopia; normal desktop runs retain Chromium sandboxing.
+if (
+  process.env.OPENTOPIA_SANDBOX === "1" ||
+  process.argv.includes("--opentopia-outer-sandbox")
+) {
+  app.commandLine.appendSwitch("no-sandbox");
+}
+if (process.env.OPENTOPIA_BROWSER_SMOKE_DISABLE_GPU === "1") {
+  app.disableHardwareAcceleration();
+}
+// Keep the main process alive long enough for the promise handlers below to
+// publish the real exit code after the last test window is destroyed.
+app.on("window-all-closed", () => {});
 
 function listen(server) {
   return new Promise((resolve, reject) => {
@@ -124,11 +141,13 @@ async function main() {
   await listen(pageServer);
 
   const window = new BrowserWindow({
-    x: -10_000,
+    x: 0,
     y: 0,
     width: 1280,
     height: 800,
     show: true,
+    opacity: 0.01,
+    focusable: false,
     skipTaskbar: true,
   });
   const host = createDesktopBrowserHost({
@@ -138,6 +157,17 @@ async function main() {
     getMainWindow: () => window,
   });
   host.attachWindow(window);
+  const ipcHandlers = new Map();
+  host.registerIpc({
+    handle(channel, handler) {
+      ipcHandlers.set(channel, handler);
+    },
+  });
+  const invokeHostIpc = (channel, ...args) => {
+    const handler = ipcHandlers.get(channel);
+    if (!handler) throw new Error(`browser host did not register ${channel}`);
+    return handler({ sender: window.webContents }, ...args);
+  };
 
   try {
     const address = pageServer.address();
@@ -216,10 +246,7 @@ async function main() {
     const input = observation.nodes.find(
       (node) => node.tagName === "input" && node.editable,
     );
-    const button = observation.nodes.find(
-      (node) => node.role === "button" && node.name === "Apply",
-    );
-    if (!input || !button) {
+    if (!input) {
       throw new Error("browser observation did not expose expected node refs");
     }
     await executeAction("type observed input", {
@@ -230,10 +257,22 @@ async function main() {
       operation: "type",
       text: "after",
     });
+    const observationAfterType = await executeAction("observe after typing", {
+      sessionId,
+      action: "observe",
+    });
+    const button = observationAfterType.nodes.find(
+      (node) => node.role === "button" && node.name === "Apply",
+    );
+    if (!button) {
+      throw new Error(
+        "browser observation did not expose the refreshed button ref",
+      );
+    }
     const clickReceipt = await executeAction("click observed button", {
       sessionId,
       action: "perform",
-      observationId: observation.observationId,
+      observationId: observationAfterType.observationId,
       nodeRef: button.nodeRef,
       operation: "click",
     });
@@ -247,10 +286,21 @@ async function main() {
       sessionId,
       action: "snapshot",
     });
+    await runStep("show screenshot surface", () =>
+      invokeHostIpc(IPC_CHANNELS.show, sessionId, {
+        x: 0,
+        y: 0,
+        width: 1280,
+        height: 800,
+      }),
+    );
     const screenshot = await executeAction("screenshot", {
       sessionId,
       action: "screenshot",
     });
+    await runStep("hide screenshot surface", () =>
+      invokeHostIpc(IPC_CHANNELS.hide, sessionId),
+    );
     const text = snapshot.contents.find((content) => content.type === "text");
     const structuredSnapshot = snapshot.contents.find(
       (content) => content.type === "json",
@@ -448,18 +498,25 @@ async function main() {
       nodeRef: popupButton.nodeRef,
       operation: "click",
     });
-    const popupObservation = await executeAction("observe owned popup", {
-      sessionId: complexSessionId,
-      action: "observe",
-    });
-    if (
-      popupObservation.targets.length < 2 ||
-      !popupObservation.text.includes("Popup ready")
-    ) {
+    const popupObservation = await runStep("observe owned popup", async () => {
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        const observation = await host.executeAction({
+          sessionId: complexSessionId,
+          action: "observe",
+        });
+        if (
+          observation.targets.length >= 2 &&
+          observation.text.includes("Popup ready")
+        ) {
+          return observation;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
       throw new Error(
         "popup was not owned and activated by the browser session",
       );
-    }
+    });
     await executeAction("switch back to opener", {
       sessionId: complexSessionId,
       action: "switch_target",
@@ -503,18 +560,28 @@ async function main() {
       action: "grant_network_access",
       allowedHosts: ["127.0.0.1"],
     });
-    const addressBarNavigation = await runStep(
-      "user takeover permits address-bar cross-host redirect",
-      () => host.navigateFromAddressBar(addressBarSessionId, `${url}redirect`),
+    await runStep("user takeover permits address-bar cross-host redirect", () =>
+      host.navigateFromAddressBar(addressBarSessionId, `${url}redirect`),
     );
-    const finalUrl = addressBarNavigation.contents.find(
-      (content) => content.type === "json",
-    )?.value?.url;
-    if (new URL(finalUrl).hostname !== "localhost") {
+    await runStep("observe address-bar redirect", async () => {
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        const observation = await host.executeAction({
+          sessionId: addressBarSessionId,
+          action: "observe",
+        });
+        if (
+          observation.url &&
+          new URL(observation.url).hostname === "localhost"
+        ) {
+          return observation;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
       throw new Error(
         "address-bar redirect did not reach its final destination",
       );
-    }
+    });
 
     const broker = await runStep("start broker", () => host.startBroker());
     const unauthorized = await fetch(`${broker.url}/health`);
@@ -604,6 +671,7 @@ async function main() {
   } finally {
     await host.close();
     window.destroy();
+    pageServer.closeAllConnections?.();
     await new Promise((resolve) => pageServer.close(resolve));
     try {
       fs.rmSync(smokeDataRoot, { recursive: true, force: true });

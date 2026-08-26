@@ -1,8 +1,9 @@
-import { useCallback, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 
 import type { ThreadActivityStatus } from "./threadActivityStatus";
 import type { ThreadActivityStore } from "./threadActivityStore";
 import { idleThreadRunState, type ThreadRunState } from "./threadRunState";
+import { markVisibleThreadActivityRead } from "./threadActivityVisibility";
 
 export function useThreadRunState(
   store: ThreadActivityStore | null,
@@ -43,4 +44,26 @@ export function useThreadActivityStatuses(
     store.getVisibleStatusesSnapshot,
     store.getVisibleStatusesSnapshot,
   );
+}
+
+/** Keeps lifecycle notifications read while their conversation is on screen. */
+export function useVisibleThreadActivityRead(
+  store: ThreadActivityStore | null,
+  visibleThreadId: string | null,
+): void {
+  const visibleThreadIdRef = useRef(visibleThreadId);
+  visibleThreadIdRef.current = visibleThreadId;
+
+  useEffect(() => {
+    if (!store) return;
+    if (visibleThreadId) store.markRead(visibleThreadId);
+    return store.subscribeToChanges((changedThreadId, activity) =>
+      markVisibleThreadActivityRead(
+        store,
+        visibleThreadIdRef.current,
+        changedThreadId,
+        activity,
+      ),
+    );
+  }, [store, visibleThreadId]);
 }

@@ -28,7 +28,6 @@ import type { SendShortcut } from "../../editorPreferences";
 import { getDroppedContextFiles, selectContextFiles } from "../../platform";
 import { friendlyProviderError } from "../../providerErrors";
 import { resolveThreadModelContextWindow } from "../../modelCapabilities";
-import { resolveThreadActivityEventStatus } from "../../threadActivityStatus";
 import { canCancelTurn } from "../../threadRunState";
 import { threadTitleFromPrompt } from "../../threadTitle";
 import type { ToolTabKind } from "../../toolTabs";
@@ -48,7 +47,10 @@ import type {
 } from "../../types";
 import { useComposerDraft } from "../../useComposerDraft";
 import { useConversationSession } from "../../useConversationSession";
-import { useThreadRunState } from "../../useThreadActivityStore";
+import {
+  useThreadRunState,
+  useVisibleThreadActivityRead,
+} from "../../useThreadActivityStore";
 import { workspaceRootKey } from "../../workspaceRootKey";
 
 export function SideTaskConversation({
@@ -125,16 +127,17 @@ export function SideTaskConversation({
       if (event.payload.type === "error") {
         setActionError(friendlyProviderError(event.payload.message));
       }
-      if (resolveThreadActivityEventStatus(event) !== undefined) {
-        conversationRegistry?.activityStore.markRead(threadId);
-      }
     },
-    [conversationRegistry, threadId],
+    [threadId],
   );
 
   const { controller: sessionController, state: sessionState } =
     useConversationSession(conversationRegistry, threadId, handleSideTaskEvent);
   const runState = useThreadRunState(
+    conversationRegistry?.activityStore ?? null,
+    threadId,
+  );
+  useVisibleThreadActivityRead(
     conversationRegistry?.activityStore ?? null,
     threadId,
   );
@@ -168,10 +171,6 @@ export function SideTaskConversation({
       contextWindow?.contextWindowTokens,
     );
   }, [events, modelSelection, settings?.activeProviderId, settings?.providers]);
-
-  useEffect(() => {
-    if (threadId) conversationRegistry?.activityStore.markRead(threadId);
-  }, [conversationRegistry, threadId]);
 
   const pendingApprovalQueue = useMemo(
     () =>

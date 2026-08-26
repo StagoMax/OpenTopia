@@ -1,5 +1,6 @@
 import type { KeyringMetadata, LogFileInfo, SecretSources } from "./provider";
 import type {
+  BrowserNewTabRequest,
   BrowserProfilePersistence,
   ChromeBridgeState,
   WebPreviewBounds,
@@ -449,6 +450,9 @@ declare global {
         hide(sessionId: string): Promise<unknown>;
         onStateChanged(
           listener: (state: WebPreviewState) => void,
+        ): (() => void) | void;
+        onNewTabRequested(
+          listener: (request: BrowserNewTabRequest) => void,
         ): (() => void) | void;
       };
       chromeBridge?: {

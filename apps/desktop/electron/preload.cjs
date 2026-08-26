@@ -35,6 +35,15 @@ const browserHost = Object.freeze({
     ipcRenderer.on("browser-host:state", wrapped);
     return () => ipcRenderer.removeListener("browser-host:state", wrapped);
   },
+  onNewTabRequested: (listener) => {
+    if (typeof listener !== "function") {
+      throw new TypeError("Browser new-tab listener must be a function.");
+    }
+    const wrapped = (_event, request) => listener(request);
+    ipcRenderer.on("browser-host:new-tab-requested", wrapped);
+    return () =>
+      ipcRenderer.removeListener("browser-host:new-tab-requested", wrapped);
+  },
 });
 
 const chromeBridge = Object.freeze({

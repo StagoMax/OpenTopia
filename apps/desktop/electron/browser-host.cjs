@@ -19,6 +19,7 @@ const IPC_CHANNELS = Object.freeze({
   show: "browser-host:show",
   hide: "browser-host:hide",
   state: "browser-host:state",
+  newTabRequested: "browser-host:new-tab-requested",
 });
 
 const MAX_SESSIONS = 32;
@@ -40,6 +41,7 @@ const MAX_OBSERVATIONS_PER_SESSION = 12;
 const OBSERVATION_TTL_MS = 120_000;
 const MAX_NODE_POSITION_DRIFT = 24;
 const DEFAULT_PROFILE_ID = "default";
+const USER_BROWSER_TAB_SESSION_PREFIX = "browser:tab:";
 const PROFILE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const PROFILE_PERSISTENCE = new Set(["persistent", "ephemeral"]);
 const EPHEMERAL_PARTITION_NONCE = crypto.randomBytes(16).toString("hex");
@@ -331,18 +333,121 @@ function navigationHistory(webContents) {
   return webContents.navigationHistory || webContents;
 }
 
+function fallbackHistoryForView(entry) {
+  for (const target of entry.targets.values()) {
+    if (target.view === entry.view) return target.fallbackHistory;
+  }
+  return null;
+}
+
+function faviconForView(entry) {
+  for (const target of entry.targets.values()) {
+    if (target.view === entry.view) return target.faviconUrl;
+  }
+  return null;
+}
+
+function canMoveFallbackHistory(fallbackHistory, offset) {
+  if (!fallbackHistory) return false;
+  const targetIndex = fallbackHistory.index + offset;
+  return (
+    Number.isInteger(targetIndex) &&
+    targetIndex >= 0 &&
+    targetIndex < fallbackHistory.entries.length
+  );
+}
+
+function canMoveTargetHistory(entry, offset) {
+  const targetHistory = entry.targetHistory;
+  if (!targetHistory) return false;
+  const targetIndex = targetHistory.index + offset;
+  const targetRef = targetHistory.entries[targetIndex];
+  return (
+    Number.isInteger(targetIndex) &&
+    targetIndex >= 0 &&
+    targetIndex < targetHistory.entries.length &&
+    Boolean(targetRef && entry.targets.has(targetRef))
+  );
+}
+
+function recordTargetNavigation(entry, targetRef) {
+  const targetHistory = entry.targetHistory;
+  if (!targetHistory) return;
+  if (targetHistory.entries[targetHistory.index] === targetRef) return;
+  targetHistory.entries.splice(targetHistory.index + 1);
+  targetHistory.entries.push(targetRef);
+  targetHistory.index = targetHistory.entries.length - 1;
+}
+
+function removeTargetFromHistory(entry, targetRef) {
+  const targetHistory = entry.targetHistory;
+  if (!targetHistory) return;
+  const entries = targetHistory.entries.filter((item) => item !== targetRef);
+  targetHistory.entries = entries;
+  targetHistory.index = entries.lastIndexOf(entry.activeTargetRef);
+}
+
+function recordFallbackNavigation(target, rawUrl) {
+  const url = typeof rawUrl === "string" ? rawUrl : "";
+  if (!url) return;
+  const fallbackHistory = target.fallbackHistory;
+  if (fallbackHistory.nativeNavigationPending) return;
+  const pendingIndex = fallbackHistory.pendingIndex;
+  if (pendingIndex !== null) {
+    const expectedUrl = fallbackHistory.entries[pendingIndex];
+    if (expectedUrl) {
+      // Preserve the target history slot when a fallback navigation redirects.
+      fallbackHistory.entries[pendingIndex] = url;
+      fallbackHistory.index = pendingIndex;
+      fallbackHistory.pendingIndex = null;
+      return;
+    }
+    fallbackHistory.pendingIndex = null;
+  }
+
+  if (fallbackHistory.entries[fallbackHistory.index] === url) return;
+  fallbackHistory.entries.splice(fallbackHistory.index + 1);
+  fallbackHistory.entries.push(url);
+  fallbackHistory.index = fallbackHistory.entries.length - 1;
+}
+
+function historyIndexCanMove(history, offset) {
+  if (typeof history?.getActiveIndex !== "function") return null;
+  try {
+    const targetIndex = history.getActiveIndex() + offset;
+    if (!Number.isInteger(targetIndex) || targetIndex < 0) return false;
+    if (typeof history.getEntryAtIndex === "function") {
+      return history.getEntryAtIndex(targetIndex) != null;
+    }
+    if (typeof history.getAllEntries === "function") {
+      return targetIndex < history.getAllEntries().length;
+    }
+    if (typeof history.length === "function") {
+      return targetIndex < history.length();
+    }
+  } catch {
+    // Fall through to the direction helpers when Electron has not exposed a
+    // stable index snapshot yet.
+  }
+  return null;
+}
+
 function canGoToHistoryOffset(history, offset, legacyMethod) {
   // Electron's legacy canGoBack/canGoForward methods can report false for
   // same-document entries created by pushState or hash navigation. The
-  // offset API covers both document and same-document history entries.
+  // offset API covers both document and same-document history entries. Some
+  // Chromium history restores briefly report false here after the entry index
+  // has already moved, so corroborate a false result against the index.
   if (typeof history?.canGoToOffset === "function") {
     try {
-      return Boolean(history.canGoToOffset(offset));
+      if (history.canGoToOffset(offset)) return true;
     } catch {
       // Fall through to the legacy API on older or partially initialized
       // Electron implementations.
     }
   }
+  const indexCanMove = historyIndexCanMove(history, offset);
+  if (indexCanMove !== null) return indexCanMove;
   try {
     if (typeof history?.[legacyMethod] === "function") {
       return Boolean(history[legacyMethod]());
@@ -478,19 +583,28 @@ function createDesktopBrowserHost(options) {
 
   function sessionState(entry) {
     const webContents = entry.view.webContents;
+    const fallbackHistory = fallbackHistoryForView(entry);
     return {
       sessionId: entry.sessionId,
       profileId: entry.profileId,
       profilePersistence: entry.profilePersistence,
       url: webContents.isDestroyed() ? "" : webContents.getURL(),
       title: webContents.isDestroyed() ? "" : webContents.getTitle(),
+      faviconUrl: webContents.isDestroyed() ? null : faviconForView(entry),
       loading: webContents.isDestroyed() ? false : webContents.isLoading(),
-      canGoBack: webContents.isDestroyed() ? false : canGoBack(webContents),
+      canGoBack: webContents.isDestroyed()
+        ? false
+        : canGoBack(webContents) ||
+          canMoveFallbackHistory(fallbackHistory, -1) ||
+          canMoveTargetHistory(entry, -1),
       canGoForward: webContents.isDestroyed()
         ? false
-        : canGoForward(webContents),
+        : canGoForward(webContents) ||
+          canMoveFallbackHistory(fallbackHistory, 1) ||
+          canMoveTargetHistory(entry, 1),
       visible: Boolean(
         entry.requestedVisible &&
+        entry.displayBoundsReady &&
         !windowSuspended &&
         entry.attached &&
         entry.bounds.width > 0 &&
@@ -524,6 +638,7 @@ function createDesktopBrowserHost(options) {
     if (entry.destroyed) return;
     const visible = Boolean(
       entry.requestedVisible &&
+      entry.displayBoundsReady &&
       !windowSuspended &&
       entry.attached &&
       entry.bounds.width > 0 &&
@@ -536,6 +651,10 @@ function createDesktopBrowserHost(options) {
     const window = getMainWindow();
     if (!window || window.isDestroyed() || entry.destroyed || entry.attached)
       return;
+    // A newly-created WebContentsView is visible by default. Hide it before
+    // attaching so its background bounds can never flash over the renderer
+    // while the requested visibility is still false.
+    entry.view.setVisible(false);
     window.contentView.addChildView(entry.view);
     entry.attached = true;
     entry.view.setBounds(entry.bounds);
@@ -566,7 +685,7 @@ function createDesktopBrowserHost(options) {
     return target;
   }
 
-  function switchActiveTarget(entry, targetRef) {
+  function switchActiveTarget(entry, targetRef, { recordHistory = true } = {}) {
     const target = entry.targets.get(targetRef);
     if (!target || target.view.webContents.isDestroyed()) {
       throw new BrowserHostError(
@@ -580,6 +699,7 @@ function createDesktopBrowserHost(options) {
     if (wasAttached) detachEntry(entry);
     entry.activeTargetRef = targetRef;
     entry.view = target.view;
+    if (recordHistory) recordTargetNavigation(entry, targetRef);
     entry.observations.clear();
     if (wasAttached) attachEntry(entry);
     emitState(entry);
@@ -592,6 +712,13 @@ function createDesktopBrowserHost(options) {
       openerTargetRef,
       view,
       frameRefs: new Map(),
+      faviconUrl: null,
+      fallbackHistory: {
+        entries: [],
+        index: -1,
+        pendingIndex: null,
+        nativeNavigationPending: false,
+      },
     };
     entry.targets.set(target.targetRef, target);
     sessionsByWebContentsId.set(view.webContents.id, entry);
@@ -654,6 +781,35 @@ function createDesktopBrowserHost(options) {
     webContents.setWindowOpenHandler((details) => {
       setImmediate(async () => {
         if (entry.destroyed || !entry.targets.has(target.targetRef)) return;
+        let targetUrl;
+        try {
+          targetUrl = normalizeUrl(details.url);
+        } catch (error) {
+          log("warn", "browser.target.navigation-rejected", {
+            sessionId: entry.sessionId,
+            openerTargetRef: target.targetRef,
+            error: serializeError(error),
+          });
+          return;
+        }
+        if (entry.sessionId.startsWith(USER_BROWSER_TAB_SESSION_PREFIX)) {
+          const window = getMainWindow();
+          if (
+            window &&
+            !window.isDestroyed() &&
+            !window.webContents.isDestroyed()
+          ) {
+            window.webContents.send(IPC_CHANNELS.newTabRequested, {
+              openerSessionId: entry.sessionId,
+              url: targetUrl,
+            });
+            log("info", "browser.tab.open-requested", {
+              sessionId: entry.sessionId,
+              url: targetUrl,
+            });
+          }
+          return;
+        }
         const popupView = new WebContentsView({
           webPreferences: {
             partition: entry.partition,
@@ -666,23 +822,48 @@ function createDesktopBrowserHost(options) {
             backgroundThrottling: false,
           },
         });
+        // Keep a provisional popup detached and hidden until it has a usable
+        // document. Native child views render above the React renderer, so
+        // activating the default blank document would leave a white overlay
+        // behind whenever popup navigation is redirected, blocked, or fails.
+        popupView.setVisible(false);
         popupView.setBounds(DEFAULT_BACKGROUND_BOUNDS);
         const popup = registerTarget(entry, popupView, target.targetRef);
-        switchActiveTarget(entry, popup.targetRef);
         log("info", "browser.target.created", {
           sessionId: entry.sessionId,
           targetRef: popup.targetRef,
           openerTargetRef: target.targetRef,
         });
         try {
-          await popupView.webContents.loadURL(normalizeUrl(details.url));
+          await withTimeout(
+            () => popupView.webContents.loadURL(targetUrl),
+            MAX_WAIT_MS,
+            "Popup navigation",
+          );
+          if (
+            entry.destroyed ||
+            !entry.targets.has(popup.targetRef) ||
+            popupView.webContents.isDestroyed()
+          ) {
+            return;
+          }
+          switchActiveTarget(entry, popup.targetRef);
+          log("info", "browser.target.activated", {
+            sessionId: entry.sessionId,
+            targetRef: popup.targetRef,
+            openerTargetRef: target.targetRef,
+          });
         } catch (error) {
           if (entry.lastError?.code !== "network_host_blocked") {
             log("warn", "browser.target.navigation-failed", {
               sessionId: entry.sessionId,
               targetRef: popup.targetRef,
+              url: targetUrl,
               error: serializeError(error),
             });
+          }
+          if (!popupView.webContents.isDestroyed()) {
+            popupView.webContents.close();
           }
         }
       });
@@ -730,6 +911,27 @@ function createDesktopBrowserHost(options) {
       });
     }
 
+    webContents.on("did-navigate", (_event, url) => {
+      recordFallbackNavigation(target, url);
+    });
+    webContents.on("did-navigate-in-page", (_event, url, isMainFrame) => {
+      if (isMainFrame !== false) recordFallbackNavigation(target, url);
+    });
+    webContents.on("page-favicon-updated", (_event, favicons) => {
+      let faviconUrl = null;
+      for (const candidate of Array.isArray(favicons) ? favicons : []) {
+        try {
+          faviconUrl = normalizeUrl(candidate);
+          break;
+        } catch {
+          // Ignore invalid or non-HTTP(S) favicon candidates from the page.
+        }
+      }
+      if (target.faviconUrl === faviconUrl) return;
+      target.faviconUrl = faviconUrl;
+      emitState(entry);
+    });
+
     const updateEvents = [
       "did-start-loading",
       "did-stop-loading",
@@ -750,6 +952,7 @@ function createDesktopBrowserHost(options) {
     webContents.on("destroyed", () => {
       sessionsByWebContentsId.delete(webContents.id);
       entry.targets.delete(target.targetRef);
+      removeTargetFromHistory(entry, target.targetRef);
       if (entry.destroyed || entry.activeTargetRef !== target.targetRef) return;
       const fallback =
         entry.targets.get(target.openerTargetRef) ||
@@ -762,8 +965,11 @@ function createDesktopBrowserHost(options) {
         }
         entry.activeTargetRef = fallback.targetRef;
         entry.view = fallback.view;
+        recordTargetNavigation(entry, fallback.targetRef);
         entry.attached = false;
-        attachEntry(entry);
+        if (entry.requestedVisible && entry.displayBoundsReady)
+          attachEntry(entry);
+        else entry.view.setVisible(false);
         emitState(entry);
       }
     });
@@ -836,8 +1042,14 @@ function createDesktopBrowserHost(options) {
       view,
       targets: new Map(),
       activeTargetRef: null,
+      targetHistory: { entries: [], index: -1 },
       dialogs: [],
       bounds: { ...DEFAULT_BACKGROUND_BOUNDS },
+      // The default bounds provide a stable viewport for background browser
+      // work, but must never be treated as an on-screen layout measurement.
+      // Otherwise an early visibility request can cover the entire app with a
+      // native child view before React reports the browser panel rectangle.
+      displayBoundsReady: false,
       requestedVisible: false,
       attached: false,
       destroyed: false,
@@ -853,7 +1065,7 @@ function createDesktopBrowserHost(options) {
     sessions.set(normalized, entry);
     const target = registerTarget(entry, view);
     entry.activeTargetRef = target.targetRef;
-    attachEntry(entry);
+    entry.targetHistory = { entries: [target.targetRef], index: 0 };
     emitState(entry);
     log("info", "browser.session.created", {
       sessionId: normalized,
@@ -956,18 +1168,19 @@ function createDesktopBrowserHost(options) {
     if (webContents.isDestroyed()) return Promise.resolve(sessionState(entry));
 
     const offset = direction === "back" ? -1 : 1;
+    const targetHistory = entry.targetHistory;
+    const fallbackHistory = fallbackHistoryForView(entry);
     let history;
     let targetIndex = null;
     let targetUrl = null;
-    let canNavigate = false;
+    let canUseNativeHistory = false;
     try {
       history = navigationHistory(webContents);
-      canNavigate =
-        canGoToHistoryOffset(
-          history,
-          offset,
-          direction === "back" ? "canGoBack" : "canGoForward",
-        );
+      canUseNativeHistory = canGoToHistoryOffset(
+        history,
+        offset,
+        direction === "back" ? "canGoBack" : "canGoForward",
+      );
       if (typeof history.getActiveIndex === "function") {
         const activeIndex = history.getActiveIndex();
         if (Number.isInteger(activeIndex)) {
@@ -981,18 +1194,46 @@ function createDesktopBrowserHost(options) {
       // Keep the controls fail-closed when Electron has already discarded the
       // underlying navigation history.
     }
-    if (!history || !canNavigate) {
+    const targetHistoryIndex = canMoveTargetHistory(entry, offset)
+      ? targetHistory.index + offset
+      : null;
+    const fallbackTargetIndex = canMoveFallbackHistory(fallbackHistory, offset)
+      ? fallbackHistory.index + offset
+      : null;
+    // Moving between owned page targets is the user-visible back/forward
+    // relationship for a popup opened inside the single View pane. Prefer it
+    // over an unrelated native history stack the newly activated target may
+    // already expose.
+    const useTargetHistory = targetHistoryIndex !== null;
+    const useFallbackHistory =
+      !useTargetHistory && !canUseNativeHistory && fallbackTargetIndex !== null;
+    if (!canUseNativeHistory && !useTargetHistory && !useFallbackHistory) {
       return Promise.resolve(sessionState(entry));
     }
-    const navigate =
-      typeof history.goToOffset === "function"
-        ? () => history.goToOffset(offset)
-        : direction === "back"
-          ? () => history.goBack()
-          : () => history.goForward();
+    if (useTargetHistory) {
+      const targetRef = targetHistory.entries[targetHistoryIndex];
+      targetHistory.index = targetHistoryIndex;
+      switchActiveTarget(entry, targetRef, { recordHistory: false });
+      return Promise.resolve(emitState(entry));
+    }
+    if (useFallbackHistory) {
+      targetIndex = fallbackTargetIndex;
+      targetUrl = fallbackHistory.entries[targetIndex] || null;
+    }
+    const nativeNavigate =
+      targetIndex !== null && typeof history?.goToIndex === "function"
+        ? () => history.goToIndex(targetIndex)
+        : typeof history?.goToOffset === "function"
+          ? () => history.goToOffset(offset)
+          : direction === "back"
+            ? () => history.goBack()
+            : () => history.goForward();
 
     const navigationGeneration = (entry.navigationGeneration += 1);
     entry.lastError = null;
+    if (!useFallbackHistory && fallbackHistory) {
+      fallbackHistory.nativeNavigationPending = true;
+    }
 
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -1002,15 +1243,19 @@ function createDesktopBrowserHost(options) {
         clearTimeout(timer);
         webContents.removeListener("did-navigate", onNavigate);
         webContents.removeListener("did-navigate-in-page", onInPageNavigate);
+        webContents.removeListener("did-stop-loading", onStopLoading);
         webContents.removeListener("did-fail-load", onFailLoad);
         webContents.removeListener("destroyed", onDestroyed);
       };
 
       const complete = (error = null) => {
-        if (settled || entry.navigationGeneration !== navigationGeneration) return;
+        if (settled || entry.navigationGeneration !== navigationGeneration)
+          return;
         settled = true;
         cleanup();
+        if (fallbackHistory) fallbackHistory.nativeNavigationPending = false;
         if (error) {
+          if (useFallbackHistory) fallbackHistory.pendingIndex = null;
           if (!entry.destroyed) {
             entry.lastError = serializeError(error);
             emitState(entry);
@@ -1032,7 +1277,16 @@ function createDesktopBrowserHost(options) {
       };
 
       const historyMoveCommitted = () => {
-        if (targetIndex === null || typeof history.getActiveIndex !== "function") {
+        if (useFallbackHistory) {
+          return (
+            fallbackHistory.pendingIndex === null &&
+            fallbackHistory.index === targetIndex
+          );
+        }
+        if (
+          targetIndex === null ||
+          typeof history.getActiveIndex !== "function"
+        ) {
           return true;
         }
         try {
@@ -1046,6 +1300,13 @@ function createDesktopBrowserHost(options) {
       };
       const onInPageNavigate = (_event, _url, isMainFrame) => {
         if (isMainFrame !== false && historyMoveCommitted()) complete();
+      };
+      const onStopLoading = () => {
+        // A history entry restored from Chromium's back-forward cache does not
+        // consistently emit did-navigate. Once the navigation history confirms
+        // the expected entry, stopped loading is an equally safe completion
+        // signal for the renderer IPC call.
+        if (historyMoveCommitted()) complete();
       };
       const onFailLoad = (
         _event,
@@ -1085,6 +1346,7 @@ function createDesktopBrowserHost(options) {
 
       webContents.on("did-navigate", onNavigate);
       webContents.on("did-navigate-in-page", onInPageNavigate);
+      webContents.on("did-stop-loading", onStopLoading);
       webContents.on("did-fail-load", onFailLoad);
       webContents.once("destroyed", onDestroyed);
       timer = setTimeout(() => {
@@ -1099,7 +1361,15 @@ function createDesktopBrowserHost(options) {
       timer.unref?.();
 
       try {
-        navigate();
+        if (useFallbackHistory) {
+          fallbackHistory.pendingIndex = targetIndex;
+          const load = webContents.loadURL(targetUrl);
+          if (load && typeof load.catch === "function") {
+            void load.catch((error) => complete(error));
+          }
+        } else {
+          nativeNavigate();
+        }
       } catch (error) {
         complete(error);
       }
@@ -1720,11 +1990,13 @@ function createDesktopBrowserHost(options) {
   async function screenshot(entry) {
     const webContents = entry.view.webContents;
     const surfaceWasVisible = sessionState(entry).visible;
+    const attachedForCapture = !entry.attached;
     let bytes;
     let captureBackend = "capture_page";
     let fallbackReason = null;
     try {
       if (!surfaceWasVisible) {
+        if (attachedForCapture) attachEntry(entry);
         entry.view.setBounds({
           ...entry.bounds,
           x: -entry.bounds.width - 1,
@@ -1790,7 +2062,8 @@ function createDesktopBrowserHost(options) {
       if (!surfaceWasVisible && !entry.destroyed) {
         entry.view.setVisible(false);
         entry.view.setBounds(entry.bounds);
-        setActualVisibility(entry);
+        if (attachedForCapture) detachEntry(entry);
+        else setActualVisibility(entry);
       }
     }
     if (bytes.length > MAX_SCREENSHOT_BYTES) {
@@ -2120,15 +2393,23 @@ function createDesktopBrowserHost(options) {
   function setBounds(entry, rawBounds) {
     const window = getMainWindow();
     const bounds = normalizeBounds(rawBounds, window);
+    const attachedBefore = entry.attached;
     const changed =
       entry.bounds.x !== bounds.x ||
       entry.bounds.y !== bounds.y ||
       entry.bounds.width !== bounds.width ||
       entry.bounds.height !== bounds.height;
     entry.bounds = bounds;
-    if (changed) entry.view.setBounds(bounds);
-    setActualVisibility(entry);
-    return changed ? emitState(entry) : sessionState(entry);
+    entry.displayBoundsReady = true;
+    if (entry.requestedVisible && !entry.attached) {
+      attachEntry(entry);
+    } else {
+      if (changed) entry.view.setBounds(bounds);
+      setActualVisibility(entry);
+    }
+    return changed || attachedBefore !== entry.attached
+      ? emitState(entry)
+      : sessionState(entry);
   }
 
   function setVisibility(entry, visible) {
@@ -2138,10 +2419,23 @@ function createDesktopBrowserHost(options) {
         "visible must be a boolean.",
       );
     }
+    if (visible) {
+      // Native child views always render above the React renderer. Treat the
+      // window as a single display slot so a stale tab cannot cover the active
+      // tab (or the rest of the application) when multiple sessions exist.
+      for (const other of sessions.values()) {
+        if (other === entry || other.destroyed) continue;
+        const visibilityChanged = other.requestedVisible;
+        other.requestedVisible = false;
+        detachEntry(other);
+        if (visibilityChanged) emitState(other);
+      }
+    }
     const requestedVisibilityChanged = entry.requestedVisible !== visible;
     const attachedBefore = entry.attached;
     entry.requestedVisible = visible;
-    if (visible) attachEntry(entry);
+    if (visible && entry.displayBoundsReady) attachEntry(entry);
+    else detachEntry(entry);
     setActualVisibility(entry);
     const changed =
       requestedVisibilityChanged || attachedBefore !== entry.attached;
@@ -2522,7 +2816,17 @@ function createDesktopBrowserHost(options) {
       return setVisibility(entry, true);
     });
     handle(IPC_CHANNELS.hide, (sessionId) =>
-      setVisibility(requireSession(sessionId), false),
+      (() => {
+        const normalized = normalizeSessionId(sessionId);
+        const entry = sessions.get(normalized);
+        if (!entry || entry.destroyed) {
+          // React effects can finish their visibility cleanup after a tab has
+          // already destroyed the native session. Hiding is intentionally
+          // idempotent so this normal teardown order never surfaces as a 404.
+          return { sessionId: normalized, visible: false, missing: true };
+        }
+        return setVisibility(entry, false);
+      })(),
     );
   }
 
@@ -2537,7 +2841,10 @@ function createDesktopBrowserHost(options) {
     removeWindowListeners();
     attachedWindow = window;
     windowSuspended = window.isMinimized() || !window.isVisible();
-    for (const entry of sessions.values()) attachEntry(entry);
+    for (const entry of sessions.values()) {
+      if (entry.requestedVisible && entry.displayBoundsReady)
+        attachEntry(entry);
+    }
 
     const suspend = () => {
       windowSuspended = true;
@@ -2546,10 +2853,42 @@ function createDesktopBrowserHost(options) {
         emitState(entry);
       }
     };
+    const appCommand = (event, command) => {
+      const direction =
+        command === "browser-backward"
+          ? "back"
+          : command === "browser-forward"
+            ? "forward"
+            : null;
+      if (!direction) return;
+      const entry = [...sessions.values()].find(
+        (candidate) =>
+          !candidate.destroyed &&
+          candidate.requestedVisible &&
+          candidate.attached &&
+          candidate.displayBoundsReady,
+      );
+      if (!entry) return;
+
+      // Consume the mouse side-button only while a visible browser session is
+      // active, matching Chromium's browser navigation behavior without
+      // hijacking the same hardware shortcut elsewhere in OpenTopia.
+      event.preventDefault();
+      void runExclusive(entry, () => {
+        beginUserControl(entry);
+        return navigateHistory(entry, direction);
+      }).catch((error) => {
+        if (!entry.destroyed) {
+          entry.lastError = serializeError(error);
+          emitState(entry);
+        }
+      });
+    };
     const resume = () => {
       windowSuspended = false;
       for (const entry of sessions.values()) {
-        attachEntry(entry);
+        if (entry.requestedVisible && entry.displayBoundsReady)
+          attachEntry(entry);
         setActualVisibility(entry);
         emitState(entry);
       }
@@ -2569,7 +2908,7 @@ function createDesktopBrowserHost(options) {
       if (!isMainFrame) return;
       for (const entry of sessions.values()) {
         entry.requestedVisible = false;
-        setActualVisibility(entry);
+        detachEntry(entry);
         emitState(entry);
       }
     };
@@ -2587,6 +2926,8 @@ function createDesktopBrowserHost(options) {
       "did-start-navigation",
       rendererNavigationStarted,
     ]);
+    window.on("app-command", appCommand);
+    windowListeners.push([window, "app-command", appCommand]);
     window.once("closed", closed);
     windowListeners.push([window, "closed", closed]);
   }

@@ -448,6 +448,11 @@ export type WebPreviewBounds = {
   height: number;
 };
 
+export type BrowserNewTabRequest = {
+  openerSessionId: string;
+  url: string;
+};
+
 export type BrowserProfilePersistence = "persistent" | "ephemeral";
 
 export type BrowserRuntimeRoute = "managed" | "chrome";
@@ -476,6 +481,7 @@ export type WebPreviewState = {
   profilePersistence: BrowserProfilePersistence;
   url: string;
   title?: string;
+  faviconUrl?: string | null;
   loading: boolean;
   canGoBack: boolean;
   canGoForward: boolean;

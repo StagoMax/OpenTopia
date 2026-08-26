@@ -1505,6 +1505,13 @@
   white-space: nowrap;
 }
 
+.tool-tab-favicon {
+  flex: 0 0 var(--icon-size-xs);
+  width: var(--icon-size-xs);
+  height: var(--icon-size-xs);
+  object-fit: contain;
+}
+
 .tool-tab-close {
   display: grid;
   place-items: center;

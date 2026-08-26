@@ -101,7 +101,6 @@ import {
   shouldDeliverTaskNotification,
   writeTaskNotificationPreferences,
 } from "./taskNotifications";
-import { resolveThreadActivityEventStatus } from "./threadActivityStatus";
 import { ThreadActivityStore } from "./threadActivityStore";
 import { promoteThreadByActivity } from "./threadRecency";
 import { errorMessage, isAbortError } from "./errorMessage";
@@ -141,6 +140,7 @@ import type {
   BackendStartupStatus,
   ArtifactContent,
   ArtifactDescriptor,
+  BrowserNewTabRequest,
   BrowserNavigationRequest,
   CollaborationMode,
   CodexAccountStatus,
@@ -185,6 +185,7 @@ import type {
   WorkspaceEntry,
   WorkspaceFilePreview,
   WorkspaceTree,
+  WebPreviewState,
   WindowsSandboxSetupStatus,
 } from "./types";
 import { reuseUnchangedAgentList } from "./agentListState";
@@ -192,13 +193,21 @@ import { PreviewSessionStore } from "./previewSessionStore";
 import { ConversationSessionRegistry } from "./conversationSessionController";
 import { newBrowserTabSessionId } from "./browserNavigation";
 import { useConversationSessionSelector } from "./useConversationSession";
-import { useThreadRunState } from "./useThreadActivityStore";
+import {
+  useThreadRunState,
+  useVisibleThreadActivityRead,
+} from "./useThreadActivityStore";
 import {
   appConversationStateEqual,
   selectAppConversationState,
 } from "./appConversationState";
 import { Sidebar } from "./features/sidebar/Sidebar";
-import { toolTabTitle, type ToolTab, type ToolTabKind } from "./toolTabs";
+import {
+  browserTabTitle,
+  toolTabTitle,
+  type ToolTab,
+  type ToolTabKind,
+} from "./toolTabs";
 import {
   artifactReferencesFromText,
   type ArtifactReference,
@@ -490,6 +499,7 @@ export function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
+  useVisibleThreadActivityRead(threadActivityStore, activeThreadId);
   useEffect(
     () =>
       threadActivityStore.subscribeToChanges((threadId, activity) => {
@@ -816,7 +826,11 @@ export function App() {
   const workspaceResizeFrameRef = useRef<number | null>(null);
   const markdownNavigationIdRef = useRef(0);
   const browserTabSequenceRef = useRef(0);
+  const browserTabNavigationIdRef = useRef(0);
   const browserTabLaunchGenerationRef = useRef(0);
+  const browserNewTabRequestHandlerRef = useRef<
+    (request: BrowserNewTabRequest) => void
+  >(() => {});
   const taskNotificationPreferencesRef = useRef(taskNotificationPreferences);
   const pendingTaskNotificationEventsRef = useRef<AgentEvent[]>([]);
   const pendingEventCommitTraceRef = useRef(
@@ -841,6 +855,14 @@ export function App() {
     },
     [],
   );
+  useEffect(() => {
+    const subscribe = window.opentopia?.browserHost?.onNewTabRequested;
+    if (!subscribe) return;
+    const unsubscribe = subscribe((request) =>
+      browserNewTabRequestHandlerRef.current(request),
+    );
+    return typeof unsubscribe === "function" ? unsubscribe : undefined;
+  }, []);
   const markThreadActivityRead = useCallback(
     (threadId: string) => threadActivityStore.markRead(threadId),
     [threadActivityStore],
@@ -1216,14 +1238,6 @@ export function App() {
   const ingestEvent = useCallback(
     (event: AgentEvent) => {
       const isActiveThread = event.threadId === activeThreadIdRef.current;
-      const activityStatus = resolveThreadActivityEventStatus(event);
-      if (
-        isActiveThread &&
-        activityStatus !== undefined &&
-        activityStatus !== null
-      ) {
-        markThreadActivityRead(event.threadId);
-      }
       if (!isActiveThread) return;
 
       if (
@@ -2090,7 +2104,7 @@ export function App() {
     setConversationCollapsed(false);
   }
 
-  function openNewBrowserTab() {
+  function openNewBrowserTab(initialUrl?: string) {
     const browserHost = window.opentopia?.browserHost;
     if (!browserHost) {
       openSharedBrowserTab();
@@ -2107,13 +2121,23 @@ export function App() {
         }
         const id = `tool-browser:${sessionId}`;
         const sequence = ++browserTabSequenceRef.current;
+        const fallbackTitle = `浏览器 ${sequence}`;
+        const browserNavigation = initialUrl
+          ? {
+              id: `${sessionId}:${++browserTabNavigationIdRef.current}`,
+              url: initialUrl,
+            }
+          : undefined;
         setToolTabs((current) => [
           ...current,
           {
             id,
             kind: "browser",
-            title: `浏览器 ${sequence}`,
+            title: initialUrl
+              ? browserTabTitle({ url: initialUrl }, fallbackTitle)
+              : fallbackTitle,
             browserSessionId: sessionId,
+            browserNavigation,
           },
         ]);
         setActiveToolTabId(id);
@@ -2126,6 +2150,13 @@ export function App() {
         }
       });
   }
+
+  browserNewTabRequestHandlerRef.current = ({ openerSessionId, url }) => {
+    const openerStillExists = toolTabsRef.current.some(
+      (tab) => tab.browserSessionId === openerSessionId,
+    );
+    if (openerStillExists) openNewBrowserTab(url);
+  };
 
   function openSharedBrowserTab() {
     setToolTabs((current) =>
@@ -2144,6 +2175,23 @@ export function App() {
     setToolStageOpen(true);
     setConversationCollapsed(false);
   }
+
+  const updateBrowserTabState = useCallback(
+    (tabId: string, state: WebPreviewState) => {
+      setToolTabs((current) =>
+        current.map((tab) => {
+          if (tab.id !== tabId || tab.kind !== "browser") return tab;
+          const title = browserTabTitle(state, tab.title);
+          const browserFaviconUrl = state.faviconUrl ?? undefined;
+          return title === tab.title &&
+            tab.browserFaviconUrl === browserFaviconUrl
+            ? tab
+            : { ...tab, title, browserFaviconUrl };
+        }),
+      );
+    },
+    [],
+  );
 
   async function openSideTask() {
     if (!client || !activeThread) return;
@@ -4422,6 +4470,7 @@ export function App() {
             onOpenImagePreview={openInlineImagePreview}
             onOpenToolTab={openToolTab}
             onOpenNewBrowserTab={openNewBrowserTab}
+            onBrowserTabStateChange={updateBrowserTabState}
             onOpenSideTask={() => void openSideTask()}
             onThreadUpdated={(updatedThread) =>
               setThreads((current) =>

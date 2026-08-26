@@ -36,6 +36,7 @@ export type ToolTab = {
   /** An explicit value denotes a person-created, independent browser tab. */
   browserSessionId?: string;
   browserNavigation?: BrowserNavigationRequest;
+  browserFaviconUrl?: string;
 };
 
 export const toolTabMenuItems: Array<{
@@ -88,6 +89,22 @@ export function toolTabTitle(kind: ToolTabKind): string {
     case "preview":
       return "预览";
   }
+}
+
+export function browserTabTitle(
+  state: { title?: string; url: string },
+  fallback: string,
+): string {
+  const pageTitle = state.title?.trim();
+  if (pageTitle) return pageTitle;
+  if (state.url) {
+    try {
+      return new URL(state.url).hostname || fallback;
+    } catch {
+      // Keep the stable tab label while a provisional URL is being reported.
+    }
+  }
+  return fallback;
 }
 
 export function toolTabIcon(kind: ToolTabKind): typeof Folder {

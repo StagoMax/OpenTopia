@@ -42,6 +42,10 @@ const activityStoreSource = readFileSync(
   new URL("./threadActivityStore.ts", import.meta.url),
   "utf8",
 );
+const activityHookSource = readFileSync(
+  new URL("./useThreadActivityStore.ts", import.meta.url),
+  "utf8",
+);
 const liveMessageListSource = readFileSync(
   new URL(
     "./features/conversation/LiveConversationMessageList.tsx",
@@ -137,7 +141,9 @@ test("tracks task lifecycle events at the conversation registry boundary", () =>
     appSource,
     /conversationRegistry\?\.subscribeToEvents\(forwardConversationEvent\)/,
   );
-  assert.match(appSource, /resolveThreadActivityEventStatus\(event\)/);
+  assert.match(appSource, /useVisibleThreadActivityRead\(/);
+  assert.match(activityHookSource, /store\.subscribeToChanges/);
+  assert.match(activityHookSource, /markVisibleThreadActivityRead\(/);
   assert.match(conversationControllerSource, /openThreadActivityStream\(/);
   assert.match(
     conversationControllerSource,

@@ -67,6 +67,10 @@ test("uses HTTP for local development hosts", () => {
 
 test("uses Google for text and incomplete URLs", () => {
   assert.equal(
+    resolveAddressBarInput("baidu"),
+    "https://www.google.com/search?q=baidu",
+  );
+  assert.equal(
     resolveAddressBarInput("rust async trait"),
     "https://www.google.com/search?q=rust+async+trait",
   );

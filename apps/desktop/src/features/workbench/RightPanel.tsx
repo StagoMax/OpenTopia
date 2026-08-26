@@ -70,6 +70,7 @@ import type {
   WorkspaceEntry,
   WorkspaceFilePreview,
   WorkspaceTree,
+  WebPreviewState,
 } from "../../types";
 import type { DesktopToolMenuAction } from "../../types/platform";
 import type { ExecutionPermissionMode } from "../composer/Composer";
@@ -151,6 +152,7 @@ export function RightPanel({
   onGetArtifact,
   onOpenToolTab,
   onOpenNewBrowserTab,
+  onBrowserTabStateChange,
   onOpenSideTask,
   onThreadUpdated,
   onChangePermissionMode,
@@ -255,6 +257,7 @@ export function RightPanel({
   onGetArtifact(threadId: string, artifactId: string): Promise<ArtifactContent>;
   onOpenToolTab(kind: ToolTabKind): void;
   onOpenNewBrowserTab(): void;
+  onBrowserTabStateChange(tabId: string, state: WebPreviewState): void;
   onOpenSideTask(): void;
   onThreadUpdated(thread: Thread): void;
   onChangePermissionMode(mode: ExecutionPermissionMode): void;
@@ -430,6 +433,9 @@ export function RightPanel({
               events={events}
               sessionId={activeToolTab.browserSessionId}
               navigationRequest={activeToolTab.browserNavigation ?? null}
+              onStateChange={(state) =>
+                onBrowserTabStateChange(activeToolTab.id, state)
+              }
             />
           ) : activeToolTab.kind === "computer" ? (
             <ComputerPanel
@@ -632,6 +638,12 @@ function ToolTabStrip({
                 {tab.kind === "preview" &&
                 tab.previewTarget?.type === "attachment" ? (
                   <FileTypeIcon name={title} size={14} />
+                ) : tab.kind === "browser" && tab.browserFaviconUrl ? (
+                  <img
+                    className="tool-tab-favicon"
+                    src={tab.browserFaviconUrl}
+                    alt=""
+                  />
                 ) : (
                   <Icon size={13} />
                 )}

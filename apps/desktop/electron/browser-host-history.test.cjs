@@ -1,7 +1,10 @@
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const test = require("node:test");
-const { IPC_CHANNELS, createDesktopBrowserHost } = require("./browser-host.cjs");
+const {
+  IPC_CHANNELS,
+  createDesktopBrowserHost,
+} = require("./browser-host.cjs");
 
 class FakeNavigationHistory {
   constructor(webContents) {
@@ -19,6 +22,7 @@ class FakeNavigationHistory {
   canGoToOffset(offset) {
     // Model the Electron 41 behavior for same-document history: the legacy
     // direction helpers can be stale while the offset API is authoritative.
+    if (this.offsetCheckStale) return false;
     return this.entries[this.activeIndex + offset] !== undefined;
   }
 
@@ -55,13 +59,22 @@ class FakeNavigationHistory {
     this.pendingIndex = this.activeIndex + offset;
   }
 
-  finishNavigation() {
+  goToIndex(index) {
+    this.calls.push(`index:${index}`);
+    this.pendingIndex = index;
+  }
+
+  finishNavigation({ event = "did-navigate" } = {}) {
     assert.notEqual(this.pendingIndex, null, "expected a pending history move");
     this.activeIndex = this.pendingIndex;
     this.pendingIndex = null;
     const entry = this.entries[this.activeIndex];
     this.webContents.url = entry.url;
     this.webContents.title = entry.title;
+    if (event === "did-stop-loading") {
+      this.webContents.emit("did-stop-loading");
+      return;
+    }
     if (this.sameDocumentEntry) {
       this.webContents.emit("did-navigate-in-page", {}, entry.url, true);
     } else {
@@ -88,6 +101,8 @@ class FakeWebContents extends EventEmitter {
       sendCommand: async () => {},
     };
     this.navigationHistory = new FakeNavigationHistory(this);
+    this.windowOpenHandler = null;
+    this.pendingLoads = [];
   }
 
   isDestroyed() {
@@ -106,7 +121,34 @@ class FakeWebContents extends EventEmitter {
     return this.title;
   }
 
-  setWindowOpenHandler() {}
+  setWindowOpenHandler(handler) {
+    this.windowOpenHandler = handler;
+  }
+
+  openWindow(url) {
+    assert.ok(this.windowOpenHandler, "expected a window-open handler");
+    return this.windowOpenHandler({ url });
+  }
+
+  loadURL(url) {
+    this.url = url;
+    return new Promise((resolve, reject) => {
+      this.pendingLoads.push({ resolve, reject });
+    });
+  }
+
+  finishLoad({ title = "Loaded" } = {}) {
+    const load = this.pendingLoads.shift();
+    assert.ok(load, "expected a pending page load");
+    this.title = title;
+    load.resolve();
+  }
+
+  failLoad(error = new Error("navigation failed")) {
+    const load = this.pendingLoads.shift();
+    assert.ok(load, "expected a pending page load");
+    load.reject(error);
+  }
 
   close() {
     this.destroyed = true;
@@ -116,15 +158,24 @@ class FakeWebContents extends EventEmitter {
 
 function createHarness() {
   const views = [];
+  const attachedViews = new Set();
   class FakeWebContentsView {
     constructor() {
       this.webContents = new FakeWebContents();
+      this.visible = true;
+      this.bounds = null;
+      this.visibilityChanges = [];
       views.push(this);
     }
 
-    setBounds() {}
+    setBounds(bounds) {
+      this.bounds = { ...bounds };
+    }
 
-    setVisible() {}
+    setVisible(visible) {
+      this.visible = visible;
+      this.visibilityChanges.push(visible);
+    }
   }
 
   const renderer = new FakeWebContents();
@@ -133,8 +184,17 @@ function createHarness() {
   const window = new EventEmitter();
   window.webContents = renderer;
   window.contentView = {
-    addChildView() {},
-    removeChildView() {},
+    addChildView(view) {
+      assert.equal(
+        view.visible,
+        false,
+        "browser views must be hidden before they are attached",
+      );
+      attachedViews.add(view);
+    },
+    removeChildView(view) {
+      attachedViews.delete(view);
+    },
   };
   window.isDestroyed = () => false;
   window.isMinimized = () => false;
@@ -157,6 +217,8 @@ function createHarness() {
 
   return {
     host,
+    window,
+    attachedViews,
     states,
     views,
     invoke(channel, ...args) {
@@ -203,9 +265,12 @@ test("back and forward resolve only after the corresponding history navigation c
         return null;
       });
     await waitFor(() => history.calls.length === 1);
-    assert.deepEqual(history.calls, ["back-offset"]);
+    assert.deepEqual(history.calls, ["index:0"]);
     assert.equal(backSettled, false);
-    assert.equal((await invoke(IPC_CHANNELS.getState, sessionId)).url, initial.url);
+    assert.equal(
+      (await invoke(IPC_CHANNELS.getState, sessionId)).url,
+      initial.url,
+    );
 
     views[0].webContents.emit("did-navigate", {}, "https://example.test/three");
     views[0].webContents.emit(
@@ -233,7 +298,7 @@ test("back and forward resolve only after the corresponding history navigation c
       return state;
     });
     await waitFor(() => history.calls.length === 2);
-    assert.deepEqual(history.calls, ["back-offset", "forward-offset"]);
+    assert.deepEqual(history.calls, ["index:0", "index:1"]);
     assert.equal(forwardSettled, false);
 
     history.finishNavigation();
@@ -245,6 +310,181 @@ test("back and forward resolve only after the corresponding history navigation c
       channel: IPC_CHANNELS.state,
       state: afterForward,
     });
+  } finally {
+    await host.close();
+  }
+});
+
+test("visible browser session handles mouse back and forward app commands", async () => {
+  const { host, invoke, views, window } = createHarness();
+  const sessionId = "browser:mouse-history-test";
+  try {
+    await invoke(IPC_CHANNELS.create, { sessionId, visible: false });
+    await invoke(IPC_CHANNELS.show, sessionId, {
+      x: 320,
+      y: 80,
+      width: 640,
+      height: 480,
+    });
+    const history = views[0].webContents.navigationHistory;
+    const event = {
+      preventDefaultCalls: 0,
+      preventDefault() {
+        this.preventDefaultCalls += 1;
+      },
+    };
+
+    window.emit("app-command", event, "browser-backward");
+    await waitFor(() => history.calls.length === 1);
+    assert.equal(event.preventDefaultCalls, 1);
+    assert.deepEqual(history.calls, ["index:0"]);
+    history.finishNavigation();
+
+    window.emit("app-command", event, "browser-forward");
+    await waitFor(() => history.calls.length === 2);
+    assert.equal(event.preventDefaultCalls, 2);
+    assert.deepEqual(history.calls, ["index:0", "index:1"]);
+    history.finishNavigation();
+  } finally {
+    await host.close();
+  }
+});
+
+test("history index keeps navigation available when Electron's offset check is stale", async () => {
+  const { host, invoke, views } = createHarness();
+  const sessionId = "browser:history-index-stale-test";
+  try {
+    await invoke(IPC_CHANNELS.create, { sessionId, visible: true });
+    const history = views[0].webContents.navigationHistory;
+    history.offsetCheckStale = true;
+
+    const state = await invoke(IPC_CHANNELS.getState, sessionId);
+    assert.equal(state.canGoBack, true);
+    assert.equal(state.canGoForward, true);
+
+    const back = invoke(IPC_CHANNELS.back, sessionId);
+    await waitFor(() => history.calls.length === 1);
+    assert.deepEqual(history.calls, ["index:0"]);
+    history.finishNavigation();
+
+    const afterBack = await back;
+    assert.equal(afterBack.url, "https://example.test/one");
+    assert.equal(afterBack.canGoBack, false);
+    assert.equal(afterBack.canGoForward, true);
+  } finally {
+    await host.close();
+  }
+});
+
+test("state publishes the page favicon after the active view reports one", async () => {
+  const { host, invoke, views } = createHarness();
+  const sessionId = "browser:favicon-state-test";
+  try {
+    await invoke(IPC_CHANNELS.create, { sessionId, visible: false });
+    views[0].webContents.emit("page-favicon-updated", {}, [
+      "https://example.test/favicon.ico",
+    ]);
+
+    const state = await invoke(IPC_CHANNELS.getState, sessionId);
+    assert.equal(state.faviconUrl, "https://example.test/favicon.ico");
+  } finally {
+    await host.close();
+  }
+});
+
+test("recorded page navigations provide history when Electron exposes none", async () => {
+  const { host, invoke, views } = createHarness();
+  const sessionId = "browser:fallback-history-test";
+  try {
+    await invoke(IPC_CHANNELS.create, { sessionId, visible: false });
+    const webContents = views[0].webContents;
+
+    for (const [url, title] of [
+      ["https://example.test/one", "One"],
+      ["https://example.test/two", "Two"],
+    ]) {
+      webContents.url = url;
+      webContents.title = title;
+      webContents.emit("did-navigate", {}, url, 200, "OK");
+    }
+    webContents.navigationHistory = {};
+
+    const beforeBack = await invoke(IPC_CHANNELS.getState, sessionId);
+    assert.equal(beforeBack.canGoBack, true);
+    assert.equal(beforeBack.canGoForward, false);
+
+    const back = invoke(IPC_CHANNELS.back, sessionId);
+    await waitFor(() => webContents.pendingLoads.length === 1);
+    webContents.finishLoad({ title: "One" });
+    webContents.emit("did-navigate", {}, webContents.url, 200, "OK");
+    const afterBack = await back;
+    assert.equal(afterBack.url, "https://example.test/one");
+    assert.equal(afterBack.canGoBack, false);
+    assert.equal(afterBack.canGoForward, true);
+
+    const forward = invoke(IPC_CHANNELS.forward, sessionId);
+    await waitFor(() => webContents.pendingLoads.length === 1);
+    webContents.finishLoad({ title: "Two" });
+    webContents.emit("did-navigate", {}, webContents.url, 200, "OK");
+    const afterForward = await forward;
+    assert.equal(afterForward.url, "https://example.test/two");
+    assert.equal(afterForward.canGoBack, true);
+    assert.equal(afterForward.canGoForward, false);
+  } finally {
+    await host.close();
+  }
+});
+
+test("back and forward switch between owned popup targets", async () => {
+  const { host, invoke, views } = createHarness();
+  const sessionId = "browser:target-history-test";
+  try {
+    await invoke(IPC_CHANNELS.create, {
+      sessionId,
+      visible: true,
+      bounds: { x: 320, y: 80, width: 640, height: 480 },
+    });
+    const opener = views[0].webContents;
+
+    opener.openWindow("https://baidu.test/");
+    await waitFor(
+      () =>
+        views.length === 2 && views[1].webContents.pendingLoads.length === 1,
+    );
+    const popup = views[1].webContents;
+    popup.finishLoad({ title: "Baidu" });
+    popup.emit("did-navigate", {}, popup.url, 200, "OK");
+    await waitFor(() => views[1].visible);
+
+    const beforeBack = await invoke(IPC_CHANNELS.getState, sessionId);
+    assert.equal(beforeBack.canGoBack, true);
+
+    const afterBack = await invoke(IPC_CHANNELS.back, sessionId);
+    assert.equal(afterBack.url, opener.url);
+    assert.equal(afterBack.canGoForward, true);
+
+    const afterForward = await invoke(IPC_CHANNELS.forward, sessionId);
+    assert.equal(afterForward.url, popup.url);
+  } finally {
+    await host.close();
+  }
+});
+
+test("history navigation completes when a back-forward cache restore only stops loading", async () => {
+  const { host, invoke, views } = createHarness();
+  const sessionId = "browser:history-cache-restore-test";
+  try {
+    await invoke(IPC_CHANNELS.create, { sessionId, visible: false });
+    const history = views[0].webContents.navigationHistory;
+
+    const back = invoke(IPC_CHANNELS.back, sessionId);
+    await waitFor(() => history.calls.length === 1);
+    history.finishNavigation({ event: "did-stop-loading" });
+
+    const afterBack = await back;
+    assert.equal(afterBack.url, "https://example.test/one");
+    assert.equal(afterBack.canGoBack, false);
+    assert.equal(afterBack.canGoForward, true);
   } finally {
     await host.close();
   }
@@ -271,12 +511,209 @@ test("same-document history remains navigable when legacy direction checks are s
 
     const back = invoke(IPC_CHANNELS.back, sessionId);
     await waitFor(() => history.calls.length === 1);
-    assert.deepEqual(history.calls, ["back-offset"]);
+    assert.deepEqual(history.calls, ["index:0"]);
     history.finishNavigation();
     const afterBack = await back;
     assert.equal(afterBack.url, "https://example.test/app");
     assert.equal(afterBack.canGoBack, false);
     assert.equal(afterBack.canGoForward, true);
+  } finally {
+    await host.close();
+  }
+});
+
+test("only the most recently shown browser session is visible", async () => {
+  const { attachedViews, host, invoke, views } = createHarness();
+  try {
+    await invoke(IPC_CHANNELS.create, {
+      sessionId: "browser:tab:first",
+      visible: false,
+    });
+    await invoke(IPC_CHANNELS.create, {
+      sessionId: "browser:tab:second",
+      visible: false,
+    });
+
+    assert.equal(views[0].visible, false);
+    assert.equal(views[1].visible, false);
+    assert.equal(attachedViews.size, 0);
+
+    const firstBounds = { x: 320, y: 80, width: 640, height: 480 };
+    await invoke(IPC_CHANNELS.show, "browser:tab:first", firstBounds);
+    assert.equal(views[0].visible, true);
+    assert.deepEqual(views[0].bounds, firstBounds);
+    assert.deepEqual([...attachedViews], [views[0]]);
+
+    const secondBounds = { x: 360, y: 96, width: 600, height: 440 };
+    await invoke(IPC_CHANNELS.show, "browser:tab:second", secondBounds);
+    assert.equal(views[0].visible, false);
+    assert.equal(views[1].visible, true);
+    assert.deepEqual(views[1].bounds, secondBounds);
+    assert.deepEqual([...attachedViews], [views[1]]);
+
+    assert.equal(
+      (await invoke(IPC_CHANNELS.getState, "browser:tab:first")).visible,
+      false,
+    );
+    assert.equal(
+      (await invoke(IPC_CHANNELS.getState, "browser:tab:second")).visible,
+      true,
+    );
+  } finally {
+    await host.close();
+  }
+});
+
+test("a browser view cannot cover the app before its panel bounds are measured", async () => {
+  const { attachedViews, host, invoke, views } = createHarness();
+  const sessionId = "browser:unmeasured-visible-test";
+  try {
+    const initial = await invoke(IPC_CHANNELS.create, {
+      sessionId,
+      visible: true,
+    });
+
+    assert.equal(initial.visible, false);
+    assert.equal(views[0].visible, false);
+    assert.equal(attachedViews.size, 0);
+
+    const bounds = { x: 320, y: 80, width: 640, height: 480 };
+    const measured = await invoke(IPC_CHANNELS.setBounds, sessionId, bounds);
+    assert.equal(measured.visible, true);
+    assert.equal(views[0].visible, true);
+    assert.deepEqual(views[0].bounds, bounds);
+
+    await invoke(IPC_CHANNELS.hide, sessionId);
+    assert.equal(views[0].visible, false);
+    assert.equal(attachedViews.size, 0);
+  } finally {
+    await host.close();
+  }
+});
+
+test("a Baidu target-blank result requests a new app browser tab", async () => {
+  const { attachedViews, host, invoke, states, views } = createHarness();
+  const sessionId = "browser:tab:baidu-result-test";
+  try {
+    const bounds = { x: 320, y: 80, width: 640, height: 480 };
+    await invoke(IPC_CHANNELS.create, { sessionId, visible: false });
+    await invoke(IPC_CHANNELS.show, sessionId, bounds);
+    const opener = views[0];
+    opener.webContents.url = "https://www.google.com/search?q=baidu";
+    opener.webContents.title = "baidu - Google Search";
+
+    assert.deepEqual(opener.webContents.openWindow("https://www.baidu.com/"), {
+      action: "deny",
+    });
+    await waitFor(() =>
+      states.some(({ channel }) => channel === IPC_CHANNELS.newTabRequested),
+    );
+
+    assert.equal(views.length, 1);
+    assert.equal(opener.visible, true);
+    assert.deepEqual([...attachedViews], [opener]);
+    assert.deepEqual(
+      states.find(({ channel }) => channel === IPC_CHANNELS.newTabRequested),
+      {
+        channel: IPC_CHANNELS.newTabRequested,
+        state: {
+          openerSessionId: sessionId,
+          url: "https://www.baidu.com/",
+        },
+      },
+    );
+  } finally {
+    await host.close();
+  }
+});
+
+test("a shared-browser popup remains hidden until it loads, then becomes active", async () => {
+  const { attachedViews, host, invoke, views } = createHarness();
+  const sessionId = "browser:popup-load-test";
+  try {
+    const bounds = { x: 320, y: 80, width: 640, height: 480 };
+    await invoke(IPC_CHANNELS.create, { sessionId, visible: false });
+    await invoke(IPC_CHANNELS.show, sessionId, bounds);
+    const opener = views[0];
+    opener.webContents.url = "https://www.google.com/search?q=baidu";
+    opener.webContents.title = "baidu - Google Search";
+
+    assert.deepEqual(opener.webContents.openWindow("https://www.baidu.com/"), {
+      action: "deny",
+    });
+    await waitFor(
+      () =>
+        views.length === 2 && views[1].webContents.pendingLoads.length === 1,
+    );
+    const popup = views[1];
+
+    assert.equal(opener.visible, true);
+    assert.equal(popup.visible, false);
+    assert.deepEqual([...attachedViews], [opener]);
+    assert.equal(
+      (await invoke(IPC_CHANNELS.getState, sessionId)).url,
+      opener.webContents.url,
+    );
+
+    popup.webContents.finishLoad({ title: "Baidu" });
+    await waitFor(() => popup.visible);
+
+    assert.equal(opener.visible, false);
+    assert.equal(popup.visible, true);
+    assert.deepEqual([...attachedViews], [popup]);
+    assert.deepEqual(popup.bounds, bounds);
+    const state = await invoke(IPC_CHANNELS.getState, sessionId);
+    assert.equal(state.url, "https://www.baidu.com/");
+    assert.equal(state.title, "Baidu");
+  } finally {
+    await host.close();
+  }
+});
+
+test("a failed popup load keeps the opener visible and discards the blank target", async () => {
+  const { attachedViews, host, invoke, views } = createHarness();
+  const sessionId = "browser:popup-failure-test";
+  try {
+    await invoke(IPC_CHANNELS.create, {
+      sessionId,
+      visible: true,
+      bounds: { x: 320, y: 80, width: 640, height: 480 },
+    });
+    const opener = views[0];
+
+    opener.webContents.openWindow("https://baidu.test/");
+    await waitFor(
+      () =>
+        views.length === 2 && views[1].webContents.pendingLoads.length === 1,
+    );
+    const popup = views[1];
+    popup.webContents.failLoad();
+    await waitFor(() => popup.webContents.destroyed);
+
+    assert.equal(opener.visible, true);
+    assert.equal(popup.visible, false);
+    assert.deepEqual([...attachedViews], [opener]);
+    assert.equal(
+      (await invoke(IPC_CHANNELS.getState, sessionId)).url,
+      opener.webContents.url,
+    );
+  } finally {
+    await host.close();
+  }
+});
+
+test("hide is idempotent after a browser session has already been destroyed", async () => {
+  const { host, invoke } = createHarness();
+  const sessionId = "browser:destroyed-hide-test";
+  try {
+    await invoke(IPC_CHANNELS.create, { sessionId, visible: true });
+    await invoke(IPC_CHANNELS.destroy, sessionId);
+
+    assert.deepEqual(await invoke(IPC_CHANNELS.hide, sessionId), {
+      sessionId,
+      visible: false,
+      missing: true,
+    });
   } finally {
     await host.close();
   }
