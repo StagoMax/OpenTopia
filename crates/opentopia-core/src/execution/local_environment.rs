@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -37,6 +37,24 @@ const TRANSIENT_WRITE_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(75),
     Duration::from_millis(200),
 ];
+
+type SandboxPreparationLock = tokio::sync::Mutex<()>;
+
+// Tool contexts are rebuilt whenever an execution grant changes. Preparation
+// state therefore belongs to the local executor process, not to one context.
+// Weak single-flight locks avoid retaining one mutex for every historical ACL
+// scope while completed keys remain reusable across tools and conversations.
+static PREPARED_SANDBOX_PHASES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static SANDBOX_PREPARATION_LOCKS: OnceLock<Mutex<HashMap<String, Weak<SandboxPreparationLock>>>> =
+    OnceLock::new();
+
+fn prepared_sandbox_phases() -> &'static Mutex<HashSet<String>> {
+    PREPARED_SANDBOX_PHASES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn sandbox_preparation_locks() -> &'static Mutex<HashMap<String, Weak<SandboxPreparationLock>>> {
+    SANDBOX_PREPARATION_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 fn is_transient_write_error(error: &std::io::Error) -> bool {
     #[cfg(windows)]
@@ -111,8 +129,6 @@ pub struct LocalExecutionEnvironment {
     sandbox_config: LocalSandboxConfig,
     execution_capsule: Arc<WorkspaceExecutionCapsule>,
     pub(super) running: Arc<Mutex<HashMap<String, CancellationToken>>>,
-    prepared_sandbox_scopes: Arc<Mutex<HashSet<String>>>,
-    sandbox_preparation_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl LocalExecutionEnvironment {
@@ -168,8 +184,6 @@ impl LocalExecutionEnvironment {
             sandbox_config,
             execution_capsule,
             running: Arc::new(Mutex::new(HashMap::new())),
-            prepared_sandbox_scopes: Arc::new(Mutex::new(HashSet::new())),
-            sandbox_preparation_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -301,7 +315,7 @@ impl LocalExecutionEnvironment {
         self.running.lock().unwrap().remove(request_id);
     }
 
-    async fn prepare_sandbox_scope(
+    async fn prepare_sandbox_phase(
         &self,
         preparation: Option<&SandboxPreparationPlan>,
         cwd: &Path,
@@ -310,27 +324,30 @@ impl LocalExecutionEnvironment {
         let Some(preparation) = preparation else {
             return Ok(());
         };
-        if self
-            .prepared_sandbox_scopes
+        let cache_key = format!("{}\0{}", preparation.program, preparation.key);
+        if prepared_sandbox_phases()
             .lock()
             .unwrap()
-            .contains(&preparation.key)
+            .contains(&cache_key)
         {
             return Ok(());
         }
-        let scope_lock = self
-            .sandbox_preparation_locks
-            .lock()
-            .unwrap()
-            .entry(preparation.key.clone())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
+        let scope_lock = {
+            let mut locks = sandbox_preparation_locks().lock().unwrap();
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(&cache_key).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(SandboxPreparationLock::new(()));
+                locks.insert(cache_key.clone(), Arc::downgrade(&lock));
+                lock
+            }
+        };
         let _scope_guard = scope_lock.lock().await;
-        if self
-            .prepared_sandbox_scopes
+        if prepared_sandbox_phases()
             .lock()
             .unwrap()
-            .contains(&preparation.key)
+            .contains(&cache_key)
         {
             return Ok(());
         }
@@ -378,10 +395,7 @@ impl LocalExecutionEnvironment {
             )
             .into());
         }
-        self.prepared_sandbox_scopes
-            .lock()
-            .unwrap()
-            .insert(preparation.key.clone());
+        prepared_sandbox_phases().lock().unwrap().insert(cache_key);
         Ok(())
     }
 
@@ -552,7 +566,13 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             );
         }
 
-        self.prepare_sandbox_scope(
+        self.prepare_sandbox_phase(
+            command_plan.baseline_preparation.as_ref(),
+            &cwd,
+            context.startup_timeout,
+        )
+        .await?;
+        self.prepare_sandbox_phase(
             command_plan.preparation.as_ref(),
             &cwd,
             context.startup_timeout,
@@ -840,7 +860,13 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
             context.timeout,
             context.termination_timeout,
         );
-        self.prepare_sandbox_scope(
+        self.prepare_sandbox_phase(
+            command_plan.baseline_preparation.as_ref(),
+            &cwd,
+            context.startup_timeout,
+        )
+        .await?;
+        self.prepare_sandbox_phase(
             command_plan.preparation.as_ref(),
             &cwd,
             context.startup_timeout,
@@ -1033,5 +1059,35 @@ mod tests {
         assert!(error
             .to_string()
             .contains("cannot authoritatively enforce offline networking"));
+    }
+
+    #[tokio::test]
+    async fn sandbox_preparation_cache_is_shared_across_environment_rebuilds() {
+        let key = format!("shared-preparation-test-{}", uuid::Uuid::new_v4());
+        let first = SandboxPreparationPlan {
+            key: key.clone(),
+            program: "cmd.exe".to_string(),
+            args: vec!["/d".to_string(), "/c".to_string(), "exit 0".to_string()],
+            env: Vec::new(),
+        };
+        LocalExecutionEnvironment::new("C:\\")
+            .prepare_sandbox_phase(Some(&first), Path::new("C:\\"), Duration::from_secs(1))
+            .await
+            .expect("first environment prepares the shared phase");
+
+        let would_fail_if_started = SandboxPreparationPlan {
+            key,
+            program: "cmd.exe".to_string(),
+            args: vec!["/d".to_string(), "/c".to_string(), "exit 1".to_string()],
+            env: Vec::new(),
+        };
+        LocalExecutionEnvironment::new("C:\\")
+            .prepare_sandbox_phase(
+                Some(&would_fail_if_started),
+                Path::new("C:\\"),
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("rebuilt environment reuses the process-wide preparation");
     }
 }

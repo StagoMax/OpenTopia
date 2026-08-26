@@ -573,6 +573,10 @@ pub struct SandboxCommandPlan {
     pub program: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// Stable account/runtime setup that is shared by many filesystem scopes.
+    /// It is prepared before the scope-specific phase below.
+    #[serde(default)]
+    pub baseline_preparation: Option<SandboxPreparationPlan>,
     #[serde(default)]
     pub preparation: Option<SandboxPreparationPlan>,
     pub status: SandboxCommandStatus,
@@ -612,6 +616,7 @@ impl SandboxCommandPlan {
             program: program.to_string(),
             args: args.to_vec(),
             env: Vec::new(),
+            baseline_preparation: None,
             preparation: None,
             status: SandboxCommandStatus::Disabled,
         }
@@ -622,6 +627,7 @@ impl SandboxCommandPlan {
             program: program.to_string(),
             args: args.to_vec(),
             env: Vec::new(),
+            baseline_preparation: None,
             preparation: None,
             status: SandboxCommandStatus::Unrestricted,
         }

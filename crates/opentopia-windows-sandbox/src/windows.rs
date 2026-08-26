@@ -67,7 +67,7 @@ use acl_persistence::{
 pub(super) use acl_persistence::{
     cleanup_workspace_acl, has_dedicated_user_permissions, revoke_dedicated_user_permissions,
 };
-use acl_transaction::recover_acl_transactions;
+use acl_transaction::{recover_acl_transactions, NamedAclMutex};
 use process_launch::{
     argv_to_command_line, create_job, last_error, launch, native_path, wide, AttributeList,
 };
@@ -122,10 +122,41 @@ pub(super) fn run(request: SandboxRequest) -> Result<i32> {
 /// deliberately separate from `run`: command startup only verifies policy and
 /// never rewrites ACLs on workspace or external runtime paths.
 pub(super) fn provision(request: SandboxRequest) -> Result<i32> {
+    provision_phase(request, ProvisionPhase::Complete)
+}
+
+/// Prepare account-level state that is independent of any command filesystem
+/// scope. The core executor caches this phase across tool contexts.
+pub(super) fn provision_baseline(request: SandboxRequest) -> Result<i32> {
+    provision_phase(request, ProvisionPhase::Baseline)
+}
+
+/// Reconcile only the filesystem roots and capability SID for one command
+/// scope. Account/registry migrations are handled by `provision_baseline`.
+pub(super) fn provision_scope(request: SandboxRequest) -> Result<i32> {
+    provision_phase(request, ProvisionPhase::Scope)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProvisionPhase {
+    Complete,
+    Baseline,
+    Scope,
+}
+
+#[derive(Clone, Copy)]
+enum ProvisionBackend {
+    Unelevated,
+    DedicatedUser,
+}
+
+fn provision_phase(request: SandboxRequest, phase: ProvisionPhase) -> Result<i32> {
     suppress_process_error_ui();
-    validate_managed_runtime_home(&request)?;
+    if phase != ProvisionPhase::Baseline {
+        validate_managed_runtime_home(&request)?;
+    }
     recover_acl_transactions().context("stage=apply_acl recover interrupted ACL transaction")?;
-    match request.backend {
+    let backend = match request.backend {
         BackendMode::DedicatedUser if request.persistent_stdio => anyhow::bail!(
             "stage=validate_policy persistent stdio requires the unelevated streaming backend"
         ),
@@ -144,24 +175,32 @@ pub(super) fn provision(request: SandboxRequest) -> Result<i32> {
             if crate::setup::credentials_present() && !request.persistent_stdio =>
         {
             anyhow::bail!(
-            "stage=validate_policy unelevated execution is disabled while dedicated-user credentials are installed because it shares the host identity; use auto/dedicated-user, or remove the dedicated-user sandbox first"
+                "stage=validate_policy unelevated execution is disabled while dedicated-user credentials are installed because it shares the host identity; use auto/dedicated-user, or remove the dedicated-user sandbox first"
             )
         }
-        BackendMode::Unelevated => {
+        BackendMode::Unelevated => ProvisionBackend::Unelevated,
+        BackendMode::Auto if !crate::setup::credentials_present() => ProvisionBackend::Unelevated,
+        BackendMode::DedicatedUser | BackendMode::Auto => ProvisionBackend::DedicatedUser,
+    };
+
+    match (backend, phase) {
+        (ProvisionBackend::Unelevated, ProvisionPhase::Baseline) => Ok(0),
+        (ProvisionBackend::Unelevated, _) => {
             let principal = capability_principal(&request);
             let mut capability = acl_principal_sid(&principal)?;
             ensure_persistent_capability_permissions(&request, &principal, capability.as_ptr())
                 .context("stage=apply_acl provision capability permissions")?;
             Ok(0)
         }
-        BackendMode::Auto if !crate::setup::credentials_present() => {
-            let principal = capability_principal(&request);
-            let mut capability = acl_principal_sid(&principal)?;
-            ensure_persistent_capability_permissions(&request, &principal, capability.as_ptr())
-                .context("stage=apply_acl provision capability permissions")?;
+        (ProvisionBackend::DedicatedUser, ProvisionPhase::Baseline) => {
+            provision_dedicated_user_baseline(&request)?;
             Ok(0)
         }
-        BackendMode::DedicatedUser | BackendMode::Auto => {
+        (ProvisionBackend::DedicatedUser, ProvisionPhase::Scope) => {
+            provision_dedicated_user_scope(&request)?;
+            Ok(0)
+        }
+        (ProvisionBackend::DedicatedUser, ProvisionPhase::Complete) => {
             provision_dedicated_user(&request)?;
             Ok(0)
         }
@@ -407,58 +446,118 @@ fn replace_setup_canary_runtime_generation(network: NetworkMode) -> Result<()> {
     Ok(())
 }
 
-fn provision_dedicated_user(request: &SandboxRequest) -> Result<()> {
-    crate::logging::event("apply_acl", "starting dedicated-user ACL provisioning");
+struct DedicatedUserAclContext {
+    username: String,
+    password: String,
+    user_sid: SidBuffer,
+    write_group: SidBuffer,
+    logon_token: LoggedOnToken,
+}
+
+fn load_dedicated_user_acl_context(request: &SandboxRequest) -> Result<DedicatedUserAclContext> {
     let credentials = crate::setup::load_credentials().map_err(|error| {
         anyhow::anyhow!("stage=prepare_sandbox dedicated-user backend unavailable: {error:#}")
     })?;
     crate::logging::event("apply_acl", "loaded dedicated-user ACL credentials");
     let (username, password) = match request.network {
-        NetworkMode::Deny => (
-            credentials.offline_username.as_str(),
-            credentials.offline_password.as_str(),
-        ),
-        NetworkMode::Internet => (
-            credentials.online_username.as_str(),
-            credentials.online_password.as_str(),
-        ),
+        NetworkMode::Deny => (credentials.offline_username, credentials.offline_password),
+        NetworkMode::Internet => (credentials.online_username, credentials.online_password),
     };
-    let mut user_sid = account_sid(username)?;
+    let user_sid = account_sid(&username)?;
     crate::logging::event("apply_acl", "resolved dedicated-user ACL SID");
-    let logon_token = LoggedOnToken::new(username, password)
+    let logon_token = LoggedOnToken::new(&username, &password)
         .context("stage=prepare_sandbox log on dedicated-user identity")?;
     crate::logging::event("apply_acl", "created dedicated-user ACL access token");
-    crate::logging::event("apply_acl", "preparing runtime registry ACL");
-    provision_runtime_registry_as_user(username, password)?;
-    crate::logging::event("apply_acl", "preparing broker exchange ACL");
-    ensure_broker_exchange_permissions(username, user_sid.as_ptr(), logon_token.handle)?;
-    crate::logging::event("apply_acl", "migrating legacy dedicated-user ACLs");
-    migrate_legacy_dedicated_user_acls(request, username)?;
-    let mut write_group = account_sid(crate::setup::SANDBOX_GROUP_NAME).context(
+    let write_group = account_sid(crate::setup::SANDBOX_GROUP_NAME).context(
         "stage=prepare_sandbox resolve managed sandbox filesystem group; rerun `opentopia-sandbox setup`",
     )?;
+    Ok(DedicatedUserAclContext {
+        username,
+        password,
+        user_sid,
+        write_group,
+        logon_token,
+    })
+}
+
+fn provision_dedicated_user(request: &SandboxRequest) -> Result<()> {
+    crate::logging::event("apply_acl", "starting dedicated-user ACL provisioning");
+    let mut context = load_dedicated_user_acl_context(request)?;
+    {
+        let _baseline_guard = NamedAclMutex::acquire_baseline(match request.network {
+            NetworkMode::Deny => "offline",
+            NetworkMode::Internet => "online",
+        })?;
+        provision_dedicated_user_baseline_with_context(request, &mut context)?;
+    }
+    provision_dedicated_user_scope_with_context(request, &mut context)
+}
+
+fn provision_dedicated_user_baseline(request: &SandboxRequest) -> Result<()> {
+    crate::logging::event(
+        "apply_acl",
+        "starting dedicated-user account baseline provisioning",
+    );
+    let _baseline_guard = NamedAclMutex::acquire_baseline(match request.network {
+        NetworkMode::Deny => "offline",
+        NetworkMode::Internet => "online",
+    })?;
+    let mut context = load_dedicated_user_acl_context(request)?;
+    provision_dedicated_user_baseline_with_context(request, &mut context)
+}
+
+fn provision_dedicated_user_baseline_with_context(
+    request: &SandboxRequest,
+    context: &mut DedicatedUserAclContext,
+) -> Result<()> {
+    crate::logging::event("apply_acl", "preparing runtime registry ACL");
+    provision_runtime_registry_as_user(&context.username, &context.password)?;
+    crate::logging::event("apply_acl", "preparing broker exchange ACL");
+    ensure_broker_exchange_permissions(
+        &context.username,
+        context.user_sid.as_ptr(),
+        context.logon_token.handle,
+    )?;
+    crate::logging::event("apply_acl", "migrating legacy dedicated-user ACLs");
+    migrate_legacy_dedicated_user_acls(request, &context.username)?;
     crate::logging::event("apply_acl", "migrating dedicated write ACLs to group");
     migrate_dedicated_user_write_acls_to_group(
-        username,
+        &context.username,
         crate::setup::SANDBOX_GROUP_NAME,
-        write_group.as_ptr(),
+        context.write_group.as_ptr(),
     )?;
+    Ok(())
+}
+
+fn provision_dedicated_user_scope(request: &SandboxRequest) -> Result<()> {
+    crate::logging::event(
+        "apply_acl",
+        "starting dedicated-user filesystem scope provisioning",
+    );
+    let mut context = load_dedicated_user_acl_context(request)?;
+    provision_dedicated_user_scope_with_context(request, &mut context)
+}
+
+fn provision_dedicated_user_scope_with_context(
+    request: &SandboxRequest,
+    context: &mut DedicatedUserAclContext,
+) -> Result<()> {
     crate::logging::event("apply_acl", "reconciling managed runtime ACLs");
     ensure_managed_runtime_group_permissions(
         request,
         crate::setup::SANDBOX_GROUP_NAME,
-        write_group.as_ptr(),
-        logon_token.handle,
+        context.write_group.as_ptr(),
+        context.logon_token.handle,
     )
     .context("stage=apply_acl provision managed runtime group permissions")?;
     crate::logging::event("apply_acl", "reconciling normal-token filesystem ACLs");
     ensure_persistent_user_permissions(
         request,
-        username,
-        user_sid.as_ptr(),
+        &context.username,
+        context.user_sid.as_ptr(),
         crate::setup::SANDBOX_GROUP_NAME,
-        write_group.as_ptr(),
-        logon_token.handle,
+        context.write_group.as_ptr(),
+        context.logon_token.handle,
     )?;
     let capability_principal = capability_principal(request);
     let mut capability = acl_principal_sid(&capability_principal)?;

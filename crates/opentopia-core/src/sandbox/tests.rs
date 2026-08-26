@@ -331,17 +331,81 @@ fn windows_enforce_auto_selects_the_complete_dedicated_user_backend() {
         .env
         .iter()
         .any(|(key, value)| key == "OPENTOPIA_SANDBOX_ERROR_NONCE" && !value.is_empty()));
+    let baseline = plan
+        .baseline_preparation
+        .as_ref()
+        .expect("Windows sandbox plan has an account baseline phase");
+    assert_eq!(
+        baseline.args.first().map(String::as_str),
+        Some("provision-baseline")
+    );
     let preparation = plan
         .preparation
         .as_ref()
         .expect("Windows sandbox plan has an explicit ACL preparation phase");
     assert_eq!(
         preparation.args.first().map(String::as_str),
-        Some("provision")
+        Some("provision-scope")
     );
     assert!(!preparation.args.iter().any(|arg| arg == "powershell.exe"));
 
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn windows_account_baseline_cache_is_shared_across_filesystem_scopes() {
+    let root = std::env::temp_dir().join(format!(
+        "opentopia-windows-baseline-plan-{}",
+        Uuid::new_v4()
+    ));
+    let first_workspace = root.join("first");
+    let second_workspace = root.join("second");
+    std::fs::create_dir_all(&first_workspace).expect("create first workspace");
+    std::fs::create_dir_all(&second_workspace).expect("create second workspace");
+    let build = |workspace: &Path, config: &LocalSandboxConfig| {
+        build_windows_sandbox_command_with_binary(
+            std::env::current_exe().expect("current executable"),
+            "cmd.exe",
+            &["/c".to_string(), "exit 0".to_string()],
+            workspace,
+            workspace,
+            config,
+            &SandboxLaunchOptions::default(),
+        )
+        .expect("build Windows sandbox plan")
+    };
+
+    let offline = LocalSandboxConfig::enforce();
+    let first = build(&first_workspace, &offline);
+    let second = build(&second_workspace, &offline);
+    assert_eq!(
+        first
+            .baseline_preparation
+            .as_ref()
+            .expect("first baseline")
+            .key,
+        second
+            .baseline_preparation
+            .as_ref()
+            .expect("second baseline")
+            .key
+    );
+    assert_ne!(
+        first.preparation.as_ref().expect("first scope").key,
+        second.preparation.as_ref().expect("second scope").key
+    );
+
+    let mut online = LocalSandboxConfig::enforce();
+    online.network = NetworkPolicy::Allow;
+    let online_plan = build(&first_workspace, &online);
+    assert_ne!(
+        first.baseline_preparation.expect("offline baseline").key,
+        online_plan
+            .baseline_preparation
+            .expect("online baseline")
+            .key
+    );
+    std::fs::remove_dir_all(root).expect("remove baseline plan fixture");
 }
 
 #[test]

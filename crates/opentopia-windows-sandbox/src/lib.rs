@@ -90,7 +90,11 @@ pub fn run_from_env() -> Result<i32> {
         return windows::cleanup_workspace_acl(&all_args[1..]);
     }
     #[cfg(windows)]
-    if all_args.first().map(String::as_str) == Some("provision") {
+    if matches!(
+        all_args.first().map(String::as_str),
+        Some("provision" | "provision-baseline" | "provision-scope")
+    ) {
+        let provision_mode = all_args[0].clone();
         let mut provision_args = all_args;
         provision_args[0] = "run".to_string();
         provision_args.extend([
@@ -100,7 +104,12 @@ pub fn run_from_env() -> Result<i32> {
             "/c".to_string(),
             "exit 0".to_string(),
         ]);
-        return windows::provision(parse_request(provision_args)?);
+        let request = parse_request(provision_args)?;
+        return match provision_mode.as_str() {
+            "provision-baseline" => windows::provision_baseline(request),
+            "provision-scope" => windows::provision_scope(request),
+            _ => windows::provision(request),
+        };
     }
     let request = parse_request(all_args)?;
     #[cfg(windows)]

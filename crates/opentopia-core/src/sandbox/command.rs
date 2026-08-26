@@ -192,6 +192,7 @@ fn build_bubblewrap_command(
         program: path_to_string(&backend),
         args,
         env: Vec::new(),
+        baseline_preparation: None,
         preparation: None,
         status: SandboxCommandStatus::Wrapped {
             platform: OsSandboxPlatform::Linux,
@@ -224,6 +225,7 @@ fn build_sandbox_exec_command(
         program: path_to_string(&backend),
         args,
         env: Vec::new(),
+        baseline_preparation: None,
         preparation: None,
         status: SandboxCommandStatus::Wrapped {
             platform: OsSandboxPlatform::Macos,
@@ -445,9 +447,13 @@ pub(super) fn build_windows_sandbox_command_with_binary(
         }
         .to_string(),
     ]);
+    let mut baseline_preparation_args = sandbox_args.clone();
+    baseline_preparation_args[0] = "provision-baseline".to_string();
+    let baseline_preparation_key =
+        windows_baseline_preparation_key(&baseline_preparation_args, &sandbox);
     let mut preparation_args = sandbox_args.clone();
-    preparation_args[0] = "provision".to_string();
-    let preparation_key = windows_preparation_key(&preparation_args);
+    preparation_args[0] = "provision-scope".to_string();
+    let preparation_key = windows_preparation_key(&preparation_args, &sandbox);
     sandbox_args.push("--".to_string());
     sandbox_args.push(program.to_string());
     sandbox_args.extend(args.iter().cloned());
@@ -475,6 +481,12 @@ pub(super) fn build_windows_sandbox_command_with_binary(
         program: sandbox_program.clone(),
         args: sandbox_args,
         env: env.clone(),
+        baseline_preparation: Some(SandboxPreparationPlan {
+            key: baseline_preparation_key,
+            program: sandbox_program.clone(),
+            args: baseline_preparation_args,
+            env: env.clone(),
+        }),
         preparation: Some(SandboxPreparationPlan {
             key: preparation_key,
             program: sandbox_program,
@@ -493,7 +505,54 @@ pub(super) fn build_windows_sandbox_command_with_binary(
     })
 }
 
-fn windows_preparation_key(args: &[String]) -> String {
+fn windows_baseline_preparation_key(args: &[String], helper: &Path) -> String {
+    fn argument_value<'a>(args: &'a [String], flag: &str) -> &'a str {
+        args.windows(2)
+            .find(|pair| pair[0] == flag)
+            .map(|pair| pair[1].as_str())
+            .unwrap_or("unspecified")
+    }
+
+    format!(
+        "windows-account-baseline-v1\0backend={}\0network={}\0state={}\0helper={}",
+        argument_value(args, "--backend"),
+        argument_value(args, "--network"),
+        windows_sandbox_state_generation(),
+        filesystem_metadata_generation(helper)
+    )
+}
+
+fn windows_sandbox_state_generation() -> String {
+    let Some(state_dir) = opentopia_sandbox_state_dir() else {
+        return "unavailable".to_string();
+    };
+    format!(
+        "{}\0config={}\0credentials={}",
+        path_to_string(&state_dir),
+        filesystem_metadata_generation(&state_dir.join("config.toml")),
+        filesystem_metadata_generation(&state_dir.join("credentials.dpapi"))
+    )
+}
+
+fn filesystem_metadata_generation(path: &Path) -> String {
+    use std::time::UNIX_EPOCH;
+
+    match std::fs::metadata(path) {
+        Ok(metadata) => format!(
+            "{}:{}",
+            metadata.len(),
+            metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                .map(|value| value.as_nanos())
+                .unwrap_or_default()
+        ),
+        Err(error) => format!("unavailable:{:?}", error.kind()),
+    }
+}
+
+fn windows_preparation_key(args: &[String], helper: &Path) -> String {
     const PATH_FLAGS: &[&str] = &[
         "--cwd",
         "--read-root",
@@ -515,6 +574,10 @@ fn windows_preparation_key(args: &[String]) -> String {
         key.push('=');
         key.push_str(&filesystem_object_identity(Path::new(&pair[1])));
     }
+    key.push_str("\0state=");
+    key.push_str(&windows_sandbox_state_generation());
+    key.push_str("\0helper=");
+    key.push_str(&filesystem_metadata_generation(helper));
     key
 }
 
@@ -664,6 +727,7 @@ fn build_unsupported_sandbox_command(
             program: program.to_string(),
             args: args.to_vec(),
             env: Vec::new(),
+            baseline_preparation: None,
             preparation: None,
             status: SandboxCommandStatus::BestEffortPassthrough { platform, reason },
         }),
@@ -686,6 +750,7 @@ pub(super) fn unavailable_backend(
         program: program.to_string(),
         args: args.to_vec(),
         env: Vec::new(),
+        baseline_preparation: None,
         preparation: None,
         status: SandboxCommandStatus::BestEffortPassthrough { platform, reason },
     })

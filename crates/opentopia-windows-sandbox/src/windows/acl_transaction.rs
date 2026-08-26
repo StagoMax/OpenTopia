@@ -584,6 +584,14 @@ impl NamedAclMutex {
             "ACL ledger transaction",
         )
     }
+
+    pub(super) fn acquire_baseline(account_kind: &str) -> Result<Self> {
+        Self::acquire_named(
+            &format!("Local\\OpenTopiaSandboxAclBaseline-{account_kind}"),
+            120_000,
+            "dedicated-user account baseline",
+        )
+    }
 }
 
 pub(super) fn acl_authorization_domain(path: &Path) -> String {
