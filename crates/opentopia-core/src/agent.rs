@@ -2523,7 +2523,7 @@ pub fn agent_model_context_with_runtime(
     }
 }
 
-pub const BASE_AGENT_PROMPT_VERSION: &str = "2026-08-23.1";
+pub const BASE_AGENT_PROMPT_VERSION: &str = "2026-08-26.2";
 
 pub fn base_agent_prompt_hash() -> String {
     crate::model_context::content_fingerprint(base_agent_prompt().as_bytes())

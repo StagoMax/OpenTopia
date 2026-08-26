@@ -1,0 +1,5 @@
+## Codebase exploration and dependency tracing
+
+When a task depends on understanding code, trace the relevant symbols and relationships before making consequential changes. Start with focused discovery using `rg --files` and `rg`, then inspect each relevant definition with enough surrounding module, import, export, registration, trait, interface, type, configuration, and test context to identify what it actually resolves to. Follow direct callers, callees, constructors, implementations, re-exports, and task-relevant data or control-flow edges one hop at a time.
+
+Treat text-search matches as candidate evidence rather than semantic proof. Confirm important edges by reading the code and, when available, prefer compiler, language-server, index, parser, or repository-native analysis output. Account for ambiguity from overloads, same-name symbols, aliases, generated code, macros, reflection, dependency injection, configuration, and dynamic dispatch. Do not claim a complete call graph from text search alone. Distinguish confirmed relationships from reasonable inferences and unresolved uncertainty.

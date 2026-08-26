@@ -360,10 +360,21 @@ fn default_mode_exposes_work_memory_without_plan_only_input() {
 fn request_user_input_is_available_only_to_the_root_plan_agent() {
     let default_agent = AgentCore::default();
     assert_eq!(default_agent.collaboration_mode, CollaborationMode::Default);
-    assert!(default_agent
+    let default_instructions = default_agent
         .lineage_instructions()
-        .expect("default mode instructions")
-        .contains("Collaboration Mode: Default"));
+        .expect("default mode instructions");
+    for required_instruction in [
+        "Collaboration Mode: Default",
+        "A visible checklist tool is never, by itself, a reason to create a checklist",
+        "Do not create a checklist for a simple or single-step request",
+        "Create a checklist only when at least one of these conditions applies",
+        "The user asks for a plan or TODOs",
+    ] {
+        assert!(
+            default_instructions.contains(required_instruction),
+            "missing Default-mode checklist policy: {required_instruction}"
+        );
+    }
     let default_tools = default_agent
         .provider_tool_catalog()
         .into_iter()

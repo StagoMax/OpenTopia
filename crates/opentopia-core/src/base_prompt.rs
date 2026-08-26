@@ -16,6 +16,10 @@ pub const BASE_PROMPT_MODULES: &[BasePromptModule] = &[
         content: include_str!("prompts/base/identity_and_objective.md"),
     },
     BasePromptModule {
+        id: "instruction_hierarchy",
+        content: include_str!("prompts/base/instruction_hierarchy.md"),
+    },
+    BasePromptModule {
         id: "personality",
         content: include_str!("prompts/base/personality.md"),
     },
@@ -46,6 +50,10 @@ pub const BASE_PROMPT_MODULES: &[BasePromptModule] = &[
     BasePromptModule {
         id: "working_rules",
         content: include_str!("prompts/base/working_rules.md"),
+    },
+    BasePromptModule {
+        id: "codebase_exploration",
+        content: include_str!("prompts/base/codebase_exploration.md"),
     },
     BasePromptModule {
         id: "file_editing_constraints",
@@ -97,6 +105,7 @@ mod tests {
             ids,
             [
                 "identity_and_objective",
+                "instruction_hierarchy",
                 "personality",
                 "writing_style",
                 "technical_communication",
@@ -105,6 +114,7 @@ mod tests {
                 "final_answer",
                 "formatting_and_visualizations",
                 "working_rules",
+                "codebase_exploration",
                 "file_editing_constraints",
                 "autonomy_and_persistence",
                 "destructive_actions",
