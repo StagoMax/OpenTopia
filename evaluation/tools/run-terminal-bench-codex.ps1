@@ -15,10 +15,9 @@ param(
 
     [string[]]$ExcludeTask = @(),
 
-    # Use a JSON array when a controller needs to resume a queue with more
-    # than one exclusion.  `pwsh -File` binds only the first space-separated
-    # value to a string-array parameter; subsequent values can otherwise be
-    # mistaken for positional parameters such as JobsDirectoryName.
+    # In pwsh -File mode, only the first whitespace-separated value binds to
+    # a string-array parameter. Controllers should use this JSON list when
+    # resuming more than one selected task.
     [string]$TaskListPath = '',
 
     [string]$OnlyTask = ''
@@ -35,82 +34,51 @@ if (-not (Test-Path -LiteralPath $harbor)) {
 
 $jobsRoot = Join-Path $PlanRoot $JobsDirectoryName
 New-Item -ItemType Directory -Force -Path $jobsRoot | Out-Null
-
-# This is exactly the previously valid Terminal-Bench set.  Coq, photonic,
-# and protein remain excluded because they lacked a valid paired result in the
-# before/after study; this Codex baseline is intentionally comparable.
-$tasks = @(
-    'bun-sourcemap-leak',
-    'cargo-flight-dispatch',
-    'data-anonymization',
-    'distributed-dedup',
-    'freecad-spring-clip',
-    'hof-topology-interpenetration',
-    'mp-checkpoint-consolidation',
-    'ontology-kg-querying',
-    'retro-console-soc',
-    'roy-polymorph-cn',
-    'rs-archive-clone',
-    'shadow-relay',
-    'telecom-entity-resolution',
-    'vpp-loss-divergence',
-    'wdm-design'
+$allTasks = @(
+    'bun-sourcemap-leak', 'cargo-flight-dispatch', 'data-anonymization',
+    'distributed-dedup', 'freecad-spring-clip', 'hof-topology-interpenetration',
+    'mp-checkpoint-consolidation', 'ontology-kg-querying', 'retro-console-soc',
+    'roy-polymorph-cn', 'rs-archive-clone', 'shadow-relay',
+    'telecom-entity-resolution', 'vpp-loss-divergence', 'wdm-design'
 )
+
 if ($TaskListPath) {
     if ($OnlyTask -or $ExcludeTask.Count -gt 0) {
         throw 'TaskListPath cannot be combined with OnlyTask or ExcludeTask.'
     }
-    $resolvedTaskListPath = (Resolve-Path -LiteralPath $TaskListPath).Path
-    $requestedTasks = @(Get-Content -LiteralPath $resolvedTaskListPath -Raw | ConvertFrom-Json)
-    if ($requestedTasks.Count -eq 0) {
-        throw 'TaskListPath did not contain any tasks.'
+    $tasks = @(Get-Content -LiteralPath (Resolve-Path -LiteralPath $TaskListPath).Path -Raw | ConvertFrom-Json)
+    if ($tasks.Count -eq 0 -or @($tasks | Select-Object -Unique).Count -ne $tasks.Count) {
+        throw 'TaskListPath must contain a nonempty, unique task list.'
     }
-    if (@($requestedTasks | Select-Object -Unique).Count -ne $requestedTasks.Count) {
-        throw 'TaskListPath contains duplicate task names.'
+    foreach ($task in $tasks) {
+        if ($allTasks -notcontains $task) { throw "TaskListPath contains an unsupported task: $task" }
     }
-    foreach ($task in $requestedTasks) {
-        if ($tasks -notcontains $task) {
-            throw "TaskListPath contains a task outside the selected valid Terminal-Bench set: $task"
-        }
-    }
-    $tasks = @($requestedTasks)
 } elseif ($OnlyTask) {
-    if ($tasks -notcontains $OnlyTask) {
-        throw "OnlyTask is not in the selected valid Terminal-Bench set: $OnlyTask"
-    }
+    if ($allTasks -notcontains $OnlyTask) { throw "OnlyTask is not selected: $OnlyTask" }
     $tasks = @($OnlyTask)
-} elseif ($ExcludeTask.Count -gt 0) {
+} else {
     foreach ($task in $ExcludeTask) {
-        if ($tasks -notcontains $task) {
-            throw "ExcludeTask is not in the selected valid Terminal-Bench set: $task"
-        }
+        if ($allTasks -notcontains $task) { throw "ExcludeTask is not selected: $task" }
     }
-    $tasks = @($tasks | Where-Object { $_ -notin $ExcludeTask })
-    if ($tasks.Count -eq 0) {
-        throw 'ExcludeTask removed every selected Terminal-Bench task.'
-    }
+    $tasks = @($allTasks | Where-Object { $_ -notin $ExcludeTask })
 }
 
 function Stop-ChildProcessTree {
     param([Parameter(Mandatory = $true)][int]$RootProcessId)
-
     $processes = Get-CimInstance Win32_Process
-    $frontier = [System.Collections.Generic.Queue[int]]::new()
-    $frontier.Enqueue($RootProcessId)
+    $queue = [System.Collections.Generic.Queue[int]]::new()
     $seen = [System.Collections.Generic.HashSet[int]]::new()
-    $descendants = [System.Collections.Generic.List[int]]::new()
-    while ($frontier.Count -gt 0) {
-        $current = $frontier.Dequeue()
+    $queue.Enqueue($RootProcessId)
+    while ($queue.Count -gt 0) {
+        $current = $queue.Dequeue()
         if (-not $seen.Add($current)) { continue }
         foreach ($child in @($processes | Where-Object { $_.ParentProcessId -eq $current })) {
-            $descendants.Add([int]$child.ProcessId)
-            $frontier.Enqueue([int]$child.ProcessId)
+            $queue.Enqueue([int]$child.ProcessId)
         }
     }
-    foreach ($childId in @($descendants | Sort-Object -Descending)) {
-        Stop-Process -Id $childId -Force -ErrorAction SilentlyContinue
+    foreach ($processId in @($seen | Sort-Object -Descending)) {
+        Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
     }
-    Stop-Process -Id $RootProcessId -Force -ErrorAction SilentlyContinue
 }
 
 function Start-CodexTerminalTask {
@@ -120,17 +88,17 @@ function Start-CodexTerminalTask {
     New-Item -ItemType Directory -Force -Path $taskJobs | Out-Null
     $stdout = Join-Path $taskJobs 'launcher.stdout.log'
     $stderr = Join-Path $taskJobs 'launcher.stderr.log'
+    # This Windows host can fail to create redirect paths inside Start-Process.
+    # Pre-creating them makes such a failure unambiguously infrastructure-only.
+    New-Item -ItemType File -Force -Path $stdout | Out-Null
+    New-Item -ItemType File -Force -Path $stderr | Out-Null
     $arguments = @(
-        'run',
-        '--dataset', 'terminal-bench/terminal-bench@latest',
+        'run', '--dataset', 'terminal-bench/terminal-bench@latest',
         '--agent', 'evaluation.integrations.harbor.codex_container_agent:CodexContainerAgent',
         '--agent-kwarg', "run_timeout_sec=$RunTimeoutSeconds",
         '--include-task-name', "terminal-bench/$Task",
-        '--n-attempts', '1',
-        '--n-concurrent', '1',
-        '--env', 'docker',
-        '--jobs-dir', $taskJobs,
-        '--yes'
+        '--n-attempts', '1', '--n-concurrent', '1', '--env', 'docker',
+        '--jobs-dir', $taskJobs, '--yes'
     )
     $process = Start-Process -FilePath $harbor -ArgumentList $arguments `
         -WorkingDirectory $sourceRoot -WindowStyle Hidden `
@@ -147,7 +115,6 @@ $pending = [System.Collections.ArrayList]::new()
 foreach ($task in $tasks) { [void]$pending.Add($task) }
 $active = [System.Collections.ArrayList]::new()
 $completed = [System.Collections.ArrayList]::new()
-
 while ($pending.Count -gt 0 -or $active.Count -gt 0) {
     while ($pending.Count -gt 0 -and $active.Count -lt $MaxParallelTasks) {
         $task = $pending[0]
@@ -183,5 +150,5 @@ while ($pending.Count -gt 0 -or $active.Count -gt 0) {
 } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $jobsRoot 'manifest.json') -Encoding utf8
 
 if (@($completed | Where-Object { $_.exitCode -ne 0 }).Count -gt 0) {
-    throw 'One or more Codex Terminal-Bench task launchers failed. Check per-task logs before retrying.'
+    throw 'One or more Codex Terminal-Bench task launchers failed.'
 }

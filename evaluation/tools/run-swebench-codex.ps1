@@ -12,6 +12,11 @@ param(
 
     [string[]]$ExcludeInstance = @(),
 
+    # Controllers pass a JSON list here when resuming several completed
+    # instances. pwsh -File otherwise treats later string-array values as
+    # positional parameters.
+    [string]$InstanceListPath = '',
+
     [string]$OnlyInstance = ''
 )
 
@@ -29,7 +34,20 @@ $instances = @(
     'sympy__sympy-13031',
     'matplotlib__matplotlib-24627'
 )
-if ($OnlyInstance) {
+$allInstances = @($instances)
+if ($InstanceListPath) {
+    if ($OnlyInstance -or $ExcludeInstance.Count -gt 0) {
+        throw 'InstanceListPath cannot be combined with OnlyInstance or ExcludeInstance.'
+    }
+    $selectedInstances = @(Get-Content -LiteralPath (Resolve-Path -LiteralPath $InstanceListPath).Path -Raw | ConvertFrom-Json)
+    if ($selectedInstances.Count -eq 0 -or @($selectedInstances | Select-Object -Unique).Count -ne $selectedInstances.Count) {
+        throw 'InstanceListPath must contain a nonempty, unique instance list.'
+    }
+    foreach ($instance in $selectedInstances) {
+        if ($allInstances -notcontains $instance) { throw "InstanceListPath contains an unsupported instance: $instance" }
+    }
+    $instances = @($selectedInstances)
+} elseif ($OnlyInstance) {
     if ($instances -notcontains $OnlyInstance) { throw "OnlyInstance is not in the selected SWE-bench set: $OnlyInstance" }
     $instances = @($OnlyInstance)
 } elseif ($ExcludeInstance.Count -gt 0) {
@@ -53,6 +71,11 @@ while ($pending.Count -gt 0 -or $active.Count -gt 0) {
         $pending.RemoveAt(0)
         $instanceDir = Join-Path $runsRoot $instance
         New-Item -ItemType Directory -Force -Path $instanceDir | Out-Null
+        $stdout = Join-Path $instanceDir 'launcher.stdout.log'
+        $stderr = Join-Path $instanceDir 'launcher.stderr.log'
+        # The host may fail to create redirected files in Start-Process.
+        New-Item -ItemType File -Force -Path $stdout | Out-Null
+        New-Item -ItemType File -Force -Path $stderr | Out-Null
         $arguments = @(
             '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $runner,
             '-PlanRoot', $PlanRoot,
@@ -62,8 +85,8 @@ while ($pending.Count -gt 0 -or $active.Count -gt 0) {
         )
         $process = Start-Process -FilePath 'pwsh.exe' -ArgumentList $arguments `
             -WorkingDirectory (Get-Location).Path -WindowStyle Hidden `
-            -RedirectStandardOutput (Join-Path $instanceDir 'launcher.stdout.log') `
-            -RedirectStandardError (Join-Path $instanceDir 'launcher.stderr.log') -PassThru
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr -PassThru
         [void]$active.Add([pscustomobject]@{
             instance = $instance
             process = $process
