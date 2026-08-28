@@ -13,6 +13,23 @@ from swebench.harness.run_evaluation import run_instance
 from swebench.harness.utils import make_test_spec
 
 
+def write_text_with_lf(
+    path: Path, data: str, encoding: str | None = None, errors: str | None = None
+) -> int:
+    """Write runner intermediates without Windows CRLF translation.
+
+    SWE-bench's ``run_instance`` writes the model patch with ``Path.write_text``.
+    On this Windows scorer host that transforms a valid LF-only unified diff into
+    CRLF before it reaches the Linux grading container, breaking hunk matching.
+    The override is scoped to the official runner call below; its JSON result is
+    written after the original method is restored.
+    """
+    with path.open(
+        "w", encoding=encoding or "utf-8", errors=errors, newline="\n"
+    ) as stream:
+        return stream.write(data)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--instances", required=True, type=Path)
@@ -36,13 +53,18 @@ def main() -> None:
     args = parse_args()
     instance = find_jsonl_row(args.instances, args.instance_id)
     prediction = find_jsonl_row(args.prediction, args.instance_id)
-    result = run_instance(
-        make_test_spec(instance),
-        prediction,
-        docker.from_env(timeout=600),
-        args.run_id,
-        timeout=args.timeout_seconds,
-    )
+    original_write_text = Path.write_text
+    Path.write_text = write_text_with_lf
+    try:
+        result = run_instance(
+            make_test_spec(instance),
+            prediction,
+            docker.from_env(timeout=600),
+            args.run_id,
+            timeout=args.timeout_seconds,
+        )
+    finally:
+        Path.write_text = original_write_text
     record = {
         "schemaVersion": 1,
         "officialHarness": "SWE-bench 5.0.2 run_instance",

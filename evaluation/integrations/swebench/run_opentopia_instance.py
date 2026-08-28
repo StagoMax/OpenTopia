@@ -18,6 +18,7 @@ import secrets
 import sys
 import tarfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-label", required=True)
     parser.add_argument("--reasoning-effort", default="high")
     parser.add_argument("--max-output-tokens", type=int, default=8192)
-    parser.add_argument("--rollout-limit-tokens", type=int, default=50_000)
+    parser.add_argument("--rollout-limit-tokens", type=int)
     parser.add_argument("--run-timeout-seconds", type=int, default=1800)
     parser.add_argument("--prepare-only", action="store_true")
     return parser.parse_args()
@@ -104,6 +105,8 @@ def api(
     method: str,
     path: str,
     body: dict[str, Any] | None = None,
+    *,
+    timeout_seconds: int = 30,
 ) -> Any:
     encoded_body = base64.b64encode(
         b"" if body is None else json.dumps(body, separators=(",", ":")).encode("utf-8")
@@ -114,7 +117,7 @@ def api(
             f"data = base64.b64decode({encoded_body!r}) if {body is not None!r} else None",
             "headers = {'authorization': 'Bearer ' + os.environ['OPENTOPIA_EVAL_INTERNAL_TOKEN'], 'content-type': 'application/json'}",
             f"request = urllib.request.Request('http://127.0.0.1:{SERVER_PORT}{path}', data=data, headers=headers, method={method!r})",
-            "with urllib.request.urlopen(request, timeout=30) as response:",
+            f"with urllib.request.urlopen(request, timeout={timeout_seconds}) as response:",
             "    sys.stdout.write(response.read().decode('utf-8'))",
         ]
     )
@@ -172,11 +175,15 @@ def configure_server(
     provider["model"] = required_env(config, "OPENTOPIA_EVAL_MODEL")
     provider["reasoningEffort"] = args.reasoning_effort
     provider["maxOutputTokens"] = args.max_output_tokens
-    provider["rolloutBudget"] = {
-        "limitTokens": args.rollout_limit_tokens,
-        "samplingTokenWeight": 1.0,
-        "prefillTokenWeight": 1.0,
-    }
+    provider["rolloutBudget"] = (
+        {
+            "limitTokens": args.rollout_limit_tokens,
+            "samplingTokenWeight": 1.0,
+            "prefillTokenWeight": 1.0,
+        }
+        if args.rollout_limit_tokens is not None
+        else None
+    )
     api(container, token, "PATCH", "/api/settings", {"providers": providers, "activeProviderId": provider_id})
     profile = api(container, token, "POST", "/api/provider/test", {"providerId": provider_id})
     if not profile.get("reachable") or not profile.get("modelAvailable"):
@@ -209,6 +216,24 @@ def usage_from_events(events: list[dict[str, Any]]) -> tuple[dict[str, int], boo
     return usage, cache_reported
 
 
+def event_metrics(events: list[dict[str, Any]]) -> dict[str, int]:
+    event_types = [
+        (event.get("payload") or {}).get("type")
+        for event in events
+        if isinstance(event, dict)
+    ]
+    return {
+        "modelRequests": sum(event_type == "model_request" for event_type in event_types),
+        "providerResponses": sum(
+            event_type == "provider_response_received" for event_type in event_types
+        ),
+        "toolCallsStarted": sum(event_type == "tool_call_started" for event_type in event_types),
+        "toolCallsFinished": sum(
+            event_type == "tool_call_finished" for event_type in event_types
+        ),
+    }
+
+
 def run_agent(
     container: docker.models.containers.Container,
     instance: dict[str, Any],
@@ -230,8 +255,12 @@ def run_agent(
     deadline = time.monotonic() + args.run_timeout_seconds
     approvals = 0
     terminal: dict[str, Any] | None = None
+    last_candidate: dict[str, Any] | None = None
+    controlled_timeout = False
     while time.monotonic() < deadline:
         candidate = api(container, token, "GET", f"/api/threads/{thread_id}/turn")
+        if isinstance(candidate, dict):
+            last_candidate = candidate
         status = candidate.get("status") if candidate else None
         if status in {"succeeded", "failed", "cancelled", "interrupted", "waiting_user_action"}:
             terminal = candidate
@@ -246,9 +275,36 @@ def run_agent(
                 approvals += 1
         time.sleep(1)
     if terminal is None:
-        api(container, token, "POST", f"/api/threads/{thread_id}/turn/cancel")
-        raise RuntimeError(f"OpenTopia exceeded {args.run_timeout_seconds}s wall-clock budget")
-    events = api(container, token, "GET", f"/api/threads/{thread_id}/events?since=0")
+        controlled_timeout = True
+        api(container, token, "POST", f"/api/threads/{thread_id}/turn/cancel", {})
+        for _ in range(10):
+            candidate = api(container, token, "GET", f"/api/threads/{thread_id}/turn")
+            if isinstance(candidate, dict):
+                last_candidate = candidate
+            if candidate and candidate.get("status") in {
+                "succeeded",
+                "failed",
+                "cancelled",
+                "interrupted",
+            }:
+                terminal = candidate
+                break
+            time.sleep(1)
+        if terminal is None:
+            terminal = last_candidate or {
+                "status": "timed_out",
+                "error": "turn status unavailable after controlled timeout",
+            }
+    # The conversation projection keeps the event types and token-usage fields
+    # needed for scoring while omitting large model/tool payloads.  This avoids
+    # a long agent run failing during post-run telemetry collection.
+    events = api(
+        container,
+        token,
+        "GET",
+        f"/api/threads/{thread_id}/events?since=0&view=conversation",
+        timeout_seconds=300,
+    )
     if not isinstance(events, list):
         raise RuntimeError("OpenTopia events response was not a list")
     controlled.update({
@@ -256,6 +312,9 @@ def run_agent(
         "turnStatus": terminal.get("status"),
         "turnError": terminal.get("error"),
         "automaticApprovals": approvals,
+        "controlledTimeout": controlled_timeout,
+        "rolloutLimitTokens": args.rollout_limit_tokens,
+        **event_metrics(events),
     })
     diff = exec_checked(container, "git diff --binary --no-ext-diff")
     return diff, controlled, events
@@ -268,7 +327,10 @@ def main() -> None:
     instance = read_instance(args.instances, args.instance_id)
     args.logs_dir.mkdir(parents=True, exist_ok=True)
     client = docker.from_env(timeout=600)
-    image = client.images.pull(str(instance["image"]))
+    try:
+        image = client.images.get(str(instance["image"]))
+    except docker.errors.ImageNotFound:
+        image = client.images.pull(str(instance["image"]))
     safe_label = "".join(ch if ch.isalnum() else "-" for ch in args.run_label.lower())
     container_name = f"opentopia-swebench-{safe_label}-{args.instance_id.lower()}"
     container = None
@@ -300,7 +362,10 @@ def main() -> None:
         else:
             upload_server(container, args.server_binary)
             env_values = dict(dotenv_values(args.env_file)) if args.env_file else {}
+            agent_started = time.monotonic()
+            agent_started_at = datetime.now(timezone.utc).isoformat()
             diff, controlled, events = run_agent(container, instance, env_values, args)
+            agent_finished_at = datetime.now(timezone.utc).isoformat()
             usage, cache_reported = usage_from_events(events)
             args.logs_dir.joinpath("opentopia-events.json").write_text(json.dumps(events, indent=2) + "\n", encoding="utf-8")
             prediction = {
@@ -317,6 +382,9 @@ def main() -> None:
                 "cacheTelemetry": "provider_reported" if cache_reported else "unsupported",
                 "eventCount": len(events),
                 "patchBytes": len(diff.encode("utf-8")),
+                "agentStartedAtUtc": agent_started_at,
+                "agentFinishedAtUtc": agent_finished_at,
+                "agentDurationSeconds": time.monotonic() - agent_started,
             })
     except Exception as error:
         record.update({"status": "infrastructure_error", "errorType": type(error).__name__, "error": str(error)})

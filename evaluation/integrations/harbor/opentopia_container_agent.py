@@ -121,12 +121,14 @@ class OpenTopiaContainerAgent(BaseAgent):
         *,
         env: dict[str, str] | None = None,
         timeout_sec: int = 60,
+        user: str | int | None = None,
     ) -> str:
         result = await environment.exec(
             command,
             cwd=self._workdir,
             env=env,
             timeout_sec=timeout_sec,
+            user=user,
         )
         if result.return_code != 0:
             detail = (result.stderr or result.stdout or "no command output").strip()
@@ -141,27 +143,73 @@ class OpenTopiaContainerAgent(BaseAgent):
         method: str,
         path: str,
         body: dict[str, Any] | None = None,
+        *,
+        timeout_sec: int = 60,
     ) -> Any:
         body_data = b"" if body is None else json.dumps(body, separators=(",", ":")).encode()
         encoded_body = base64.b64encode(body_data).decode("ascii")
-        # Terminal-Bench images consistently include Python, whereas curl is
-        # not part of every task image. Keep this transport stdlib-only.
+        # Terminal-Bench images do not consistently include Python or curl.
+        # Harbor executes task commands through Bash, so its built-in
+        # /dev/tcp support is the smallest common transport for the local,
+        # authenticated OpenTopia control plane.
         script = "\n".join(
             [
-                "import base64, os, sys, urllib.request",
-                f"data = base64.b64decode({encoded_body!r}) if {bool(body)!r} else None",
-                "headers = {'authorization': 'Bearer ' + os.environ['OPENTOPIA_EVAL_INTERNAL_TOKEN'], 'content-type': 'application/json'}",
-                f"request = urllib.request.Request('http://127.0.0.1:{self._SERVER_PORT}{path}', data=data, headers=headers, method={method!r})",
-                "with urllib.request.urlopen(request, timeout=30) as response:",
-                "    sys.stdout.write(response.read().decode('utf-8'))",
+                "set -euo pipefail",
+                f"method={shlex.quote(method)}",
+                f"request_path={shlex.quote(path)}",
+                f"body_b64={shlex.quote(encoded_body)}",
+                "body=$(printf %s \"$body_b64\" | base64 -d)",
+                "content_length=$(printf %s \"$body\" | wc -c | tr -d ' ')",
+                "exec 3<>/dev/tcp/127.0.0.1/" + str(self._SERVER_PORT),
+                "printf '%s %s HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nAuthorization: Bearer %s\\r\\nContent-Type: application/json\\r\\nContent-Length: %s\\r\\nConnection: close\\r\\n\\r\\n%s' \\",
+                "  \"$method\" \"$request_path\" \"$OPENTOPIA_EVAL_INTERNAL_TOKEN\" \"$content_length\" \"$body\" >&3",
+                "IFS= read -r status_line <&3",
+                "response_length=''",
+                "transfer_encoding=''",
+                "while IFS= read -r header <&3; do",
+                "  header=${header%$'\\r'}",
+                "  [[ -z \"$header\" ]] && break",
+                "  if [[ \"$header\" == [Cc]ontent-[Ll]ength:* ]]; then",
+                "    response_length=${header#*:}; response_length=${response_length//[[:space:]]/}",
+                "  fi",
+                "  if [[ \"$header\" == [Tt]ransfer-[Ee]ncoding:* ]]; then",
+                "    transfer_encoding=${header#*:}; transfer_encoding=${transfer_encoding//[[:space:]]/}",
+                "  fi",
+                "done",
+                "if [[ \"$response_length\" =~ ^[0-9]+$ ]]; then",
+                "  dd bs=1 count=\"$response_length\" status=none <&3",
+                "elif [[ \"$transfer_encoding\" == *chunked* ]]; then",
+                "  while IFS= read -r chunk_header <&3; do",
+                "    chunk_header=${chunk_header%$'\\r'}",
+                "    chunk_size_hex=${chunk_header%%;*}",
+                "    [[ \"$chunk_size_hex\" =~ ^[0-9A-Fa-f]+$ ]] || exit 22",
+                "    chunk_size=$((16#$chunk_size_hex))",
+                "    if (( chunk_size == 0 )); then",
+                "      while IFS= read -r trailer <&3; do",
+                "        trailer=${trailer%$'\\r'}",
+                "        [[ -z \"$trailer\" ]] && break",
+                "      done",
+                "      break",
+                "    fi",
+                "    dd bs=1 count=\"$chunk_size\" status=none <&3",
+                "    IFS= read -r chunk_terminator <&3",
+                "  done",
+                "else",
+                "  echo \"OpenTopia response had neither Content-Length nor chunked transfer encoding\" >&2",
+                "  exit 22",
+                "fi",
+                "status_code=${status_line#* }",
+                "status_code=${status_code%% *}",
+                "[[ \"$status_code\" =~ ^2[0-9][0-9]$ ]]",
             ]
         )
         encoded_script = base64.b64encode(script.encode()).decode("ascii")
-        command = f"printf %s {shlex.quote(encoded_script)} | base64 -d | python3"
+        command = f"printf %s {shlex.quote(encoded_script)} | base64 -d | bash"
         output = await self._exec(
             environment,
             command,
             env={"OPENTOPIA_EVAL_INTERNAL_TOKEN": self._auth_token},
+            timeout_sec=timeout_sec,
         )
         try:
             return json.loads(output)
@@ -306,7 +354,15 @@ class OpenTopiaContainerAgent(BaseAgent):
             timeout_sec=30,
         )
         await environment.upload_file(self._server_binary, self._SERVER_PATH)
-        await self._exec(environment, f"chmod 755 {self._SERVER_PATH}", timeout_sec=30)
+        # Harbor transfers the binary as root so it may not be owned by the task
+        # user.  Change only its mode as root, then start OpenTopia as the task
+        # user below; this preserves the benchmark's ordinary execution context.
+        await self._exec(
+            environment,
+            f"chmod 755 {self._SERVER_PATH}",
+            timeout_sec=30,
+            user="root",
+        )
         server_command = (
             f"nohup {self._SERVER_PATH} --host 127.0.0.1 --port {self._SERVER_PORT} "
             f"--db {self._SERVER_DB_PATH} --permission full-access "
@@ -395,12 +451,34 @@ class OpenTopiaContainerAgent(BaseAgent):
                 usage["cachedInputTokens"] += int(payload.get("cached_input_tokens") or 0)
         return usage, cache_reported
 
+    @staticmethod
+    def _event_metrics(events: list[dict[str, Any]]) -> dict[str, int]:
+        """Return content-free interaction counts for paired comparisons."""
+        event_types = [
+            (event.get("payload") or {}).get("type")
+            for event in events
+            if isinstance(event, dict)
+        ]
+        return {
+            "modelRequests": sum(event_type == "model_request" for event_type in event_types),
+            "providerResponses": sum(
+                event_type == "provider_response_received" for event_type in event_types
+            ),
+            "toolCallsStarted": sum(
+                event_type == "tool_call_started" for event_type in event_types
+            ),
+            "toolCallsFinished": sum(
+                event_type == "tool_call_finished" for event_type in event_types
+            ),
+        }
+
     async def run(
         self,
         instruction: str,
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
+        run_started_at = time.monotonic()
         thread_id = await self._create_thread(environment)
         message = await self._api(
             environment,
@@ -411,11 +489,15 @@ class OpenTopiaContainerAgent(BaseAgent):
         deadline = time.monotonic() + self._run_timeout_sec
         terminal_statuses = {"succeeded", "failed", "cancelled", "interrupted"}
         terminal: dict[str, Any] | None = None
+        last_candidate: dict[str, Any] | None = None
+        controlled_timeout = False
         approval_count = 0
         while time.monotonic() < deadline:
             candidate = await self._api(
                 environment, "GET", f"/api/threads/{thread_id}/turn"
             )
+            if isinstance(candidate, dict):
+                last_candidate = candidate
             if candidate and candidate.get("status") in terminal_statuses:
                 terminal = candidate
                 break
@@ -427,17 +509,51 @@ class OpenTopiaContainerAgent(BaseAgent):
             await self._sleep()
 
         if terminal is None:
-            await self._api(environment, "POST", f"/api/threads/{thread_id}/turn/cancel")
-            raise RuntimeError(
-                f"OpenTopia exceeded the controlled {self._run_timeout_sec}s wall-clock budget"
+            controlled_timeout = True
+            # The server's cancellation endpoint extracts a JSON body even
+            # when no specific Turn id is requested.  Sending an empty
+            # object preserves the endpoint contract; an absent body yields
+            # HTTP 400 and hides the controlled timeout from Harbor.
+            await self._api(
+                environment,
+                "POST",
+                f"/api/threads/{thread_id}/turn/cancel",
+                {},
             )
+            # Retain all observable events after cancellation.  A timeout is
+            # a scored failure, but its token, cache, and tool-use data are
+            # still essential to a before/after efficiency comparison.
+            for _ in range(10):
+                candidate = await self._api(
+                    environment, "GET", f"/api/threads/{thread_id}/turn"
+                )
+                if isinstance(candidate, dict):
+                    last_candidate = candidate
+                if candidate and candidate.get("status") in terminal_statuses:
+                    terminal = candidate
+                    break
+                await self._sleep()
+            if terminal is None:
+                terminal = last_candidate or {
+                    "status": "timed_out",
+                    "error": "turn status unavailable after controlled timeout",
+                }
 
-        events = await self._api(environment, "GET", f"/api/threads/{thread_id}/events?since=0")
+        # The conversation projection retains token usage and interaction
+        # event types while redacting model request/response bodies.  This
+        # keeps the terminal telemetry transfer tractable for tool-heavy tasks.
+        events = await self._api(
+            environment,
+            "GET",
+            f"/api/threads/{thread_id}/events?since=0&view=conversation",
+            timeout_sec=300,
+        )
         if not isinstance(events, list):
             raise RuntimeError("OpenTopia events response was not a list")
         events_path = self.logs_dir / "opentopia-events.json"
         events_path.write_text(json.dumps(events, indent=2) + "\n", encoding="utf-8")
         usage, cache_reported = self._usage_from_events(events)
+        event_metrics = self._event_metrics(events)
         context.n_input_tokens = usage["inputTokens"]
         context.n_output_tokens = usage["outputTokens"]
         if cache_reported:
@@ -458,8 +574,14 @@ class OpenTopiaContainerAgent(BaseAgent):
             "reasoningTokens": usage["reasoningTokens"],
             "cacheTelemetry": "provider_reported" if cache_reported else "unsupported",
             "eventCount": len(events),
+            **event_metrics,
+            "turnElapsedMs": int((time.monotonic() - run_started_at) * 1000),
+            "controlledTimeout": controlled_timeout,
         }
-        if terminal.get("status") != "succeeded":
-            raise RuntimeError(
-                f"OpenTopia turn did not succeed: {terminal.get('status')} {terminal.get('error') or ''}".strip()
-            )
+        # Let Terminal-Bench run its official verifier even when the model
+        # turn timed out or failed.  Raising here makes Harbor discard the
+        # collected AgentContext telemetry, turning a scored model failure
+        # into an infrastructure failure with null token/cache metrics.  The
+        # terminal turn state and controlledTimeout marker above retain the
+        # distinction, while the verifier remains the authority for task
+        # success.

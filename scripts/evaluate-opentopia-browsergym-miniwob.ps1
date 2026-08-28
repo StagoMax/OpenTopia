@@ -274,7 +274,7 @@ foreach ($name in @(
 $apiToken = New-Token
 $env:OPENTOPIA_API_TOKEN = $apiToken
 $env:OPENTOPIA_SANDBOX_NETWORK = "deny"
-$env:OPENTOPIA_TOOL_ALLOWLIST = "browser,complete_task"
+$env:OPENTOPIA_TOOL_ALLOWLIST = "browser"
 $env:OPENTOPIA_EVAL_ENABLE_BROWSER_PLUGIN = "1"
 $taskResults = @()
 $providerPreflightCompleted = $false

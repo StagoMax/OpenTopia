@@ -186,7 +186,7 @@ function Get-ComputerMetrics {
     toolCallsByName = $tools
     computerActions = $actions
     computerActionCount = $actions.Count
-    unexpectedTools = @($tools.Keys | Where-Object { $_ -notin @("computer", "set_plan", "update_plan", "complete_task") })
+    unexpectedTools = @($tools.Keys | Where-Object { $_ -notin @("computer", "update_plan") })
     inputTokens = $inputTokens
     outputTokens = $outputTokens
     totalTokens = $totalTokens

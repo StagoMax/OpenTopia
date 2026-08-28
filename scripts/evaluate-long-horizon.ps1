@@ -215,7 +215,6 @@ function Get-TrajectoryMetrics {
   $toolCallsFinished = 0
   $planUpdates = 0
   $testToolCalls = 0
-  $completionToolCalls = 0
   $verifiedPlanCompletionCalls = 0
   [int64]$inputTokens = 0
   [int64]$outputTokens = 0
@@ -250,9 +249,6 @@ function Get-TrajectoryMetrics {
         ) {
           $testToolCalls += 1
         }
-        if ($name -eq "complete_task") {
-          $completionToolCalls += 1
-        }
       }
       "tool_call_finished" {
         $toolCallsFinished += 1
@@ -260,17 +256,14 @@ function Get-TrajectoryMetrics {
         if (
           $metadata.toolName -eq "update_plan" -and
           $metadata.success -eq $true -and
-          (
-            $metadata.currentScopeComplete -eq $true -or
-            $metadata.allStepsComplete -eq $true
-          )
+          $metadata.status -eq "completed"
         ) {
           $verifiedPlanCompletionCalls += 1
         }
       }
-      "plan_updated" {
+      "work_form_updated" {
         $planUpdates += 1
-        $latestPlan = $payload.plan
+        $latestPlan = $payload.form
       }
       "token_usage" {
         if ($null -ne $payload.input_tokens) {
@@ -297,7 +290,7 @@ function Get-TrajectoryMetrics {
   }
   $planStatus = [ordered]@{ pending = 0; inProgress = 0; completed = 0 }
   if ($latestPlan) {
-    foreach ($step in @($latestPlan.steps)) {
+    foreach ($step in @($latestPlan.items)) {
       switch ([string]$step.status) {
         "pending" { $planStatus.pending += 1 }
         "in_progress" { $planStatus.inProgress += 1 }
@@ -314,7 +307,6 @@ function Get-TrajectoryMetrics {
     planUpdates = $planUpdates
     latestPlan = $planStatus
     testToolCalls = $testToolCalls
-    completionToolCalls = $completionToolCalls
     verifiedPlanCompletionCalls = $verifiedPlanCompletionCalls
     inputTokens = $inputTokens
     outputTokens = $outputTokens
@@ -637,12 +629,12 @@ try {
   ))
   $recovery.eventsRecovered = $recoveredEvents.Count -eq $eventsPhase1.Count
   $recoveredPlans = @($recoveredEvents | Where-Object {
-    $_.payload.type -eq "plan_updated"
+    $_.payload.type -eq "work_form_updated"
   })
   $recovery.durablePlanRecovered = $recoveredPlans.Count -gt 0
   if ($recoveredPlans.Count -gt 0) {
-    $recoveredPlan = $recoveredPlans[$recoveredPlans.Count - 1].payload.plan
-    $recovery.activePlanRecovered = @($recoveredPlan.steps | Where-Object {
+    $recoveredPlan = $recoveredPlans[$recoveredPlans.Count - 1].payload.form
+    $recovery.activePlanRecovered = @($recoveredPlan.items | Where-Object {
       $_.status -ne "completed"
     }).Count -gt 0
   }
@@ -720,12 +712,8 @@ $minCompletedPlanSteps = if ($null -ne $task.process.minCompletedPlanSteps) {
   [int]$task.process.minCompletedPlanSteps
 } else { 4 }
 $requireExplicitCompletion = $task.process.requireExplicitCompletion -eq $true
-$phase1CompletionSignals =
-  $phase1Metrics.completionToolCalls +
-  $phase1Metrics.verifiedPlanCompletionCalls
-$completionSignals =
-  $metrics.completionToolCalls +
-  $metrics.verifiedPlanCompletionCalls
+$phase1CompletionSignals = $phase1Metrics.verifiedPlanCompletionCalls
+$completionSignals = $metrics.verifiedPlanCompletionCalls
 $latestPlanComplete =
   $metrics.planUpdates -gt 0 -and
   $metrics.latestPlan.pending -eq 0 -and
@@ -852,8 +840,6 @@ $result = [ordered]@{
   processContract = [ordered]@{
     passed = $processContractPassed
     requireExplicitCompletion = $requireExplicitCompletion
-    phase1CompletionCalls = $phase1Metrics.completionToolCalls
-    totalCompletionCalls = $metrics.completionToolCalls
     phase1VerifiedPlanCompletions = $phase1Metrics.verifiedPlanCompletionCalls
     totalVerifiedPlanCompletions = $metrics.verifiedPlanCompletionCalls
     minPlanUpdates = $minPlanUpdates

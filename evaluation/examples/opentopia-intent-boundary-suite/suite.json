@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "opentopia-intent-boundary",
+  "version": "1.0.0",
+  "title": "OpenTopia request intent boundary",
+  "description": "Checks that analysis, diagnosis, and repair-plan requests produce evidence-backed answers without being treated as authorization to implement changes.",
+  "evaluationClass": "conformance",
+  "visibility": "public",
+  "frozen": false,
+  "repetitions": 1,
+  "tasks": [
+    "tasks/diagnose-and-plan/task.json",
+    "tasks/repair-question/task.json"
+  ]
+}
