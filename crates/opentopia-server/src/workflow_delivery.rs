@@ -16,20 +16,20 @@ pub(crate) async fn deliver_run_output(
     run: &FlowRunV1,
     force: bool,
 ) -> anyhow::Result<WorkflowDeliveryReceiptV1> {
-    let deployment_id = run
-        .deployment_id
-        .context("Flow run is not backed by a Workflow deployment")?;
+    let flow_revision_id = run
+        .flow_revision_id
+        .context("Flow run is not backed by an active Flow Revision")?;
     let snapshot = run
-        .deployment_snapshot
+        .flow_revision
         .as_ref()
-        .context("Flow run has no immutable deployment snapshot")?;
+        .context("Flow run has no immutable Flow Revision")?;
     let output = &snapshot.output;
 
     let mut receipt = match state.store.get_workflow_delivery_receipt_for_run(run.id)? {
         Some(receipt) => receipt,
         None => {
             let candidate =
-                WorkflowDeliveryReceiptV1::pending(run.id, deployment_id, output.kind_name());
+                WorkflowDeliveryReceiptV1::pending(run.id, flow_revision_id, output.kind_name());
             match state.store.insert_workflow_delivery_receipt(&candidate) {
                 Ok(receipt) => receipt,
                 Err(_) => state
@@ -108,7 +108,7 @@ pub(crate) async fn deliver_run_output(
                 .json(&json!({
                     "schemaVersion": 1,
                     "runId": run.id,
-                    "deploymentId": deployment_id,
+                    "flowRevisionId": flow_revision_id,
                     "flowId": run.flow_id,
                     "flowVersion": run.flow_version,
                     "output": run.output.clone().unwrap_or(Value::Null),
@@ -186,7 +186,7 @@ pub(crate) async fn deliver_run_output(
                 assigned_to.clone(),
                 json!({
                     "runId": run.id,
-                    "deploymentId": deployment_id,
+                    "flowRevisionId": flow_revision_id,
                     "output": run.output,
                 }),
             );
@@ -224,7 +224,7 @@ fn ensure_delivery_recovery_task(
             .unwrap_or_else(|| "输出投递失败，需要人工检查。".to_string()),
         json!({
             "runId": run.id,
-            "deploymentId": receipt.deployment_id,
+            "flowRevisionId": receipt.flow_revision_id,
             "receiptId": receipt.id,
             "attempt": receipt.attempt,
             "outputKind": receipt.output_kind,

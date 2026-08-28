@@ -341,20 +341,32 @@
   color: var(--text-secondary);
 }
 
-.ot-select__input {
+.ot-select__trigger {
   min-width: 0;
-  height: var(--control-height-md);
+  min-height: var(--control-height-md);
   flex: 1;
   border: 0;
   border-radius: var(--radius-md);
   outline: 0;
-  appearance: none;
   background: transparent;
   color: var(--text);
   padding: 0 var(--space-1) 0 var(--space-3);
   font: inherit;
   font-size: var(--font-size-sm);
   font-weight: var(--font-weight-medium);
+  text-align: left;
+  cursor: pointer;
+}
+
+.ot-select__trigger:disabled {
+  cursor: not-allowed;
+}
+
+.ot-select__value {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .ot-select__chevron {
@@ -362,15 +374,67 @@
   right: var(--space-3);
   color: var(--text-muted);
   pointer-events: none;
+  transition: transform var(--motion-fast) var(--ease-standard);
 }
 
-.ot-select:hover {
+.ot-select:hover,
+.ot-select--open {
   background: var(--surface-hover);
 }
 
-.ot-select:has(.ot-select__input:disabled) {
+.ot-select--open .ot-select__chevron {
+  transform: rotate(180deg);
+}
+
+.ot-select:has(.ot-select__trigger:disabled) {
   cursor: not-allowed;
   opacity: 0.52;
+}
+
+.ot-select__menu {
+  position: fixed;
+  right: auto;
+  bottom: auto;
+  z-index: var(--z-popover);
+  max-height: var(--popover-max-height);
+  overflow-y: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  box-shadow: var(--shadow-float);
+  padding: var(--space-1);
+}
+
+.ot-select__option {
+  display: flex;
+  width: 100%;
+  min-height: var(--control-height-md);
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  padding: 0 var(--space-3);
+  font: inherit;
+  font-size: var(--font-size-sm);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background-color var(--motion-fast) var(--ease-standard),
+    color var(--motion-fast) var(--ease-standard);
+}
+
+.ot-select__option:hover:not(:disabled),
+.ot-select__option[aria-checked="true"] {
+  background: var(--accent-subtle);
+  color: var(--accent);
+}
+
+.ot-select__option:disabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
 }
 
 .ot-select-field {
@@ -602,7 +666,8 @@
 .ot-number-field__input:focus-visible,
 .ot-color-field__swatch:focus-visible,
 .ot-color-field__hex:focus-visible,
-.ot-select:has(.ot-select__input:focus-visible),
+.ot-select:has(.ot-select__trigger:focus-visible),
+.ot-select__option:focus-visible,
 .ot-panel :focus-visible,
 .ot-popover-surface :focus-visible {
   outline: 2px solid var(--focus-ring);

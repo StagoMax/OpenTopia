@@ -145,6 +145,28 @@ try {
   if ($trial.status -ne "passed") {
     throw "Flow simulation failed: $($trial | ConvertTo-Json -Depth 20 -Compress)"
   }
+  $testStarted = Invoke-TopiaApi POST "/api/flow-drafts/$($draft.draft.id)/test-run" @{
+    input = @{ verificationId = "$verificationId-test-run" }
+    startedBy = "opentopia-e2e"
+  }
+  $testPaused = Wait-ForRunStatus $testStarted.id @("waiting_approval", "failed", "cancelled")
+  if ($testPaused.status -ne "waiting_approval") {
+    throw "Flow Test Run did not pause for approval"
+  }
+  $testTasks = @(Invoke-TopiaApi GET "/api/human-tasks?status=pending&flowRunId=$($testStarted.id)")
+  if ($testTasks.Count -ne 1 -or $testTasks[0].taskType -ne "approval") {
+    throw "Flow Test Run did not create one approval HumanTask"
+  }
+  Invoke-TopiaApi POST "/api/human-tasks/$($testTasks[0].id)/resolve" @{
+    expectedRevision = $testTasks[0].revision
+    action = "approve"
+    note = "approve real Test Run before publish"
+    idempotencyKey = "phase3-test-run-$verificationId"
+  } | Out-Null
+  $testCompleted = Wait-ForRunStatus $testStarted.id @("succeeded", "failed", "cancelled")
+  if ($testCompleted.status -ne "succeeded") {
+    throw "Flow Test Run failed before publish"
+  }
   $definition = Invoke-TopiaApi POST "/api/flow-drafts/$($draft.draft.id)/publish" @{ publishedBy = "opentopia-e2e" }
   $deployment = Invoke-TopiaApi POST "/api/workflow-deployments" @{
     flowId = $definition.flowId
@@ -152,6 +174,7 @@ try {
     name = "Phase 3 background deployment"
     environment = "e2e"
     createdBy = "opentopia-e2e"
+    outputReviewPolicy = "always_review_output"
   }
   $started = Invoke-TopiaApi POST "/api/threads/$($thread.id)/workflow-deployments/$($deployment.id)/runs" @{
     input = @{ verificationId = $verificationId }
@@ -233,6 +256,7 @@ try {
     threadId = $thread.id
     deploymentId = $deployment.id
     runId = $completed.id
+    testRunId = $testCompleted.id
     status = $completed.status
     outputReviewRequired = $completed.outputReviewRequired
     outputReviewed = $completed.outputReviewed

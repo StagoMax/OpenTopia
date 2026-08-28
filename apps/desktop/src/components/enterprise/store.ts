@@ -1,25 +1,23 @@
 import { useEffect, useMemo, useSyncExternalStore } from "react";
 import type { ApiClient } from "../../api/client";
 import type {
+  ActiveFlow,
   AgentInstance,
   AgentTemplateVersionView,
   Connection,
-  FlowDefinition,
+  FlowCase,
   FlowRun,
   HumanTask,
-  WorkflowDeployment,
-  WorkflowTriggerInvocation,
 } from "../../types";
 
 export type EnterpriseSnapshot = {
   status: "idle" | "loading" | "ready" | "error";
   templates: readonly AgentTemplateVersionView[];
   agents: readonly AgentInstance[];
-  workflows: readonly FlowDefinition[];
-  deployments: readonly WorkflowDeployment[];
+  flows: readonly ActiveFlow[];
   runs: readonly FlowRun[];
   tasks: readonly HumanTask[];
-  invocations: readonly WorkflowTriggerInvocation[];
+  cases: readonly FlowCase[];
   connections: readonly Connection[];
   error: string | null;
   refreshedAt: string | null;
@@ -29,11 +27,10 @@ const INITIAL_SNAPSHOT: EnterpriseSnapshot = {
   status: "idle",
   templates: [],
   agents: [],
-  workflows: [],
-  deployments: [],
+  flows: [],
   runs: [],
   tasks: [],
-  invocations: [],
+  cases: [],
   connections: [],
   error: null,
   refreshedAt: null,
@@ -63,33 +60,30 @@ export class EnterpriseStore {
     this.loadPromise = Promise.all([
       this.client.listAgentTemplates(),
       this.client.listAgentInstances({ limit: 200 }),
-      this.client.searchFlows(),
-      this.client.listWorkflowDeployments(),
+      this.client.listFlows(),
       this.client.listAllFlowRuns({ limit: 200 }),
       this.client.listHumanTasks({ status: "pending" }),
-      this.client.listWorkflowTriggerInvocations(),
+      this.client.listFlowCases(),
       this.client.listConnections(),
     ])
       .then(
         ([
           templates,
           agents,
-          workflows,
-          deployments,
+          flows,
           runs,
           tasks,
-          invocations,
+          cases,
           connections,
         ]) => {
           this.update({
             status: "ready",
             templates,
             agents,
-            workflows,
-            deployments,
+            flows,
             runs,
             tasks,
-            invocations,
+            cases,
             connections,
             error: null,
             refreshedAt: new Date().toISOString(),

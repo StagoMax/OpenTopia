@@ -7,17 +7,20 @@ import {
   trustSignals,
 } from "./model.ts";
 import type { EnterpriseSnapshot } from "./store.ts";
+import {
+  createFinalActivation,
+  createManualActivation,
+} from "./flowActivation.ts";
 
 function snapshot(): EnterpriseSnapshot {
   return {
     status: "ready",
     templates: [],
     agents: [],
-    workflows: [],
-    deployments: [],
+    flows: [],
     runs: [],
     tasks: [],
-    invocations: [],
+    cases: [],
     connections: [],
     error: null,
     refreshedAt: "2026-08-21T00:00:00.000Z",
@@ -56,7 +59,7 @@ test("trust signals fail closed for degraded connections", () => {
   assert.equal(trustSignals(value)[0]?.level, "warning");
 });
 
-test("guided workflow pins an ordered Agent template sequence without exposing JSON", () => {
+test("guided workflow pins reusable Agents and derives graph edges from Final subscriptions", () => {
   const reviewer = {
     template: { templateId: "reviewer", version: 3, name: "Reviewer" },
   } as unknown as EnterpriseSnapshot["templates"][number];
@@ -68,12 +71,30 @@ test("guided workflow pins an ordered Agent template sequence without exposing J
     name: "Review flow",
     owner: "ops",
     outcome: "Review incoming records",
-    templates: [reviewer, writer],
+    agents: [
+      {
+        selection: {
+          id: "agent-reviewer",
+          templateKey: "reviewer@3",
+          activation: createManualActivation(),
+        },
+        template: reviewer,
+      },
+      {
+        selection: {
+          id: "agent-writer",
+          templateKey: "writer@2",
+          activation: createFinalActivation("agent-reviewer"),
+        },
+        template: writer,
+      },
+    ],
     requireApproval: true,
   });
   assert.deepEqual(spec.graph.nodes[0]?.config, {
     reference: "reviewer",
     templateVersion: 3,
+    activation: createManualActivation(),
   });
   assert.deepEqual(
     spec.graph.nodes.map((node) => node.kind),
@@ -82,8 +103,8 @@ test("guided workflow pins an ordered Agent template sequence without exposing J
   assert.deepEqual(
     spec.graph.edges.map((edge) => [edge.from, edge.to]),
     [
-      ["agent-1", "agent-2"],
-      ["agent-2", "review"],
+      ["agent-reviewer", "agent-writer"],
+      ["agent-writer", "review"],
       ["review", "output"],
     ],
   );

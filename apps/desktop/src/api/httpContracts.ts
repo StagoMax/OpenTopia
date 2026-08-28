@@ -9,7 +9,7 @@ export type HttpContractKey = Extract<keyof DesktopHttpResponsesV1, string>;
 type HttpSchema = {
   $schema?: string;
   definitions?: Record<string, unknown>;
-  properties?: Record<string, unknown>;
+  properties?: Record<string, Record<string, unknown>>;
 };
 
 const schema = desktopHttpSchema as HttpSchema;
@@ -51,15 +51,20 @@ function validatorFor(contract: HttpContractKey): ValidateFunction {
   const existing = validators.get(contract);
   if (existing) return existing;
 
-  if (!schema.properties?.[contract]) {
+  const responseSchema = schema.properties?.[contract];
+  if (!responseSchema) {
     throw new ApiContractError(contract, "contract is not registered");
   }
 
+  // Compile only the selected response schema. The root schema's `properties`
+  // object is an endpoint registry, not a set of properties shared by every
+  // response. Including the whole registry beside `$ref` makes a response
+  // field such as `health` also validate against the top-level `health`
+  // endpoint contract.
   const validate = ajv.compile({
     $schema: schema.$schema,
-    $ref: `#/properties/${escapeJsonPointer(contract)}`,
     definitions: schema.definitions,
-    properties: schema.properties,
+    ...responseSchema,
   });
   validators.set(contract, validate);
   return validate;
@@ -95,8 +100,4 @@ function addIntegerFormats(): void {
   add("uint16", (value) => unsigned(value) && value <= 65_535);
   add("uint32", (value) => unsigned(value) && value <= 4_294_967_295);
   add("uint64", unsigned);
-}
-
-function escapeJsonPointer(value: string): string {
-  return value.replaceAll("~", "~0").replaceAll("/", "~1");
 }

@@ -3,7 +3,7 @@ use crate::connection::{
     ConnectionCapabilityRevisionV1, ConnectionStatusV1, ConnectionV1, IntegrationDefinitionV1,
 };
 use crate::effect_journal::{EffectIntent, EffectJournalRecord, EffectStatus};
-use crate::enterprise::AgentTemplateVersionV1;
+use crate::enterprise::{AgentTemplateSpecV1, AgentTemplateVersionV1};
 use crate::flow::{FlowDefinitionV1, FlowDraftV1, FlowTrialV1};
 use crate::flow_runtime::{FlowRunStatusV1, FlowRunV1};
 use crate::human_task::{HumanTaskStatusV1, HumanTaskV1};
@@ -14,7 +14,7 @@ use crate::model::{
     UserInputRequest, UserInputResponse, UserInputStatus,
 };
 use crate::work_form::{WorkForm, WorkScope};
-use crate::workflow::{WorkflowDeploymentStatusV1, WorkflowDeploymentV1};
+use crate::workflow::{ActiveFlowV1, FlowStatusV1};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -291,6 +291,17 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         template_id: &str,
         version: u32,
     ) -> anyhow::Result<Option<AgentTemplateVersionV1>>;
+    fn create_agent_template_version(
+        &self,
+        template_id: String,
+        name: String,
+        owner: String,
+        spec: AgentTemplateSpecV1,
+    ) -> anyhow::Result<AgentTemplateVersionV1>;
+    fn list_agent_template_versions(
+        &self,
+        include_archived: bool,
+    ) -> anyhow::Result<Vec<AgentTemplateVersionV1>>;
     fn insert_integration_definition(
         &self,
         definition: &IntegrationDefinitionV1,
@@ -356,24 +367,14 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         flow_id: &str,
         version: Option<u32>,
     ) -> anyhow::Result<Option<FlowDefinitionV1>>;
-    fn insert_workflow_deployment(
+    fn insert_active_flow(&self, flow: &ActiveFlowV1) -> anyhow::Result<ActiveFlowV1>;
+    fn get_active_flow(&self, flow_id: &str) -> anyhow::Result<Option<ActiveFlowV1>>;
+    fn list_active_flows(&self, status: Option<FlowStatusV1>) -> anyhow::Result<Vec<ActiveFlowV1>>;
+    fn update_active_flow(
         &self,
-        deployment: &WorkflowDeploymentV1,
-    ) -> anyhow::Result<WorkflowDeploymentV1>;
-    fn get_workflow_deployment(
-        &self,
-        deployment_id: Uuid,
-    ) -> anyhow::Result<Option<WorkflowDeploymentV1>>;
-    fn list_workflow_deployments(
-        &self,
-        flow_id: Option<&str>,
-        status: Option<WorkflowDeploymentStatusV1>,
-    ) -> anyhow::Result<Vec<WorkflowDeploymentV1>>;
-    fn update_workflow_deployment(
-        &self,
-        deployment: &WorkflowDeploymentV1,
+        flow: &ActiveFlowV1,
         expected_revision: u32,
-    ) -> anyhow::Result<WorkflowDeploymentV1>;
+    ) -> anyhow::Result<ActiveFlowV1>;
     fn insert_flow_run(&self, run: &FlowRunV1) -> anyhow::Result<FlowRunV1>;
     fn get_flow_run(&self, run_id: Uuid) -> anyhow::Result<Option<FlowRunV1>>;
     fn list_flow_runs(&self, thread_id: Uuid) -> anyhow::Result<Vec<FlowRunV1>>;

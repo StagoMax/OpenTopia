@@ -1,6 +1,7 @@
 use crate::enterprise::{
     AgentRiskClassV1, CapabilityProjection, DataClassification, ENTERPRISE_SCHEMA_VERSION_V1,
 };
+use crate::flow_activation::{activation_root_node_ids, validate_graph_activations};
 use crate::model_context::content_fingerprint;
 use crate::workflow_state::validate_graph_state_writes;
 use chrono::{DateTime, Utc};
@@ -590,8 +591,26 @@ pub fn validate_flow_spec(
         }
     }
 
+    for (node_id, message) in validate_graph_activations(&spec.graph) {
+        error(
+            "graph.trigger.invalid",
+            message,
+            Some(node_id),
+            None,
+            "Make every Trigger source valid and keep Agent Final subscriptions aligned with graph edges.",
+        );
+    }
+
     let mut reachable = BTreeSet::new();
-    let mut queue = VecDeque::from([spec.graph.entry_node_id.as_str()]);
+    let activation_roots = activation_root_node_ids(&spec.graph);
+    let mut queue = if activation_roots.is_empty() {
+        VecDeque::from([spec.graph.entry_node_id.as_str()])
+    } else {
+        activation_roots
+            .iter()
+            .map(String::as_str)
+            .collect::<VecDeque<_>>()
+    };
     while let Some(id) = queue.pop_front() {
         if !reachable.insert(id) {
             continue;

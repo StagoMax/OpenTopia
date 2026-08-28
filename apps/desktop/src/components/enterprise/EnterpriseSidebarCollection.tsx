@@ -4,7 +4,6 @@ import {
   Inbox,
   LayoutDashboard,
   Library,
-  RadioTower,
   ShieldCheck,
   Workflow,
 } from "lucide-react";
@@ -24,55 +23,37 @@ export function EnterpriseSidebarCollection({
   const { snapshot } = useEnterpriseStore(client);
   const rows =
     view === "agents"
-      ? snapshot.agents
-          .slice(0, 40)
-          .map((agent) => ({
-            id: agent.id,
-            title: `${agent.templateId}@${agent.templateVersion}`,
-            detail: shortId(agent.id),
-            status: agent.status,
-            icon: Bot,
-          }))
+      ? snapshot.agents.slice(0, 40).map((agent) => ({
+          id: agent.id,
+          title: `${agent.templateId}@${agent.templateVersion}`,
+          detail: shortId(agent.id),
+          status: agent.status,
+          icon: Bot,
+        }))
       : view === "inbox"
-        ? snapshot.tasks
-            .slice(0, 40)
-            .map((task) => ({
-              id: task.id,
-              title: task.title,
-              detail: task.taskType.replaceAll("_", " "),
-              status: task.status,
-              icon: Inbox,
-            }))
+        ? snapshot.tasks.slice(0, 40).map((task) => ({
+            id: task.id,
+            title: task.title,
+            detail: task.taskType.replaceAll("_", " "),
+            status: task.status,
+            icon: Inbox,
+          }))
         : view === "workflow-templates"
-          ? snapshot.workflows
-              .slice(0, 40)
-              .map((workflow) => ({
-                id: workflow.id,
-                title: workflow.name,
-                detail: `${workflow.flowId}@${workflow.version}`,
-                status: "published",
-                icon: Workflow,
-              }))
-          : view === "automation"
-            ? snapshot.deployments
-                .slice(0, 40)
-                .map((deployment) => ({
-                  id: deployment.id,
-                  title: deployment.name,
-                  detail: `${deployment.environment} · release candidate`,
-                  status: deployment.status,
-                  icon: RadioTower,
+          ? snapshot.flows.slice(0, 40).map((flow) => ({
+              id: flow.id,
+              title: flow.name,
+              detail: `${flow.flowId}@${flow.activeRevision.compiledWorkflow.flowVersion}`,
+              status: flow.status,
+              icon: Workflow,
+            }))
+          : view === "runs"
+              ? snapshot.runs.slice(0, 40).map((run) => ({
+                  id: run.id,
+                  title: run.flowId,
+                  detail: shortId(run.id),
+                  status: run.status,
+                  icon: Activity,
                 }))
-            : view === "runs"
-              ? snapshot.runs
-                  .slice(0, 40)
-                  .map((run) => ({
-                    id: run.id,
-                    title: run.flowId,
-                    detail: shortId(run.id),
-                    status: run.status,
-                    icon: Activity,
-                  }))
               : view === "trust"
                 ? trustSignals(snapshot).map((signal) => ({
                     id: signal.id,
@@ -132,6 +113,6 @@ export function EnterpriseSidebarCollection({
 }
 
 function sidebarTitle(view: FlowPrimaryView): string {
-  if (view === "workflow-templates") return "Workflow Templates";
+  if (view === "workflow-templates") return "Flows";
   return view.charAt(0).toUpperCase() + view.slice(1);
 }

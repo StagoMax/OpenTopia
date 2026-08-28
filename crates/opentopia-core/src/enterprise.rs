@@ -377,6 +377,8 @@ pub struct ExperienceSurfaceProfile {
 impl ExperienceSurfaceProfile {
     pub fn flow_control_tools() -> BTreeSet<String> {
         [
+            "agent_search",
+            "agent_create",
             "flow_search",
             "flow_create",
             "flow_update",

@@ -15,7 +15,7 @@ export type SelectFieldProps<T extends string> = Omit<
 
 /**
  * A complete select field with one visual control boundary. Keeping the label,
- * help text, error state, and native select in one primitive prevents feature
+ * help text, error state, and app-owned menu in one primitive prevents feature
  * forms from wrapping an already bordered Select in another control shell.
  */
 export function SelectField<T extends string>({
@@ -29,6 +29,7 @@ export function SelectField<T extends string>({
 }: SelectFieldProps<T>) {
   const generatedId = useId();
   const id = providedId ?? generatedId;
+  const labelId = `${id}-label`;
   const supportingTextId = hint || error ? `${id}-description` : undefined;
   const describedBy =
     [props["aria-describedby"], supportingTextId].filter(Boolean).join(" ") ||
@@ -41,11 +42,16 @@ export function SelectField<T extends string>({
         .join(" ")}
       htmlFor={id}
     >
-      <span className="ot-select-field__label">{label}</span>
+      <span className="ot-select-field__label" id={labelId}>
+        {label}
+      </span>
       <Select
         {...props}
         aria-describedby={describedBy}
         aria-invalid={error ? true : props["aria-invalid"]}
+        aria-labelledby={[props["aria-labelledby"], labelId]
+          .filter(Boolean)
+          .join(" ")}
         id={id}
         options={options}
       />

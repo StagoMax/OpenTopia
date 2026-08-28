@@ -1,4 +1,5 @@
 import type {
+  ActiveFlow,
   AgentInstance,
   AgentInstanceStatus,
   AgentModelPolicy,
@@ -10,7 +11,8 @@ import type {
   CapabilityProjection,
   ContributionHostSnapshot,
   ExecutionResourceGrant,
-  FlowDefinition,
+  FlowCase,
+  FlowCaseResult,
   FlowDraftView,
   FlowRun,
   FlowSpec,
@@ -33,18 +35,12 @@ import type {
   PluginSettingsResponse,
   PluginView,
   ThreadCapabilities,
-  WorkflowDeployment,
   WorkflowDeliveryReceipt,
   WorkflowDeliveryStatus,
   WorkflowEvaluation,
   WorkflowEvaluationSummary,
-  WorkflowIngressPolicy,
-  WorkflowInvocationResult,
   WorkflowOutput,
   WorkflowOutputReviewPolicy,
-  WorkflowRelease,
-  WorkflowTrigger,
-  WorkflowTriggerInvocation,
 } from "../../types";
 import type { AgentTemplateConnectionAccessView } from "../generated/desktop-http-v1.generated";
 import { ApiResponseError, queryString } from "./transport";
@@ -346,207 +342,107 @@ export class ExtensionsApi extends ConfigurationApi {
     );
   }
 
-  async searchFlows(query = ""): Promise<FlowDefinition[]> {
+  async listFlows(
+    filters: { query?: string; status?: ActiveFlow["status"] } = {},
+  ): Promise<ActiveFlow[]> {
     return this.get(
-      "searchFlows",
-      `/api/flows${queryString({ query: query || undefined })}`,
-    );
-  }
-
-  async listWorkflowDeployments(
-    filters: {
-      flowId?: string;
-      status?: WorkflowDeployment["status"];
-    } = {},
-  ): Promise<WorkflowDeployment[]> {
-    return this.get(
-      "listWorkflowDeployments",
-      `/api/workflow-deployments${queryString({
-        flowId: filters.flowId,
+      "listFlows",
+      `/api/flows${queryString({
+        query: filters.query || undefined,
         status: filters.status,
       })}`,
     );
   }
 
-  async getWorkflowDeployment(
-    deploymentId: string,
-  ): Promise<WorkflowDeployment> {
+  async getFlow(flowId: string): Promise<ActiveFlow> {
     return this.get(
-      "getWorkflowDeployment",
-      `/api/workflow-deployments/${encodeURIComponent(deploymentId)}`,
+      "getFlow",
+      `/api/flows/${encodeURIComponent(flowId)}`,
     );
   }
 
-  async createWorkflowDeployment(input: {
-    flowId: string;
-    flowVersion: number;
-    name: string;
-    environment: string;
-    createdBy: string;
-    trigger?: WorkflowTrigger;
-    output?: WorkflowOutput;
-    outputReviewPolicy?: WorkflowOutputReviewPolicy;
-  }): Promise<WorkflowDeployment> {
-    return this.post(
-      "createWorkflowDeployment",
-      "/api/workflow-deployments",
-      input,
-    );
-  }
-
-  async listWorkflowReleases(
-    filters: {
-      status?: WorkflowRelease["status"];
-    } = {},
-  ): Promise<WorkflowRelease[]> {
-    return this.get(
-      "listWorkflowReleases",
-      `/api/workflow-releases${queryString({ status: filters.status })}`,
-    );
-  }
-
-  async getWorkflowRelease(releaseId: string): Promise<WorkflowRelease> {
-    return this.get(
-      "getWorkflowRelease",
-      `/api/workflow-releases/${encodeURIComponent(releaseId)}`,
-    );
-  }
-
-  async createWorkflowRelease(input: {
-    releaseKey: string;
-    environment: string;
-    threadId: string;
-    deploymentId: string;
-    trigger: WorkflowTrigger;
-    ingressPolicy?: WorkflowIngressPolicy;
-    createdBy: string;
-  }): Promise<WorkflowRelease> {
-    return this.post("createWorkflowRelease", "/api/workflow-releases", input);
-  }
-
-  async invokeWorkflowRelease(
-    releaseId: string,
+  async invokeFlow(
+    flowId: string,
     input: { idempotencyKey: string; input?: unknown },
-  ): Promise<WorkflowInvocationResult> {
+  ): Promise<FlowCaseResult> {
     return this.post(
-      "invokeWorkflowRelease",
-      `/api/workflow-releases/${encodeURIComponent(releaseId)}/invoke`,
+      "invokeFlow",
+      `/api/flows/${encodeURIComponent(flowId)}/invoke`,
       input,
     );
   }
 
-  async setWorkflowReleaseCanary(
-    releaseId: string,
-    input: { expectedRevision: number; deploymentId: string; percent: number },
-  ): Promise<WorkflowRelease> {
-    return this.post(
-      "setWorkflowReleaseCanary",
-      `/api/workflow-releases/${encodeURIComponent(releaseId)}/canary`,
-      input,
-    );
-  }
-
-  async promoteWorkflowRelease(
-    releaseId: string,
-    expectedRevision: number,
-  ): Promise<WorkflowRelease> {
-    return this.post(
-      "promoteWorkflowRelease",
-      `/api/workflow-releases/${encodeURIComponent(releaseId)}/promote`,
-      { expectedRevision },
-    );
-  }
-
-  async rollbackWorkflowRelease(
-    releaseId: string,
-    expectedRevision: number,
-  ): Promise<WorkflowRelease> {
-    return this.post(
-      "rollbackWorkflowRelease",
-      `/api/workflow-releases/${encodeURIComponent(releaseId)}/rollback`,
-      { expectedRevision },
-    );
-  }
-
-  async disableWorkflowRelease(
-    releaseId: string,
-    expectedRevision: number,
-  ): Promise<WorkflowRelease> {
-    return this.post(
-      "disableWorkflowRelease",
-      `/api/workflow-releases/${encodeURIComponent(releaseId)}/disable`,
-      { expectedRevision },
-    );
-  }
-
-  async dispatchWorkflowEvent(input: {
+  async dispatchFlowEvent(input: {
     source: string;
     eventType: string;
     idempotencyKey: string;
     payload?: unknown;
-  }): Promise<WorkflowInvocationResult[]> {
-    return this.post("dispatchWorkflowEvent", "/api/workflow-events", input);
+  }): Promise<FlowCaseResult[]> {
+    return this.post("dispatchFlowEvent", "/api/flow-events", input);
   }
 
-  async listWorkflowTriggerInvocations(
-    filters: {
-      releaseId?: string;
-    } = {},
-  ): Promise<WorkflowTriggerInvocation[]> {
+  async listFlowCases(filters: { flowId?: string } = {}): Promise<FlowCase[]> {
     return this.get(
-      "listWorkflowTriggerInvocations",
-      `/api/workflow-trigger-invocations${queryString({ releaseId: filters.releaseId })}`,
+      "listFlowCases",
+      `/api/flow-cases${queryString({ flowId: filters.flowId })}`,
     );
   }
 
-  async startPendingWorkflowInvocation(
-    invocationId: string,
-  ): Promise<WorkflowInvocationResult> {
+  async startPendingFlowCase(caseId: string): Promise<FlowCaseResult> {
     return this.post(
-      "startPendingWorkflowInvocation",
-      `/api/workflow-trigger-invocations/${encodeURIComponent(invocationId)}/start`,
+      "startPendingFlowCase",
+      `/api/flow-cases/${encodeURIComponent(caseId)}/start`,
       {},
     );
   }
 
-  async listWorkflowDeliveryReceipts(
+  async supersedePendingFlowCase(
+    caseId: string,
+    input: { replacementCaseId?: string; note: string },
+  ): Promise<FlowCase> {
+    return this.post(
+      "supersedePendingFlowCase",
+      `/api/flow-cases/${encodeURIComponent(caseId)}/supersede`,
+      input,
+    );
+  }
+
+  async listFlowDeliveryReceipts(
     filters: {
-      deploymentId?: string;
+      flowRevisionId?: string;
       status?: WorkflowDeliveryStatus;
     } = {},
   ): Promise<WorkflowDeliveryReceipt[]> {
     return this.get(
-      "listWorkflowDeliveryReceipts",
-      `/api/workflow-delivery-receipts${queryString({
-        deploymentId: filters.deploymentId,
+      "listFlowDeliveryReceipts",
+      `/api/flow-delivery-receipts${queryString({
+        flowRevisionId: filters.flowRevisionId,
         status: filters.status,
       })}`,
     );
   }
 
-  async retryWorkflowDelivery(
+  async retryFlowDelivery(
     receiptId: string,
     expectedRevision: number,
   ): Promise<WorkflowDeliveryReceipt> {
     return this.post(
-      "retryWorkflowDelivery",
-      `/api/workflow-delivery-receipts/${encodeURIComponent(receiptId)}/retry`,
+      "retryFlowDelivery",
+      `/api/flow-delivery-receipts/${encodeURIComponent(receiptId)}/retry`,
       { expectedRevision },
     );
   }
 
-  async listWorkflowEvaluations(
-    filters: {
-      deploymentId?: string;
-    } = {},
+  async listFlowEvaluations(
+    filters: { flowRevisionId?: string } = {},
   ): Promise<WorkflowEvaluation[]> {
     return this.get(
-      "listWorkflowEvaluations",
-      `/api/workflow-evaluations${queryString({ deploymentId: filters.deploymentId })}`,
+      "listFlowEvaluations",
+      `/api/flow-evaluations${queryString({ flowRevisionId: filters.flowRevisionId })}`,
     );
   }
 
-  async createWorkflowEvaluation(input: {
+  async createFlowEvaluation(input: {
     runId: string;
     evaluator: string;
     score: number;
@@ -555,41 +451,48 @@ export class ExtensionsApi extends ConfigurationApi {
     note?: string;
   }): Promise<WorkflowEvaluation> {
     return this.post(
-      "createWorkflowEvaluation",
-      "/api/workflow-evaluations",
+      "createFlowEvaluation",
+      "/api/flow-evaluations",
       input,
     );
   }
 
-  async getWorkflowEvaluationSummary(
-    deploymentId: string,
+  async getFlowEvaluationSummary(
+    flowRevisionId: string,
   ): Promise<WorkflowEvaluationSummary> {
     return this.get(
-      "getWorkflowEvaluationSummary",
-      `/api/workflow-evaluation-summary${queryString({ deploymentId })}`,
+      "getFlowEvaluationSummary",
+      `/api/flow-evaluation-summary${queryString({ flowRevisionId })}`,
     );
   }
 
-  async disableWorkflowDeployment(
-    deploymentId: string,
+  async pauseFlow(
+    flowId: string,
     expectedRevision: number,
-  ): Promise<WorkflowDeployment> {
+  ): Promise<ActiveFlow> {
     return this.post(
-      "disableWorkflowDeployment",
-      `/api/workflow-deployments/${encodeURIComponent(deploymentId)}/disable`,
+      "pauseFlow",
+      `/api/flows/${encodeURIComponent(flowId)}/pause`,
       { expectedRevision },
     );
   }
 
-  async startDeployedWorkflowRun(
-    threadId: string,
-    deploymentId: string,
-    input: unknown,
-  ): Promise<FlowRun> {
+  async resumeFlow(flowId: string, expectedRevision: number): Promise<ActiveFlow> {
     return this.post(
-      "startDeployedWorkflowRun",
-      `/api/threads/${encodeURIComponent(threadId)}/workflow-deployments/${encodeURIComponent(deploymentId)}/runs`,
-      { input },
+      "resumeFlow",
+      `/api/flows/${encodeURIComponent(flowId)}/resume`,
+      { expectedRevision },
+    );
+  }
+
+  async copyFlow(
+    flowId: string,
+    input: { flowId: string; name: string; owner: string },
+  ): Promise<FlowDraftView> {
+    return this.post(
+      "copyFlow",
+      `/api/flows/${encodeURIComponent(flowId)}/copy`,
+      input,
     );
   }
 
@@ -664,16 +567,19 @@ export class ExtensionsApi extends ConfigurationApi {
     );
   }
 
-  async publishFlowDraft(
+  async activateFlowDraft(
     draftId: string,
-    publishedBy: string,
-  ): Promise<FlowDefinition> {
+    input: {
+      activatedBy: string;
+      expectedFlowRevision?: number;
+      output?: WorkflowOutput;
+      outputReviewPolicy?: WorkflowOutputReviewPolicy;
+    },
+  ): Promise<ActiveFlow> {
     return this.post(
-      "publishFlowDraft",
-      `/api/flow-drafts/${encodeURIComponent(draftId)}/publish`,
-      {
-        publishedBy,
-      },
+      "activateFlowDraft",
+      `/api/flow-drafts/${encodeURIComponent(draftId)}/activate`,
+      input,
     );
   }
 
@@ -694,17 +600,6 @@ export class ExtensionsApi extends ConfigurationApi {
     return this.get(
       "getFlowRun",
       `/api/flow-runs/${encodeURIComponent(runId)}`,
-    );
-  }
-
-  async startFlowRun(
-    threadId: string,
-    input: { flowId: string; version?: number; input?: unknown },
-  ): Promise<FlowRun> {
-    return this.post(
-      "startFlowRun",
-      `/api/threads/${encodeURIComponent(threadId)}/flow-runs`,
-      input,
     );
   }
 

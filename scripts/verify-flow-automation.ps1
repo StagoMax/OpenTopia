@@ -216,6 +216,12 @@ try {
   if (-not $validated.draft.lastValidation.valid) { throw "P5 Flow validation failed" }
   $trial = Invoke-TopiaApi POST "/api/flow-drafts/$($draft.draft.id)/simulate" @{ input = @{ orderId = "trial" } }
   if ($trial.status -ne "passed") { throw "P5 Flow simulation failed" }
+  $testStarted = Invoke-TopiaApi POST "/api/flow-drafts/$($draft.draft.id)/test-run" @{
+    input = @{ orderId = "test-run" }
+    startedBy = "opentopia-e2e"
+  }
+  $completedTestRun = Complete-ProductionRun $testStarted.id "test-run-$verificationId"
+  if ($completedTestRun.status -ne "succeeded") { throw "P5 Flow Test Run failed" }
   $definition = Invoke-TopiaApi POST "/api/flow-drafts/$($draft.draft.id)/publish" @{ publishedBy = "opentopia-e2e" }
 
   $webhookDeployment = New-Deployment $definition "P5 webhook primary" @{ kind = "webhook"; endpoint = "$sinkUrl/deliver"; credentialRef = "env:WORKFLOW_OUTPUT_TOKEN" }
@@ -323,6 +329,7 @@ try {
     webhookIdempotent = $true
     webhookRateLimited = $true
     webhookRunId = $completedWebhookRun.id
+    testRunId = $completedTestRun.id
     webhookReceiptId = $webhookReceipt.id
     evaluationId = $evaluation.id
     evaluationPassRate = $summary.passRate

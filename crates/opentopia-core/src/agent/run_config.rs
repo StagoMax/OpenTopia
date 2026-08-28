@@ -291,6 +291,10 @@ impl FlowNodeHarness for PreparedAgentRun {
             "Flow resume permission mode does not match its prepared Agent run"
         );
         anyhow::ensure!(
+            request.context.sandbox_config.as_ref() == Some(self.authority.sandbox_config()),
+            "Flow resume sandbox does not match its prepared Agent run"
+        );
+        anyhow::ensure!(
             request
                 .effective_capabilities
                 .is_subset_of(self.authority.capability_projection()),
@@ -300,10 +304,59 @@ impl FlowNodeHarness for PreparedAgentRun {
             request.command.validates(&request.interrupt),
             "Flow ResumeCommand does not match its interrupt"
         );
+        // Initial node execution clones the Flow-level harness and attenuates
+        // it to the frozen node/Agent projection before the continuation is
+        // captured. Rebuild that same node-scoped harness before validating or
+        // resuming; comparing the continuation to the wider Flow harness would
+        // incorrectly reject every approval that actually used a restricted
+        // Agent capability.
+        let mut agent = self.agent.clone();
+        agent.restrict_capabilities(&request.effective_capabilities);
+        agent.align_execution_authority_with_capabilities()?;
+        agent.retain_external_tools_for_context(&request.context)?;
+        agent.retain_external_tools_for_projection();
+        agent.set_tool_call_budget(request.remaining_tool_calls);
+        if let Some(tools) = request
+            .node
+            .config
+            .get("allowedTools")
+            .and_then(serde_json::Value::as_array)
+        {
+            agent.restrict_to_tools(tools.iter().filter_map(serde_json::Value::as_str));
+        }
+        if let Some(spec) = request.workflow_agent_spec.as_ref() {
+            anyhow::ensure!(
+                spec.node_id == request.node.id,
+                "Flow resume Agent spec does not match its frozen Revision node"
+            );
+            agent.restrict_capabilities(&spec.capabilities);
+            agent.align_execution_authority_with_capabilities()?;
+            agent.retain_external_tools_for_projection();
+            agent.set_library_namespaces(
+                spec.knowledge_binding
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|binding| binding.namespaces.iter().cloned()),
+            );
+        }
         let continuation = request.interrupt.continuation.decode()?;
-        self.validate_continuation(&continuation)?;
-        let result = self
-            .agent
+        let node_authority = agent
+            .execution_authority
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Flow resume lost its node execution authority"))?;
+        let continuation_authority = continuation
+            .execution_authority
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("continuation is missing its execution authority"))?;
+        anyhow::ensure!(
+            continuation_authority == node_authority,
+            "continuation execution authority does not match the prepared node run"
+        );
+        anyhow::ensure!(
+            continuation.turn_id == self.identity.turn_id,
+            "continuation turn identity does not match the prepared run"
+        );
+        let result = agent
             .resume_from_signal_streaming(
                 continuation,
                 request.command.signal.clone().into_agent_signal(),

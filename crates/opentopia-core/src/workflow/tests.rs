@@ -144,24 +144,27 @@ fn compiler_freezes_node_identity_and_operation_union() {
 }
 
 #[test]
-fn deployment_snapshot_is_immutable_and_manual_inbox_scoped() {
+fn flow_revision_is_immutable_and_manual_inbox_scoped() {
     let (template, binding) = template_with_operation();
     let agent =
         WorkflowAgentSpecV1::compile("review", &template, &[binding]).expect("compile Agent node");
     let compiled =
         CompiledWorkflowV1::compile(&definition(&template), vec![agent]).expect("compile workflow");
-    let deployment = WorkflowDeploymentV1::new(
+    let flow = ActiveFlowV1::new(
         "Lead review production",
-        "production",
+        Uuid::new_v4(),
         compiled,
         "release-manager",
     )
-    .expect("deployment");
-    let restored: WorkflowDeploymentV1 =
-        serde_json::from_str(&serde_json::to_string(&deployment).expect("serialize deployment"))
-            .expect("restore deployment");
+    .expect("active Flow");
+    let restored: ActiveFlowV1 =
+        serde_json::from_str(&serde_json::to_string(&flow).expect("serialize Flow"))
+            .expect("restore Flow");
 
-    assert_eq!(restored, deployment);
-    assert_eq!(restored.snapshot.trigger, WorkflowTriggerSpecV1::Manual);
-    assert_eq!(restored.snapshot.output, WorkflowOutputSpecV1::Inbox);
+    assert_eq!(restored, flow);
+    assert_eq!(
+        restored.active_revision.trigger,
+        WorkflowTriggerSpecV1::Manual
+    );
+    assert_eq!(restored.active_revision.output, WorkflowOutputSpecV1::Inbox);
 }

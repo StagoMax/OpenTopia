@@ -255,6 +255,23 @@ try {
   if (-not $validated.draft.lastValidation.valid) { throw "Connection workflow validation failed" }
   $trial = Invoke-TopiaApi POST "/api/flow-drafts/$($flowDraft.draft.id)/simulate" @{ input = @{ customerId = "C-42" } }
   if ($trial.status -ne "passed") { throw "Connection workflow trial failed" }
+  $testStarted = Invoke-TopiaApi POST "/api/flow-drafts/$($flowDraft.draft.id)/test-run" @{
+    input = @{ customerId = "C-42-test-run" }
+    startedBy = "opentopia-e2e"
+  }
+  $testPaused = Wait-ForRunStatus $testStarted.id @("waiting_approval", "failed", "cancelled")
+  if ($testPaused.status -ne "waiting_approval") { throw "Connection Flow Test Run did not reach approval" }
+  $testTasks = @(Invoke-TopiaApi GET "/api/human-tasks?status=pending&flowRunId=$($testStarted.id)")
+  if ($testTasks.Count -ne 1 -or $testTasks[0].taskType -ne "approval") {
+    throw "Connection Flow Test Run did not create one approval task"
+  }
+  Invoke-TopiaApi POST "/api/human-tasks/$($testTasks[0].id)/resolve" @{
+    expectedRevision = $testTasks[0].revision
+    action = "approve"
+    idempotencyKey = "connection-test-run-$verificationId"
+  } | Out-Null
+  $testRun = Complete-FlowRun (Wait-ForRunStatus $testStarted.id @("waiting_human", "succeeded", "failed", "cancelled"))
+  if ($testRun.status -ne "succeeded") { throw "Connection Flow Test Run failed" }
   $definition = Invoke-TopiaApi POST "/api/flow-drafts/$($flowDraft.draft.id)/publish" @{ publishedBy = "opentopia-e2e" }
   $deployment = Invoke-TopiaApi POST "/api/workflow-deployments" @{
     flowId = $definition.flowId
@@ -353,6 +370,7 @@ try {
     operationId = $operation.capabilityId
     agentInstanceId = $instance.instance.id
     deploymentId = $deployment.id
+    testRunId = $testRun.id
     authorizedRunId = $run.id
     authorizedRunStatus = $run.status
     structuredCallCustomerId = $call.structuredContent.customerId

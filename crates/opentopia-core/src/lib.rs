@@ -3,6 +3,7 @@ mod agent_composition;
 mod agent_kernel;
 pub mod agent_profiles;
 pub mod agent_runtime;
+mod agent_tools;
 pub mod api_contract;
 pub mod artifact_runtime;
 pub mod background;
@@ -35,6 +36,7 @@ mod execution_runtime;
 pub mod execution_spec;
 pub mod file_mutation;
 pub mod flow;
+pub mod flow_activation;
 pub mod flow_runtime;
 mod flow_tools;
 pub mod git_workflow;
@@ -235,6 +237,12 @@ pub use flow::{
     GraphNodeV1, HarnessNodeTargetV1, LoopExhaustionActionV1, MAX_FLOW_DURATION_SECONDS,
     MAX_FLOW_LOOP_ITERATIONS, MAX_FLOW_NODES,
 };
+pub use flow_activation::{
+    activation_agent_final_sources, activation_root_node_ids, default_graph_ingress_policy,
+    default_graph_trigger, graph_ingress_policy_for_trigger, initial_ready_nodes,
+    node_activation_ready, parse_node_activation, validate_graph_activations, FlowNodeActivationV1,
+    FlowTriggerExpressionV1, FlowTriggerSourceV1, FLOW_NODE_ACTIVATION_CONFIG_KEY,
+};
 pub use flow_runtime::{
     evaluate_condition as evaluate_flow_condition, prepare_flow_interrupt_resume,
     prepare_flow_resume, resolve_flow_approval, spawn_flow_run, FlowNodeExecutionOutcomeV1,
@@ -411,9 +419,9 @@ pub use spreadsheet::{
     MAX_OUTPUT_FILE_BYTES as MAX_SPREADSHEET_OUTPUT_BYTES,
 };
 pub use store::{
-    normalize_workspace_key, AgentTemplateStoreError, ConnectionStoreError, ContextBudget,
-    FlowStoreError, HumanTaskStoreError, ProviderContextStateKind, ProviderConversationState,
-    SessionStore, SqliteSessionStore, StoreError, WorkflowDeploymentStoreError,
+    normalize_workspace_key, ActiveFlowStoreError, AgentTemplateStoreError, ConnectionStoreError,
+    ContextBudget, FlowStoreError, HumanTaskStoreError, ProviderContextStateKind,
+    ProviderConversationState, SessionStore, SqliteSessionStore, StoreError,
 };
 pub use tool_result_ingress::tool_result_is_error;
 pub use tool_runtime::{
@@ -426,23 +434,20 @@ pub use tool_state::ToolStateStore;
 pub use tools::{
     browser_handoff_for_node, browser_handoff_required, ApplyPatchTool, BrowserHandoffRequired,
     BrowserTool, ComputerTool, DocumentTool, ListSkillsTool, McpToolWrapper, NativePatchOperation,
-    PdfTool, ReadArtifactTool, ReadSkillTool, RequestUserInputTool, SetPlanTool, ShellTool,
-    SpreadsheetTool, Tool, ToolApprovalMode, ToolCapabilityDescriptor, ToolExecutionPolicy,
-    ToolInvocationContext, ToolRegistry, ToolRiskLevel, ToolSource, UpdatePlanTool,
-    WorkspaceSearchTool,
+    PdfTool, ReadArtifactTool, ReadSkillTool, RequestUserInputTool, ShellTool, SpreadsheetTool,
+    Tool, ToolApprovalMode, ToolCapabilityDescriptor, ToolExecutionPolicy, ToolInvocationContext,
+    ToolRegistry, ToolRiskLevel, ToolSource, UpdatePlanTool, WorkspaceSearchTool,
 };
 pub use turn_inbox::{BufferedTurnInbox, TurnInbox, TurnInboxItem};
 pub use work_form::{WorkForm, WorkFormStatus, WorkItem, WorkItemStatus, WorkScope};
 pub use workflow::{
-    CompiledWorkflowV1, DeploymentSnapshotV1, WorkflowAgentSpecV1, WorkflowCompileError,
-    WorkflowDeploymentStatusV1, WorkflowDeploymentV1, WorkflowOutputReviewPolicyV1,
-    WorkflowOutputSpecV1, WorkflowTriggerSpecV1,
+    ActiveFlowV1, CompiledWorkflowV1, FlowRevisionV1, FlowStatusV1, WorkflowAgentSpecV1,
+    WorkflowCompileError, WorkflowOutputReviewPolicyV1, WorkflowOutputSpecV1,
+    WorkflowTriggerSpecV1,
 };
 pub use workflow_automation::{
-    WorkflowDeliveryReceiptV1, WorkflowDeliveryStatusV1, WorkflowEvaluationV1,
-    WorkflowIngressPolicyV1, WorkflowReleaseStatusV1, WorkflowReleaseV1,
-    WorkflowTriggerInvocationStatusV1, WorkflowTriggerInvocationV1,
-    WORKFLOW_AUTOMATION_SCHEMA_VERSION_V1,
+    FlowCaseStatusV1, FlowCaseV1, WorkflowDeliveryReceiptV1, WorkflowDeliveryStatusV1,
+    WorkflowEvaluationV1, WorkflowIngressPolicyV1, WORKFLOW_AUTOMATION_SCHEMA_VERSION_V1,
 };
 pub use workflow_interrupt::{
     AgentContinuationEnvelopeV1, FlowNodeInterruptV1, FlowResumeCommandV1, FlowResumeSignalV1,

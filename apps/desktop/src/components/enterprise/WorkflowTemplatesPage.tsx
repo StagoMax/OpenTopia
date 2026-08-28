@@ -1,8 +1,11 @@
 import {
   CheckCircle2,
+  Copy,
   FileJson2,
   FlaskConical,
+  PauseCircle,
   Play,
+  PlayCircle,
   Plus,
   RefreshCw,
   Send,
@@ -19,10 +22,14 @@ import {
   type EnterprisePageHeaderChange,
 } from "./pageHeader";
 import { useEnterpriseStore } from "./store";
+import { FlowAgentReferencePage } from "./FlowAgentReferencePage";
+import { FlowTriggerConfigPage } from "./FlowTriggerConfigPage";
 import {
-  WorkflowAgentSequenceEditor,
+  createManualActivation,
+  templateKey,
   type WorkflowAgentSelection,
-} from "./WorkflowAgentSequenceEditor";
+} from "./flowActivation";
+import { WorkflowGraphEditor } from "./WorkflowGraphEditor";
 
 export function WorkflowTemplatesPage({
   client,
@@ -52,30 +59,58 @@ export function WorkflowTemplatesPage({
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const [detailPage, setDetailPage] = useState<{
+    kind: "trigger" | "agent";
+    nodeId: string;
+  } | null>(null);
 
+  const detailAgent = detailPage
+    ? (agentSelections.find((item) => item.id === detailPage.nodeId) ?? null)
+    : null;
   useEnterpriseSubpageHeader(onPageHeaderChange, creating, {
-    title: "Workflow Templates / 创建工作流模板",
-    backLabel: "返回 Workflow Templates",
-    onBack: () => setCreating(false),
+    title: detailPage
+      ? `Flows / ${name} / ${detailPage.kind === "trigger" ? "配置 Trigger" : "Agent 设置"}`
+      : "Flows / 创建 Flow",
+    backLabel: detailPage ? "返回 Flow 图" : "返回 Flows",
+    onBack: () => {
+      if (detailPage) setDetailPage(null);
+      else setCreating(false);
+    },
   });
 
   useEffect(() => {
-    const available = new Set(publishedTemplates.map(keyOf));
+    const available = new Set(publishedTemplates.map(templateKey));
     setAgentSelections((current) => {
       const valid = current.filter((item) => available.has(item.templateKey));
       if (valid.length > 0) return valid;
       const first = publishedTemplates[0];
       return first
-        ? [{ id: crypto.randomUUID(), templateKey: keyOf(first) }]
+        ? [
+            {
+              id: `agent-${crypto.randomUUID()}`,
+              templateKey: templateKey(first),
+              activation: createManualActivation(),
+            },
+          ]
         : [];
     });
   }, [publishedTemplates]);
 
-  const selectedTemplates = agentSelections
-    .map((selection) =>
-      publishedTemplates.find((item) => keyOf(item) === selection.templateKey),
-    )
-    .filter((item): item is AgentTemplateVersionView => Boolean(item));
+  const selectedAgents = agentSelections
+    .map((selection) => {
+      const template = publishedTemplates.find(
+        (item) => templateKey(item) === selection.templateKey,
+      );
+      return template ? { selection, template } : null;
+    })
+    .filter(
+      (
+        item,
+      ): item is {
+        selection: WorkflowAgentSelection;
+        template: AgentTemplateVersionView;
+      } => Boolean(item),
+    );
   const passedDryRun = Boolean(
     draft?.trials.some(
       (trial) =>
@@ -125,20 +160,19 @@ export function WorkflowTemplatesPage({
     return (
       <div className="enterprise-page enterprise-workflow-templates">
         <Panel
-          title="Workflow Templates / 工作流模板"
+          title="Flows / 工作流"
           actions={
             <Button
               onClick={() => setCreating(true)}
               size="compact"
               variant="primary"
             >
-              <Plus aria-hidden="true" size={14} /> New Workflow
+              <Plus aria-hidden="true" size={14} /> New Flow
             </Button>
           }
         >
           <p className="enterprise-page__lede">
-            用 Agent
-            Template、触发器、审查节点和输出契约构建可验证、可发布的工作流。
+            Flow 是可直接运行的事件图：在同一处配置 Agent、节点 Trigger、人工确认、输出与运行状态。
           </p>
           {notice ? (
             <p className="enterprise-page__message is-success" role="status">
@@ -146,27 +180,114 @@ export function WorkflowTemplatesPage({
             </p>
           ) : null}
           <ol className="enterprise-card-list">
-            {snapshot.workflows.map((workflow) => (
-              <li key={`${workflow.flowId}@${workflow.version}`}>
+            {snapshot.flows.map((flow) => (
+              <li key={flow.flowId}>
                 <Workflow aria-hidden="true" size={17} />
                 <span>
-                  <strong>{workflow.name}</strong>
+                  <strong>{flow.name}</strong>
                   <small>
-                    {workflow.flowId}@{workflow.version} ·{" "}
-                    {workflow.graph.nodes.length} nodes
+                    {flow.flowId}@{flow.activeRevision.compiledWorkflow.flowVersion} ·{" "}
+                    {flow.activeRevision.compiledWorkflow.graph.nodes.length} nodes ·{" "}
+                    {flow.activeRevision.trigger.kind.replaceAll("_", " ")}
                   </small>
                 </span>
-                <Badge variant="success">published</Badge>
+                <div className="enterprise-actions">
+                  <Badge variant={flow.status === "active" ? "success" : "neutral"}>
+                    {flow.status}
+                  </Badge>
+                  <Button
+                    aria-label={`${flow.status === "active" ? "暂停" : "恢复"} ${flow.name}`}
+                    disabled={Boolean(busy)}
+                    onClick={() =>
+                      void execute(`status:${flow.flowId}`, async () => {
+                        if (flow.status === "active") {
+                          await client.pauseFlow(flow.flowId, flow.revision);
+                        } else {
+                          await client.resumeFlow(flow.flowId, flow.revision);
+                        }
+                        await store.load(true);
+                      })
+                    }
+                    size="compact"
+                    variant="quiet"
+                  >
+                    {flow.status === "active" ? (
+                      <PauseCircle aria-hidden="true" size={14} />
+                    ) : (
+                      <PlayCircle aria-hidden="true" size={14} />
+                    )}
+                    {flow.status === "active" ? "暂停" : "恢复"}
+                  </Button>
+                  <Button
+                    aria-label={`复制 ${flow.name}`}
+                    disabled={Boolean(busy)}
+                    onClick={() =>
+                      void execute(`copy:${flow.flowId}`, async () => {
+                        const suffix = crypto.randomUUID().slice(0, 8);
+                        const copyId = `${flow.flowId}-copy-${suffix}`;
+                        const copyName = `${flow.name} Copy`;
+                        const copied = await client.copyFlow(flow.flowId, {
+                          flowId: copyId,
+                          name: copyName,
+                          owner,
+                        });
+                        setFlowId(copyId);
+                        setName(copyName);
+                        setOutcome(copied.draft.spec.description);
+                        setDraft(copied);
+                        setCreating(true);
+                        setNotice("已创建副本草稿；自动 Trigger 已改为人工确认，请复核后再激活。");
+                      })
+                    }
+                    size="compact"
+                    variant="quiet"
+                  >
+                    <Copy aria-hidden="true" size={14} /> 复制
+                  </Button>
+                </div>
               </li>
             ))}
-            {snapshot.workflows.length === 0 ? (
-              <li className="enterprise-list__empty">
-                尚无已发布 Workflow Template。
-              </li>
+            {snapshot.flows.length === 0 ? (
+              <li className="enterprise-list__empty">尚无已激活 Flow。</li>
             ) : null}
           </ol>
         </Panel>
       </div>
+    );
+  }
+
+  if (detailPage?.kind === "trigger" && detailAgent) {
+    return (
+      <FlowTriggerConfigPage
+        node={detailAgent}
+        onChange={(activation) =>
+          setAgentSelections((current) =>
+            current.map((item) =>
+              item.id === detailAgent.id ? { ...item, activation } : item,
+            ),
+          )
+        }
+        selections={agentSelections}
+        templates={publishedTemplates}
+      />
+    );
+  }
+
+  if (detailPage?.kind === "agent" && detailAgent) {
+    return (
+      <FlowAgentReferencePage
+        node={detailAgent}
+        onChange={(nextTemplateKey) =>
+          setAgentSelections((current) =>
+            current.map((item) =>
+              item.id === detailAgent.id
+                ? { ...item, templateKey: nextTemplateKey }
+                : item,
+            ),
+          )
+        }
+        templates={publishedTemplates}
+      />
     );
   }
 
@@ -187,8 +308,8 @@ export function WorkflowTemplatesPage({
   function createDraft() {
     if (
       !threadId ||
-      selectedTemplates.length === 0 ||
-      selectedTemplates.length !== agentSelections.length ||
+      selectedAgents.length === 0 ||
+      selectedAgents.length !== agentSelections.length ||
       !outcome.trim()
     )
       return;
@@ -200,7 +321,7 @@ export function WorkflowTemplatesPage({
           name: name.trim(),
           owner: owner.trim(),
           outcome: outcome.trim(),
-          templates: selectedTemplates,
+          agents: selectedAgents,
           requireApproval,
         }),
       );
@@ -211,10 +332,10 @@ export function WorkflowTemplatesPage({
 
   return (
     <div className="enterprise-page enterprise-workflow-templates">
-      <Panel title="Guided workflow builder / 引导式工作流创建">
+      <Panel title="Flow builder / 工作流图创建">
         <p className="enterprise-page__lede">
-          按顺序组合多个 Agent Template，并通过 Dry Run 与真实 Test Run
-          后发布为不可变工作流版本。
+          每个节点引用一个独立 Agent，并用 Trigger 表达式订阅外部事件或其他
+          Agent 的 Final；通过 Dry Run 与真实 Test Run 后激活不可变 Revision。
         </p>
         {!threadId ? (
           <p className="enterprise-page__message is-warning" role="status">
@@ -246,9 +367,13 @@ export function WorkflowTemplatesPage({
               value={outcome}
             />
           </label>
-          <WorkflowAgentSequenceEditor
+          <WorkflowGraphEditor
             disabled={publishedTemplates.length === 0}
             onChange={setAgentSelections}
+            onEditAgent={(nodeId) => setDetailPage({ kind: "agent", nodeId })}
+            onEditTrigger={(nodeId) =>
+              setDetailPage({ kind: "trigger", nodeId })
+            }
             selections={agentSelections}
             templates={publishedTemplates}
           />
@@ -264,8 +389,8 @@ export function WorkflowTemplatesPage({
           <Button
             disabled={
               !threadId ||
-              selectedTemplates.length === 0 ||
-              selectedTemplates.length !== agentSelections.length ||
+              selectedAgents.length === 0 ||
+              selectedAgents.length !== agentSelections.length ||
               !outcome.trim() ||
               Boolean(busy)
             }
@@ -353,18 +478,22 @@ export function WorkflowTemplatesPage({
               Boolean(busy)
             }
             onClick={() =>
-              void execute("publish", async () => {
-                await client.publishFlowDraft(draft!.draft.id, owner.trim());
-                await store.load(true);
-                setNotice(
-                  "Workflow Template 已发布，可前往 Deployments 创建不可变部署快照。 ",
+              void execute("activate", async () => {
+                const active = snapshot.flows.find(
+                  (flow) => flow.flowId === draft!.draft.spec.flowId,
                 );
+                await client.activateFlowDraft(draft!.draft.id, {
+                  activatedBy: owner.trim(),
+                  expectedFlowRevision: active?.revision,
+                });
+                await store.load(true);
+                setNotice("Flow 已激活；Trigger 现在会直接创建 Case，并按入口策略进入待处理或立即运行。 ");
                 setCreating(false);
               })
             }
             variant="primary"
           >
-            <Send aria-hidden="true" size={14} /> 发布
+            <Send aria-hidden="true" size={14} /> 激活 Flow
           </Button>
         </div>
         {draft ? (
@@ -412,10 +541,10 @@ function WorkflowProgress({
     ["Validated", Boolean(draft.draft.lastValidation?.valid)],
     ["Dry Run", passedDryRun],
     ["Test Run", successfulTestRun],
-    ["Published", draft.draft.status === "published"],
+    ["Activated", draft.draft.status === "published"],
   ] as const;
   return (
-    <ol className="enterprise-progress" aria-label="Workflow 发布进度">
+    <ol className="enterprise-progress" aria-label="Flow 激活进度">
       {steps.map(([label, done]) => (
         <li className={done ? "is-done" : undefined} key={label}>
           <CheckCircle2 aria-hidden="true" size={15} />
@@ -424,12 +553,6 @@ function WorkflowProgress({
       ))}
     </ol>
   );
-}
-
-function keyOf(item: {
-  template: { templateId: string; version: number };
-}): string {
-  return `${item.template.templateId}@${item.template.version}`;
 }
 
 function readableError(error: unknown): string {

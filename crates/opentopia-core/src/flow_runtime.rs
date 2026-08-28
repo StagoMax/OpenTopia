@@ -3,6 +3,7 @@ use crate::flow::{
     compile_flow, FlowBudgetV1, FlowDefinitionV1, GraphDefinitionV1, GraphEdgeV1,
     GraphLoopPolicyV1, GraphNodeKindV1, GraphNodeV1, LoopExhaustionActionV1,
 };
+use crate::flow_activation::{default_graph_trigger, initial_ready_nodes, node_activation_ready};
 use crate::human_task::{HumanTaskActionV1, HumanTaskV1};
 use crate::model::UserInputResponse;
 use crate::tools::ToolInvocationContext;
@@ -11,9 +12,8 @@ use crate::workflow_interrupt::{
 };
 use crate::workflow_state::{apply_state_writes, parse_state_writes};
 use crate::{
-    CompiledWorkflowV1, DeploymentSnapshotV1, RuntimeConnectionAuthorityV1, WorkflowAgentSpecV1,
-    WorkflowDeploymentStatusV1, WorkflowDeploymentV1, WorkflowOutputReviewPolicyV1,
-    WorkflowOutputSpecV1, WorkflowTriggerSpecV1,
+    ActiveFlowV1, CompiledWorkflowV1, FlowRevisionV1, FlowStatusV1, RuntimeConnectionAuthorityV1,
+    WorkflowAgentSpecV1, WorkflowOutputReviewPolicyV1, WorkflowOutputSpecV1, WorkflowTriggerSpecV1,
 };
 use anyhow::Context;
 use async_trait::async_trait;
@@ -233,9 +233,9 @@ pub struct FlowRunV1 {
     pub definition_id: Uuid,
     pub definition_content_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deployment_id: Option<Uuid>,
+    pub flow_revision_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deployment_snapshot: Option<DeploymentSnapshotV1>,
+    pub flow_revision: Option<FlowRevisionV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_draft_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -243,6 +243,11 @@ pub struct FlowRunV1 {
     pub revision: u32,
     pub status: FlowRunStatusV1,
     pub input: Value,
+    /// The ingress source that created this Run. It is persisted separately
+    /// from the raw `input` so the active Flow can target any configured node
+    /// Trigger without mutating its immutable Revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_trigger: Option<WorkflowTriggerSpecV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<Value>,
     pub graph: GraphDefinitionV1,
@@ -273,7 +278,7 @@ pub struct FlowRunV1 {
     pub loop_counts: BTreeMap<String, u32>,
     pub node_executions: u32,
     pub tool_calls: u32,
-    /// Production deployments pause after terminal output until a HumanTask
+    /// Active Flows pause after terminal output until a HumanTask
     /// records the review decision. Trial/manual compatibility runs may opt out.
     #[serde(default)]
     pub output_review_required: bool,
@@ -339,19 +344,20 @@ impl FlowRunV1 {
             flow_version: definition.version,
             definition_id: definition.id,
             definition_content_hash: definition.content_hash.clone(),
-            deployment_id: None,
-            deployment_snapshot: None,
+            flow_revision_id: None,
+            flow_revision: None,
             test_draft_id: None,
             test_draft_revision: None,
             revision: 1,
             status: FlowRunStatusV1::Queued,
             input,
+            ingress_trigger: None,
             output: None,
             graph: definition.graph.clone(),
             connection_authority: Some(connection_authority.attenuate(&effective_capabilities)),
             effective_capabilities,
             budget: definition.budget.clone(),
-            ready_nodes: vec![definition.graph.entry_node_id.clone()],
+            ready_nodes: initial_ready_nodes(&definition.graph, None),
             node_runs: Vec::new(),
             node_outputs: BTreeMap::new(),
             state: BTreeMap::new(),
@@ -373,20 +379,31 @@ impl FlowRunV1 {
         })
     }
 
-    pub fn new_from_deployment(
-        thread_id: Uuid,
-        deployment: &WorkflowDeploymentV1,
+    pub fn new_from_flow(flow: &ActiveFlowV1, input: Value) -> anyhow::Result<Self> {
+        let trigger = flow.active_revision.trigger.clone();
+        Self::new_from_flow_with_trigger(flow, input, &trigger)
+    }
+
+    pub fn new_from_flow_with_trigger(
+        flow: &ActiveFlowV1,
         input: Value,
+        trigger: &WorkflowTriggerSpecV1,
     ) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            deployment.status == WorkflowDeploymentStatusV1::Active,
-            "Workflow deployment is not active"
-        );
-        let workflow = &deployment.snapshot.compiled_workflow;
+        anyhow::ensure!(flow.status == FlowStatusV1::Active, "Flow is paused");
+        Self::new_from_revision(flow.thread_id, &flow.active_revision, input, trigger)
+    }
+
+    pub fn new_from_revision(
+        thread_id: Uuid,
+        revision: &FlowRevisionV1,
+        input: Value,
+        trigger: &WorkflowTriggerSpecV1,
+    ) -> anyhow::Result<Self> {
+        let workflow = &revision.compiled_workflow;
         anyhow::ensure!(
             workflow.schema_version == ENTERPRISE_SCHEMA_VERSION_V1
-                && deployment.snapshot.schema_version == ENTERPRISE_SCHEMA_VERSION_V1,
-            "Workflow deployment snapshot uses an unsupported schema version"
+                && revision.schema_version == ENTERPRISE_SCHEMA_VERSION_V1,
+            "Flow revision uses an unsupported schema version"
         );
         let now = Utc::now();
         Ok(Self {
@@ -397,13 +414,14 @@ impl FlowRunV1 {
             flow_version: workflow.flow_version,
             definition_id: workflow.definition_id,
             definition_content_hash: workflow.definition_content_hash.clone(),
-            deployment_id: Some(deployment.id),
-            deployment_snapshot: Some(deployment.snapshot.clone()),
+            flow_revision_id: Some(revision.id),
+            flow_revision: Some(revision.clone()),
             test_draft_id: None,
             test_draft_revision: None,
             revision: 1,
             status: FlowRunStatusV1::Queued,
             input,
+            ingress_trigger: Some(trigger.clone()),
             output: None,
             graph: workflow.graph.clone(),
             // Production Agent-node authority is owned by the compiled
@@ -411,7 +429,7 @@ impl FlowRunV1 {
             connection_authority: Some(RuntimeConnectionAuthorityV1::DenyAll),
             effective_capabilities: workflow.root_capabilities.clone(),
             budget: workflow.budget.clone(),
-            ready_nodes: vec![workflow.graph.entry_node_id.clone()],
+            ready_nodes: initial_ready_nodes(&workflow.graph, Some(trigger)),
             node_runs: Vec::new(),
             node_outputs: BTreeMap::new(),
             state: BTreeMap::new(),
@@ -421,7 +439,7 @@ impl FlowRunV1 {
             loop_counts: BTreeMap::new(),
             node_executions: 0,
             tool_calls: 0,
-            output_review_required: deployment.snapshot.output_review_policy
+            output_review_required: revision.output_review_policy
                 == WorkflowOutputReviewPolicyV1::AlwaysReviewOutput,
             output_reviewed: false,
             waiting_node_id: None,
@@ -441,17 +459,18 @@ impl FlowRunV1 {
         compiled_workflow: CompiledWorkflowV1,
         input: Value,
     ) -> anyhow::Result<Self> {
-        let deployment = WorkflowDeploymentV1::new_with_options(
+        let trigger = default_graph_trigger(&compiled_workflow.graph);
+        let flow = ActiveFlowV1::new_with_options(
             "Workflow test run",
-            "test",
+            thread_id,
             compiled_workflow,
-            WorkflowTriggerSpecV1::Manual,
+            trigger,
             WorkflowOutputSpecV1::Inbox,
             WorkflowOutputReviewPolicyV1::ExplicitNodesOnly,
             "workflow-test-runner",
         )?;
-        let mut run = Self::new_from_deployment(thread_id, &deployment, input)?;
-        run.deployment_id = None;
+        let mut run = Self::new_from_flow(&flow, input)?;
+        run.flow_revision_id = None;
         run.test_draft_id = Some(draft_id);
         run.test_draft_revision = Some(draft_revision);
         run.definition_id = draft_id;
@@ -466,14 +485,14 @@ impl FlowRunV1 {
     }
 
     pub fn harness_capabilities(&self) -> CapabilityProjection {
-        self.deployment_snapshot
+        self.flow_revision
             .as_ref()
             .map(|snapshot| snapshot.compiled_workflow.harness_capabilities.clone())
             .unwrap_or_else(|| self.effective_capabilities.clone())
     }
 
     pub fn harness_connection_authority(&self) -> RuntimeConnectionAuthorityV1 {
-        self.deployment_snapshot
+        self.flow_revision
             .as_ref()
             .map(|snapshot| {
                 snapshot
@@ -485,13 +504,13 @@ impl FlowRunV1 {
     }
 
     pub fn workflow_agent_spec(&self, node_id: &str) -> Option<&WorkflowAgentSpecV1> {
-        self.deployment_snapshot
+        self.flow_revision
             .as_ref()
             .and_then(|snapshot| snapshot.compiled_workflow.agent_spec(node_id))
     }
 
     pub fn workflow_agent_specs(&self) -> Vec<WorkflowAgentSpecV1> {
-        self.deployment_snapshot
+        self.flow_revision
             .as_ref()
             .map(|snapshot| {
                 snapshot
@@ -564,6 +583,9 @@ pub struct FlowNodeExecutionRequestV1 {
     pub flow_run_id: Uuid,
     pub node_run_id: Uuid,
     pub node: GraphNodeV1,
+    /// The unmodified payload that created the FlowRun (`@Flow.input`).
+    pub flow_input: Value,
+    /// The payload that activated this node (`@Trigger.input`).
     pub input: Value,
     pub effective_capabilities: CapabilityProjection,
     pub workflow_agent_spec: Option<WorkflowAgentSpecV1>,
@@ -591,6 +613,7 @@ pub struct FlowNodeResumeRequestV1 {
     pub flow_run_id: Uuid,
     pub node_run_id: Uuid,
     pub node: GraphNodeV1,
+    pub flow_input: Value,
     pub input: Value,
     pub effective_capabilities: CapabilityProjection,
     pub workflow_agent_spec: Option<WorkflowAgentSpecV1>,
@@ -636,7 +659,7 @@ fn restrict_flow_node_connection_context(
                 })?;
                 anyhow::ensure!(
                     route.operation() == *operation,
-                    "Workflow Agent node Connection route {name} differs from its DeploymentSnapshot"
+                    "Flow Agent node Connection route {name} differs from its frozen Revision"
                 );
             }
             context
@@ -693,13 +716,14 @@ pub fn resolve_flow_approval(
         .waiting_node_id
         .clone()
         .context("Flow run is missing its waiting approval node")?;
-    let output = json!({
+    let decision = json!({
         "approved": approved,
         "note": note.unwrap_or_default(),
     });
     let node_run = run
         .active_node_run_mut(&node_id)
         .context("Flow approval node run is missing")?;
+    let output = approval_output(node_run.input.clone(), approved, note);
     node_run.status = if approved {
         FlowNodeRunStatusV1::Succeeded
     } else {
@@ -713,7 +737,7 @@ pub fn resolve_flow_approval(
         } else {
             "Approval rejected"
         },
-        output.clone(),
+        decision,
     ));
     node_run.completed_at = Some(Utc::now());
     run.waiting_node_id = None;
@@ -730,6 +754,19 @@ pub fn resolve_flow_approval(
     }
     run.touch();
     Ok(())
+}
+
+fn approval_output(input: Value, approved: bool, note: Option<&str>) -> Value {
+    let mut output = match input {
+        Value::Object(object) => object,
+        value => Map::from_iter([("value".to_string(), value)]),
+    };
+    output.insert("approved".to_string(), Value::Bool(approved));
+    output.insert(
+        "note".to_string(),
+        Value::String(note.unwrap_or_default().to_string()),
+    );
+    Value::Object(output)
 }
 
 pub fn prepare_flow_interrupt_resume(
@@ -1107,6 +1144,10 @@ const MAX_SUPERSTEP_CONCURRENCY: usize = 8;
 const MAX_CHECKPOINT_HISTORY: usize = 100;
 
 fn ready_superstep_nodes(run: &FlowRunV1) -> Vec<String> {
+    let ingress_trigger = run
+        .ingress_trigger
+        .as_ref()
+        .or_else(|| run.flow_revision.as_ref().map(|snapshot| &snapshot.trigger));
     run.ready_nodes
         .iter()
         .filter(|node_id| {
@@ -1115,7 +1156,14 @@ fn ready_superstep_nodes(run: &FlowRunV1) -> Vec<String> {
                 .nodes
                 .iter()
                 .find(|node| node.id == node_id)
-                .is_some_and(|node| node.kind != GraphNodeKindV1::Join || join_ready(run, node_id))
+                .is_some_and(|node| {
+                    node_activation_ready(node, ingress_trigger, run.node_outputs.keys().cloned())
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| {
+                            node.kind != GraphNodeKindV1::Join || join_ready(run, node_id)
+                        })
+                })
         })
         .cloned()
         .collect()
@@ -1225,6 +1273,7 @@ async fn execute_checkpoint_node(
                         flow_run_id: run.id,
                         node_run_id: item.node_run_id,
                         node,
+                        flow_input: run.input.clone(),
                         input: item.input.clone(),
                         effective_capabilities: node_capabilities,
                         workflow_agent_spec: run.workflow_agent_spec(&item.node_id).cloned(),
@@ -1319,6 +1368,7 @@ async fn execute_resume_checkpoint_node(
                 flow_run_id: run.id,
                 node_run_id: previous_write.node_run_id,
                 node,
+                flow_input: run.input.clone(),
                 input: run
                     .active_checkpoint
                     .as_ref()
@@ -2479,7 +2529,7 @@ mod tests {
     }
 
     #[test]
-    fn deployed_flow_run_owns_the_immutable_deployment_snapshot() {
+    fn active_flow_run_owns_the_immutable_flow_revision() {
         let mut definition = definition(
             vec![runtime_node("output", GraphNodeKindV1::Output, json!({}))],
             Vec::new(),
@@ -2487,31 +2537,27 @@ mod tests {
         definition.capabilities = CapabilityProjection::deny_all();
         let compiled =
             crate::CompiledWorkflowV1::compile(&definition, Vec::new()).expect("compile workflow");
-        let deployment = crate::WorkflowDeploymentV1::new(
+        let flow = crate::ActiveFlowV1::new(
             "Runtime production",
-            "production",
+            Uuid::new_v4(),
             compiled,
             "release-manager",
         )
-        .expect("deployment");
+        .expect("active Flow");
 
-        let run = FlowRunV1::new_from_deployment(
-            Uuid::new_v4(),
-            &deployment,
-            json!({"requestId": "lead-1"}),
-        )
-        .expect("deployed run");
+        let run =
+            FlowRunV1::new_from_flow(&flow, json!({"requestId": "lead-1"})).expect("Flow run");
         let restored: FlowRunV1 =
-            serde_json::from_str(&serde_json::to_string(&run).expect("serialize deployed run"))
-                .expect("restore deployed run");
+            serde_json::from_str(&serde_json::to_string(&run).expect("serialize Flow run"))
+                .expect("restore Flow run");
 
-        assert_eq!(restored.deployment_id, Some(deployment.id));
+        assert_eq!(restored.flow_revision_id, Some(flow.active_revision.id));
         assert_eq!(
             restored
-                .deployment_snapshot
+                .flow_revision
                 .as_ref()
                 .map(|snapshot| snapshot.content_hash.as_str()),
-            Some(deployment.snapshot.content_hash.as_str())
+            Some(flow.active_revision.content_hash.as_str())
         );
         assert_eq!(
             restored.harness_connection_authority(),
@@ -2524,32 +2570,31 @@ mod tests {
     }
 
     #[test]
-    fn deployment_can_limit_review_to_explicit_approval_nodes() {
+    fn active_flow_can_limit_review_to_explicit_approval_nodes() {
         let definition = definition(
             vec![runtime_node("output", GraphNodeKindV1::Output, json!({}))],
             Vec::new(),
         );
         let compiled =
             crate::CompiledWorkflowV1::compile(&definition, Vec::new()).expect("compile workflow");
-        let deployment = crate::WorkflowDeploymentV1::new_with_options(
+        let flow = crate::ActiveFlowV1::new_with_options(
             "Unattended runtime",
-            "production",
+            Uuid::new_v4(),
             compiled,
             crate::WorkflowTriggerSpecV1::Manual,
             crate::WorkflowOutputSpecV1::Inbox,
             crate::WorkflowOutputReviewPolicyV1::ExplicitNodesOnly,
             "release-manager",
         )
-        .expect("deployment");
+        .expect("active Flow");
 
-        let run = FlowRunV1::new_from_deployment(Uuid::new_v4(), &deployment, json!({}))
-            .expect("deployed run");
+        let run = FlowRunV1::new_from_flow(&flow, json!({})).expect("Flow run");
 
         assert!(!run.output_review_required);
     }
 
     #[tokio::test]
-    async fn deployed_agent_node_executes_only_its_frozen_workflow_agent_spec() {
+    async fn active_flow_agent_node_executes_only_its_frozen_workflow_agent_spec() {
         let store = Arc::new(SqliteSessionStore::open(":memory:").expect("open store"));
         let thread = store
             .create_thread_with_mode(
@@ -2591,15 +2636,10 @@ mod tests {
         };
         let compiled = crate::CompiledWorkflowV1::compile(&definition, vec![agent_spec])
             .expect("compile workflow");
-        let deployment = crate::WorkflowDeploymentV1::new(
-            "Frozen workflow",
-            "production",
-            compiled,
-            "release-manager",
-        )
-        .expect("deployment");
-        let run = FlowRunV1::new_from_deployment(thread.id, &deployment, json!({"case": 1}))
-            .expect("create run");
+        let flow =
+            crate::ActiveFlowV1::new("Frozen workflow", thread.id, compiled, "release-manager")
+                .expect("active Flow");
+        let run = FlowRunV1::new_from_flow(&flow, json!({"case": 1})).expect("create run");
         let run_id = run.id;
         store.insert_flow_run(&run).expect("persist run");
         let harness = Arc::new(SpecRecordingHarness::default());
@@ -2904,7 +2944,11 @@ mod tests {
         let completed = wait_for_status(&store, run.id, FlowRunStatusV1::Succeeded).await;
         assert_eq!(
             completed.output,
-            Some(json!({"approved": true, "note": "reviewed"}))
+            Some(json!({
+                "request": "deploy",
+                "approved": true,
+                "note": "reviewed"
+            }))
         );
     }
 

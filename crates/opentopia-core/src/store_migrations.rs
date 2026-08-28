@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 pub(crate) const LEGACY_DATABASE_SCHEMA_VERSION: i64 = 19;
-pub(crate) const CURRENT_DATABASE_SCHEMA_VERSION: i64 = 29;
+pub(crate) const CURRENT_DATABASE_SCHEMA_VERSION: i64 = 31;
 
 const LEGACY_BASELINE_NAME: &str = "legacy_baseline_v19";
 const MIGRATION_LEDGER_SQL: &str = include_str!("migrations/0019_legacy_baseline.sql");
@@ -127,6 +127,18 @@ const MIGRATIONS: &[Migration] = &[
         name: "workflow_automation",
         sql: include_str!("migrations/0029_workflow_automation.sql"),
         verify: verify_v29,
+    },
+    Migration {
+        version: 30,
+        name: "workflow_invocation_superseded",
+        sql: include_str!("migrations/0030_workflow_invocation_superseded.sql"),
+        verify: verify_v30,
+    },
+    Migration {
+        version: 31,
+        name: "flow_product_model",
+        sql: include_str!("migrations/0031_flow_product_model.sql"),
+        verify: verify_v31,
     },
 ];
 
@@ -678,6 +690,51 @@ fn verify_v29(conn: &Connection) -> anyhow::Result<()> {
         !human_task_sql.contains("foreign key(source_id) references flow_runs"),
         "human_tasks source_id must be polymorphic"
     );
+    Ok(())
+}
+
+fn verify_v30(conn: &Connection) -> anyhow::Result<()> {
+    verify_v29(conn)?;
+    let invocation_sql = table_sql(conn, "workflow_trigger_invocations")?
+        .context("workflow_trigger_invocations table is missing")?
+        .to_ascii_lowercase();
+    anyhow::ensure!(
+        invocation_sql.contains("superseded"),
+        "workflow_trigger_invocations must accept superseded audit records"
+    );
+    Ok(())
+}
+
+fn verify_v31(conn: &Connection) -> anyhow::Result<()> {
+    for removed in [
+        "workflow_deployments",
+        "workflow_releases",
+        "workflow_trigger_invocations",
+        "workflow_delivery_receipts",
+        "workflow_evaluations",
+    ] {
+        anyhow::ensure!(!table_exists(conn, removed)?, "{removed} must be removed");
+    }
+    for table in [
+        "flows",
+        "flow_cases",
+        "flow_delivery_receipts",
+        "flow_evaluations",
+    ] {
+        anyhow::ensure!(table_exists(conn, table)?, "{table} table is missing");
+    }
+    for index in [
+        "idx_flows_status_updated",
+        "idx_flows_thread_updated",
+        "idx_flow_cases_flow_updated",
+        "idx_flow_cases_status_updated",
+        "idx_flow_cases_trigger_created",
+        "idx_flow_delivery_receipts_status_updated",
+        "idx_flow_delivery_receipts_revision_updated",
+        "idx_flow_evaluations_revision_created",
+    ] {
+        anyhow::ensure!(index_exists(conn, index)?, "{index} index is missing");
+    }
     Ok(())
 }
 

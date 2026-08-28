@@ -31,37 +31,21 @@ export type WorkflowOutput =
       assignedTo?: string | null;
     };
 
-export type WorkflowRelease = {
+export type FlowCase = {
   schemaVersion: number;
   id: string;
-  revision: number;
-  releaseKey: string;
-  environment: string;
-  threadId: string;
-  status: "active" | "disabled";
-  trigger: WorkflowTrigger;
-  ingressPolicy: WorkflowIngressPolicy;
-  primaryDeploymentId: string;
-  canaryDeploymentId?: string | null;
-  canaryPercent: number;
-  previousPrimaryDeploymentId?: string | null;
-  createdAt: string;
-  updatedAt: string;
-  createdBy: string;
-};
-
-export type WorkflowTriggerInvocation = {
-  schemaVersion: number;
-  id: string;
-  releaseId: string;
+  flowId: string;
   triggerId: string;
   idempotencyKey: string;
-  deploymentId: string;
+  flowRevisionId: string;
+  flowRevision: import("./flow").FlowRevision;
   flowRunId?: string | null;
-  status: "accepted" | "started" | "failed";
+  status: "accepted" | "started" | "failed" | "superseded";
   inputHash: string;
   input: unknown;
   error?: string | null;
+  supersededByCaseId?: string | null;
+  statusNote?: string | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -74,7 +58,7 @@ export type WorkflowDeliveryReceipt = {
   id: string;
   revision: number;
   runId: string;
-  deploymentId: string;
+  flowRevisionId: string;
   outputKind: "inbox" | "webhook" | "connection_operation" | "human_task";
   status: WorkflowDeliveryStatus;
   attempt: number;
@@ -91,7 +75,7 @@ export type WorkflowEvaluation = {
   schemaVersion: number;
   id: string;
   runId: string;
-  deploymentId: string;
+  flowRevisionId: string;
   evaluator: string;
   score: number;
   passed: boolean;
@@ -100,14 +84,14 @@ export type WorkflowEvaluation = {
   createdAt: string;
 };
 
-export type WorkflowInvocationResult = {
-  invocation: WorkflowTriggerInvocation;
+export type FlowCaseResult = {
+  case: FlowCase;
   run?: FlowRun | null;
   reused: boolean;
 };
 
 export type WorkflowEvaluationSummary = {
-  deploymentId: string;
+  flowRevisionId: string;
   totalRuns: number;
   runStatusCounts: Record<string, number>;
   evaluationCount: number;

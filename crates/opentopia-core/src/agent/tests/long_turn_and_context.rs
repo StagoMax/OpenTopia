@@ -906,6 +906,39 @@ fn completion_guard_has_no_plan_requirement_or_evidence_business_scan() {
     assert!(source.contains("completion_registry.signals"));
 }
 
+#[test]
+fn paused_work_form_produces_partial_outcome() {
+    let turn_id = Uuid::new_v4();
+    let form = WorkForm::new(
+        Uuid::new_v4(),
+        WorkScope::Turn(turn_id),
+        "Current task plan",
+        vec![crate::work_form::WorkItem {
+            id: "later".to_string(),
+            title: "Continue later".to_string(),
+            status: WorkItemStatus::Deferred,
+            completion_disposition: crate::completion_runtime::CompletionDisposition::Blocking,
+            depends_on: Vec::new(),
+            note: Some("Waiting for a later run".to_string()),
+            acceptance: Vec::new(),
+            evidence_refs: Vec::new(),
+        }],
+    );
+    let result = ProviderToolResult {
+        call_id: "call_plan".to_string(),
+        name: "update_plan".to_string(),
+        output: "Plan updated".to_string(),
+        content: Vec::new(),
+        is_error: false,
+        metadata: json!({ "workForm": form }),
+    };
+
+    assert!(matches!(
+        finalization_outcome(None, turn_id, None, &[result]).expect("classify WorkForm"),
+        AgentTurnOutcome::Partial { .. }
+    ));
+}
+
 fn test_workspace(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("opentopia-{name}-{}", Uuid::new_v4()));
     fs::create_dir_all(&path).unwrap();

@@ -13,7 +13,6 @@ test("maps fixed Flow navigation to one primary destination", () => {
     ["overview", "flow-overview"],
     ["agents", "flow-agents"],
     ["workflow-templates", "flow-workflow-templates"],
-    ["automation", "flow-automation"],
     ["runs", "flow-runs"],
     ["trust", "flow-trust"],
   ] as const) {
@@ -27,15 +26,6 @@ test("maps fixed Flow navigation to one primary destination", () => {
       destination,
     );
   }
-  assert.equal(
-    resolveSidebarDestination({
-      experienceMode: "flow",
-      flowPrimaryView: "deployments",
-      toolStageOpen: false,
-      activeToolKind: null,
-    }),
-    "flow-deployments",
-  );
   assert.equal(
     resolveSidebarDestination({
       experienceMode: "flow",

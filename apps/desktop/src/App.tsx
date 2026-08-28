@@ -17,8 +17,6 @@ import {
   Inbox,
   LayoutDashboard,
   Library,
-  Rocket,
-  RadioTower,
   ShieldCheck,
   Workflow,
   X,
@@ -34,7 +32,6 @@ import { ApprovalDialog } from "./components/ApprovalDialog";
 import { PlanChoiceCard } from "./components/PlanChoiceCard";
 import type { ImagePreviewSource } from "./components/PreviewHost";
 import { ConnectionSidebarCollection } from "./components/connections";
-import { WorkflowDeploymentSidebarCollection } from "./components/workflowDeployments";
 import {
   EnterpriseSidebarCollection,
   FlowEnterpriseWorkspace,
@@ -191,7 +188,11 @@ import type {
 import { reuseUnchangedAgentList } from "./agentListState";
 import { PreviewSessionStore } from "./previewSessionStore";
 import { ConversationSessionRegistry } from "./conversationSessionController";
-import { newBrowserTabSessionId } from "./browserNavigation";
+import {
+  browserSessionId,
+  initializeBrowserTabSession,
+  newBrowserTabSessionId,
+} from "./browserNavigation";
 import { useConversationSessionSelector } from "./useConversationSession";
 import {
   useThreadRunState,
@@ -826,7 +827,6 @@ export function App() {
   const workspaceResizeFrameRef = useRef<number | null>(null);
   const markdownNavigationIdRef = useRef(0);
   const browserTabSequenceRef = useRef(0);
-  const browserTabNavigationIdRef = useRef(0);
   const browserTabLaunchGenerationRef = useRef(0);
   const browserNewTabRequestHandlerRef = useRef<
     (request: BrowserNewTabRequest) => void
@@ -2112,9 +2112,8 @@ export function App() {
     }
     const sessionId = newBrowserTabSessionId();
     const launchGeneration = browserTabLaunchGenerationRef.current;
-    void browserHost
-      .createSession({ sessionId, visible: false })
-      .then(() => {
+    void initializeBrowserTabSession(browserHost, sessionId, initialUrl)
+      .then((openedUrl) => {
         if (launchGeneration !== browserTabLaunchGenerationRef.current) {
           void browserHost.destroySession(sessionId).catch(() => {});
           return;
@@ -2122,22 +2121,15 @@ export function App() {
         const id = `tool-browser:${sessionId}`;
         const sequence = ++browserTabSequenceRef.current;
         const fallbackTitle = `浏览器 ${sequence}`;
-        const browserNavigation = initialUrl
-          ? {
-              id: `${sessionId}:${++browserTabNavigationIdRef.current}`,
-              url: initialUrl,
-            }
-          : undefined;
         setToolTabs((current) => [
           ...current,
           {
             id,
             kind: "browser",
-            title: initialUrl
-              ? browserTabTitle({ url: initialUrl }, fallbackTitle)
+            title: openedUrl
+              ? browserTabTitle({ url: openedUrl }, fallbackTitle)
               : fallbackTitle,
             browserSessionId: sessionId,
-            browserNavigation,
           },
         ]);
         setActiveToolTabId(id);
@@ -2145,6 +2137,7 @@ export function App() {
         setConversationCollapsed(false);
       })
       .catch((error: unknown) => {
+        void browserHost.destroySession(sessionId).catch(() => {});
         if (launchGeneration === browserTabLaunchGenerationRef.current) {
           setActionError(`无法新建浏览器：${errorMessage(error)}`);
         }
@@ -2153,7 +2146,10 @@ export function App() {
 
   browserNewTabRequestHandlerRef.current = ({ openerSessionId, url }) => {
     const openerStillExists = toolTabsRef.current.some(
-      (tab) => tab.browserSessionId === openerSessionId,
+      (tab) =>
+        tab.browserSessionId === openerSessionId ||
+        (tab.id === "tool-browser" &&
+          browserSessionId(activeThreadIdRef.current) === openerSessionId),
     );
     if (openerStillExists) openNewBrowserTab(url);
   };
@@ -3977,9 +3973,7 @@ export function App() {
             })}
             pluginsOpen={sidebarDestination === "plugins"}
             contextualCollection={
-              sidebarDestination === "flow-deployments" && client ? (
-                <WorkflowDeploymentSidebarCollection client={client} />
-              ) : sidebarDestination === "flow-connections" && client ? (
+              sidebarDestination === "flow-connections" && client ? (
                 <ConnectionSidebarCollection client={client} />
               ) : flowPrimarySurface && client ? (
                 <EnterpriseSidebarCollection
@@ -4918,8 +4912,6 @@ function flowPrimaryHeadingIcon(view: FlowPrimaryView) {
   if (view === "workflow-templates")
     return <Workflow aria-hidden="true" size={15} />;
   if (view === "inbox") return <Inbox aria-hidden="true" size={15} />;
-  if (view === "deployments") return <Rocket aria-hidden="true" size={15} />;
-  if (view === "automation") return <RadioTower aria-hidden="true" size={15} />;
   if (view === "runs") return <Activity aria-hidden="true" size={15} />;
   if (view === "connections") return <Cable aria-hidden="true" size={15} />;
   if (view === "trust") return <ShieldCheck aria-hidden="true" size={15} />;
@@ -4929,11 +4921,9 @@ function flowPrimaryHeadingIcon(view: FlowPrimaryView) {
 
 function flowPrimaryHeadingTitle(view: FlowPrimaryView): string | undefined {
   if (view === "overview") return "Overview / 运行总览";
-  if (view === "agents") return "Agents / Agent 身份";
-  if (view === "workflow-templates") return "Workflow Templates / 工作流模板";
+  if (view === "agents") return "Agents / Agent 配置";
+  if (view === "workflow-templates") return "Flows / 工作流";
   if (view === "inbox") return "Inbox / 待处理";
-  if (view === "deployments") return "Deployments / 部署";
-  if (view === "automation") return "Automation / 自动化与投递";
   if (view === "runs") return "Runs / 运行追踪";
   if (view === "connections") return "Connections / 连接";
   if (view === "trust") return "Trust / 信任中心";

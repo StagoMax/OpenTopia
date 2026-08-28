@@ -195,6 +195,7 @@ try {
   }
 
   $schema = @{ type = "object" }
+  $entryTriggerId = [guid]::NewGuid().ToString()
   $flowSpec = @{
     flowId = "enterprise-surface-$verificationId"
     name = "Enterprise surface verification"
@@ -208,8 +209,33 @@ try {
       schemaVersion = 1
       entryNodeId = "intake"
       nodes = @(
-        (New-GraphNode "intake" "Intake Agent" "agent" @{ reference = $templateA.template.templateId; templateVersion = $templateA.template.version }),
-        (New-GraphNode "review" "Review Agent" "agent" @{ reference = $templateB.template.templateId; templateVersion = $templateB.template.version }),
+        (New-GraphNode "intake" "Intake Agent" "agent" @{
+          reference = $templateA.template.templateId
+          templateVersion = $templateA.template.version
+          activation = @{
+            expression = @{
+              operator = "source"
+              source = @{
+                kind = "event_subscription"
+                triggerId = $entryTriggerId
+                source = "opentopia-e2e"
+                eventType = "enterprise.requested"
+              }
+            }
+            ingressPolicy = "immediate"
+          }
+        }),
+        (New-GraphNode "review" "Review Agent" "agent" @{
+          reference = $templateB.template.templateId
+          templateVersion = $templateB.template.version
+          activation = @{
+            expression = @{
+              operator = "source"
+              source = @{ kind = "agent_final"; nodeId = "intake" }
+            }
+            ingressPolicy = "immediate"
+          }
+        }),
         (New-GraphNode "output" "Inbox output" "output" @{})
       )
       edges = @(
@@ -227,6 +253,17 @@ try {
   if (-not $validated.draft.lastValidation.valid) { throw "Workflow validation failed" }
   $trial = Invoke-TopiaApi POST "/api/flow-drafts/$($flowDraft.draft.id)/simulate" @{ input = @{ request = "verify enterprise surface" } }
   if ($trial.status -ne "passed") { throw "Workflow Trial failed" }
+  $testStarted = Invoke-TopiaApi POST "/api/flow-drafts/$($flowDraft.draft.id)/test-run" @{
+    input = @{ request = "verify configured Trigger test run" }
+    startedBy = "opentopia-e2e"
+  }
+  $testRun = Wait-ForRunStatus $testStarted.id @("succeeded", "failed", "cancelled")
+  if ($testRun.status -ne "succeeded") {
+    throw "Workflow Test Run did not execute the configured Agent Trigger: $($testRun.status) $($testRun.error)"
+  }
+  if (@($testRun.nodeRuns | Where-Object { $_.nodeId -in @("intake", "review") -and $_.status -eq "succeeded" }).Count -ne 2) {
+    throw "Workflow Test Run did not execute both Agent nodes"
+  }
   $definition = Invoke-TopiaApi POST "/api/flow-drafts/$($flowDraft.draft.id)/publish" @{ publishedBy = "opentopia-e2e" }
 
   Invoke-TopiaExpectedError "/api/threads/$($thread.id)/flow-runs" @{ flowId = $definition.flowId; version = $definition.version; input = @{} } 400
@@ -240,6 +277,9 @@ try {
   }
   $agentSpecs = @($deployment.snapshot.compiledWorkflow.agentSpecs.PSObject.Properties | ForEach-Object { $_.Value })
   if ($agentSpecs.Count -ne 2) { throw "DeploymentSnapshot did not freeze two WorkflowAgentSpecs" }
+  if ($deployment.snapshot.trigger.kind -ne "event_subscription" -or $deployment.snapshot.trigger.triggerId -ne $entryTriggerId) {
+    throw "Deployment did not derive its default Trigger from the entry Agent"
+  }
   $instructions = @($agentSpecs | ForEach-Object { $_.instructions } | Sort-Object -Unique)
   if ($instructions.Count -ne 2) { throw "WorkflowAgentSpecs did not preserve independent instructions" }
   foreach ($agentSpec in $agentSpecs) {
@@ -269,6 +309,9 @@ try {
   if ($run.status -ne "succeeded") {
     throw "Deployed Agent workflow did not succeed: $($run.status) $($run.error)"
   }
+  if ($run.input.request -ne "verify frozen per-node Agent identity" -or $run.ingressTrigger.triggerId -ne $entryTriggerId) {
+    throw "FlowRun did not preserve the raw event payload and actual ingress Trigger"
+  }
   if (@($run.nodeRuns | Where-Object { $_.nodeId -in @("intake", "review") -and $_.status -eq "succeeded" }).Count -ne 2) {
     throw "Both independently frozen Agent nodes did not succeed"
   }
@@ -296,8 +339,12 @@ try {
     deploymentSnapshotHash = $deployment.snapshot.contentHash
     frozenAgentNodes = @($agentSpecs | ForEach-Object { "$($_.nodeId):$($_.templateId)@$($_.templateVersion)" })
     runId = $run.id
+    testRunId = $testRun.id
     runStatus = $run.status
     successfulAgentNodes = @($run.nodeRuns | Where-Object { $_.nodeId -in @("intake", "review") -and $_.status -eq "succeeded" }).Count
+    entryTriggerId = $entryTriggerId
+    rawEventPreserved = $true
+    finalSubscriptionExecuted = $true
     globalAgents = $globalAgents.Count
     globalRuns = $globalRuns.Count
     templates = $templates.Count

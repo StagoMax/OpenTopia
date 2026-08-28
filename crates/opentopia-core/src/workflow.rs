@@ -1,4 +1,4 @@
-//! Immutable workflow compilation and deployment snapshots.
+//! Immutable workflow compilation and active Flow revisions.
 //!
 //! A published Flow definition describes graph intent. This module freezes the
 //! executable identity of every Agent node so a Run never re-resolves mutable
@@ -288,11 +288,13 @@ impl CompiledWorkflowV1 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct DeploymentSnapshotV1 {
+pub struct FlowRevisionV1 {
     pub schema_version: u16,
     pub id: Uuid,
     pub compiled_workflow: CompiledWorkflowV1,
     pub trigger: WorkflowTriggerSpecV1,
+    #[serde(default)]
+    pub ingress_policy: crate::workflow_automation::WorkflowIngressPolicyV1,
     pub output: WorkflowOutputSpecV1,
     #[serde(default)]
     pub output_review_policy: WorkflowOutputReviewPolicyV1,
@@ -301,7 +303,7 @@ pub struct DeploymentSnapshotV1 {
     pub created_by: String,
 }
 
-impl DeploymentSnapshotV1 {
+impl FlowRevisionV1 {
     pub fn new(compiled_workflow: CompiledWorkflowV1, created_by: impl Into<String>) -> Self {
         Self::new_with_io(
             compiled_workflow,
@@ -333,6 +335,24 @@ impl DeploymentSnapshotV1 {
         output_review_policy: WorkflowOutputReviewPolicyV1,
         created_by: impl Into<String>,
     ) -> Self {
+        Self::new_with_ingress_policy(
+            compiled_workflow,
+            trigger,
+            crate::workflow_automation::WorkflowIngressPolicyV1::Immediate,
+            output,
+            output_review_policy,
+            created_by,
+        )
+    }
+
+    pub fn new_with_ingress_policy(
+        compiled_workflow: CompiledWorkflowV1,
+        trigger: WorkflowTriggerSpecV1,
+        ingress_policy: crate::workflow_automation::WorkflowIngressPolicyV1,
+        output: WorkflowOutputSpecV1,
+        output_review_policy: WorkflowOutputReviewPolicyV1,
+        created_by: impl Into<String>,
+    ) -> Self {
         let created_by = created_by.into();
         let id = Uuid::new_v4();
         let created_at = Utc::now();
@@ -340,6 +360,7 @@ impl DeploymentSnapshotV1 {
             id,
             &compiled_workflow,
             &trigger,
+            ingress_policy,
             &output,
             output_review_policy,
             &created_by,
@@ -350,6 +371,7 @@ impl DeploymentSnapshotV1 {
             id,
             compiled_workflow,
             trigger,
+            ingress_policy,
             output,
             output_review_policy,
             content_hash: content_fingerprint(&bytes),
@@ -361,45 +383,46 @@ impl DeploymentSnapshotV1 {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkflowDeploymentStatusV1 {
+pub enum FlowStatusV1 {
     Active,
-    Disabled,
+    Paused,
 }
 
-impl WorkflowDeploymentStatusV1 {
+impl FlowStatusV1 {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Active => "active",
-            Self::Disabled => "disabled",
+            Self::Paused => "paused",
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct WorkflowDeploymentV1 {
+pub struct ActiveFlowV1 {
     pub schema_version: u16,
     pub id: Uuid,
     pub revision: u32,
+    pub flow_id: String,
     pub name: String,
-    pub environment: String,
-    pub status: WorkflowDeploymentStatusV1,
-    pub snapshot: DeploymentSnapshotV1,
+    pub thread_id: Uuid,
+    pub status: FlowStatusV1,
+    pub active_revision: FlowRevisionV1,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub created_by: String,
 }
 
-impl WorkflowDeploymentV1 {
+impl ActiveFlowV1 {
     pub fn new(
         name: impl Into<String>,
-        environment: impl Into<String>,
+        thread_id: Uuid,
         compiled_workflow: CompiledWorkflowV1,
         created_by: impl Into<String>,
     ) -> Result<Self, WorkflowCompileError> {
         Self::new_with_io(
             name,
-            environment,
+            thread_id,
             compiled_workflow,
             WorkflowTriggerSpecV1::Manual,
             WorkflowOutputSpecV1::Inbox,
@@ -409,7 +432,7 @@ impl WorkflowDeploymentV1 {
 
     pub fn new_with_io(
         name: impl Into<String>,
-        environment: impl Into<String>,
+        thread_id: Uuid,
         compiled_workflow: CompiledWorkflowV1,
         trigger: WorkflowTriggerSpecV1,
         output: WorkflowOutputSpecV1,
@@ -417,7 +440,7 @@ impl WorkflowDeploymentV1 {
     ) -> Result<Self, WorkflowCompileError> {
         Self::new_with_options(
             name,
-            environment,
+            thread_id,
             compiled_workflow,
             trigger,
             output,
@@ -428,30 +451,54 @@ impl WorkflowDeploymentV1 {
 
     pub fn new_with_options(
         name: impl Into<String>,
-        environment: impl Into<String>,
+        thread_id: Uuid,
         compiled_workflow: CompiledWorkflowV1,
         trigger: WorkflowTriggerSpecV1,
         output: WorkflowOutputSpecV1,
         output_review_policy: WorkflowOutputReviewPolicyV1,
         created_by: impl Into<String>,
     ) -> Result<Self, WorkflowCompileError> {
+        Self::new_with_ingress_policy(
+            name,
+            thread_id,
+            compiled_workflow,
+            trigger,
+            crate::workflow_automation::WorkflowIngressPolicyV1::Immediate,
+            output,
+            output_review_policy,
+            created_by,
+        )
+    }
+
+    pub fn new_with_ingress_policy(
+        name: impl Into<String>,
+        thread_id: Uuid,
+        compiled_workflow: CompiledWorkflowV1,
+        trigger: WorkflowTriggerSpecV1,
+        ingress_policy: crate::workflow_automation::WorkflowIngressPolicyV1,
+        output: WorkflowOutputSpecV1,
+        output_review_policy: WorkflowOutputReviewPolicyV1,
+        created_by: impl Into<String>,
+    ) -> Result<Self, WorkflowCompileError> {
         let name = name.into().trim().to_string();
-        let environment = environment.into().trim().to_string();
         let created_by = created_by.into().trim().to_string();
-        if name.is_empty() || environment.is_empty() || created_by.is_empty() {
-            return Err(WorkflowCompileError::InvalidDeploymentIdentity);
+        if name.is_empty() || created_by.is_empty() {
+            return Err(WorkflowCompileError::InvalidFlowIdentity);
         }
+        let flow_id = compiled_workflow.flow_id.clone();
         let now = Utc::now();
         Ok(Self {
             schema_version: ENTERPRISE_SCHEMA_VERSION_V1,
             id: Uuid::new_v4(),
             revision: 1,
+            flow_id,
             name,
-            environment,
-            status: WorkflowDeploymentStatusV1::Active,
-            snapshot: DeploymentSnapshotV1::new_with_options(
+            thread_id,
+            status: FlowStatusV1::Active,
+            active_revision: FlowRevisionV1::new_with_ingress_policy(
                 compiled_workflow,
                 trigger,
+                ingress_policy,
                 output,
                 output_review_policy,
                 created_by.clone(),
@@ -462,10 +509,53 @@ impl WorkflowDeploymentV1 {
         })
     }
 
-    pub fn disable(&mut self) {
-        self.status = WorkflowDeploymentStatusV1::Disabled;
+    pub fn pause(&mut self) {
+        self.status = FlowStatusV1::Paused;
         self.revision = self.revision.saturating_add(1);
         self.updated_at = Utc::now();
+    }
+
+    pub fn resume(&mut self) {
+        self.status = FlowStatusV1::Active;
+        self.touch();
+    }
+
+    pub fn touch(&mut self) {
+        self.revision = self.revision.saturating_add(1);
+        self.updated_at = Utc::now();
+    }
+
+    pub fn apply_revision(
+        &mut self,
+        name: impl Into<String>,
+        compiled_workflow: CompiledWorkflowV1,
+        trigger: WorkflowTriggerSpecV1,
+        ingress_policy: crate::workflow_automation::WorkflowIngressPolicyV1,
+        output: WorkflowOutputSpecV1,
+        output_review_policy: WorkflowOutputReviewPolicyV1,
+        applied_by: impl Into<String>,
+    ) -> Result<(), WorkflowCompileError> {
+        if compiled_workflow.flow_id != self.flow_id {
+            return Err(WorkflowCompileError::FlowRevisionIdentityMismatch);
+        }
+        let name = name.into().trim().to_string();
+        let applied_by = applied_by.into().trim().to_string();
+        if name.is_empty() || applied_by.is_empty() {
+            return Err(WorkflowCompileError::InvalidFlowIdentity);
+        }
+        self.name = name;
+        self.active_revision = FlowRevisionV1::new_with_ingress_policy(
+            compiled_workflow,
+            trigger,
+            ingress_policy,
+            output,
+            output_review_policy,
+            applied_by,
+        );
+        self.status = FlowStatusV1::Active;
+        self.revision = self.revision.saturating_add(1);
+        self.updated_at = Utc::now();
+        Ok(())
     }
 }
 
@@ -491,7 +581,7 @@ pub enum WorkflowCompileError {
         template_id: String,
         template_version: u32,
     },
-    #[error("Agent node {node_id} uses legacy MCP grants; migrate {template_id}@{template_version} to structured Connection operations before deployment")]
+    #[error("Agent node {node_id} uses legacy MCP grants; migrate {template_id}@{template_version} to structured Connection operations before Flow activation")]
     LegacyMcpAgentTemplate {
         node_id: String,
         template_id: String,
@@ -513,8 +603,10 @@ pub enum WorkflowCompileError {
     AgentSpecIdentityMismatch { node_id: String },
     #[error("Connection operation alias resolves to different routes: {model_tool_name}")]
     OperationAliasConflict { model_tool_name: String },
-    #[error("deployment name, environment, and createdBy are required")]
-    InvalidDeploymentIdentity,
+    #[error("Flow name and createdBy are required")]
+    InvalidFlowIdentity,
+    #[error("a Flow revision cannot change its Flow identity")]
+    FlowRevisionIdentityMismatch,
 }
 
 fn compiled_workflow_hash(

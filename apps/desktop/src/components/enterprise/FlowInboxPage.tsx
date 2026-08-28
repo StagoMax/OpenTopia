@@ -1,12 +1,15 @@
 import { Clock3, Play, RadioTower, RefreshCw } from "lucide-react";
+import { useState } from "react";
 import type { ApiClient } from "../../api/client";
 import { HumanTaskInboxPanel } from "../HumanTaskInboxPanel";
 import { Badge, Button, IconButton, Panel } from "../ui";
-import { useWorkflowAutomationStore } from "./automation/store";
+import { useEnterpriseStore } from "./store";
 
 export function FlowInboxPage({ client }: { client: ApiClient }) {
-  const { snapshot, store } = useWorkflowAutomationStore(client);
-  const pending = snapshot.invocations.filter(
+  const { snapshot, store } = useEnterpriseStore(client);
+  const [busyCaseId, setBusyCaseId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const pending = snapshot.cases.filter(
     (item) => item.status === "accepted" && !item.flowRunId,
   );
 
@@ -17,7 +20,7 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
         actions={
           <IconButton
             aria-label="刷新待确认事件"
-            disabled={Boolean(snapshot.busyAction)}
+            disabled={Boolean(busyCaseId)}
             onClick={() => void store.load(true)}
             size="compact"
           >
@@ -27,45 +30,57 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
       >
         <p className="enterprise-page__lede">
           事件已经通过入口认证和幂等检查，但尚未创建 Flow
-          Run。确认后将使用事件接收时固定的 Deployment 启动运行。
+          Run。确认后将使用事件接收时冻结的 Flow Revision 启动运行。
         </p>
-        {snapshot.error || snapshot.notice ? (
+        {snapshot.error || actionError ? (
           <p
-            className={`enterprise-page__message${snapshot.error ? " is-error" : " is-success"}`}
-            role={snapshot.error ? "alert" : "status"}
+            className="enterprise-page__message is-error"
+            role="alert"
           >
-            {snapshot.error ?? snapshot.notice}
+            {snapshot.error ?? actionError}
           </p>
         ) : null}
         <ol className="enterprise-pending-events">
-          {pending.map((invocation) => {
-            const release = snapshot.releases.find(
-              (item) => item.id === invocation.releaseId,
+          {pending.map((flowCase) => {
+            const flow = snapshot.flows.find(
+              (item) => item.flowId === flowCase.flowId,
             );
-            const busy = snapshot.busyAction === `start:${invocation.id}`;
+            const busy = busyCaseId === flowCase.id;
             return (
-              <li key={invocation.id}>
+              <li key={flowCase.id}>
                 <span className="enterprise-pending-events__icon">
                   <RadioTower aria-hidden="true" size={16} />
                 </span>
                 <span className="enterprise-pending-events__content">
                   <span>
-                    <strong>{release?.releaseKey ?? "Workflow event"}</strong>
+                    <strong>{flow?.name ?? flowCase.flowId}</strong>
                     <Badge variant="warning">waiting review</Badge>
                   </span>
                   <small>
                     <Clock3 aria-hidden="true" size={13} />
-                    {new Date(invocation.createdAt).toLocaleString()} ·{" "}
-                    {invocation.idempotencyKey}
+                    {new Date(flowCase.createdAt).toLocaleString()} ·{" "}
+                    {flowCase.idempotencyKey}
                   </small>
                   <details>
                     <summary>查看事件输入</summary>
-                    <pre>{JSON.stringify(invocation.input, null, 2)}</pre>
+                    <pre>{JSON.stringify(flowCase.input, null, 2)}</pre>
                   </details>
                 </span>
                 <Button
-                  disabled={Boolean(snapshot.busyAction)}
-                  onClick={() => void store.startPending(invocation)}
+                  disabled={Boolean(busyCaseId)}
+                  onClick={() => {
+                    setBusyCaseId(flowCase.id);
+                    setActionError(null);
+                    void client
+                      .startPendingFlowCase(flowCase.id)
+                      .then(() => store.load(true))
+                      .catch((error: unknown) =>
+                        setActionError(
+                          error instanceof Error ? error.message : String(error),
+                        ),
+                      )
+                      .finally(() => setBusyCaseId(null));
+                  }}
                   size="compact"
                   variant="primary"
                 >

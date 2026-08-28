@@ -1,4 +1,9 @@
 import type { AgentTemplateVersionView, FlowSpec } from "../../types";
+import {
+  activationAgentFinalNodeIds,
+  activationHasIngress,
+  type WorkflowAgentSelection,
+} from "./flowActivation.ts";
 import type { EnterpriseSnapshot } from "./store";
 
 export type TrustSignal = {
@@ -84,7 +89,7 @@ export function trustSignals(snapshot: EnterpriseSnapshot): TrustSignal[] {
       id: "draft-templates",
       level: "attention",
       title: `${draftTemplates} 个 Agent 模板版本尚未发布`,
-      detail: "只有发布且固定 content hash 的版本能进入 DeploymentSnapshot。",
+      detail: "只有已发布且固定 content hash 的 Agent 版本能进入 Flow Revision。",
     });
   }
   return signals;
@@ -99,21 +104,25 @@ export function guidedWorkflowSpec(input: {
   name: string;
   owner: string;
   outcome: string;
-  templates: AgentTemplateVersionView[];
+  agents: Array<{
+    selection: WorkflowAgentSelection;
+    template: AgentTemplateVersionView;
+  }>;
   requireApproval: boolean;
 }): FlowSpec {
   const objectSchema = { type: "object" };
   const approvalId = "review";
   const outputId = "output";
-  const agentIds = input.templates.map((_, index) => `agent-${index + 1}`);
-  const nodes: FlowSpec["graph"]["nodes"] = input.templates.map(
-    (template, index) => ({
-      id: agentIds[index]!,
+  const agentIds = input.agents.map((agent) => agent.selection.id);
+  const nodes: FlowSpec["graph"]["nodes"] = input.agents.map(
+    ({ selection, template }) => ({
+      id: selection.id,
       label: template.template.name,
       kind: "agent",
       config: {
         reference: template.template.templateId,
         templateVersion: template.template.version,
+        activation: selection.activation,
       },
       inputSchema: objectSchema,
       outputSchema: objectSchema,
@@ -137,9 +146,51 @@ export function guidedWorkflowSpec(input: {
     inputSchema: objectSchema,
     outputSchema: objectSchema,
   });
-  const path = input.requireApproval
-    ? [...agentIds, approvalId, outputId]
-    : [...agentIds, outputId];
+  const subscriptionEdges = input.agents.flatMap(({ selection }) =>
+    activationAgentFinalNodeIds(selection.activation).map((from) => ({
+      from,
+      to: selection.id,
+      condition: null,
+      allowedFields: [],
+      dataClassification: "internal" as const,
+      onError: null,
+      loopPolicy: null,
+    })),
+  );
+  const sourceIds = new Set(subscriptionEdges.map((edge) => edge.from));
+  const terminalAgentIds = agentIds.filter((id) => !sourceIds.has(id));
+  const terminalIds = terminalAgentIds.length
+    ? terminalAgentIds
+    : agentIds.slice(-1);
+  const terminalTarget = input.requireApproval ? approvalId : outputId;
+  const terminalEdges = terminalIds.map((from) => ({
+    from,
+    to: terminalTarget,
+    condition: null,
+    allowedFields: [],
+    dataClassification: "internal" as const,
+    onError: null,
+    loopPolicy: null,
+  }));
+  const controlEdges = input.requireApproval
+    ? [
+        {
+          from: approvalId,
+          to: outputId,
+          condition: null,
+          allowedFields: [],
+          dataClassification: "internal" as const,
+          onError: null,
+          loopPolicy: null,
+        },
+      ]
+    : [];
+  const entryNodeId =
+    input.agents.find(({ selection }) =>
+      activationHasIngress(selection.activation),
+    )?.selection.id ??
+    agentIds[0] ??
+    outputId;
   return {
     flowId: input.flowId,
     name: input.name,
@@ -151,17 +202,9 @@ export function guidedWorkflowSpec(input: {
     outputSchema: objectSchema,
     graph: {
       schemaVersion: 1,
-      entryNodeId: agentIds[0] ?? outputId,
+      entryNodeId,
       nodes,
-      edges: path.slice(0, -1).map((from, index) => ({
-        from,
-        to: path[index + 1]!,
-        condition: null,
-        allowedFields: [],
-        dataClassification: "internal",
-        onError: null,
-        loopPolicy: null,
-      })),
+      edges: [...subscriptionEdges, ...terminalEdges, ...controlEdges],
     },
     requestedCapabilities: {
       allowAllTools: false,

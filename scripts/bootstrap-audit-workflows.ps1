@@ -6,8 +6,11 @@ param(
   [string]$CreditProject = "",
   [string]$Owner = "audit-platform-admin",
   [string]$Approver = "audit-risk-approver",
-  [string]$Environment = "local",
+  [string]$ProviderConnectionId = "custom-provider-3",
+  [string]$ModelId = "gpt-5.6-terra",
+  [string]$ReasoningEffort = "medium",
   [switch]$SkipSeedEvents,
+  [string]$TestQueuedCaseId = "",
   [switch]$ValidateDataOnly
 )
 
@@ -36,7 +39,7 @@ $creditNamespace = "opentopia.audit.credit-review.v1"
 
 function Invoke-TopiaApi {
   param(
-    [Parameter(Mandatory = $true)][ValidateSet("GET", "POST", "PATCH")][string]$Method,
+    [Parameter(Mandatory = $true)][ValidateSet("GET", "POST", "PUT", "PATCH")][string]$Method,
     [Parameter(Mandatory = $true)][string]$Path,
     [object]$Body = $null,
     [int]$TimeoutSec = 300
@@ -51,7 +54,13 @@ function Invoke-TopiaApi {
     $parameters.ContentType = "application/json; charset=utf-8"
     $parameters.Body = $Body | ConvertTo-Json -Depth 100 -Compress
   }
-  Invoke-RestMethod @parameters
+  try {
+    Invoke-RestMethod @parameters
+  }
+  catch {
+    $detail = [string]$_.ErrorDetails.Message
+    throw "$Method $Path failed: $($_.Exception.Message) $detail"
+  }
 }
 
 function Expand-TopiaItems {
@@ -74,7 +83,7 @@ function Wait-FlowRunStatus {
 
 function Resolve-FlowReviewTask {
   param([object]$Run, [string]$TaskType, [string]$IdempotencyKey)
-  $task = @(Invoke-TopiaApi GET "/api/human-tasks?status=pending&flowRunId=$($Run.id)") |
+  $task = @(Expand-TopiaItems (Invoke-TopiaApi GET "/api/human-tasks?status=pending&flowRunId=$($Run.id)")) |
     Where-Object { $_.taskType -eq $TaskType } |
     Select-Object -First 1
   if (-not $task) { throw "Flow Run $($Run.id) is missing $TaskType HumanTask" }
@@ -361,7 +370,7 @@ function Get-WorkInjuryDemoEvents {
     $expenseLines = @($case.expense_lines)
     $expenseTotal = ($expenseLines | Measure-Object -Property amount -Sum).Sum
     [ordered]@{
-      idempotencyKey = "demo-event:work-injury:${caseId}:v1"
+      idempotencyKey = "demo-event:work-injury:${caseId}:node-trigger-v2"
       caseId = $caseId
       payload = [ordered]@{
         caseId = $caseId
@@ -394,7 +403,7 @@ function Get-CreditDemoEvents {
     $application = @($documents | Where-Object { $_.document_type -eq "loan_application" } | Select-Object -First 1)
     $applicationFields = if ($application.Count -gt 0) { $application[0].fields } else { $null }
     [ordered]@{
-      idempotencyKey = "demo-event:credit-review:${caseId}:v1"
+      idempotencyKey = "demo-event:credit-review:${caseId}:node-trigger-v2"
       caseId = $caseId
       payload = [ordered]@{
         caseId = $caseId
@@ -415,32 +424,31 @@ function Get-CreditDemoEvents {
 
 function Seed-DemoEvents {
   param(
-    [Parameter(Mandatory = $true)][object]$Release,
-    [Parameter(Mandatory = $true)][object]$Deployment,
+    [Parameter(Mandatory = $true)][object]$Flow,
     [Parameter(Mandatory = $true)][object[]]$Events
   )
   $caseIds = @($Events | ForEach-Object { [string]$_.caseId })
   if (($caseIds | Sort-Object -Unique).Count -ne $caseIds.Count) {
-    throw "Demo event case IDs must be unique for Release $($Release.id)"
+    throw "Demo event case IDs must be unique for Flow $($Flow.flowId)"
   }
   $idempotencyKeys = @($Events | ForEach-Object { [string]$_.idempotencyKey })
   if (($idempotencyKeys | Sort-Object -Unique).Count -ne $idempotencyKeys.Count) {
-    throw "Demo event idempotency keys must be unique for Release $($Release.id)"
+    throw "Demo event idempotency keys must be unique for Flow $($Flow.flowId)"
   }
   $seeded = foreach ($event in $Events) {
-    $result = Invoke-TopiaApi POST "/api/workflow-releases/$($Release.id)/invoke" @{
+    $result = Invoke-TopiaApi POST "/api/flows/$([Uri]::EscapeDataString($Flow.flowId))/invoke" @{
       idempotencyKey = [string]$event.idempotencyKey
       input = $event.payload
     }
-    if ($result.invocation.releaseId -ne $Release.id -or $result.invocation.deploymentId -ne $Deployment.id) {
-      throw "Demo event '$($event.caseId)' was routed outside its target Release or Deployment"
+    if ($result.case.flowId -ne $Flow.flowId -or $result.case.flowRevisionId -ne $Flow.activeRevision.id) {
+      throw "Demo event '$($event.caseId)' was routed outside its target Flow Revision"
     }
-    if ($result.invocation.status -ne "accepted" -or $result.invocation.flowRunId -or $result.run) {
+    if ($result.case.status -ne "accepted" -or $result.case.flowRunId -or $result.run) {
       throw "Demo event '$($event.caseId)' did not remain pending for human trigger review"
     }
     [ordered]@{
       caseId = [string]$event.caseId
-      invocationId = [string]$result.invocation.id
+      caseIdRecord = [string]$result.case.id
       reused = [bool]$result.reused
     }
   }
@@ -448,6 +456,55 @@ function Seed-DemoEvents {
     requested = $Events.Count
     accepted = @($seeded).Count
     events = @($seeded)
+  }
+}
+
+function Test-QueuedAuditCase {
+  param(
+    [Parameter(Mandatory = $true)][object[]]$Flows,
+    [Parameter(Mandatory = $true)][string]$CaseId
+  )
+  $matches = @(
+    foreach ($flow in $Flows) {
+      foreach ($event in @($flow.demoEventBatch.events)) {
+        if ([string]$event.caseId -eq $CaseId) {
+          [ordered]@{ flow = $flow; event = $event }
+        }
+      }
+    }
+  )
+  if ($matches.Count -ne 1) {
+    throw "Expected exactly one queued Demo event for case '$CaseId', found $($matches.Count)"
+  }
+  $match = $matches[0]
+  $started = Invoke-TopiaApi POST "/api/flow-cases/$($match.event.caseIdRecord)/start" @{}
+  if ($started.case.status -ne "started" -or -not $started.run.id) {
+    throw "Queued Demo event '$CaseId' did not start"
+  }
+  $run = Wait-FlowRunStatus $started.run.id @("waiting_approval", "waiting_human", "succeeded", "failed", "cancelled")
+  if ($run.status -eq "waiting_approval") {
+    Resolve-FlowReviewTask $run "approval" "migration-case-approval-$($run.id)"
+    $run = Wait-FlowRunStatus $run.id @("waiting_human", "succeeded", "failed", "cancelled")
+  }
+  if ($run.status -eq "waiting_human") {
+    Resolve-FlowReviewTask $run "output_review" "migration-case-output-$($run.id)"
+    $run = Wait-FlowRunStatus $run.id @("succeeded", "failed", "cancelled")
+  }
+  if ($run.status -ne "succeeded") {
+    throw "Queued Demo event '$CaseId' failed: $($run.status) $($run.error)"
+  }
+  $agentNodes = @($run.nodeRuns | Where-Object { $_.nodeId -in @("domain_audit", "sag_evidence", "review_report") })
+  if ($agentNodes.Count -ne 3 -or @($agentNodes | Where-Object { $_.status -ne "succeeded" }).Count -gt 0) {
+    throw "Queued Demo event '$CaseId' did not complete all three Agent nodes"
+  }
+  [ordered]@{
+    caseId = $CaseId
+    flowCaseId = [string]$started.case.id
+    flowRunId = [string]$run.id
+    flowRevisionId = [string]$run.flowRevisionId
+    status = [string]$run.status
+    agentNodes = @($agentNodes | ForEach-Object { [ordered]@{ nodeId = [string]$_.nodeId; status = [string]$_.status; toolCalls = [int]$_.toolCalls } })
+    output = $run.output
   }
 }
 
@@ -468,6 +525,16 @@ function New-AuditFlow {
     workspaceRoot = $repoRoot
     experienceMode = "flow"
   }
+  $thread = Invoke-TopiaApi PUT "/api/threads/$($thread.id)/model" @{
+    selection = @{
+      connectionId = $ProviderConnectionId
+      modelId = $ModelId
+      reasoningEffort = $ReasoningEffort
+    }
+  }
+  if ($thread.modelSelection.connectionId -ne $ProviderConnectionId -or $thread.modelSelection.modelId -ne $ModelId) {
+    throw "Flow thread was not pinned to $ProviderConnectionId / $ModelId"
+  }
   $inputSchema = @{
     type = "object"
     required = @("caseId")
@@ -481,26 +548,51 @@ function New-AuditFlow {
     additionalProperties = $false
   }
   $objectSchema = @{ type = "object" }
+  # The ingress Trigger belongs to the entry Agent and is frozen into the Flow
+  # definition before validation, Test Run, or Flow activation.
+  $triggerId = [guid]::NewGuid().ToString()
+  $eventActivation = @{
+    expression = @{
+      operator = "source"
+      source = @{
+        kind = "event_subscription"
+        triggerId = $triggerId
+        source = $EventSource
+        eventType = $EventType
+      }
+    }
+    ingressPolicy = "require_review"
+  }
+  $domainFinalActivation = @{
+    expression = @{
+      operator = "source"
+      source = @{ kind = "agent_final"; nodeId = "domain_audit" }
+    }
+    ingressPolicy = "immediate"
+  }
   $node = {
-    param($Id, $Label, $Template, $Instructions)
+    param($Id, $Label, $Template, $Instructions, $Activation = $null)
+    $config = @{
+      reference = $Template.templateId
+      templateVersion = $Template.version
+      instructions = $Instructions
+    }
+    if ($null -ne $Activation) { $config.activation = $Activation }
     @{
       id = $Id
       label = $Label
       kind = "agent"
-      config = @{
-        reference = $Template.templateId
-        templateVersion = $Template.version
-        instructions = $Instructions
-      }
+      config = $config
       inputSchema = $objectSchema
       outputSchema = $objectSchema
     }
   }
   $nodes = @(
-    (& $node "domain_audit" "Structured audit" $DomainTemplate "Call the approved external-SAG domain audit tool. Never call legacy RAG tools. Preserve caseId, runId, rule findings, evidence IDs, and policy search queries."),
-    (& $node "sag_evidence" "SAG policy evidence" $EvidenceTemplate "Call library_search for every policy query from the previous node. Use only the template-frozen namespace and return title, sourcePath, eventId/evidenceId, and a concise excerpt."),
+    (& $node "domain_audit" "Structured audit" $DomainTemplate "Use @Flow.input as the immutable case event and @Trigger.input as this Agent's activation payload. Call the approved external-SAG domain audit tool. Never call legacy RAG tools. Preserve caseId, runId, rule findings, evidence IDs, and policy search queries." $eventActivation),
+    (& $node "sag_evidence" "SAG policy evidence" $EvidenceTemplate "This Agent is triggered by the domain_audit Agent Final notification. Process the domain_audit product available in @Trigger.input while retaining the original case at @Flow.input. Call library_search for every policy query. Use only the template-frozen namespace and return title, sourcePath, eventId/evidenceId, and a concise excerpt." $domainFinalActivation),
     @{ id = "evidence_validator"; label = "Evidence completeness check"; kind = "validator"; config = @{}; inputSchema = $objectSchema; outputSchema = $objectSchema },
     @{ id = "review_gate"; label = "Human review gate"; kind = "approval"; config = @{}; inputSchema = $objectSchema; outputSchema = $objectSchema },
+    @{ id = "review_context"; label = "Assemble review context"; kind = "join"; config = @{}; inputSchema = $objectSchema; outputSchema = $objectSchema },
     (& $node "review_report" "Review report" $ReportTemplate "Merge structured facts, rule findings, and SAG citations into a JSON review draft. This is human review assistance, never an automatic approval, denial, payment, or lending decision."),
     @{ id = "output"; label = "Output pending human review"; kind = "output"; config = @{}; inputSchema = $objectSchema; outputSchema = $objectSchema }
   )
@@ -508,7 +600,11 @@ function New-AuditFlow {
     @{ from = "domain_audit"; to = "sag_evidence"; allowedFields = @(); dataClassification = "confidential" },
     @{ from = "sag_evidence"; to = "evidence_validator"; allowedFields = @(); dataClassification = "confidential" },
     @{ from = "evidence_validator"; to = "review_gate"; allowedFields = @(); dataClassification = "confidential" },
-    @{ from = "review_gate"; to = "review_report"; allowedFields = @(); dataClassification = "confidential" },
+    @{ from = "domain_audit"; to = "review_context"; allowedFields = @(); dataClassification = "confidential" },
+    @{ from = "sag_evidence"; to = "review_context"; allowedFields = @(); dataClassification = "confidential" },
+    @{ from = "evidence_validator"; to = "review_context"; allowedFields = @(); dataClassification = "confidential" },
+    @{ from = "review_gate"; to = "review_context"; allowedFields = @(); dataClassification = "confidential" },
+    @{ from = "review_context"; to = "review_report"; allowedFields = @(); dataClassification = "confidential" },
     @{ from = "review_report"; to = "output"; allowedFields = @(); dataClassification = "confidential" }
   )
   $spec = @{
@@ -549,41 +645,29 @@ function New-AuditFlow {
   if ($testRun.status -ne "succeeded") {
     throw "Flow Test Run failed for ${FlowId}: $($testRun.status) $($testRun.error)"
   }
-  $definition = Invoke-TopiaApi POST "/api/flow-drafts/$($draft.draft.id)/publish" @{ publishedBy = $Approver }
-  $deployment = Invoke-TopiaApi POST "/api/workflow-deployments" @{
-    flowId = $definition.flowId
-    flowVersion = $definition.version
-    name = "$Name - $Environment"
-    environment = $Environment
-    createdBy = $Owner
+  $existing = @(Expand-TopiaItems (Invoke-TopiaApi GET "/api/flows?query=$([Uri]::EscapeDataString($FlowId))")) |
+    Where-Object { $_.flowId -eq $FlowId } |
+    Select-Object -First 1
+  $activation = @{
+    activatedBy = $Approver
     outputReviewPolicy = "always_review_output"
     output = @{ kind = "inbox" }
   }
-  $release = Invoke-TopiaApi POST "/api/workflow-releases" @{
-    releaseKey = "$FlowId-$($deployment.id.ToString().Substring(0, 8))"
-    environment = $Environment
-    threadId = $thread.id
-    deploymentId = $deployment.id
-    trigger = @{
-      kind = "event_subscription"
-      triggerId = [guid]::NewGuid().ToString()
-      source = $EventSource
-      eventType = $EventType
-    }
-    ingressPolicy = "require_review"
-    createdBy = $Owner
+  if ($existing) { $activation.expectedFlowRevision = [int]$existing.revision }
+  $flow = Invoke-TopiaApi POST "/api/flow-drafts/$($draft.draft.id)/activate" $activation
+  if ($flow.activeRevision.trigger.triggerId -ne $triggerId -or $flow.activeRevision.ingressPolicy -ne "require_review") {
+    throw "Flow did not inherit the entry Agent Trigger and review policy"
   }
   $seed = [ordered]@{ requested = 0; accepted = 0; events = @() }
   if (-not $SkipSeedEvents) {
-    $seed = Seed-DemoEvents -Release $release -Deployment $deployment -Events $DemoEvents
+    $seed = Seed-DemoEvents -Flow $flow -Events $DemoEvents
   }
   @{
     threadId = $thread.id
-    flowId = $definition.flowId
-    flowVersion = $definition.version
-    deploymentId = $deployment.id
-    releaseId = $release.id
-    ingressPolicy = $release.ingressPolicy
+    flowId = $flow.flowId
+    flowRevisionId = $flow.activeRevision.id
+    flowVersion = $flow.activeRevision.compiledWorkflow.flowVersion
+    ingressPolicy = $flow.activeRevision.ingressPolicy
     demoEventBatch = $seed
   }
 }
@@ -719,6 +803,12 @@ $creditFlow = New-AuditFlow `
   -TestCaseId "case_income_mismatch" `
   -DemoEvents $creditDemoEvents
 
+$caseTest = $null
+if ($TestQueuedCaseId) {
+  if ($SkipSeedEvents) { throw "-TestQueuedCaseId requires seeded Demo events" }
+  $caseTest = Test-QueuedAuditCase -Flows @($workFlow, $creditFlow) -CaseId $TestQueuedCaseId
+}
+
 [ordered]@{
   configuredAt = [DateTime]::UtcNow.ToString("o")
   knowledgeLibraries = @($workKnowledge, $creditKnowledge)
@@ -740,5 +830,6 @@ $creditFlow = New-AuditFlow `
     "$($creditEvidence.templateId)@$($creditEvidence.version)",
     "$($creditReport.templateId)@$($creditReport.version)"
   )
-  workflows = @($workFlow, $creditFlow)
+  flows = @($workFlow, $creditFlow)
+  testedQueuedCase = $caseTest
 } | ConvertTo-Json -Depth 100

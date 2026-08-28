@@ -1,6 +1,82 @@
 /* eslint-disable */
 // Generated from the Rust DTO schema. Run `pnpm contracts:generate`; do not edit.
 
+/**
+ * Frozen authority for external Connection operations.
+ *
+ * This discriminator is independent from collaboration snapshots because the same immutable authority is also owned by persisted Flow runs. In particular, `structured { operations: [] }` is an explicit empty grant and must never fall back to mutable legacy thread MCP bindings.
+ */
+export type RuntimeConnectionAuthorityV1 =
+  | {
+      mode: "deny_all";
+      [k: string]: unknown;
+    }
+  | {
+      mode: "legacy_mcp";
+      [k: string]: unknown;
+    }
+  | {
+      mode: "structured";
+      operations?: ExecutionConnectionOperationV1[];
+      [k: string]: unknown;
+    };
+export type ResourceKind = "file" | "network" | "database";
+export type DataClassification = "public" | "internal" | "confidential" | "restricted";
+export type AgentRiskClassV1 = "low" | "medium" | "high" | "critical";
+export type LoopExhaustionActionV1 = "require_human" | "return_partial" | "fail";
+export type GraphNodeKindV1 =
+  "agent" | "skill" | "tool" | "condition" | "validator" | "approval" | "join" | "loop" | "output";
+export type WorkflowIngressPolicyV1 = "immediate" | "require_review";
+export type WorkflowOutputSpecV1 =
+  | {
+      kind: "inbox";
+      [k: string]: unknown;
+    }
+  | {
+      credentialRef?: string | null;
+      endpoint: string;
+      kind: "webhook";
+      [k: string]: unknown;
+    }
+  | {
+      kind: "connection_operation";
+      operation: ExecutionConnectionOperationV1;
+      [k: string]: unknown;
+    }
+  | {
+      assignedTo?: string | null;
+      description: string;
+      kind: "human_task";
+      title: string;
+      [k: string]: unknown;
+    };
+export type WorkflowOutputReviewPolicyV1 = "explicit_nodes_only" | "always_review_output";
+export type WorkflowTriggerSpecV1 =
+  | {
+      kind: "manual";
+      [k: string]: unknown;
+    }
+  | {
+      kind: "webhook";
+      tokenRef: string;
+      triggerId: string;
+      [k: string]: unknown;
+    }
+  | {
+      intervalSeconds: number;
+      kind: "schedule";
+      nextFireAt: string;
+      triggerId: string;
+      [k: string]: unknown;
+    }
+  | {
+      eventType: string;
+      kind: "event_subscription";
+      source: string;
+      triggerId: string;
+      [k: string]: unknown;
+    };
+export type FlowStatusV1 = "active" | "paused";
 export type WorkspaceDiffScope = "staged" | "unstaged";
 export type HumanTaskActionV1 =
   "approve" | "reject" | "retry" | "resume" | "submit" | "reconnect" | "acknowledge" | "cancel";
@@ -17,8 +93,6 @@ export type HumanTaskTypeV1 =
   | "manual";
 export type BrowserRuntimeRoute = "managed" | "chrome";
 export type ExperienceMode = "work" | "code" | "flow";
-export type ResourceKind = "file" | "network" | "database";
-export type DataClassification = "public" | "internal" | "confidential" | "restricted";
 export type AgentInstanceStatusV1 = "active" | "suspended" | "completed" | "revoked";
 export type WorkflowInterruptKindV1 =
   "approval" | "input_request" | "external_action" | "effect_reconciliation" | "resume_retry";
@@ -43,78 +117,6 @@ export type FlowResumeSignalV1 =
       [k: string]: unknown;
     };
 export type WorkflowCheckpointStatusV1 = "running" | "committed" | "failed" | "cancelled";
-/**
- * Frozen authority for external Connection operations.
- *
- * This discriminator is independent from collaboration snapshots because the same immutable authority is also owned by persisted Flow runs. In particular, `structured { operations: [] }` is an explicit empty grant and must never fall back to mutable legacy thread MCP bindings.
- */
-export type RuntimeConnectionAuthorityV1 =
-  | {
-      mode: "deny_all";
-      [k: string]: unknown;
-    }
-  | {
-      mode: "legacy_mcp";
-      [k: string]: unknown;
-    }
-  | {
-      mode: "structured";
-      operations?: ExecutionConnectionOperationV1[];
-      [k: string]: unknown;
-    };
-export type AgentRiskClassV1 = "low" | "medium" | "high" | "critical";
-export type LoopExhaustionActionV1 = "require_human" | "return_partial" | "fail";
-export type GraphNodeKindV1 =
-  "agent" | "skill" | "tool" | "condition" | "validator" | "approval" | "join" | "loop" | "output";
-export type WorkflowOutputSpecV1 =
-  | {
-      kind: "inbox";
-      [k: string]: unknown;
-    }
-  | {
-      credential_ref?: string | null;
-      endpoint: string;
-      kind: "webhook";
-      [k: string]: unknown;
-    }
-  | {
-      kind: "connection_operation";
-      operation: ExecutionConnectionOperationV1;
-      [k: string]: unknown;
-    }
-  | {
-      assigned_to?: string | null;
-      description: string;
-      kind: "human_task";
-      title: string;
-      [k: string]: unknown;
-    };
-export type WorkflowOutputReviewPolicyV1 = "explicit_nodes_only" | "always_review_output";
-export type WorkflowTriggerSpecV1 =
-  | {
-      kind: "manual";
-      [k: string]: unknown;
-    }
-  | {
-      kind: "webhook";
-      token_ref: string;
-      trigger_id: string;
-      [k: string]: unknown;
-    }
-  | {
-      interval_seconds: number;
-      kind: "schedule";
-      next_fire_at: string;
-      trigger_id: string;
-      [k: string]: unknown;
-    }
-  | {
-      event_type: string;
-      kind: "event_subscription";
-      source: string;
-      trigger_id: string;
-      [k: string]: unknown;
-    };
 export type FlowNodeRunStatusV1 =
   | "running"
   | "waiting_approval"
@@ -138,18 +140,6 @@ export type FlowRunStatusV1 =
 export type ContextFactStatus = "active" | "resolved" | "superseded";
 export type ContextCheckpointMode =
   "legacy_text" | "manual" | "structured_local" | "native_provider";
-export type CapabilityChangeKindV1 = "added" | "removed" | "expanded" | "reduced";
-export type AgentTemplateStatusV1 = "draft" | "published";
-export type ConnectionAuthVerificationV1 =
-  "not_required" | "unverified" | "legacy_unverified" | "verified";
-export type ConnectionOwnerTypeV1 = "personal" | "org_shared" | "service_account";
-export type ConnectionRuntimeBindingV1 = {
-  kind: "mcp_server";
-  serverId: string;
-  [k: string]: unknown;
-};
-export type ConnectionStatusV1 =
-  "configured" | "ready" | "degraded" | "reauth_required" | "disabled";
 export type FlowValidationSeverityV1 = "error" | "warning";
 export type FlowSourceV1 =
   | {
@@ -166,14 +156,23 @@ export type FlowSourceV1 =
 export type FlowDraftStatusV1 =
   "drafting" | "reviewing" | "validating" | "ready_to_publish" | "published";
 export type FlowTrialStatusV1 = "passed" | "failed";
+export type CapabilityChangeKindV1 = "added" | "removed" | "expanded" | "reduced";
+export type AgentTemplateStatusV1 = "draft" | "published";
+export type ConnectionAuthVerificationV1 =
+  "not_required" | "unverified" | "legacy_unverified" | "verified";
+export type ConnectionOwnerTypeV1 = "personal" | "org_shared" | "service_account";
+export type ConnectionRuntimeBindingV1 = {
+  kind: "mcp_server";
+  serverId: string;
+  [k: string]: unknown;
+};
+export type ConnectionStatusV1 =
+  "configured" | "ready" | "degraded" | "reauth_required" | "disabled";
 export type IntegrationAuthSchemeV1 = "none" | "api_key" | "oauth2" | "external";
 export type CapabilityDiscoveryKindV1 = "mcp_tools_list" | "static";
 export type IntegrationKindV1 = "mcp" | "oauth_api" | "database" | "local_app";
 export type McpLifecycleStatus = "not_started" | "starting" | "ready" | "error" | "disabled";
-export type WorkflowDeploymentStatusV1 = "active" | "disabled";
-export type WorkflowIngressPolicyV1 = "immediate" | "require_review";
-export type WorkflowReleaseStatusV1 = "active" | "disabled";
-export type WorkflowTriggerInvocationStatusV1 = "accepted" | "started" | "failed";
+export type FlowCaseStatusV1 = ("accepted" | "started" | "failed") | "superseded";
 export type GitWorkflowActionKind =
   | "status"
   | "list_branches"
@@ -944,14 +943,14 @@ export type GuardianReviewStatus =
   | "invalid_reviewer_response"
   | "aborted";
 export type GuardianUserAuthorization = "unknown" | "low" | "medium" | "high";
+export type WorkflowDeliveryStatusV1 =
+  "pending" | "delivered" | "failed" | "waiting_human" | "cancelled";
 export type ApprovalStatus = "pending" | "approved" | "denied";
 export type UserInputStatus = "pending" | "answered";
 export type ProviderDriverTrust = "built_in" | "signed";
 export type SkillScope = "workspace" | "user";
 export type TerminalEventKind =
   "started" | "stdout" | "stderr" | "finished" | "cancelled" | "error";
-export type WorkflowDeliveryStatusV1 =
-  "pending" | "delivered" | "failed" | "waiting_human" | "cancelled";
 export type WorkspaceEntryKind = "file" | "directory" | "symlink" | "other";
 export type TurnUndoConflictKind =
   | "unavailable"
@@ -1008,6 +1007,7 @@ export type MediaHandlerSelection =
 export type AppViewSessionStatus = "ready" | "stopped";
 
 export interface DesktopHttpResponsesV1 {
+  activateFlowDraft: ActiveFlowV1;
   applyWorkspaceDiffHunk: WorkspaceDiffActionResponse;
   archiveAgentTemplate: DeleteResponse;
   assignHumanTask: HumanTaskV1;
@@ -1023,25 +1023,22 @@ export interface DesktopHttpResponsesV1 {
   closePreview: ResourceReleaseResponse;
   closeTerminalSession: TerminalSessionResponse;
   compactContext: ContextSummary;
+  copyFlow: FlowDraftView;
   createAgentInstance: CreateAgentInstanceResponse;
   createAgentTemplateVersion: AgentTemplateVersionView;
   createConnection: ConnectionV1;
   createFlowDraft: FlowDraftView;
+  createFlowEvaluation: WorkflowEvaluationV1;
   createIntegrationDefinition: IntegrationDefinitionV1;
   createMcpServer: McpServerView;
   createProject: Project;
   createThread: Thread;
-  createWorkflowDeployment: WorkflowDeploymentV1;
-  createWorkflowEvaluation: WorkflowEvaluationV1;
-  createWorkflowRelease: WorkflowReleaseV1;
   decideApproval: ApprovalDecisionResponse;
   deleteAgentTemplateVersion: DeleteResponse;
   deleteMcpServer: DeleteResponse;
   deleteProject: DeleteResponse;
   deleteThread: DeleteResponse;
-  disableWorkflowDeployment: WorkflowDeploymentV1;
-  disableWorkflowRelease: WorkflowReleaseV1;
-  dispatchWorkflowEvent: WorkflowInvocationResult[];
+  dispatchFlowEvent: FlowCaseResult[];
   ensureTerminalSession: TerminalSessionResponse;
   executeLocalGit: LocalGitV1Response;
   generateThreadTitle: GenerateThreadTitleResponse;
@@ -1054,6 +1051,8 @@ export interface DesktopHttpResponsesV1 {
   getConnectionCapabilityRevision: ConnectionCapabilityRevisionV1;
   getContextStatus: ContextStatusResponse;
   getContributionHosts: ContributionHostSnapshot;
+  getFlow: ActiveFlowV1;
+  getFlowEvaluationSummary: FlowEvaluationSummary;
   getFlowRun: FlowRunV1;
   getGoal?: GoalSnapshot | null;
   getHumanTask: HumanTaskV1;
@@ -1078,16 +1077,13 @@ export interface DesktopHttpResponsesV1 {
   getTurnFileDiffPreview: TurnFileDiffPreview;
   getTurnStatus?: TurnRecord | null;
   getWindowsSandboxSetup: WindowsSandboxSetupStatus;
-  getWorkflowDeployment: WorkflowDeploymentV1;
-  getWorkflowEvaluationSummary: WorkflowEvaluationSummary;
-  getWorkflowRelease: WorkflowReleaseV1;
   getWorkspaceDiff: WorkspaceDiff;
   health: HealthResponse;
   ingestSagText: LibraryIngestionResponseView;
   installPlugin: PluginView;
   interruptAgent: DeleteResponse;
+  invokeFlow: FlowCaseResult;
   invokeMediaHandler: MediaHandlerInvocationResponse;
-  invokeWorkflowRelease: WorkflowInvocationResult;
   listActivityStatuses: TurnRecord[];
   listAgentInstances: AgentInstanceV1[];
   listAgentTemplates: AgentTemplateVersionView[];
@@ -1099,8 +1095,12 @@ export interface DesktopHttpResponsesV1 {
   listConnections: ConnectionV1[];
   listConversationEvents: AgentEvent[];
   listEvents: AgentEvent[];
+  listFlowCases: FlowCaseV1[];
+  listFlowDeliveryReceipts: WorkflowDeliveryReceiptV1[];
   listFlowDrafts: FlowDraftView[];
+  listFlowEvaluations: WorkflowEvaluationV1[];
   listFlowRuns: FlowRunV1[];
+  listFlows: ActiveFlowV1[];
   listHumanTasks: HumanTaskV1[];
   listIntegrationDefinitions: IntegrationDefinitionV1[];
   listLibraryProviders: LibraryProviderDescriptor[];
@@ -1118,20 +1118,14 @@ export interface DesktopHttpResponsesV1 {
   listThreadAgentInstances: AgentInstanceV1[];
   listThreadMcpServers: ThreadMcpServerView[];
   listThreads: Thread[];
-  listWorkflowDeliveryReceipts: WorkflowDeliveryReceiptV1[];
-  listWorkflowDeployments: WorkflowDeploymentV1[];
-  listWorkflowEvaluations: WorkflowEvaluationV1[];
-  listWorkflowReleases: WorkflowReleaseV1[];
-  listWorkflowTriggerInvocations: WorkflowTriggerInvocationV1[];
   listWorkspaceTree: WorkspaceTree;
   logoutCodexAccount: DeleteResponse;
   observeComputerWindow: ComputerObservation;
+  pauseFlow: ActiveFlowV1;
   pauseFlowRun: FlowRunV1;
   postPluginAppMessage: AppViewMessage;
   previewTurnUndo: TurnUndoPreview;
-  promoteWorkflowRelease: WorkflowReleaseV1;
   publishAgentTemplateVersion: AgentTemplateVersionView;
-  publishFlowDraft: FlowDefinitionV1;
   readWorkspaceFile: WorkspaceFilePreview;
   refreshConnectionCapabilities: RefreshConnectionCapabilitiesResponse;
   removeWindowsSandbox: WindowsSandboxSetupStatus;
@@ -1141,15 +1135,14 @@ export interface DesktopHttpResponsesV1 {
   respondToUserInput: UserInputResponseAccepted;
   restartMcpServer: McpServerStatus;
   resumeExternalAction: ExternalActionResumeResponse;
+  resumeFlow: ActiveFlowV1;
   resumeFlowRun: FlowRunV1;
+  retryFlowDelivery: WorkflowDeliveryReceiptV1;
   retryManagedOfficeRuntime: OfficeRuntimeStatus;
   retryManagedPowerShell: ShellRuntimeStatus;
-  retryWorkflowDelivery: WorkflowDeliveryReceiptV1;
   revertWorkspaceFile: WorkspaceDiffActionResponse;
-  rollbackWorkflowRelease: WorkflowReleaseV1;
   runBrowserCommand: BrowserOutput;
   runGitWorkflow: GitWorkflowResponse;
-  searchFlows: FlowDefinitionV1[];
   searchLibrary: LibrarySearchResponseView;
   selectContextLoader: MediaHandlerSelection;
   selectPreviewHandler: MediaHandlerSelection;
@@ -1160,17 +1153,15 @@ export interface DesktopHttpResponsesV1 {
   setThreadMcpServer: ThreadMcpServer;
   setThreadModel: Thread;
   setThreadPlugin: PluginView;
-  setWorkflowReleaseCanary: WorkflowReleaseV1;
   setupWindowsSandbox: WindowsSandboxSetupStatus;
   simulateFlowDraft: FlowTrialV1;
   startCodexLogin: CodexLoginStart;
-  startDeployedWorkflowRun: FlowRunV1;
-  startFlowRun: FlowRunV1;
   startFlowTestRun: FlowRunV1;
-  startPendingWorkflowInvocation: WorkflowInvocationResult;
+  startPendingFlowCase: FlowCaseResult;
   startPluginAppSession: AppViewSessionResponse;
   startTerminalCommand: TerminalStartResponse;
   stopPluginAppSession: AppViewSession;
+  supersedePendingFlowCase: FlowCaseV1;
   syncProviderModels: ProviderModelSyncResult;
   testConnection: TestConnectionResponse;
   testProviderConnection: ProviderHealthCheck;
@@ -1190,6 +1181,187 @@ export interface DesktopHttpResponsesV1 {
   validateFlowDraft: FlowDraftView;
   writeResourceContent: PreviewDescriptor;
   writeTerminalSession: TerminalSessionResponse;
+}
+export interface ActiveFlowV1 {
+  activeRevision: FlowRevisionV1;
+  createdAt: string;
+  createdBy: string;
+  flowId: string;
+  id: string;
+  name: string;
+  revision: number;
+  schemaVersion: number;
+  status: FlowStatusV1;
+  threadId: string;
+  updatedAt: string;
+  [k: string]: unknown;
+}
+export interface FlowRevisionV1 {
+  compiledWorkflow: CompiledWorkflowV1;
+  contentHash: string;
+  createdAt: string;
+  createdBy: string;
+  id: string;
+  ingressPolicy?: WorkflowIngressPolicyV1 & string;
+  output: WorkflowOutputSpecV1;
+  outputReviewPolicy?: WorkflowOutputReviewPolicyV1 & string;
+  schemaVersion: number;
+  trigger: WorkflowTriggerSpecV1;
+  [k: string]: unknown;
+}
+export interface CompiledWorkflowV1 {
+  agentSpecs: {
+    [k: string]: WorkflowAgentSpecV1;
+  };
+  budget: FlowBudgetV1;
+  contentHash: string;
+  definitionContentHash: string;
+  definitionId: string;
+  flowId: string;
+  flowVersion: number;
+  graph: GraphDefinitionV1;
+  harnessCapabilities: CapabilityProjection;
+  harnessConnectionAuthority: RuntimeConnectionAuthorityV1;
+  inputSchema: unknown;
+  outputSchema: unknown;
+  rootCapabilities: CapabilityProjection;
+  schemaVersion: number;
+  [k: string]: unknown;
+}
+export interface WorkflowAgentSpecV1 {
+  capabilities: CapabilityProjection;
+  connectionAuthority: RuntimeConnectionAuthorityV1;
+  connectionBindings: ConnectionBindingV1[];
+  instructions: string;
+  knowledgeBinding?: SagKnowledgeBindingV1 | null;
+  modelPolicy: AgentModelPolicyV1;
+  name: string;
+  nodeId: string;
+  outputSchema: unknown;
+  owner: string;
+  resourceGrants: ExecutionResourceGrantV1[];
+  riskClass: AgentRiskClassV1;
+  stateSchema: unknown;
+  templateContentHash: string;
+  templateId: string;
+  templateVersion: number;
+  [k: string]: unknown;
+}
+/**
+ * A deterministic, fail-closed view of the capabilities available to one Agent execution. `allow_all_*` is explicit so a missing field never means unrestricted access when an ExecutionContext is deserialized.
+ */
+export interface CapabilityProjection {
+  allowAllMcpServers?: boolean;
+  allowAllPlugins?: boolean;
+  allowAllSkills?: boolean;
+  allowAllTools?: boolean;
+  allowAllWorkspaceRoots?: boolean;
+  mcpServers?: string[];
+  plugins?: string[];
+  skills?: string[];
+  tools?: string[];
+  workspaceRoots?: string[];
+  [k: string]: unknown;
+}
+/**
+ * Credential-free operation route frozen into an Agent instance. The runtime must still revalidate the live Connection and fingerprint immediately before crossing the external-call boundary.
+ */
+export interface ExecutionConnectionOperationV1 {
+  capabilityRevision: number;
+  connectionId: string;
+  mcpServerId: string;
+  modelToolName: string;
+  operationId: string;
+  pinnedOperationFingerprint: string;
+  providerToolName: string;
+}
+/**
+ * Pins one account-level Connection and the immutable capability revision that was reviewed when an Agent template was published.
+ */
+export interface ConnectionBindingV1 {
+  capabilityRevision: number;
+  connectionId: string;
+  operationGrants?: OperationGrantV1[];
+}
+/**
+ * Grants one stable provider operation. The operation ID is deliberately not a runtime tool name; the server resolves it through the pinned capability revision before execution.
+ */
+export interface OperationGrantV1 {
+  operationId: string;
+}
+/**
+ * Immutable, server-enforced SAG scope available to an Agent. Namespaces are intentionally absent from the model-facing tool schema so the model cannot widen the template's knowledge boundary at invocation time.
+ */
+export interface SagKnowledgeBindingV1 {
+  namespaces: string[];
+  [k: string]: unknown;
+}
+export interface AgentModelPolicyV1 {
+  allowAllModels?: boolean;
+  allowedModels?: AgentModelBindingV1[];
+  [k: string]: unknown;
+}
+export interface AgentModelBindingV1 {
+  modelId: string;
+  providerId: string;
+  [k: string]: unknown;
+}
+export interface ExecutionResourceGrantV1 {
+  bindingId: string;
+  canRead: boolean;
+  canWrite: boolean;
+  kind: ResourceKind;
+  maxDataClassification: DataClassification;
+  /**
+   * A workspace-relative root, network origin, or logical database route.
+   */
+  resource: string;
+  [k: string]: unknown;
+}
+export interface FlowBudgetV1 {
+  maxDurationSeconds: number;
+  maxLoopIterations: number;
+  maxNodeExecutions: number;
+  maxToolCalls: number;
+  [k: string]: unknown;
+}
+export interface GraphDefinitionV1 {
+  edges: GraphEdgeV1[];
+  entryNodeId: string;
+  nodes: GraphNodeV1[];
+  schemaVersion: number;
+  [k: string]: unknown;
+}
+export interface GraphEdgeV1 {
+  allowedFields?: string[];
+  condition?: string | null;
+  dataClassification?: DataClassification & string;
+  from: string;
+  loopPolicy?: GraphLoopPolicyV1 | null;
+  onError?: string | null;
+  to: string;
+  [k: string]: unknown;
+}
+export interface GraphLoopPolicyV1 {
+  continueCondition: string;
+  maxIterations: number;
+  onExhausted: LoopExhaustionActionV1;
+  [k: string]: unknown;
+}
+export interface GraphNodeV1 {
+  config?: {
+    [k: string]: unknown;
+  };
+  id: string;
+  inputSchema?: {
+    [k: string]: unknown;
+  };
+  kind: GraphNodeKindV1;
+  label: string;
+  outputSchema?: {
+    [k: string]: unknown;
+  };
+  [k: string]: unknown;
 }
 export interface WorkspaceDiffActionResponse {
   diff: WorkspaceDiff;
@@ -1315,77 +1487,6 @@ export interface EnterpriseExecutionContextV1 {
   threadId: string;
   [k: string]: unknown;
 }
-/**
- * A deterministic, fail-closed view of the capabilities available to one Agent execution. `allow_all_*` is explicit so a missing field never means unrestricted access when an ExecutionContext is deserialized.
- */
-export interface CapabilityProjection {
-  allowAllMcpServers?: boolean;
-  allowAllPlugins?: boolean;
-  allowAllSkills?: boolean;
-  allowAllTools?: boolean;
-  allowAllWorkspaceRoots?: boolean;
-  mcpServers?: string[];
-  plugins?: string[];
-  skills?: string[];
-  tools?: string[];
-  workspaceRoots?: string[];
-  [k: string]: unknown;
-}
-/**
- * Pins one account-level Connection and the immutable capability revision that was reviewed when an Agent template was published.
- */
-export interface ConnectionBindingV1 {
-  capabilityRevision: number;
-  connectionId: string;
-  operationGrants?: OperationGrantV1[];
-}
-/**
- * Grants one stable provider operation. The operation ID is deliberately not a runtime tool name; the server resolves it through the pinned capability revision before execution.
- */
-export interface OperationGrantV1 {
-  operationId: string;
-}
-/**
- * Credential-free operation route frozen into an Agent instance. The runtime must still revalidate the live Connection and fingerprint immediately before crossing the external-call boundary.
- */
-export interface ExecutionConnectionOperationV1 {
-  capabilityRevision: number;
-  connectionId: string;
-  mcpServerId: string;
-  modelToolName: string;
-  operationId: string;
-  pinnedOperationFingerprint: string;
-  providerToolName: string;
-}
-/**
- * Immutable, server-enforced SAG scope available to an Agent. Namespaces are intentionally absent from the model-facing tool schema so the model cannot widen the template's knowledge boundary at invocation time.
- */
-export interface SagKnowledgeBindingV1 {
-  namespaces: string[];
-  [k: string]: unknown;
-}
-export interface AgentModelPolicyV1 {
-  allowAllModels?: boolean;
-  allowedModels?: AgentModelBindingV1[];
-  [k: string]: unknown;
-}
-export interface AgentModelBindingV1 {
-  modelId: string;
-  providerId: string;
-  [k: string]: unknown;
-}
-export interface ExecutionResourceGrantV1 {
-  bindingId: string;
-  canRead: boolean;
-  canWrite: boolean;
-  kind: ResourceKind;
-  maxDataClassification: DataClassification;
-  /**
-   * A workspace-relative root, network origin, or logical database route.
-   */
-  resource: string;
-  [k: string]: unknown;
-}
 export interface McpCallResult {
   content: unknown[];
   isError: boolean;
@@ -1410,14 +1511,18 @@ export interface FlowRunV1 {
   createdAt: string;
   definitionContentHash: string;
   definitionId: string;
-  deploymentId?: string | null;
-  deploymentSnapshot?: DeploymentSnapshotV1 | null;
   effectiveCapabilities: CapabilityProjection;
   error?: string | null;
   flowId: string;
+  flowRevision?: FlowRevisionV1 | null;
+  flowRevisionId?: string | null;
   flowVersion: number;
   graph: GraphDefinitionV1;
   id: string;
+  /**
+   * The ingress source that created this Run. It is persisted separately from the raw `input` so the active Flow can target any configured node Trigger without mutating its immutable Revision.
+   */
+  ingressTrigger?: WorkflowTriggerSpecV1 | null;
   input: unknown;
   loopCounts?: {
     [k: string]: number;
@@ -1429,7 +1534,7 @@ export interface FlowRunV1 {
   nodeRuns?: FlowNodeRunV1[];
   output?: unknown;
   /**
-   * Production deployments pause after terminal output until a HumanTask records the review decision. Trial/manual compatibility runs may opt out.
+   * Active Flows pause after terminal output until a HumanTask records the review decision. Trial/manual compatibility runs may opt out.
    */
   outputReviewRequired?: boolean;
   outputReviewed?: boolean;
@@ -1557,13 +1662,6 @@ export interface UserInputAnswer {
   questionId: string;
   [k: string]: unknown;
 }
-export interface FlowBudgetV1 {
-  maxDurationSeconds: number;
-  maxLoopIterations: number;
-  maxNodeExecutions: number;
-  maxToolCalls: number;
-  [k: string]: unknown;
-}
 export interface WorkflowCheckpointSummaryV1 {
   completedAt: string;
   createdAt: string;
@@ -1572,94 +1670,6 @@ export interface WorkflowCheckpointSummaryV1 {
   pendingWriteCount: number;
   status: WorkflowCheckpointStatusV1;
   superstep: number;
-  [k: string]: unknown;
-}
-export interface DeploymentSnapshotV1 {
-  compiledWorkflow: CompiledWorkflowV1;
-  contentHash: string;
-  createdAt: string;
-  createdBy: string;
-  id: string;
-  output: WorkflowOutputSpecV1;
-  outputReviewPolicy?: WorkflowOutputReviewPolicyV1 & string;
-  schemaVersion: number;
-  trigger: WorkflowTriggerSpecV1;
-  [k: string]: unknown;
-}
-export interface CompiledWorkflowV1 {
-  agentSpecs: {
-    [k: string]: WorkflowAgentSpecV1;
-  };
-  budget: FlowBudgetV1;
-  contentHash: string;
-  definitionContentHash: string;
-  definitionId: string;
-  flowId: string;
-  flowVersion: number;
-  graph: GraphDefinitionV1;
-  harnessCapabilities: CapabilityProjection;
-  harnessConnectionAuthority: RuntimeConnectionAuthorityV1;
-  inputSchema: unknown;
-  outputSchema: unknown;
-  rootCapabilities: CapabilityProjection;
-  schemaVersion: number;
-  [k: string]: unknown;
-}
-export interface WorkflowAgentSpecV1 {
-  capabilities: CapabilityProjection;
-  connectionAuthority: RuntimeConnectionAuthorityV1;
-  connectionBindings: ConnectionBindingV1[];
-  instructions: string;
-  knowledgeBinding?: SagKnowledgeBindingV1 | null;
-  modelPolicy: AgentModelPolicyV1;
-  name: string;
-  nodeId: string;
-  outputSchema: unknown;
-  owner: string;
-  resourceGrants: ExecutionResourceGrantV1[];
-  riskClass: AgentRiskClassV1;
-  stateSchema: unknown;
-  templateContentHash: string;
-  templateId: string;
-  templateVersion: number;
-  [k: string]: unknown;
-}
-export interface GraphDefinitionV1 {
-  edges: GraphEdgeV1[];
-  entryNodeId: string;
-  nodes: GraphNodeV1[];
-  schemaVersion: number;
-  [k: string]: unknown;
-}
-export interface GraphEdgeV1 {
-  allowedFields?: string[];
-  condition?: string | null;
-  dataClassification?: DataClassification & string;
-  from: string;
-  loopPolicy?: GraphLoopPolicyV1 | null;
-  onError?: string | null;
-  to: string;
-  [k: string]: unknown;
-}
-export interface GraphLoopPolicyV1 {
-  continueCondition: string;
-  maxIterations: number;
-  onExhausted: LoopExhaustionActionV1;
-  [k: string]: unknown;
-}
-export interface GraphNodeV1 {
-  config?: {
-    [k: string]: unknown;
-  };
-  id: string;
-  inputSchema?: {
-    [k: string]: unknown;
-  };
-  kind: GraphNodeKindV1;
-  label: string;
-  outputSchema?: {
-    [k: string]: unknown;
-  };
   [k: string]: unknown;
 }
 export interface FlowNodeRunV1 {
@@ -1819,6 +1829,80 @@ export interface ContextCheckpointFile {
   summary: string;
   [k: string]: unknown;
 }
+export interface FlowDraftView {
+  draft: FlowDraftV1;
+  testRuns: FlowRunV1[];
+  trials: FlowTrialV1[];
+  [k: string]: unknown;
+}
+export interface FlowDraftV1 {
+  contentHash: string;
+  createdAt: string;
+  effectiveCapabilities: CapabilityProjection;
+  id: string;
+  lastValidation?: FlowValidationReportV1 | null;
+  revision: number;
+  schemaVersion: number;
+  spec: FlowSpecV1;
+  status: FlowDraftStatusV1;
+  threadId: string;
+  updatedAt: string;
+  [k: string]: unknown;
+}
+export interface FlowValidationReportV1 {
+  issues: FlowValidationIssueV1[];
+  valid: boolean;
+  validatedAt: string;
+  [k: string]: unknown;
+}
+export interface FlowValidationIssueV1 {
+  code: string;
+  edgeIndex?: number | null;
+  message: string;
+  nodeId?: string | null;
+  remediation: string;
+  severity: FlowValidationSeverityV1;
+  [k: string]: unknown;
+}
+export interface FlowSpecV1 {
+  budget?: FlowBudgetV1;
+  categories?: string[];
+  description: string;
+  flowId: string;
+  graph: GraphDefinitionV1;
+  inputSchema?: {
+    [k: string]: unknown;
+  };
+  name: string;
+  outputSchema?: {
+    [k: string]: unknown;
+  };
+  owner: string;
+  pendingDecisions?: string[];
+  requestedCapabilities?: CapabilityProjection;
+  riskClass: AgentRiskClassV1;
+  source: FlowSourceV1;
+  [k: string]: unknown;
+}
+export interface FlowTrialV1 {
+  createdAt: string;
+  draftId: string;
+  draftRevision: number;
+  id: string;
+  input: unknown;
+  report: FlowValidationReportV1;
+  schemaVersion: number;
+  status: FlowTrialStatusV1;
+  steps: FlowSimulationStepV1[];
+  [k: string]: unknown;
+}
+export interface FlowSimulationStepV1 {
+  boundedBy?: number | null;
+  harnessTarget: string;
+  nodeId: string;
+  order: number;
+  [k: string]: unknown;
+}
 export interface CreateAgentInstanceResponse {
   bound: boolean;
   instance: AgentInstanceV1;
@@ -1917,78 +2001,17 @@ export interface ConnectionAccountV1 {
   workspaceName?: string | null;
   [k: string]: unknown;
 }
-export interface FlowDraftView {
-  draft: FlowDraftV1;
-  testRuns: FlowRunV1[];
-  trials: FlowTrialV1[];
-  [k: string]: unknown;
-}
-export interface FlowDraftV1 {
-  contentHash: string;
+export interface WorkflowEvaluationV1 {
   createdAt: string;
-  effectiveCapabilities: CapabilityProjection;
+  evaluator: string;
+  flowRevisionId: string;
   id: string;
-  lastValidation?: FlowValidationReportV1 | null;
-  revision: number;
+  labels?: string[];
+  note?: string | null;
+  passed: boolean;
+  runId: string;
   schemaVersion: number;
-  spec: FlowSpecV1;
-  status: FlowDraftStatusV1;
-  threadId: string;
-  updatedAt: string;
-  [k: string]: unknown;
-}
-export interface FlowValidationReportV1 {
-  issues: FlowValidationIssueV1[];
-  valid: boolean;
-  validatedAt: string;
-  [k: string]: unknown;
-}
-export interface FlowValidationIssueV1 {
-  code: string;
-  edgeIndex?: number | null;
-  message: string;
-  nodeId?: string | null;
-  remediation: string;
-  severity: FlowValidationSeverityV1;
-  [k: string]: unknown;
-}
-export interface FlowSpecV1 {
-  budget?: FlowBudgetV1;
-  categories?: string[];
-  description: string;
-  flowId: string;
-  graph: GraphDefinitionV1;
-  inputSchema?: {
-    [k: string]: unknown;
-  };
-  name: string;
-  outputSchema?: {
-    [k: string]: unknown;
-  };
-  owner: string;
-  pendingDecisions?: string[];
-  requestedCapabilities?: CapabilityProjection;
-  riskClass: AgentRiskClassV1;
-  source: FlowSourceV1;
-  [k: string]: unknown;
-}
-export interface FlowTrialV1 {
-  createdAt: string;
-  draftId: string;
-  draftRevision: number;
-  id: string;
-  input: unknown;
-  report: FlowValidationReportV1;
-  schemaVersion: number;
-  status: FlowTrialStatusV1;
-  steps: FlowSimulationStepV1[];
-  [k: string]: unknown;
-}
-export interface FlowSimulationStepV1 {
-  boundedBy?: number | null;
-  harnessTarget: string;
-  nodeId: string;
-  order: number;
+  score: number;
   [k: string]: unknown;
 }
 export interface IntegrationDefinitionV1 {
@@ -2069,66 +2092,23 @@ export interface ThreadModelSelection {
   reasoningEffort?: string | null;
   [k: string]: unknown;
 }
-export interface WorkflowDeploymentV1 {
-  createdAt: string;
-  createdBy: string;
-  environment: string;
-  id: string;
-  name: string;
-  revision: number;
-  schemaVersion: number;
-  snapshot: DeploymentSnapshotV1;
-  status: WorkflowDeploymentStatusV1;
-  updatedAt: string;
-  [k: string]: unknown;
-}
-export interface WorkflowEvaluationV1 {
-  createdAt: string;
-  deploymentId: string;
-  evaluator: string;
-  id: string;
-  labels?: string[];
-  note?: string | null;
-  passed: boolean;
-  runId: string;
-  schemaVersion: number;
-  score: number;
-  [k: string]: unknown;
-}
-export interface WorkflowReleaseV1 {
-  canaryDeploymentId?: string | null;
-  canaryPercent: number;
-  createdAt: string;
-  createdBy: string;
-  environment: string;
-  id: string;
-  ingressPolicy?: WorkflowIngressPolicyV1 & string;
-  previousPrimaryDeploymentId?: string | null;
-  primaryDeploymentId: string;
-  releaseKey: string;
-  revision: number;
-  schemaVersion: number;
-  status: WorkflowReleaseStatusV1;
-  threadId: string;
-  trigger: WorkflowTriggerSpecV1;
-  updatedAt: string;
-  [k: string]: unknown;
-}
 export interface ApprovalDecisionResponse {
   accepted: boolean;
   executed: boolean;
   [k: string]: unknown;
 }
-export interface WorkflowInvocationResult {
-  invocation: WorkflowTriggerInvocationV1;
+export interface FlowCaseResult {
+  case: FlowCaseV1;
   reused: boolean;
   run?: FlowRunV1 | null;
   [k: string]: unknown;
 }
-export interface WorkflowTriggerInvocationV1 {
+export interface FlowCaseV1 {
   createdAt: string;
-  deploymentId: string;
   error?: string | null;
+  flowId: string;
+  flowRevision: FlowRevisionV1;
+  flowRevisionId: string;
   flowRunId?: string | null;
   id: string;
   idempotencyKey: string;
@@ -2136,9 +2116,10 @@ export interface WorkflowTriggerInvocationV1 {
     [k: string]: unknown;
   };
   inputHash: string;
-  releaseId: string;
   schemaVersion: number;
-  status: WorkflowTriggerInvocationStatusV1;
+  status: FlowCaseStatusV1;
+  statusNote?: string | null;
+  supersededByCaseId?: string | null;
   triggerId: string;
   updatedAt: string;
   [k: string]: unknown;
@@ -2428,6 +2409,27 @@ export interface MediaHandlerDescriptor {
   pluginId: string;
   priority: number;
   runtime: string;
+  [k: string]: unknown;
+}
+export interface FlowEvaluationSummary {
+  averageScore?: number | null;
+  deliveryStatusCounts: {
+    [k: string]: number;
+  };
+  evaluationCount: number;
+  failureClusters: FlowFailureCluster[];
+  flowRevisionId: string;
+  passRate?: number | null;
+  runStatusCounts: {
+    [k: string]: number;
+  };
+  totalRuns: number;
+  [k: string]: unknown;
+}
+export interface FlowFailureCluster {
+  count: number;
+  key: string;
+  sample: string;
   [k: string]: unknown;
 }
 export interface GoalSnapshot {
@@ -3233,27 +3235,6 @@ export interface WindowsSandboxSetupComponents {
   onlineIdentity: boolean;
   [k: string]: unknown;
 }
-export interface WorkflowEvaluationSummary {
-  averageScore?: number | null;
-  deliveryStatusCounts: {
-    [k: string]: number;
-  };
-  deploymentId: string;
-  evaluationCount: number;
-  failureClusters: WorkflowFailureCluster[];
-  passRate?: number | null;
-  runStatusCounts: {
-    [k: string]: number;
-  };
-  totalRuns: number;
-  [k: string]: unknown;
-}
-export interface WorkflowFailureCluster {
-  count: number;
-  key: string;
-  sample: string;
-  [k: string]: unknown;
-}
 export interface HealthResponse {
   apiVersion: number;
   officeRuntime: OfficeRuntimeStatus;
@@ -3719,6 +3700,24 @@ export interface ContextCompactionMetrics {
   tokensRemoved?: number;
   [k: string]: unknown;
 }
+export interface WorkflowDeliveryReceiptV1 {
+  attempt: number;
+  createdAt: string;
+  deliveredAt?: string | null;
+  error?: string | null;
+  flowRevisionId: string;
+  id: string;
+  idempotencyKey: string;
+  outputKind: string;
+  providerResult?: unknown;
+  responseStatus?: number | null;
+  revision: number;
+  runId: string;
+  schemaVersion: number;
+  status: WorkflowDeliveryStatusV1;
+  updatedAt: string;
+  [k: string]: unknown;
+}
 export interface LibraryProviderDescriptor {
   capabilities: LibraryProviderCapabilities;
   description: string;
@@ -3824,24 +3823,6 @@ export interface ThreadMcpServer {
   updatedAt: string;
   [k: string]: unknown;
 }
-export interface WorkflowDeliveryReceiptV1 {
-  attempt: number;
-  createdAt: string;
-  deliveredAt?: string | null;
-  deploymentId: string;
-  error?: string | null;
-  id: string;
-  idempotencyKey: string;
-  outputKind: string;
-  providerResult?: unknown;
-  responseStatus?: number | null;
-  revision: number;
-  runId: string;
-  schemaVersion: number;
-  status: WorkflowDeliveryStatusV1;
-  updatedAt: string;
-  [k: string]: unknown;
-}
 export interface WorkspaceTree {
   entries: WorkspaceEntry[];
   path: string;
@@ -3903,27 +3884,6 @@ export interface TurnUndoConflict {
   kind: TurnUndoConflictKind;
   path?: string | null;
   reason: string;
-  [k: string]: unknown;
-}
-export interface FlowDefinitionV1 {
-  budget: FlowBudgetV1;
-  capabilities: CapabilityProjection;
-  categories: string[];
-  contentHash: string;
-  description: string;
-  flowId: string;
-  graph: GraphDefinitionV1;
-  id: string;
-  inputSchema: unknown;
-  name: string;
-  outputSchema: unknown;
-  owner: string;
-  publishedAt: string;
-  publishedBy: string;
-  riskClass: AgentRiskClassV1;
-  schemaVersion: number;
-  source: FlowSourceV1;
-  version: number;
   [k: string]: unknown;
 }
 export interface WorkspaceFilePreview {

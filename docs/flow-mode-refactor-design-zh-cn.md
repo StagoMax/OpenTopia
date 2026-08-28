@@ -1,1511 +1,303 @@
-# OpenTopia 企业 Agent 与 Workflow 重构设计方案
-
-> 状态：实施基线 v2.1（Phase 0–5 已实现；企业子页面导航与表单边界已统一）
-> 日期：2026-08-23
-> 输入：`Flow模式重构.md`、当前仓库实现、`docs/enterprise-agent-platform-design-zh-cn.md`
-> 范围：企业 Agent 与 Workflow 控制面、模板、状态图运行时、部署、触发器、输出、连接器权限、人工任务和桌面 UI
-
-## 1. 结论
-
-Flow 模式不应继续被定义成“对话旁边的一块流程 JSON/Trace 面板”，而应升级为企业 Agent 与 Workflow 控制面。推荐采用下面的对象链：
-
-```text
-AgentTemplate（Agent 模板）
-  ├── 创建 Agent -> 独立身份，可直接对话和执行任务
-  └── 派生 WorkflowAgentSpec -> 作为工作流中的 Agent 配置
-
-WorkflowDefinition（UI：工作流模板）
-  = WorkflowAgentSpecs + 编排关系 + TriggerContract + OutputContract
-  -> Trial 跑通并发布
-  -> 创建并激活 WorkflowDeployment（工作流部署）
-  -> Trigger 被触发后创建 WorkflowRun（工作流运行）
-  -> 需要人工时创建 HumanTask，并进入 Inbox
-```
-
-这里有六个需要严格区分的领域对象：
-
-1. `AgentTemplateVersion`：Agent 的完整可复用配置；
-2. `Agent`：由 Agent Template 创建、可独立对话的 Agent；
-3. `WorkflowAgentSpec`：由 Agent Template 派生、嵌入 WorkflowDefinition 的 Agent 配置，不是运行实例；
-4. `WorkflowDefinitionVersion`：由 Agent 配置、编排、触发契约和输出契约组成的不可变工作流定义；
-5. `WorkflowDeployment`：工作流定义跑通后创建的、已配置环境并等待触发的部署；
-6. `WorkflowRun`：Deployment 每次被触发后创建的一次具体执行。
-
-推荐保留当前已经实现的 `AgentTemplateVersion`、`AgentInstance`、`FlowDraft`、`FlowDefinition`、`FlowRun`、静态校验、试运行和不可变发布，在其上补齐四个缺失层：
-
-1. `OrgUnit`：部门或项目的企业业务边界；
-2. `WorkflowDeployment`：将 WorkflowDefinition 激活为可接收 Trigger 的业务部署；
-3. `CapabilityGrant`：基于已认证 Connection、操作级且默认拒绝的确定性权限；
-4. `HumanTask`：与 Run 解耦、可聚合审批、补充输入、故障恢复和输出审查的人工协同对象。
-
-不建议把已激活的工作流命名为 `Engine`。它表达的是“哪个定义版本已经在什么部门和环境中被部署”，准确名称是 `WorkflowDeployment`。`Engine` 应保留给共享的 `WorkflowRuntime`：所有 Deployment 都由同一个运行时调度，不为每个工作流复制 Harness 或常驻进程。
-
-产品控制面参考 OpenAI Frontier，状态图运行时参考 LangGraph；OpenTopia 在二者之间保留自己的 Agent Template、账号级 Connection、WorkflowDeployment、HumanTask、AgentContinuation 和外部副作用安全边界。
-
-### 1.1 命名约定
-
-| 中文产品名称    | UI 英文            | 领域/代码名称               | 职责                                                    |
-| --------------- | ------------------ | --------------------------- | ------------------------------------------------------- |
-| Agent 模板      | Agent templates    | `AgentTemplateVersion`      | Library、Connection、工具、模型、权限和行为的可复用配置 |
-| Agent           | Agents             | `Agent`                     | 可独立对话和执行任务的稳定身份                          |
-| 流程 Agent 配置 | Workflow agent     | `WorkflowAgentSpec`         | 从 Agent 模板派生的工作流内嵌配置，不持有运行状态       |
-| 工作流模板      | Workflow templates | `WorkflowDefinitionVersion` | Agent 配置、编排、Trigger 和 Output 的不可变定义        |
-| 工作流部署      | Deployments        | `WorkflowDeployment`        | 将定义绑定到部门、环境和真实端点并激活                  |
-| 工作流运行      | Runs / Cases       | `WorkflowRun`               | 一次触发产生的具体执行                                  |
-| 人工任务        | Inbox              | `HumanTask`                 | 审批、补充输入、输出审查、恢复和人工处理                |
-| 工作流运行时    | Workflow runtime   | `WorkflowRuntime`           | 共享调度和执行基础设施，不是用户创建的业务对象          |
-
-## 2. 当前实现判断
-
-### 2.1 已经具备的基础
-
-当前代码不是从零开始：
-
-- `enterprise.rs` 已有默认拒绝、只允许收窄的 `CapabilityProjection`；
-- 已有不可变的 Agent 模板版本、能力差异和实例化；
-- `flow.rs` 已有 FlowDraft、FlowDefinition、FlowTrial、Graph 节点/边、受控循环和校验；
-- `flow_runtime.rs` 已有 FlowRun、NodeRun、暂停、恢复、审批等待和 Transcript；
-- 服务端已有 Agent 模板和 Flow 的创建、验证、模拟、发布、运行 API；
-- Desktop 已有 Flow 模式、Agent 模板面板和运行 Trace。
-
-因此本次重构应增加企业控制面，不应重写 Harness、模型循环、工具注册、Flow 校验器或节点执行器。
-
-### 2.2 根因与缺口
-
-当前实现的主要问题不是某个组件缺字段，而是产品对象边界还不完整：
-
-| 现状                                         | 根因                                         | 结果                                               |
-| -------------------------------------------- | -------------------------------------------- | -------------------------------------------------- |
-| FlowDraft、发布 Flow 和 Run 集中在同一个面板 | Definition、Deployment、Run 没有独立产品入口 | 配置密集、对象关系不清晰                           |
-| 直接编辑 Flow spec JSON                      | 领域对象没有形成业务化编辑器                 | 只有开发者可用，难以审查权限和数据流               |
-| Agent 模板用逗号列表和 JSON 配资源           | 能力目录没有被产品化                         | 无法看见 App 的操作级权限和来源                    |
-| 已发布 Flow 可直接在会话中启动               | 缺少 WorkflowDeployment                      | 无法把跑通的模板部署为稳定、可触发的业务对象       |
-| Approval 只是 Run 的一种状态                 | 缺少独立 HumanTask 模型                      | 无法统一处理审批、补充输入、恢复、分派、SLA 和审计 |
-| Library、Plugin、MCP、App 概念并列           | 包、连接实例、业务数据和授权没有分层         | 用户不知道“装了什么”“连了什么”“谁能做什么”         |
-| Flow 是右侧 Tool Stage                       | Flow 仍被当作会话的附属工具                  | 无法承载企业运营工作台                             |
-
-当前 `ExperienceSurfaceProfile::Flow` 使用 unrestricted 能力，再依赖后续上下文收窄。对 Flow 设计态来说边界过宽。设计会话默认只应看见目录、设计、验证、模拟和发布工具；生产操作必须通过独立 Trial 或 WorkflowDeployment 的执行快照获得。
-
-### 2.3 当前类型到目标领域名的映射
-
-命名调整不要求第一阶段立即重命名所有代码。先通过领域服务和 ViewModel 建立语义边界，再决定是否迁移底层类型：
-
-| 当前实现                 | 目标领域语义                | 迁移建议                                  |
-| ------------------------ | --------------------------- | ----------------------------------------- |
-| `AgentTemplateVersionV1` | `AgentTemplateVersion`      | 保留，名称已经准确                        |
-| `AgentInstanceV1`        | `Agent`                     | API/UI 简化为 Agent，内部可暂时保留类型名 |
-| `FlowDraftV1`            | `WorkflowDraft`             | 通过适配层迁移，不阻塞现有 `flow_*` 工具  |
-| `FlowDefinitionV1`       | `WorkflowDefinitionVersion` | 明确它是不可变定义，不是部署              |
-| 新增                     | `WorkflowAgentSpec`         | 从 AgentTemplate 派生的工作流内嵌配置     |
-| 新增                     | `WorkflowDeployment`        | 补齐定义到生产运行之间的部署层            |
-| `FlowRunV1`              | `WorkflowRun`               | 保留存储兼容，逐步切换 API/ViewModel      |
-| `FlowRuntime`            | `WorkflowRuntime`           | 共享运行时，不暴露为用户可创建对象        |
-
-## 3. 统一术语与领域模型
-
-### 3.1 企业范围
-
-```text
-EnterpriseWorkspace
-└── OrgUnit（type = department | project）
-    ├── Agents
-    ├── WorkflowDefinitions
-    ├── WorkflowDeployments
-    ├── Connections / Knowledge
-    ├── WorkflowRuns / Cases
-    └── HumanTasks
-```
-
-不建议直接复用当前 `Project` 表示部门。当前 `Project` 的语义是本地工作目录和会话分组，带 `workspace_root`；企业部门/项目是身份、策略、连接和运行数据的治理边界。两者可以建立显式关联，但不应使用同一实体承担两种职责。
-
-推荐领域名为 `OrgUnit`，UI 可根据 `kind` 显示“部门”或“项目”。
-
-### 3.2 AgentTemplateVersion：岗位模板
-
-Agent Template 是 Agent 的完整可复用配置来源，不代表正在工作的身份。它有两个合法出口：创建独立 Agent，或派生工作流内部的 `WorkflowAgentSpec`：
-
-- 名称、职责、指令和完成条件；
-- 允许的模型策略；
-- Skill、Plugin 和工具能力；
-- 已绑定的 Library、知识库与允许检索的数据范围；
-- 已连接的 CRM、ERP、财务系统、数据库、MCP 或其他外部 Connection；
-- 每个 Connection 上允许使用的工具、操作、资源和字段范围；
-- 输入、输出和持久状态 schema；
-- 委派范围、预算、风险等级和审批规则；
-- 所有者、审阅者、版本和发布状态。
-
-模板可以保存具体 `LibraryBindingRef` 和 `ConnectionBindingRef`，因为这正是创建 Agent 时需要复用的配置。引用中只保存 Connection ID、能力和范围，不复制明文凭证；凭证继续由 Connection/Vault 管理。模板发布后固定这些引用及其授权版本，创建 Agent 时再生成不可变的 `AgentConfigSnapshot`。
-
-```text
-AgentTemplateFactory
-  ├── createStandaloneAgent(templateVersion)
-  └── deriveWorkflowAgentSpec(templateVersion, workflowDefinitionId, roleKey)
-```
-
-两条路径使用相同的 Agent 配置契约。区别是生命周期：独立 Agent 拥有稳定身份、对话和状态；WorkflowAgentSpec 只是 WorkflowDefinition 中的版本化配置，负责描述工作流角色。
-
-### 3.3 Agent：AI 员工
-
-建议把当前对外名称 `AgentInstance` 简化为 `Agent`，代码内部可保留兼容名称。它代表一个可以被分配工作的稳定身份：
-
-- 固定引用已发布的模板版本；
-- 属于一个 `OrgUnit`；
-- 有独立身份、状态、记忆范围、预算和审计；
-- 可以独立接受用户对话，也可以被显式分配给其他业务对象；
-- 实际权限是模板上限与当前环境授权的交集；
-- 模板升级不会静默改变既有 Agent，必须显式升级并生成权限 Diff。
-
-打开 Agent 对话时，系统从 `AgentConfigSnapshot` 投影其 Library、Connection、Skill 和工具目录，因此用户不需要在每个会话中重新配置。Agent 的对话记录和运行状态属于 Agent，不回写 Agent Template。
-
-### 3.4 WorkflowDefinitionVersion：工作流定义
-
-UI 中可以称为“工作流模板”，领域层使用 `WorkflowDefinitionVersion`，因为已发布对象是精确且不可变的定义。它由 Agent 配置、触发器契约、编排关系和输出契约组成：
-
-- 一个或多个 `WorkflowAgentSpec`；每个配置都由某个 `AgentTemplateVersion` 派生；
-- Trigger 接口、输入 schema、认证和过滤契约；
-- Output 接口、输出 schema 和投递契约；
-- Agent 节点之间的依赖、分支、并行、循环和审批关系；
-- Agent、Skill、Tool、Condition、Validator、Approval、Join、Loop、Output 节点；
-- 错误、重试、超时、补偿和人工升级策略；
-- 连接器和知识能力需求；
-- 预算、风险和评测门槛；
-- 不可变版本和内容哈希。
-
-一个 WorkflowAgentSpec 至少包含 `role_key`、来源 Agent Template 版本、在该 Workflow 中的职责和允许继续收窄的覆盖配置。UI 可以把它呈现为工作流中的 Agent，但领域层明确它还不是运行身份。
-
-```text
-WorkflowDefinitionVersion
-  trigger_contracts[]
-  agent_specs[]
-    - role_key
-    - source_agent_template_version
-    - agent_config_snapshot
-    - workflow_specific_overrides
-  graph
-  output_contracts[]
-```
-
-这保证 Agent Template 是唯一配置来源，同时避免让一个模板直接持有正在运行、会产生状态的 Agent。创建 WorkflowDeployment 时，WorkflowAgentSpec 可以绑定现有 Agent，或物化为 Deployment 管理的 Agent 身份；每次 WorkflowRun 再建立独立 Run Context。
-
-### 3.5 WorkflowDeployment：工作流部署
-
-`WorkflowDeployment` 是 WorkflowDefinition 跑通、验证并绑定环境后的可触发对象。它回答“哪个定义版本正在什么部门、什么环境中运行”：
-
-```text
-WorkflowDeployment
-  workflow_definition_version
-  org_unit
-  environment
-  agent_bindings[]
-  trigger_endpoints[]
-  output_endpoints[]
-  review_policy
-  runtime_policy
-  release_state
-```
-
-状态建议：
-
-```text
-draft -> validating -> ready -> active -> paused -> retired
-                    \-> blocked
-```
-
-Deployment 激活时生成不可变 `DeploymentSnapshot`，固定 WorkflowDefinition、Agent bindings、Library/Connection 引用、Trigger 和 Output。所有新 WorkflowRun 固定引用该快照；修改配置产生新 Deployment revision，不能改写已经开始的 Run。
-
-Deployment 的 `active` 仅表示可接收触发。真正执行工作的 `WorkflowRuntime` 是共享基础设施，不是 Deployment 的子进程。
-
-### 3.6 WorkflowRun / Case：一次业务执行
-
-Trigger 命中 WorkflowDeployment 后创建一个 `WorkflowRun`。`Case` 是同一运行面向运营人员的业务视图：
-
-- `WorkflowRun`：图快照、节点、状态机、预算、事件和检查点；
-- `CaseView`：业务标题、关键字段、当前负责人、SLA、结果和待处理事项。
-
-推荐导航三级结构：
-
-```text
-部门 / 项目
-  -> Workflow Deployments
-  -> Workflow Runs / Cases
-```
-
-### 3.7 HumanTask：统一人工任务
-
-Inbox 是一个查询和工作界面，不应成为审批或运行状态的事实源。事实源是可独立分派、审计和恢复 WorkflowRun 的 `HumanTask`：
-
-```text
-HumanTask
-  type: approval | input_request | output_review | recovery | reconnect | data_correction | manual
-  source_type: flow_run | external_event | manual
-  source_ref
-  workflow_run_ref? / node_run_ref?
-  checkpoint_ref?
-  org_unit
-  assignee / candidate_group
-  priority / due_at / sla
-  reason_code
-  evidence_snapshot
-  action_schema
-  continuation_ref?
-  status
-```
-
-一个 WorkflowRun 可以产生多个 HumanTask；一个 HumanTask 的决定通过幂等 continuation 恢复对应节点。审批可使用 `approve/reject`，故障恢复则使用 `retry/skip/replace_connection/abort/escalate` 等由 `action_schema` 明确定义的动作，不能把所有人工处理都伪装成“批准”。
-
-文档提出“所有 WorkflowRun 输出统一进入 Inbox”。MVP 可以把 `review_mode=all` 设为默认，但领域模型应从一开始支持：
-
-- `all`：全部人工审查；
-- `risk_based`：由确定性风险规则决定；
-- `sampled`：按比例抽检；
-- `exceptions_only`：仅异常和低置信度；
-- `none`：仅低风险且策略允许。
-
-高风险和带副作用输出仍由平台策略强制审查，WorkflowDeployment 不能关闭。
-
-### 3.8 Flow 中断、人工任务与恢复
-
-并非所有失败都应进入 Inbox。Runtime 先对中断进行分类：
-
-| 中断类型                         | WorkflowRun 行为                                         | 是否创建 HumanTask           |
-| -------------------------------- | -------------------------------------------------------- | ---------------------------- |
-| 短暂技术故障，例如超时或限流     | 按策略自动重试和退避                                     | 否，超过阈值后再转人工或失败 |
-| 预先声明的审批检查点             | 保存 checkpoint，进入 `waiting_for_human`                | 是：`approval`               |
-| 缺少业务输入或需要选择分支       | 保存 checkpoint，进入 `waiting_for_human`                | 是：`input_request`          |
-| Connection 登录过期              | 保存 checkpoint，进入 `waiting_for_human`                | 是：`reconnect`              |
-| 人可以采取恢复动作的中断性失败   | 保存错误、证据和外部副作用状态，进入 `waiting_for_human` | 是：`recovery`               |
-| 不可恢复或不应由人决定的终止错误 | 进入 `failed`，保留重新运行入口                          | 否，避免制造无意义待办       |
-
-```text
-WorkflowRun: running
-  -> InterruptPolicy（中断策略分类）
-  -> Save Checkpoint（保存一致检查点）
-  -> HumanTask: open
-  -> WorkflowRun: waiting_for_human
-  -> Human Action（人工决定，带 expectedRevision 和 Idempotency-Key）
-  -> WorkflowRun: resuming
-  -> Continue / Compensate / Fail（继续、补偿或终止）
-```
-
-“当前 Flow 内的审批卡片”和“Inbox 中的人工任务”必须引用同一个 `human_task_id`：
-
-- 用户正在查看相关 WorkflowRun 时，在时间线阻断节点处显示 `HumanTaskPanel`，顶部同时出现紧凑的 `Flow interrupted` 状态条；
-- 简单、低风险动作可以在就地面板完成；高风险动作只提供 `在 Inbox 中处理`，进入完整 Evidence + Decision 工作台；
-- 用户不在当前 Run 时，通过 Inbox badge、桌面通知或外部消息发送 deep link；
-- 任一入口完成动作后，其他入口实时变为已处理，不能重复恢复或重复执行副作用；
-- 外部审批系统可以作为 HumanTask 的决策通道，但回调必须完成身份校验、权限校验、签名、幂等和审计，通知本身不是批准结果。
-
-## 4. Apps、MCP、Connection 与知识库
-
-### 4.1 MCP-first 统一集成模型
-
-Connection 与 MCP 服务高度相关，但二者不应使用同一个领域对象。MCP 是接入协议和能力提供方式；Connection 是某个账号完成认证后，可被 Agent 实际使用的连接实例。同一个 MCP 服务登录账号 A 和账号 B，应产生两个 Connection，因为它们的数据边界、工具目录和授权范围可能完全不同。
-
-```text
-Plugin / IntegrationProvider（插件 / 集成提供方）
-  -> IntegrationDefinition（集成定义：MCP Server、OAuth API、数据库或本地 App）
-     -> Connection（已认证连接：账号、租户、环境与凭证句柄）
-        -> DiscoveredCapabilityCatalog（该账号实际暴露的工具与资源目录）
-           -> CapabilityGrant（允许 Agent 使用的能力子集）
-```
-
-- `Plugin`：安装到平台的能力包，可能提供 Skill、MCP Server 定义或其他 Integration Provider；
-- `IntegrationDefinition`：描述接入类型、端点、认证方式和能力发现方式，`kind` 可以是 `mcp`、`oauth_api`、`database` 或 `local_app`；
-- `Connection`：用户、企业共享账号或服务账号完成认证后形成的实例，保存账号身份、tenant/workspace、环境、scope、凭证句柄、健康状态和配置修订号；
-- `DiscoveredCapabilityCatalog`：认证后从 MCP `tools/list`、`resources/list` 或其他 Provider 元数据中发现并规范化的实际能力；
-- `CapabilityGrant`：对工具、操作、资源范围、字段、用途和风险的授权，是 Agent Template 可以选择的上限子集。
-
-这样建模仍然允许 UI 把 MCP 服务展示在 Connections Catalog 中，但不会把“服务定义”“登录账号”和“Agent 获得的权限”混成一个对象。对于非 MCP 的 CRM REST API、数据库或本地 App，也复用同一套 Connection 生命周期，而无需伪装成 MCP。
-
-知识库单独建模：
-
-```text
-KnowledgeSource -> KnowledgeBase -> KnowledgeGrant
-```
-
-`KnowledgeSource` 负责同步，`KnowledgeBase` 是可检索集合，`KnowledgeGrant` 约束查询范围、数据等级和可导出字段。不要把 RAG 资料与可写业务 App 都塞进一个泛化 Library 字符串列表。
-
-#### 审核场景的数据边界
-
-工伤医疗费用审核和信贷审核采用三层数据边界，案件样例不能因为保存在项目 `data/` 目录就被当作知识源：
-
-```text
-KnowledgeBase（知识库）
-  └── Policy / Regulation / SOP（政策、法规与审核口径）
-
-Connection（结构化连接）
-  ├── Case Detail Lookup（按 caseId 获取案件详情）
-  └── Reference Catalog Lookup（药品、耗材、试剂等基础目录查询）
-
-InboundEvent（入站事件）
-  └── caseId + payloadRef + non-sensitive summary（案件引用与非敏感摘要）
-        ├── require_review -> Pending Inbox（待处理队列，人工确认触发）
-        └── immediate      -> FlowRun（直接创建工作流运行）
-```
-
-- `KnowledgeBase（知识库）` 只保存可检索的政策依据。一个业务域使用一个隔离 namespace，域内每份真实来源登记为独立 `KnowledgeSource（知识源）`，SAG 再负责切片和索引；
-- `Connection（结构化连接）` 保存或代理案件详情和精确目录查询。大规模代码表不进入向量检索，案件详情也不复制到知识库；
-- `InboundEvent（入站事件）` 是被审核对象进入 Deployment 的入口。事件只携带 `caseId`、`payloadRef`、合成数据标记和非敏感摘要；Flow 启动后再通过冻结授权的 Connection 读取详情；
-- `Trigger Review（触发前审核）` 与 Flow 内部的 `HumanTask（人工任务）` 是两个独立边界：前者决定是否创建 Run，后者处理运行中的审批、补充输入、恢复或输出审阅。
-
-当前 Demo 按此边界配置：工伤域为 1 个知识库、18 个逻辑知识源和 107 个原始政策片段，20 个合成案件作为待处理事件；信贷域为 1 个知识库、26 个知识源，35 个合成案件作为待处理事件。工伤药品、耗材和试剂目录继续由结构化 Connection 查询。初始化脚本定向调用本次创建的 Release，因此不会把同一批 Demo 事件广播给历史同类型 Release；`require_review` 保证所有事件保持 `accepted`，人工点击后才创建 FlowRun。
-
-### 4.2 登录、能力发现与配置版本
-
-Connection 创建过程建议固定为：
-
-```text
-选择 IntegrationDefinition（选择集成定义）
-  -> Authenticate（OAuth / API Key / Service Account 登录认证）
-  -> Resolve Account Context（识别账号、租户、workspace 和环境）
-  -> Discover Capabilities（发现该账号的 tools / resources / operations）
-  -> Apply Admin Policy（应用组织级安全上限）
-  -> Publish Connection Revision（发布连接能力修订版本）
-```
-
-凭证必须进入 Secret Vault，Connection、Agent Template 和 WorkflowDeployment 只保存 `credential_ref`，不得保存或复制 token。一个 Connection 至少包含：
-
-- `provider_id`、`kind`、`endpoint_ref`；
-- `account_principal`、`tenant_id/workspace_id`、`environment`；
-- `auth_method`、`credential_ref`、`granted_scopes`、`expires_at`；
-- `ownership = personal | org_shared | service_account`；
-- `capability_catalog_revision`、`last_discovered_at`、`health`、`reauth_required`。
-
-能力目录变化必须采用 fail-closed 规则：
-
-- 登录过期、撤销授权或账号被移除时，Connection 进入 `reauth_required`，运行在调用工具前阻断；
-- 工具或 scope 减少时，立即把受影响的 Agent 和 WorkflowDeployment 标记为 `degraded` 或 `blocked`，不能继续使用旧权限；
-- 新增工具或扩大 scope 时，只更新可选目录，不自动授予已有 Agent Template；必须显式选择并发布新模板版本；
-- 生产 Workflow 优先使用 `org_shared` 或 `service_account` Connection；个人 Connection 默认只用于个人 Agent 和 Trial，除非组织策略明确允许发布。
-
-### 4.3 Apps 权限在哪里配置
-
-Agent Template 是配置 Library 和 Connection 的主入口；Integration Provider 与 Connection 侧只提供可选能力目录和组织级安全上限：
-
-1. Integration Provider 声明理论能力；Connection 登录后发现该账号实际拥有的工具、资源和 scope；
-2. Agent Template 直接选择具体 Library、Connection 以及允许的操作、资源和字段范围；
-3. 创建独立 Agent 或派生 WorkflowAgentSpec 时完整复用这些绑定，生成固定配置快照；
-4. WorkflowDefinition 可以按 WorkflowAgentSpec 或节点继续收窄，但不能扩权；
-5. WorkflowDeployment 固定最终配置版本；
-6. Runtime 在每次调用前做确定性校验。
-
-```text
-effective_app_operations =
-  provider_declared_capabilities
-  ∩ connection_discovered_capabilities
-  ∩ authenticated_account_scopes
-  ∩ connection_admin_policy
-  ∩ initiating_principal_grant
-  ∩ agent_template_ceiling
-  ∩ agent_config_snapshot
-  ∩ workflow_agent_or_node_grant
-  ∩ deployment_snapshot
-  ∩ runtime_risk_policy
-```
-
-因此不存在“Agent 模板还没创建，App 怎么配置”的循环：先在 Connections 中启用 MCP/CRM/ERP 等 Integration Definition 并完成账号登录，Connection 根据账号上下文发现可用操作；然后在 Agent Template 中选择这个 Connection 和允许的能力子集。没有可用 Connection 时，模板可以保存草稿，但不能发布为可实例化版本。
-
-UI 中以 Agent Template 的 `Libraries` 和 `Connections` 页作为配置主入口；Connections 页面展示 Provider/MCP Server、登录账号、tenant/workspace、归属类型、已发现能力、有效授权、健康状态和反向引用，例如“哪些 Agent Template、WorkflowDefinition 和 WorkflowDeployment 正在使用此操作”。
-
-### 4.4 操作级权限示例
-
-```json
-{
-  "capabilityId": "crm.customer",
-  "operations": ["read", "search", "update_status"],
-  "resourceScope": { "region": ["cn-east"], "team": ["enterprise-sales"] },
-  "fieldAllow": ["id", "name", "status", "owner"],
-  "fieldDeny": ["personal_phone", "identity_number"],
-  "purpose": "lead-qualification",
-  "maxClassification": "confidential",
-  "approval": { "requiredFor": ["update_status"] }
-}
-```
-
-不要只授权 MCP Server、Connection 或 Plugin ID。它们只能回答“连接到了哪个服务和账号”，不能回答“CRM 里可以读哪些客户、更新哪些字段，还是可以删除客户”。
-
-## 5. 触发器与输出端口
-
-### 5.1 WorkflowDefinition 定义接口，Deployment 将接口激活
-
-WorkflowDefinition 必须包含 Trigger 和 Output。定义中保存逻辑接口、schema 和行为契约：
-
-```text
-TriggerPort(name, input_schema, semantic_contract)
-OutputPort(name, output_schema, delivery_semantics)
-```
-
-创建 WorkflowDeployment 时，将定义中的接口激活为真实端点：
-
-- Trigger：manual、webhook、schedule、event_subscription、poll；
-- Output：Inbox、Webhook、App operation、消息通道、Artifact、调用方响应。
-
-WorkflowDefinition 可以保存接口类型和逻辑配置，但不得复制明文凭证、真实 Webhook secret 或其他秘密；WorkflowDeployment 的 `DeploymentSnapshot` 保存端点引用和凭证句柄。
-
-### 5.2 触发链路
-
-```text
-接收事件
-  -> 认证来源
-  -> 规范化为 TriggerEnvelope
-  -> 幂等键去重
-  -> 输入 schema 校验
-  -> 过滤与速率限制
-  -> 解析 DeploymentSnapshot
-  -> 创建 WorkflowRun
-```
-
-过滤可以由外部系统先做，但平台仍必须完成认证、schema、幂等、租户边界和限流校验，不能把外部过滤视为信任边界。
-
-### 5.3 输出链路
-
-```text
-节点输出
-  -> output schema 校验
-  -> 数据分级与 DLP
-  -> ReviewPolicy
-  -> 创建 HumanTask 或直接投递
-  -> Connector 操作级鉴权
-  -> 幂等投递
-  -> 保存 DeliveryReceipt
-```
-
-每个有副作用的输出都必须声明幂等键和失败处置。首版不实现通用分布式补偿事务；只有人可以安全处置的失败才创建 `recovery` HumanTask，由人工核对外部状态后选择重试、跳过、补偿或终止。
-
-## 6. 目标架构
-
-```mermaid
-flowchart TB
-    UI["桌面端企业 Agent 与工作流控制面<br/>Desktop Enterprise Agent & Workflow Control Plane"]
-
-    subgraph APP["应用服务层（Application Services）"]
-        AC["Agent 目录服务<br/>AgentCatalogService"]
-        FC["工作流定义服务<br/>WorkflowDefinitionService"]
-        ES["工作流部署服务<br/>WorkflowDeploymentService"]
-        RS["人工任务服务<br/>HumanTaskService"]
-        CS["外部连接管理服务<br/>ConnectionService"]
-    end
-
-    subgraph DOMAIN["企业领域层（Enterprise Domain）"]
-        AT["Agent 模板与 Agent<br/>AgentTemplate / Agent"]
-        FD["工作流定义与部署<br/>WorkflowDefinition / WorkflowDeployment"]
-        FR["工作流运行与人工任务<br/>WorkflowRun / HumanTask"]
-        CP["能力与权限策略<br/>Capability Policy"]
-    end
-
-    subgraph RUNTIME["共享运行时层（Shared Runtime）"]
-        TR["触发器接入网关<br/>Trigger Gateway"]
-        OR["Flow 节点编排器<br/>Flow Orchestrator"]
-        HK["复用现有 Agent 执行内核<br/>Existing Harness Kernel"]
-        OG["输出校验与投递网关<br/>Output Gateway"]
-    end
-
-    subgraph DATA["企业数据平面（Enterprise Data Plane）"]
-        CN["连接器执行运行时<br/>Connector Runtime"]
-        KB["知识库与检索增强<br/>Knowledge / RAG"]
-        AP["CRM、ERP、财务及内部系统<br/>CRM / ERP / Finance / Internal Apps"]
-    end
-
-    UI --> APP
-    APP --> DOMAIN
-    TR --> OR
-    OR --> HK
-    HK --> CN
-    CN --> KB
-    CN --> AP
-    OR --> OG
-    OG --> RS
-    OR -->|创建审批、输入或恢复任务<br/>Create approval, input, or recovery task| RS
-    RS -->|幂等恢复<br/>Idempotent continuation| OR
-    DOMAIN --> OR
-```
-
-依赖规则：
-
-- UI 和 `flow_*` 模型工具调用同一 Application Service；
-- Application Service 负责用例和事务，不复制权限逻辑；
-- Domain 不依赖 React、Axum、SQLite、具体 Connector 或模型 Provider；
-- Flow Orchestrator 只协调节点，不拥有第二套 Agent Loop；
-- 所有 Agent 节点继续进入现有 Harness Kernel；
-- Connector Runtime 是企业系统的执行边界；
-- 审计事件先持久化，再更新投影和通知 UI。
-
-### 6.1 LangGraph 的定位：运行时参考，不是产品领域替代品
-
-Flow Runtime 建议系统性参考 LangGraph 的 `StateGraph`、持久化 Checkpoint、动态 Interrupt、Command Resume、State History 和 Subgraph 思想。LangGraph 适合作为“如何可靠执行一张有状态图”的参考；OpenAI Frontier 继续作为企业产品控制面和信息架构参考。二者在本方案中分别回答不同问题：
-
-- OpenAI Frontier：Agent、业务上下文、身份权限、部署、评测和企业治理如何形成产品；
-- LangGraph：长时间运行的有状态图如何编译、推进、暂停、保存和恢复；
-- OpenTopia：在现有 Rust Agent Harness、Connection、Agent Template、HumanTask 和桌面端之上实现自己的统一控制面与运行时。
-
-不建议把 Python LangGraph 作为 OpenTopia Runtime 的进程内依赖，也不建议把 LangGraph 的 Thread、Interrupt Payload 或 Deployment 概念直接暴露为产品 API。应提炼其运行时不变量，在 Rust 中形成稳定的 OpenTopia 领域协议。
-
-### 6.2 LangGraph 概念映射
-
-| LangGraph               | OpenTopia 目标模型                    | 中文解释与边界                                                       |
-| ----------------------- | ------------------------------------- | -------------------------------------------------------------------- |
-| `StateGraph`            | `WorkflowDefinitionVersion`           | 已编译前的版本化工作流状态图                                         |
-| Compiled Graph          | `CompiledWorkflow`                    | 完成图结构、schema、权限和路由验证的不可变执行计划                   |
-| State                   | `WorkflowRunState`                    | 一次 Run 的类型化持久状态，不等于会话消息历史                        |
-| State Channel           | `WorkflowStateChannel`                | 节点可读写的状态字段及其数据等级                                     |
-| Reducer                 | `StateReducer`                        | 串行或并行写入如何合并，禁止依赖隐式覆盖                             |
-| Node                    | `WorkflowNode`                        | Agent、Tool、Condition、Approval、Join、Output 等执行单元            |
-| Edge / Conditional Edge | `WorkflowTransition`                  | 普通、条件、异常和循环转移                                           |
-| Thread                  | `WorkflowRun`                         | LangGraph 的持久执行游标映射到一次 Run，不与 ConversationThread 混用 |
-| Task                    | `NodeAttempt`                         | 某节点的一次可追踪执行尝试                                           |
-| Checkpoint              | `WorkflowCheckpoint`                  | 已提交 superstep 的可恢复运行快照                                    |
-| Pending Writes          | `WorkflowStateWrite`                  | 同一 superstep 中已完成节点的待合并结果                              |
-| `interrupt()`           | `InterruptRequest`                    | Runtime 发出的暂停协议，随后投影为产品级 HumanTask                   |
-| `Command(resume=...)`   | `ResumeCommand`                       | 经权限验证、带 revision 的结构化恢复命令                             |
-| Subgraph                | `NestedWorkflow` / `AgentNodeRuntime` | 子工作流或复用现有 Agent Harness 的节点内部执行                      |
-| State History           | `Run Timeline`                        | Checkpoint、NodeAttempt、HumanTask 和状态差异时间线                  |
-| Replay / Fork           | `TrialReplay` / `RunFork`             | 从历史检查点重放或创建隔离试验分支                                   |
-
-必须保留四种不同 ID：`conversation_thread_id`、`workflow_run_id`、`agent_node_session_id` 和 `human_task_id`。一个会话可以触发多个 WorkflowRun；一个 WorkflowRun 可以拥有多个 Agent 节点会话和多个人工任务。
-
-### 6.3 参考 LangGraph 的 Runtime 分层
+# OpenTopia Agent 与 Flow 设计方案
+
+> 状态：Flow 单一产品模型实施基线 v3.0
+> 日期：2026-08-28
+> 参考：OpenAI Frontier 的控制面布局、LangGraph 的状态图语义
+> 核心目标：先稳定跑通单 Agent、Flow 创建、事件待审、启动和完整运行
+
+## 1. 已确认的产品原则
+
+1. 用户直接创建 `Agent`，不需要理解 Agent Template。不可变 Agent 配置版本只作为内部实现存在。
+2. 多数任务优先用单 Agent；只有需要事件驱动、分支/汇合、长时间状态或人工门时才使用 Flow。
+3. `Flow` 是唯一面向用户的自动化对象。创建、配置、测试、激活、暂停、复制都在 Flow 上完成。
+4. Flow 不拥有额外的全局 Trigger；能进入图的节点 Trigger 决定入口。默认入口通常是第一个 Agent 节点。
+5. 后续 Agent 的 Trigger 也可以是 API、定时器、Connection Event，或上游 Agent 的 Final 完成通知。
+6. Flow 的顺序由订阅关系形成，支持链、分支、汇合和有终止条件的环，不限定为线性流程。
+7. 一次事件产生一个 `Flow Case`。同一个 Flow 被触发 N 次，对应 Case 1…N；真正开始执行后，每个 Case 关联一个 `Flow Run`。
+8. Trigger 可以设置 `立即运行` 或 `等待人工确认`。等待确认的事件进入 Inbox，用户点击启动后才创建 Run。
+9. Connection 类似带账号和授权上下文的 MCP 服务，向 Agent 暴露工具；工具结果不需要预先拼入提示词。
+10. 事件参数保留来源原始结构。提示词通过 `@Flow.input` 和 `@Trigger.input` 引用，Agent 需要详情时再调用 Connection 工具。
+
+旧的独立发布、部署和发布通道产品层已移除，不提供兼容入口。稳定性改由 Flow 内部不可变 Revision 和 Case 冻结快照保证。
+
+## 2. 核心领域模型
 
 ```mermaid
 flowchart LR
-    TD["Trigger Dispatch<br/>触发器分发"]
-    CW["Compiled Workflow<br/>已编译工作流"]
-    GR["Graph Runtime<br/>状态图运行时"]
-    NR["Node Runtime<br/>节点运行时"]
-    HK["Agent Harness Kernel<br/>现有 Agent 执行内核"]
-    CR["Connector Runtime<br/>连接器执行边界"]
-    CP["Checkpoint Store<br/>检查点存储"]
-    IR["Interrupt Request<br/>运行时中断请求"]
-    HT["Human Task<br/>人工审批、输入与恢复"]
-    RC["Resume Command<br/>结构化恢复命令"]
-    OP["Output Port<br/>输出交付接口"]
-
-    TD --> CW
-    CW --> GR
-    GR --> NR
-    NR --> HK
-    NR --> CR
-    GR <--> CP
-    NR --> IR
-    IR --> HT
-    HT --> RC
-    RC --> GR
-    GR --> OP
+    C["Connection<br/>连接与工具能力"] --> A["Agent<br/>智能体"]
+    K["Knowledge Library<br/>知识库"] --> A
+    P["Permission Grant<br/>权限授权"] --> A
+    A --> F["Flow<br/>自动化状态图"]
+    E["Source Event<br/>来源事件"] --> T["Node Trigger<br/>节点触发器"]
+    T --> F
+    F --> FC["Flow Case<br/>一次待处理事件"]
+    FC -->|"manual start / 人工启动"| FR["Flow Run<br/>一次实际执行"]
+    FC -->|"immediate / 立即运行"| FR
+    FR --> H["Human Task<br/>审批、补充或恢复"]
+    FR --> O["Output Delivery<br/>结果投递"]
 ```
 
-Runtime 内部拆为四个明确边界：
+图中英文对应代码/协议名，中文对应界面含义：
 
-1. `WorkflowCompiler`：编译 Graph、State Channel、Reducer、schema、能力授权、循环和错误路由；
-2. `GraphRuntime`：按 superstep 推进 ready nodes、条件边和并行 barrier，不执行企业权限推导；
-3. `CheckpointEngine`：原子提交状态写入、NodeAttempt、下一批 ready nodes、Interrupt 和审计事件；
-4. `InterruptCoordinator`：把 InterruptRequest 投影为 HumanTask，并在人工动作后验证 ResumeCommand。
+- `Connection`：账号、远端服务、MCP 工具和授权范围的组合；
+- `Agent`：Instructions、Connections、Knowledge、Permissions、Tools 和 Final schema 的稳定业务身份；
+- `Flow`：Agent 和控制节点构成的状态图，也是用户创建和复用的唯一自动化对象；
+- `Flow Case`：某个 Flow 接收到的一次业务事件，可等待人工启动；
+- `Flow Run`：Case 开始后产生的实际执行，固定使用 Case 保存的 Flow Revision；
+- `Human Task`：执行中的审批、中断恢复、补充输入或输出复核；
+- `Output Delivery`：Inbox、Webhook 或 Connection 写操作等结果投递。
 
-Agent 节点仍调用现有 Agent Harness Kernel，不在 GraphRuntime 内复制模型循环、工具调度或 Agent continuation 逻辑。
-
-### 6.4 应借鉴的运行时不变量
-
-#### Typed State 与 Reducer
-
-WorkflowDefinition 必须声明可检查的 `WorkflowRunState`。节点显式声明读取、写入和输出映射；并行节点可能写入同一个 State Channel 时必须有 Reducer。Reducer 必须是确定性的，并在发布前通过合并顺序测试。
+### 2.1 Flow 内部版本
 
 ```text
-WorkflowRunState
-  input
-  variables
-  agent_outputs
-  tool_results
-  human_responses
-  errors
-  output
+Flow（稳定业务身份）
+  ├── status: active | paused
+  ├── activeRevision（当前不可变执行版本）
+  │     ├── compiledGraph
+  │     ├── frozenAgentSpecs
+  │     ├── trigger
+  │     ├── ingressPolicy
+  │     ├── output
+  │     └── contentHash
+  └── revision（Flow 管理操作的 CAS 版本）
 ```
 
-状态字段同时携带 schema、数据等级和保留策略。边上的字段投影只能缩小数据范围，不能绕过 Connection 或 Agent Template 的权限边界。
+激活新草稿会替换 `activeRevision`，但已经进入队列的 Case 仍保存旧 Revision。这样无需单独的 Deployment，也能保证“事件进入时看到的配置”和“稍后人工启动时执行的配置”完全一致。
 
-#### Compile Before Run
-
-`WorkflowDefinitionVersion` 先编译为 `CompiledWorkflow`，DeploymentSnapshot 固定编译产物的 content hash。编译必须拒绝不可达节点、缺失 Trigger/Output、无上限循环、没有 Reducer 的并行冲突、无效 Agent Template/Connection、权限扩大和缺少高风险审批门。
-
-#### Checkpoint by Superstep
-
-每个已提交的 superstep 生成 Checkpoint；同一 superstep 中已成功节点的写入单独记录为 pending writes。某个并行节点失败时，恢复不能重新执行已经成功且结果已持久化的兄弟节点。首版可保存完整状态快照，状态规模达到阈值后再引入 delta checkpoint。
-
-#### Interrupt 不是 Failure
-
-审批、补充输入、输出审阅、重新登录、人工修正和外部副作用不确定都属于 Interrupt，而不是普通异常。状态流转统一为：
+### 2.2 Case 与 Run
 
 ```text
-running -> waiting_for_human -> resuming -> running | succeeded | cancelled | failed
+Source event
+  -> accept and deduplicate
+  -> FlowCase(status = accepted, frozen FlowRevision, immutable input)
+  -> ingressPolicy == require_review ? stay in Inbox : start immediately
+  -> FlowRun(status = running/...)
+  -> HumanTask when needed
+  -> Output delivery
 ```
 
-Interrupt 创建与 Run/Checkpoint 更新必须在同一事务中；ResumeCommand 也必须与 HumanTask 解决和 Run revision 更新原子提交，事务完成后才能重新调度节点。
+Case 使用 `(flowId, idempotencyKey)` 去重。同一个 key 且输入相同返回原 Case；同一个 key 但输入不同必须拒绝，不能静默覆盖或重复产生副作用。
 
-#### Command-based Resume
+## 3. Trigger 与图语义
 
-UI 和外部调用者不能直接修改 Run 状态，只能提交受 task action schema 约束的命令：
+### 3.1 Trigger 属于节点
+
+```mermaid
+flowchart LR
+    API["API Event<br/>接口事件"] --> T1["Trigger A<br/>入口条件"]
+    T1 --> A1["Agent A<br/>智能体 A"]
+    A1 --> F1["Agent Final<br/>完成通知"]
+    F1 -. "subscription / 订阅" .-> T2["Trigger B<br/>后续条件"]
+    CRM["CRM Event<br/>客户系统事件"] --> T2
+    T2 --> A2["Agent B<br/>智能体 B"]
+    A2 --> F2["Agent Final<br/>完成通知"]
+```
+
+`Agent Final` 直接复用 Agent Loop 的完成结果和完成通知，不创建新的 Final Trigger 类型。界面把“订阅上游 Final”显示在后续节点的 Trigger 区域，因为用户配置的是该节点何时启动。
+
+### 3.2 多来源表达式
+
+Trigger 表达式支持 `AND / OR / NOT`：
 
 ```text
-Approve | Reject | SubmitInput | Retry | Reconnect | CorrectData | Cancel
+OR(
+  AgentFinal("risk_check"),
+  AND(Api("manual_override"), NOT(ConnectionEvent("account_locked")))
+)
 ```
 
-每个命令至少携带 `human_task_id`、`expected_revision`、操作者身份和输入；高风险命令还携带检查结果、证据或修改前后差异。
+运行时规则：
 
-### 6.5 不直接照搬的部分
+- 根节点外部事件：`@Trigger.input == @Flow.input`；
+- 上游 Final：`@Trigger.input` 是该 Final 的结构化产物；
+- 多个 Final 汇合：`@Trigger.input` 是以来源节点 ID 为 key 的对象；
+- `@Flow.input` 在整次 Run 中保持不变，所有 Agent 都知道自己正在处理哪个原始事件；
+- 边负责数据投影和依赖，Trigger 负责真正的激活条件。
 
-LangGraph 的动态 Interrupt 在恢复时会重新进入包含 Interrupt 的节点，因此 Interrupt 之前的副作用必须幂等。OpenTopia 面向 CRM 更新、付款、发信和 ERP 操作，不能默认整节点安全重放，应采用更严格的三层恢复模型：
+### 3.3 事件原始参数
+
+邮件、CRM、ERP、Webhook 和 API 的参数不强制转换成统一大 Schema。入口适配器只负责来源鉴权、提取幂等键和保存原始 payload：
+
+```json
+{
+  "messageId": "msg_123",
+  "customerId": "cus_456",
+  "subject": "需要修改收货地址"
+}
+```
+
+Agent 可直接读取已有字段；需要邮件全文或客户详情时，通过 Connection 暴露的 MCP 工具按 ID 查询。Instructions 可以说明何时使用工具，但系统不把工具调用结果静态复制进提示词。
+
+## 4. 创建与运行流程
+
+### 4.1 单 Agent
+
+1. 用户进入 Agents，点击新建。
+2. 中间区使用自然语言描述需求。
+3. Agent Loop 调用受控创建工具生成/修改配置。
+4. 右侧实时显示 Instructions、Connections、Knowledge、Permissions、Tools、Trigger 和 Final schema。
+5. 用户测试并保存 Agent。
+6. 如果 Agent 自带外部 Trigger，事件同样可以先形成待处理 Case，再人工启动。
+
+本阶段只保证单 Agent 路径；现有多 Agent 框架保持独立，不并入本次产品流程。
+
+### 4.2 Flow
+
+1. 用户进入 Flow，点击创建，中央页面切换到新的 Flow 编辑页。
+2. 创建时即配置入口 Agent 的 Trigger 和 `立即运行/等待确认`，不能创建完成后才临时补 Trigger。
+3. 从已有 Agent 目录添加节点，通过图形化边和 Trigger 订阅配置时序。
+4. 点击节点进入该 Agent 的独立设置页；左上角返回回到原 Flow 图，Agent 与 Flow 仍高度解耦。
+5. 运行静态校验、模拟和真实 Test Run。
+6. 点击激活，Flow 保存不可变 Active Revision；之后可以暂停、继续或复制。
+7. 外部事件到达时创建 Case。需人工确认的 Case 出现在 Inbox，立即模式则自动创建 Run。
+8. 用户从 Case 查看原始输入、冻结版本、运行状态、人工任务、节点产物和最终输出。
+
+复制 Flow 会生成新草稿，并默认把自动入口改为手动确认，避免复制后意外监听同一个生产事件源。
+
+## 5. UI 信息架构
+
+固定一级导航：
 
 ```text
-WorkflowCheckpoint
-  -> 恢复整张图和已提交 superstep
-
-AgentContinuation
-  -> 恢复 Agent 节点内部的模型与工具调度安全点
-
-ActivityReceipt / IdempotencyKey
-  -> 证明外部副作用是否已经执行并防止重复调用
+Overview / 总览
+Inbox / 待处理
+Agents / 智能体
+Flows / 工作流
+Runs / 运行记录
+Connections / 连接
+Trust / 权限与风险
+Knowledge / 知识库
 ```
 
-因此：
+不再展示独立 Deployments 或 Automation 一级入口。
 
-- 确定性 Condition/Join/纯转换节点可以从节点开头重放；
-- Agent 节点优先从持久化 AgentContinuation 恢复；
-- 外部 Tool/Connector 节点必须使用幂等键、操作回执或人工核对路径；
-- 副作用状态为 unknown 时不能自动 retry，必须生成 recovery HumanTask；
-- `InterruptRequest` 只是 Runtime 协议，`HumanTask` 才是拥有 assignee、SLA、权限、证据和审计的产品实体；
-- Connection、Agent Template、WorkflowDeployment、Trigger、Output 和企业治理继续由 OpenTopia 控制面拥有，不下沉为 LangGraph Runtime 概念。
+### 5.1 页面切换和返回
 
-## 7. 推荐 API
+- 新建 Agent、新建 Flow、编辑节点 Trigger 等复杂操作使用中央页面切换，不堆叠大弹窗；
+- 返回按钮统一放在标题最左侧；
+- 标题后展示路径，例如 `Flows / 创建 Flow`、`Flows / 工伤审核 / 结构化审核 Agent`；
+- 返回时恢复原页面的搜索、筛选、滚动位置和已选节点；
+- URL/route 保存 `section + objectId + subpage`，支持通知 deep link。
 
-在现有 API 旁增加缺失资源，并让 UI 与模型工具复用同一服务：
+### 5.2 Frontier 风格三栏
 
 ```text
-/api/enterprise/org-units
-/api/enterprise/agent-templates
-/api/enterprise/agents
-/api/enterprise/workflow-drafts
-/api/enterprise/workflow-definitions
-/api/enterprise/workflow-deployments
-/api/enterprise/workflow-runs
-/api/enterprise/human-tasks
-/api/enterprise/integration-definitions
-/api/enterprise/connections
-/api/enterprise/knowledge-bases
-/api/enterprise/audit-events
-/api/enterprise/evaluations
+┌──────────────────┬────────────────────────────────────┬──────────────────────┐
+│ Global navigation│ Main editor / cases / run timeline │ Live configuration   │
+│ 全局一级导航      │ 主编辑区、事件列表、运行时间线       │ 实时配置与权限预览     │
+└──────────────────┴────────────────────────────────────┴──────────────────────┘
 ```
 
-关键动作：
+- 左侧保持稳定一级导航和当前集合；
+- 中间是 Agent Instructions、Flow Graph、Case 列表或 Run 时间线；
+- 右侧实时显示 Resources、Connections、Knowledge、Permissions、Trigger 和 Final；
+- 表单容器只有一层视觉边框，Select/Input 自身不再套重复卡片边框；
+- 所有图标按钮都有可见焦点和 `aria-label`，颜色、间距、圆角只使用设计系统 token。
+
+### 5.3 多次触发在哪里显示
+
+- Flow 列表只显示稳定 Flow 本身；
+- Inbox 显示 `accepted` 且等待人工启动的 Case；
+- Flow 详情的 Cases 页显示该 Flow 的 Case 1…N；
+- Runs 显示已启动的执行；
+- Case 详情同时展示输入和关联 Run，因此不会把模板身份与执行实例混在一起。
+
+## 6. Connection、Knowledge 和权限
+
+Connection 是固定一级配置入口，一个 Connection 至少包含：
+
+- Provider/MCP Server 身份；
+- 登录账号、tenant/workspace 与 credential reference；
+- 已发现的 Tools，以及每个工具的输入/输出 Schema；
+- Agent 可使用的操作级 grant；
+- 健康状态和被哪些 Agent/Flow 引用的影响范围。
+
+密码、OAuth token 和 API key 必须只存 Vault 引用，不能复制进 Agent 或 Flow Revision。运行时从 Flow Revision 固定的 Agent capability 获取工具授权，再由当前 Connection 注入凭据；权限只能收窄，不能因 Thread 或模型请求而扩大。
+
+SAG 知识库使用独立 namespace 隔离业务：
+
+- `opentopia.audit.work-injury.v2`：工伤医疗审核政策知识；
+- `opentopia.audit.credit-review.v1`：信贷审核政策知识。
+
+案件数据不是知识源。案件是被审核的事件，进入对应 Flow 的 Case 队列；知识库只保存政策、规则和说明文档。
+
+## 7. 工伤与信贷审核 Demo
+
+两个审核项目统一映射为新架构：
+
+```mermaid
+flowchart TD
+    EV["Audit Case Event<br/>待审核案件事件"] --> Q["Flow Case Queue<br/>待处理事件队列"]
+    Q -->|"operator starts / 人工启动"| DA["Domain Audit Agent<br/>结构化业务审核"]
+    DA --> SE["SAG Evidence Agent<br/>政策证据检索"]
+    SE --> V["Evidence Validator<br/>证据完整性校验"]
+    V --> G["Human Review Gate<br/>人工复核门"]
+    G --> R["Review Report Agent<br/>审核报告生成"]
+    R --> O["Inbox Output<br/>待人工确认结果"]
+```
+
+- 工伤 Flow 和信贷 Flow 各有自己的 Agent、Connection、SAG namespace 和事件 Trigger；
+- 入口策略为 `require_review`，Demo 案件批量进入 Inbox，不自动执行；
+- Agent 都能读取同一个不可变 `@Flow.input`；
+- 后续 Agent 通过 `@Trigger.input` 接收上游产物；
+- 报告只提供人工审核辅助，不自动做赔付、授信、拒贷等高风险最终决定；
+- 真实验收固定使用 NowCoding Connection 的 `gpt-5.6-terra`，不使用 TokenHub。
+
+## 8. API 与存储边界
+
+核心 API：
 
 ```text
-POST /workflow-definitions/{id}:run-trial
-POST /workflow-deployments/{id}:validate
-POST /workflow-deployments/{id}:activate
-POST /workflow-deployments/{id}:pause
-POST /workflow-deployments/{id}:test-trigger
-POST /human-tasks/{id}:claim
-POST /human-tasks/{id}:act
-POST /connections/{id}:authorize
-POST /connections/{id}:reauthorize
-POST /connections/{id}:refresh-capabilities
-POST /connections/{id}:test
-GET  /connections/{id}/capabilities
-GET  /connections/{id}/effective-usage
-GET  /agents/{id}/effective-capabilities
+GET  /api/flows
+GET  /api/flows/:flowId
+POST /api/flow-drafts/:draftId/activate
+POST /api/flows/:flowId/pause
+POST /api/flows/:flowId/resume
+POST /api/flows/:flowId/copy
+POST /api/flows/:flowId/invoke
+POST /api/flow-events
+GET  /api/flow-cases
+POST /api/flow-cases/:caseId/start
+POST /api/flow-cases/:caseId/supersede
+GET  /api/flow-runs/:runId
 ```
 
-所有写操作带 `Idempotency-Key` 和 `expectedRevision`。列表、搜索、事件和对象读取都以 `enterprise_workspace_id + org_unit_id` 为强制边界。
-
-## 8. 持久化建议
-
-首版需要新增或规范化以下关系：
+核心表：
 
 ```text
-enterprise_workspaces
-org_units
-
-agent_templates
-agent_template_versions
-agents
-agent_assignments
-
-integration_definitions
-connections
-connection_auth_contexts
-connection_capability_revisions
-capability_grants
-knowledge_sources
-knowledge_bases
-knowledge_grants
-
-workflow_drafts
-workflow_definition_versions
-workflow_agent_specs
-workflow_deployments
-workflow_deployment_revisions
-trigger_bindings
-output_bindings
-
-workflow_runs
-flow_node_runs
-workflow_checkpoints
-workflow_state_writes
-workflow_interrupts
-human_tasks
-human_task_actions
-delivery_receipts
-audit_events
+flows                    -- 稳定 Flow 与当前 Active Revision
+flow_cases               -- 事件、幂等键、冻结 Revision、关联 Run
+flow_runs                -- 实际状态图执行
+flow_checkpoints         -- Run 检查点
+flow_pending_writes      -- superstep 待提交写入
+human_tasks              -- 审批、恢复、补充输入和输出复核
+flow_delivery_receipts   -- 输出投递状态
+flow_evaluations         -- 运行评估
 ```
 
-Graph、schema 和策略可以继续用版本化 JSON 文档存储，但经常查询、关联和授权的字段必须规范化，例如 `org_unit_id`、版本、状态、角色绑定、Connection、账号 tenant/workspace、能力修订、操作 ID、assignee、SLA 和风险等级。`connection_auth_contexts` 只保存凭证句柄和非秘密认证元数据，实际 secret 由专用 Vault 管理。
-
-## 9. 桌面 UI 信息架构
-
-### 9.1 产品定位
-
-Flow 模式应是与 Code/Work 同级的完整 Surface，而不是右侧工具页。保留当前 OpenTopia 侧栏的空间和交互习惯，但将其纵向分成“固定一级导航 + 随导航变化的对象列表”，再配合主工作区和 Inspector：
-
-```text
-┌──────────────────────────────┬───────────────────────────────────────┬────────────────────────────┐
-│ Flow Sidebar（Flow 侧栏）    │ Main Workspace（主工作区）           │ Inspector（上下文检查器） │
-│                              │                                       │                            │
-│ Mode Switch / Global Actions │ 当前对象的详情、Chat、Graph、Timeline│ 配置、证据、风险与决定     │
-│ 模式切换 / 全局操作          │                                       │                            │
-│                              │                                       │                            │
-│ Primary Navigation           │                                       │                            │
-│ 一级导航                     │                                       │                            │
-│ Overview / Inbox / Agents    │                                       │                            │
-│ Workflows / Deployments/Runs │                                       │                            │
-│ Connections / Knowledge      │                                       │                            │
-│ Trust（按角色显示）          │                                       │                            │
-│ ──────────────────────────── │                                       │                            │
-│ Contextual Collection        │                                       │                            │
-│ 上下文对象列表               │                                       │                            │
-│ 搜索 / 筛选 / 分组 / 条目    │                                       │                            │
-│ ──────────────────────────── │                                       │                            │
-│ Organization / Settings      │                                       │                            │
-│ 组织切换 / 设置              │                                       │                            │
-└──────────────────────────────┴───────────────────────────────────────┴────────────────────────────┘
-```
-
-一级导航按业务任务分组，避免平铺十几个同级入口：
-
-- **Operate**：Overview、Inbox、Deployments、Runs；
-- **Build**：Agents、Workflow Templates；
-- **Context**：Connections、Knowledge；
-- **Trust**：Permissions、Evaluations、Audit。
-
-`Connections` 和 `Knowledge` 是固定一级导航中的一等入口，不属于侧栏底部的设置区。Agent Template 配置、Deployment readiness、Connection 失效处理和故障恢复都会频繁跳转到 Connections；把它放到底部会错误地表达成低频系统设置。侧栏底部只保留组织切换、Settings、Help 等全局工具；Trust 可以作为按角色显示的一级分组，但也不与 Settings 混在一起。
-
-一级导航决定下面 `Contextual Collection` 的对象类型：
-
-| 一级导航           | 下方列表展示                              | 列表条目的关键信息                                   |
-| ------------------ | ----------------------------------------- | ---------------------------------------------------- |
-| Overview           | 最近对象与需要关注的异常                  | 类型、状态、更新时间                                 |
-| Inbox              | HumanTask                                 | 类型、来源 Agent/Deployment/Run、原因、SLA、assignee |
-| Agents             | Agent，顶部切换 AI 员工 / Agent Templates | 名称、归属、状态、最近活动                           |
-| Workflow Templates | WorkflowDefinition                        | 草稿/已发布版本、Trial 状态、更新时间                |
-| Deployments        | WorkflowDeployment                        | active/degraded/paused、环境、待办数量、最近运行     |
-| Runs               | WorkflowRun / Case                        | 当前步骤、状态、时长、人工等待和风险                 |
-| Connections        | Connection                                | 登录账号、tenant、健康、重新认证状态                 |
-
-不要在 Deployments 列表中混排 Agent 和 HumanTask。列表必须保持单一对象类型，通过 badge 和来源摘要表达关联；需要处理的事项统一进入 Inbox。每个一级入口独立保存搜索、筛选、滚动位置和已选对象，返回时恢复上下文；URL/route 同时包含 `section + selected_id`，便于通知 deep link 和审计跳转。
-
-这个信息架构借鉴 Frontier 已公开的方向，而不是声称复刻其未公开后台：OpenAI 的公开材料强调统一运行 Agent、显式权限、审批门、审计与可观测性，并明确 Agent 可以在不同界面中参与工作。因此 OpenTopia 应保持一个稳定控制面，同时允许同一个 HumanTask 在当前 Run 和全局 Inbox 中出现。参考：[Introducing OpenAI Frontier](https://openai.com/index/introducing-openai-frontier/)、[Workspace agents for business](https://openai.com/business/workspace-agents/)。
-
-### 9.2 Overview
-
-Overview 是运营面板，不是营销首页：
-
-- 活跃 Deployments、今日 Workflow Runs、成功率、P95 时长；
-- 待处理 HumanTask 数量、逾期 SLA、高风险待办；
-- 异常 Deployment 和 Connection 健康；
-- 最近版本发布和权限变更；
-- 一条主操作：`新建 Agent` 或 `新建 Workflow Template`，根据当前空状态决定。
-
-避免用大面积渐变、插画或无行动意义的指标卡。
-
-### 9.3 Agent 模板与 Agent
-
-Agent 页面使用列表—详情结构，并把“模板”和“员工”作为两个视图：
-
-```text
-Agents
-  [AI 员工] [岗位模板]
-
-岗位模板详情：
-  Overview | Instructions | Libraries | Connections | Tools | Guardrails | Versions
-
-AI 员工详情：
-  Chat | Identity | Effective configuration | Activity | Memory | Audit
-```
-
-创建模板有两种入口：
-
-1. “描述这个岗位”——自然语言生成草稿；
-2. “手动配置”——结构化表单。
-
-`Libraries` 直接选择 Agent 可以检索的知识库；`Connections` 直接选择 CRM、ERP 等连接，并按 App/资源分组展示 operation checkbox、范围、字段和审批要求。底部始终显示模板配置与最终有效配置的 Diff。
-
-打开某个 Agent 后，`Chat` 是首要入口。对话 Composer 上方用紧凑摘要显示当前 Agent 已拥有的 Library、Connection 和工具；详细配置只在 Inspector 展开，不要求用户每次重新选择上下文。
-
-### 9.4 Workflow Template Designer
-
-Workflow Template 设计继续以对话为主要入口，Graph 是可审查的中间表示。设计过程中添加的每个 Workflow Agent 都必须选择一个 Agent Template 作为来源：
-
-```text
-┌──────────────────────────────┬──────────────────────────────┐
-│ 对话与设计记录               │ Graph / Inspector            │
-│                              │                              │
-│ 描述目标、Agent、条件        │ 当前版本、节点与验证状态     │
-│ Agent 澄清少量关键问题       │ 选择节点后编辑关键字段       │
-│ 生成/修改 Workflow Template  │ Agent Template、输入输出     │
-│ Trial、错误和发布进度        │                              │
-└──────────────────────────────┴──────────────────────────────┘
-```
-
-关键规则：
-
-- 默认不显示原始 JSON；在“高级”抽屉中只读查看，具备权限时才允许编辑；
-- Graph 支持选中和关键字段修改，不要求用户拖拽连线才能完成设计；
-- 添加 Agent 节点时使用 `从 Agent Template 派生`，并显示继承的 Library、Connection 和工具摘要；
-- Workflow Template 顶部固定展示 Trigger 和 Output，两者不是可省略的普通节点；
-- 节点使用一致的 Lucide 图标、类型标签和状态，不用彩虹色区分；
-- 校验错误同时显示在 Graph、Inspector 和可跳转的问题列表；
-- 发布按钮旁明确显示 Trial、审批和未决问题是否通过。
-
-### 9.5 Workflow Deployment Builder
-
-将已经跑通的 WorkflowDefinition 创建为 Deployment，使用可返回的五步流程并自动保存草稿：
-
-1. 选择已通过 Trial 的 WorkflowDefinition 版本和目标部门/项目；
-2. 将 WorkflowAgentSpec 绑定到已有 Agent，或物化为 Deployment 管理的 Agent；
-3. 验证每个 Agent 继承的 Library、Connection、工具和权限仍然有效；
-4. 激活 Trigger、Output endpoint 与 ReviewPolicy；
-5. Dry Run、权限 Diff、风险检查并激活。
-
-右侧固定显示 `Deployment readiness`：Agent Template 失效、Connection 异常、Trigger 未认证、Output 无幂等、扩权和未通过测试。`激活部署` 是唯一主操作。
-
-### 9.6 Workflow Runs / Cases
-
-列表默认展示业务字段，不以内部 UUID 为主：
-
-- Case 标题、Deployment、状态、当前步骤、负责人；
-- 触发时间、持续时间、SLA；
-- 风险、需要人工、输出状态；
-- 可保存的筛选器和按状态分组。
-
-Workflow Run 详情为时间线：Trigger → Agent/Tool 节点 → Validator → Review → Output。节点展开后展示输入摘要、工具调用、结果、Evidence 和错误；隐藏模型私有推理。
-
-### 9.7 Inbox
-
-Inbox 复用上述侧栏对象列表，而不是在主工作区再放一列重复 Queue。整体形成“导航与任务列表—证据—决定”的高效率布局：
-
-```text
-┌──────────────────────────────┬─────────────────────────────────────┬──────────────────────────┐
-│ Inbox Collection（任务列表）│ Evidence & Case Context（证据上下文）│ Decision（决定面板）     │
-│                              │                                     │                          │
-│ 我的 / 未分配 / 逾期        │ 为什么需要人工                      │ 按 action_schema 显示动作│
-│ Approval / Input / Recovery  │ 输入、输出、差异和来源              │ 批准/拒绝/重试/终止等    │
-│ Output Review / Reconnect    │ Flow 位置、检查点与影响范围          │ 备注、分派、升级          │
-└──────────────────────────────┴─────────────────────────────────────┴──────────────────────────┘
-```
-
-决定前必须看见：发起 Agent、代表谁行动、所属 Deployment/Run/节点、将调用哪个 App 操作、数据范围、不可逆影响、已发生的外部副作用和证据。拒绝或终止必须可选原因；编辑后批准保存原值、修改值和决定者。
-
-Inbox 条目不是普通通知：打开即进入可恢复的业务工作台。任务被他人领取或处理时，列表和当前决定面板实时更新；过期任务根据策略升级、转派或使 Run 失败，不能无限等待。
-
-### 9.8 Flow 中的就地中断面板
-
-需要提供类似 Code 模式审批卡片的 Flow 体验，但不应新增一套 Flow 专属审批状态。建议从现有 `ApprovalDialog` 中抽取通用的请求摘要、风险说明、提交态和错误态，形成共享展示组件 `HumanTaskPanel`：Code 模式继续从会话审批事件适配，Flow 模式从 `HumanTask + WorkflowRun checkpoint` 适配。两种模式可以共享交互 primitive，但不强迫底层事件使用同一种领域模型。
-
-当用户正在查看被阻断的 Run：
-
-- 主工作区顶部显示紧凑 `Flow interrupted` 状态条，包含等待原因、节点、SLA 和 `在 Inbox 中处理`；
-- 时间线在阻断节点原位插入 HumanTaskPanel，使用户知道 Flow 为什么停在这里；
-- 右侧 Inspector 显示完整 Evidence、权限、影响和 action_schema；
-- 低风险二元审批可就地处理；需要编辑数据、重新登录、恢复外部副作用或高风险批准时跳转 Inbox 完整工作台；
-- 处理后状态条变为 `Resuming`，直到 continuation 成功；不能在 UI 点击后立即假装 Run 已恢复。
-
-用户正在查看其他对象时，只显示 Inbox badge、可选桌面通知和 deep link，不强行弹出模态框打断当前工作。这样既保留 Code 模式的即时反馈，也让管理者能在 Inbox 中异步、批量地处理跨 Agent 和跨 Workflow 的任务。
-
-### 9.9 Connections 与 Knowledge
-
-Connections 页面分为：
-
-- Catalog：可用 MCP Server、CRM、ERP、数据库、消息和内部 App，标注接入类型与认证方式；
-- Connections：真实登录账号、tenant/workspace、环境、个人/共享/服务账号归属、健康和重新认证状态；
-- Capabilities：该账号实际发现的 tools/resources、组织上限、模板已授予子集、风险和审批要求；
-- Usage：被哪些 Agent Template、Agent、WorkflowDefinition 和 WorkflowDeployment 引用。
-
-Connection 详情页的主操作根据状态显示 `登录并连接`、`重新授权`、`刷新能力` 或 `测试连接`。新增能力只显示为“可授权”，不得自动进入任何已发布模板；减少或失效的能力应直接列出受影响对象和修复入口。
-
-Knowledge 页面单独展示 Source、同步状态、索引、数据等级、检索范围和引用使用情况。
-
-### 9.10 主工作区子页面与表单边界
-
-新建、编辑、发布和部署等需要持续填写或审查上下文的操作，不在列表页内纵向展开，也不默认使用模态框。它们切换中间主工作区为独立子页面，固定一级导航和左侧 Contextual Collection 保持不变，从而让用户既知道所属模块，也能专注完成当前任务。
-
-- 顶部共享标题栏是子页面导航的唯一事实源：返回按钮固定在标题最左侧，后面显示当前位置路径，例如 `Deployments / 创建部署`、`Automation / 创建发布通道`；
-- 返回动作由拥有编辑状态的领域模块提供，App 只展示路径和调用返回动作，不复制 Agent、Deployment、Release 或 Connection 的草稿状态；
-- Agent Template、Workflow Template、Deployment、Release Channel 和 Connection 的创建/编辑统一采用该模式；成功提交后回到原模块的列表或详情，返回时保留原有选择、筛选和已加载数据；
-- 页面底部的“取消”可以作为表单动作保留，但不得再创建第二套带左箭头的局部返回标题；
-- 一个表单分组只使用一层视觉边界。`Panel` 表示页面级或语义分组边界，输入控件自己拥有唯一边框，不允许用另一个带边框容器包裹已经带边框的 Select/Input；
-- Select 的可见标签、提示、错误和原生控件由统一 `SelectField` primitive 管理。Feature 页面不再通过嵌套 label/control shell 重复绘制边框或焦点环；
-- 子页面切换不得触发全局数据重载。领域 Store 继续拥有草稿、busy、error 和选择状态，顶部标题仅承担位置感与可预测返回。
-
-这套规则延续 Frontier 风格的稳定控制面：一级信息架构不因任务切换而漂移，复杂操作在主工作区获得完整空间；同时保持 OpenTopia 桌面端紧凑、低装饰和可键盘操作的设计语言。
-
-## 10. 视觉与交互规范
-
-界面应遵守现有 `design-system/MASTER.md` 和 token，而不是引入一套“AI 紫色”主题：
-
-- 工作区使用中性 surface、hairline border 和清晰分栏；
-- 蓝色仅用于主操作、选择、焦点和链接；
-- 绿/黄/红只表达状态，不作为装饰；
-- 默认 14px 正文、12px 标签、11px 元数据；
-- 32px 普通控件，28px 紧凑工具栏；
-- 列表密度高但保持 4/8px 节奏，避免大卡片堆叠；
-- transient UI 才使用阴影，常驻区域用 border；
-- 微交互使用 120/180ms token，支持 reduced motion；
-- 所有 icon-only 控件有 `aria-label`，Graph 和时间线可键盘导航；
-- 状态不能只靠颜色，必须有文字或图标；
-- 超过 300ms 的请求显示 skeleton/progress，异步按钮禁用并显示当前动作。
-
-## 11. 代码组织建议
-
-不要继续把所有 Flow UI 和状态塞进 `App.tsx` 或单一 `FlowWorkspacePanel.tsx`。建议形成独立 feature：
-
-```text
-apps/desktop/src/features/enterprise-flow/
-  EnterpriseFlowSurface.tsx
-  routes.ts
-  api.ts
-  viewModels.ts
-  hooks/
-  overview/
-  inbox/
-  agents/
-  workflow-templates/
-  deployments/
-  runs/
-  context/
-  trust/
-  components/
-```
-
-`App.tsx` 只负责模式切换、窗口骨架和 feature 挂载。feature 内使用现有 `components/ui`，共享的 ListDetail、InspectorSection、StatusBadge、ResourcePicker 等稳定后再提升为通用 primitive。
-
-服务端建议增加 application 层，避免 HTTP handler、模型工具和 Store 各自拼接领域逻辑：
-
-```text
-crates/opentopia-core/src/enterprise/
-  agents/
-  capabilities/
-  connectors/
-  workflow_definitions/
-  workflow_deployments/
-  reviews/
-
-crates/opentopia-server/src/enterprise/
-  routes/
-  services/
-  events/
-```
-
-不要求为了目录整洁立即拆 crate；先通过接口和测试固定依赖方向。
-
-## 12. 分阶段实施
-
-### Phase 0：冻结领域契约
-
-- 确定本文术语和 ID 边界；
-- 建立 `AgentTemplate -> Agent | WorkflowAgentSpec -> WorkflowDefinition -> WorkflowDeployment -> WorkflowRun -> HumanTask` 契约测试；
-- 为配置复用、权限只收窄、版本不可变、DeploymentSnapshot、幂等触发和幂等决定建立不变量；
-- 保留现有 API 行为，先增加 application service，不做 UI 大改。
-
-退出条件：新实体职责明确，模型工具和 HTTP API 可调用同一服务。
-
-### Phase 1：账号连接、能力发现与授权
-
-- 引入 IntegrationDefinition、Connection 和 ConnectionCapabilityRevision，MCP 作为首个 Provider 类型；
-- 建立 OAuth/API Key/Service Account 登录、账号上下文识别、能力发现和重新授权状态机；
-- 把 Agent Template 的 Plugin/MCP 字符串授权升级为结构化 LibraryBinding、ConnectionBinding 和 OperationGrant；
-- 增加操作级权限、资源/字段范围和有效权限解释 API；
-- 能力减少或认证失效时 fail closed，能力增加时不自动扩权；
-- Flow 设计态从 unrestricted 改为最小默认工具目录。
-
-退出条件：能回答“这个 Agent 通过哪个登录账号，为什么能对哪个 App 的哪个对象执行哪个操作”，并能在账号失效或能力变化时定位受影响对象。
-
-#### Phase 1A：已实现切片（MCP Connection Control Plane）
-
-当前先落地 Phase 1 的控制面骨架，并保持旧 MCP Runtime 与 `/api/mcp/**` 兼容：
-
-- 新增 `IntegrationDefinition`、账号级 `Connection` 和不可变 `ConnectionCapabilityRevision`；
-- `IntegrationDefinition` 只描述 Provider/服务目录，MCP runtime binding 归属于具体 `Connection`，避免多个账号静默共享同一个进程和凭据上下文；
-- 迁移现有 MCP Server 时保留原 UUID，回填一组 Definition + Connection，因此旧 Agent Template 和 Thread 引用不需要立即重写；
-- Connection 只保存 `vault://`、`keychain://`、`env://` 或 `plugin://` 等不透明凭据引用及非秘密账号元数据，不保存 token、password 或任意认证 payload；
-- 复用现有 `McpExtensionHost` 执行真实健康检查和 `tools/list`，规范化后发布内容哈希稳定的能力修订；相同内容不制造新修订，并返回新增、移除和变化的 operation diff；
-- operation 稳定 ID 使用 `connection_id + capability_kind + provider_native_name`，不依赖可编辑的 MCP display name；
-- 运行健康和认证验证是两个独立状态；stdio 进程可用不等于账号已经登录或凭据已经验证；
-- Desktop 将 Connections 作为固定一级入口，采用列表—详情布局，并提供账号/tenant、runtime、健康、测试、能力刷新和修订查看；左侧上下文集合只展示 Connection，不与会话混排。
-
-Phase 1A 的明确边界：首版只支持已有独立 stdio MCP runtime 的 `tools/list`；`resources/list` 与 `prompts/list` 必须标记为 `unsupported`。真正的 OAuth 登录回调、Vault 解析与注入、远程 HTTP MCP、多账号 runtime 创建、影响分析，以及 Agent Template 的结构化 `ConnectionBinding + OperationGrant` 留在 Phase 1B。新增能力在 Phase 1B 授权闭环完成前不会自动写入任何模板或扩大已有 Agent 权限。
-
-Phase 1A 退出条件：旧 MCP 配置可无损出现在 Connections 中；能区分 Provider 定义、账号 Connection、runtime 与能力修订；测试和刷新来自真实 MCP Host；任何 HTTP 响应、数据库文档和日志都不出现明文凭据。
-
-#### Phase 1B：已实现切片（Agent Template Operation Grants）
-
-本切片把 Phase 1A 的 Connection 能力目录接入 Agent Template，并把“界面上过滤工具”升级为真正的执行时权限边界：
-
-```text
-AgentTemplateVersion（Agent 模板版本）
-  └── ConnectionBinding（连接绑定：Connection + 固定能力修订）
-        └── OperationGrant（操作授权：稳定 operationId）
-              │
-              ▼
-Publish Resolver（发布解析器：账号、健康、修订与操作校验）
-              │
-              ▼
-AgentInstance ExecutionContext（Agent 实例执行上下文）
-  └── Frozen Connection Operations（冻结操作：精确路由 + 描述指纹）
-              │
-              ▼
-Agent Tool Catalog（Agent 工具目录：仅披露已授权操作）
-              │
-              ▼
-Pre-call Live Gate（调用前实时权限门：每次外部调用都重新校验）
-              │
-              ▼
-Exact MCP Route（精确 MCP 路由：serverId + providerToolName）
-```
-
-图中英文名称是领域/代码抽象，括号中的中文解释说明其产品职责。权限链的关键不变量如下：
-
-- `connectionBindings` 固定 `connectionId`、不可变 `capabilityRevision` 和显式 `operationGrants`；一个模板最多绑定 32 个 Connection、授权 256 个 operation；
-- 草稿只做结构校验，允许先保存尚未就绪的 Connection；发布、实例化、绑定 Agent 的每次加载和每次真实外部调用都 fail closed；
-- 发布解析器要求 Connection 与 IntegrationDefinition 已启用、Connection 为 `ready`、认证为 `verified/not_required`，并校验固定修订和活动修订中的已授权 operation 描述指纹完全一致；
-- 活动修订新增无关 operation 不会扩权；已授权 operation 被移除或描述、schema、风险 annotation、权限标签或精确路由发生变化时立即阻断，必须显式审阅并发布新模板版本；
-- Agent 实例保存经过父 Agent 和请求权限继续收窄后的 `connectionOperations`，其中只包含非秘密的 `connectionId`、修订、operationId、MCP serverId、Provider 原生工具名、模型工具别名和固定指纹；
-- 模型工具别名由 Connection 与 Provider 原生工具名确定性生成，不依赖可编辑的 MCP display name；因此同一个 Integration 的不同账号可以暴露同名原生操作而不发生全局路由冲突；
-- structured Connection 路径不读取 `thread_mcp_servers` 或 Plugin activation，避免用户配置模板后还要在每个会话重复启用，也避免 server 级开关把未授权工具重新并入目录；
-- 每次调用先经过 Store-backed live gate，再使用 `serverId + providerToolName + pinnedFingerprint` 精确调用 MCP Host。用户批准只能通过通用风险策略的 `Ask`，不能绕过 Connection 停用、重新认证、降级或 operation 变化；
-- RuntimeSnapshot 显式区分 `deny_all`、`legacy_mcp` 和 `structured`。`structured` 即使 operation 为空也不能回退到 live Thread MCP；续跑和子 Agent 只能继承或继续收窄冻结权限；
-- `FlowRun` 同样持久化三态 `connectionAuthority`。启动时按已发布 Flow 的 capability ceiling 再次收窄 operation 集合；暂停恢复和 HumanTask 恢复只消费 Run 内快照，不重新读取当前模板绑定或 Thread MCP；旧 Run 仅在其冻结 capability projection 明确包含 legacy MCP 时兼容推断为 `legacy_mcp`；
-- 旧模板缺少 `connectionBindings` 时保持历史 content hash 和 legacy MCP 执行语义。Desktop 只读显示旧授权，用户必须点击“开始迁移”才会清空 legacy 授权并改为 operation 选择，不做静默转换；
-- `GET /api/agent-templates/:templateId/versions/:version/connection-access` 按需解释模板当前是否有效、每个绑定和 operation 的问题、最终 MCP runtime 与模型工具目录；模板列表不做 N+1 权限解析。
-
-Desktop 的 Agent Template 编辑器已从 MCP UUID 文本框升级为 Connection/operation 选择器：能力修订按展开项懒加载，支持 Connection 与 operation 搜索、分批渲染、认证和健康状态、权限标签、修订失效、缺失 Connection、可恢复错误与显式 legacy 迁移。Connections 仍是固定一级入口，Agent Template 只引用账号连接和操作权限，不复制凭据。
-
-Phase 1B 的明确边界：本切片完成独立 Agent、绑定 Agent 的 Flow Run、续跑与子 Agent 所使用的 MCP `tools/list` operation 级授权和调用时撤权闭环。Flow 图中每个 `Agent` 节点依据其 `AgentTemplateVersion` 创建独立 node-scoped execution context，属于 Phase 2 的 `WorkflowAgentSpec / DeploymentSnapshot` 编译工作；在该上下文完成前，带 structured Connection binding 的 Agent 节点显式 fail closed，不继承 Root Flow Agent 的账号权限。尚未实现真实 OAuth 回调、Vault 凭据解析与账号级进程注入、远程 HTTP MCP、resource/prompt discovery、资源/字段级约束、规范化的反向影响索引，以及 Connection 失效后自动创建 HumanTask。这些能力分别进入后续 Connection Provider、WorkflowCompiler、影响分析和 HumanTask 阶段，不能用当前的 `credentialRef` 元数据冒充已完成。
-
-Phase 1B 退出条件：能够回答“某个 Agent 通过哪个 Connection 的哪个能力修订，为什么能调用哪个 operation”；新增 operation 不自动进入已有 Agent；Connection 停用、认证失效、运行降级、活动能力移除或描述变化会在外部调用前阻断；旧模板、续跑和子 Agent 不发生静默扩权。
-
-### Phase 2：WorkflowDefinition、状态图运行时与手动部署
-
-- 允许同一个 Agent Template 创建独立 Agent 和派生 WorkflowAgentSpec；
-- WorkflowCompiler 为每个 Agent 节点解析并冻结来源 AgentTemplateVersion 的独立 Connection operation authority；节点只能在 DeploymentSnapshot ceiling 内继续收窄，不能继承 Root Flow Agent 的账号身份；
-- 新增 WorkflowDefinitionVersion，包含 WorkflowAgentSpecs、Graph、Trigger 和 Output；
-- 参考 LangGraph 建立 WorkflowCompiler、类型化 State Channel、Reducer、CompiledWorkflow 和 superstep 执行模型；
-- 每个已提交 superstep 原子保存 WorkflowCheckpoint，保留并行节点的 pending writes，恢复时不重放已成功节点；
-- Trial 跑通后显式创建 WorkflowDeployment；
-- Deployment 绑定或物化 Agent，校验其 Library/Connection，并生成不可变 DeploymentSnapshot；
-- 首版仅提供 manual trigger 和 Inbox output；
-- 现有 `startFlowRun` 改为优先从 DeploymentSnapshot 创建 WorkflowRun，保留受控兼容路径。
-
-退出条件：WorkflowDefinition 未跑通不能创建 active Deployment；生产 WorkflowRun 必须由 Deployment 的 Trigger 创建；进程在任意已提交 superstep 后中断都能从最新一致 Checkpoint 恢复。
-
-#### Phase 2A：已实现切片（Workflow Compiler + Manual Deployment）
-
-本切片先完成 Phase 2 的生产身份与权限闭环，不把尚未实现的并行 superstep、Reducer 和 Checkpoint 冒充为已完成。当前落地链路如下：
-
-```text
-Published FlowDefinition（已发布工作流定义）
-  + Published AgentTemplateVersion（已发布 Agent 模板版本）
-  + Resolved Connection Operations（已解析连接操作权限）
-                         │
-                         ▼
-WorkflowCompiler（工作流编译器）
-  ├── WorkflowAgentSpec（节点级 Agent 执行配置）
-  ├── CompiledWorkflow（不可变编译产物）
-  └── contentHash（内容指纹）
-                         │
-                         ▼
-DeploymentSnapshot（部署快照）
-  ├── Manual Trigger（手动触发器）
-  ├── Inbox Output（收件箱输出）
-  └── Frozen Node Authorities（冻结的节点级权限）
-                         │
-                         ▼
-WorkflowDeployment（工作流部署）
-  ├── Active / Disabled（激活 / 已停用）
-  └── revision CAS（修订版本并发控制）
-                         │
-                         ▼
-WorkflowRun（工作流运行）
-  └── 持有同一个 DeploymentSnapshot，不重新解析当前模板或账号权限
-```
-
-图中英文是 UI/领域/代码名称，括号中的中文说明其职责。实现不变量如下：
-
-- `WorkflowCompiler` 遍历每个 `Agent` 节点，精确加载节点引用的已发布 `AgentTemplateVersion`，校验模板状态与内容哈希，并通过 Connection access resolver 解析当前仍有效的 operation grant；
-- 每个 `WorkflowAgentSpec` 固定 `nodeId`、模板 ID/版本/content hash、instructions、model policy、resource grants、risk class、Connection bindings 和精确 `RuntimeConnectionAuthority`；没有 operation 的 structured authority 仍是显式空集合，不能回退到 Thread MCP；
-- `CompiledWorkflow` 固定 Flow definition identity、Graph、schema、budget、节点 Agent specs、Harness 能力并集和 Harness operation 并集。并集只用于预装载共享 Harness 目录，不赋予节点权限；执行节点前会按该节点的 `WorkflowAgentSpec` 再次收窄；
-- Agent 节点执行优先消费 Run 内冻结的 `WorkflowAgentSpec`，不重新读取可变模板。兼容路径若遇到 structured Connection 模板会继续 fail closed，只有带 `DeploymentSnapshot` 的生产路径可以执行；
-- Node-scoped context 同时收窄 capability projection、工具 descriptor 和精确 operation route，避免一个 Agent 节点继承 Root Flow Agent 或相邻 Agent 节点的账号身份；
-- `WorkflowDeployment` 保存不可变 `DeploymentSnapshot`，数据库按 Flow、状态和更新时间建立查询索引；停用使用 `expectedRevision` CAS，不能用陈旧页面覆盖新状态；
-- 首版 Deployment 只激活 `Manual Trigger / 手动触发器` 和 `Inbox Output / 收件箱输出`。手动触发通过 Deployment API 创建 `WorkflowRun`，Run 序列化并持久化同一个快照；暂停、HumanTask 恢复和进程内继续执行都从 Run 快照读取 Harness 与节点权限；
-- Desktop 新增固定一级 `Deployments / 部署` 入口。左侧上下文集合只显示 Deployment，主区提供已发布 Flow 选择、服务端编译、快照/Agent 权限解释、手动 JSON 输入运行和带确认的停用操作；`Connections / 连接` 仍保留固定一级入口；
-- HTTP 契约新增 Deployment list/get/create/disable 与 deployed run start，并由 Rust schema 生成 Desktop 类型；旧 `startFlowRun` 暂时保留为显式兼容路径。
-
-Phase 2A 的明确边界：`WorkflowAgentSpec` 当前冻结节点执行配置，但尚未绑定或物化一个长期存在的受管 Agent 身份；Trigger/Output 当前属于 `DeploymentSnapshot`，尚未进入通用的 WorkflowDefinition 接口编辑器；现有运行协调器仍是 ready-node 队列与逐节点持久化，不是 LangGraph 风格的类型化 State Channel、Reducer、并行 superstep、pending writes 和原子 `WorkflowCheckpoint`。因此 Phase 2 退出条件尚未全部满足，下一切片是 Phase 2B 的 Checkpoint/Superstep Runtime，而不是继续扩充部署页面。
-
-Phase 2A 验收结果：同一个 Agent Template 可继续创建独立 Agent，也可在编译时派生 `WorkflowAgentSpec`；部署前会解析所有 Agent 节点和 Connection operation，任何模板缺失、未发布、内容变化、legacy MCP 或无效 Connection 都会阻断；手动 Run 固定 DeploymentSnapshot；停用后拒绝新触发；历史 Run 和快照不被改写。
-
-#### Phase 2B：已实现切片（State Channel + Superstep Checkpoint Runtime）
-
-本切片把 ready-node 顺序队列升级为参考 LangGraph 的批次提交模型，同时保留 OpenTopia 对外部副作用更保守的默认策略：
-
-```text
-Ready Nodes（就绪节点）
-        │
-        ▼
-Superstep Planner（超步规划器：冻结本批节点、输入和 attempt）
-        │
-        ├── Parallel-safe Nodes（可安全并行节点）──┐
-        └── Side-effect Nodes（副作用节点，默认串行）│
-                                                   ▼
-Pending Writes（待提交写入：逐节点持久化成功或失败结果）
-        │
-        ▼
-Atomic WorkflowCheckpoint Commit（原子工作流检查点提交）
-        ├── Node Outputs（节点输出：供边和 Join 路由）
-        ├── State Channels（状态通道：按 Reducer 合并）
-        ├── Next Ready Nodes（下一批就绪节点）
-        └── Checkpoint History（检查点历史摘要）
-```
-
-图中英文是领域/代码抽象，括号中的中文解释说明运行职责。实现不变量如下：
-
-- 一个 superstep 在开始时冻结本批 `nodeId / nodeRunId / attempt / input`，并和 Run 状态通过同一 SQLite 文档 CAS 原子持久化；节点真正执行前已经存在可恢复的边界；
-- 每个节点完成后先写入 `WorkflowPendingWrite`，不会立刻修改共享 State、后继队列或对外 Run output；全部节点产生待提交结果后才执行一次 Checkpoint commit；
-- 同一批次的完成顺序不影响结果。Pending Write 和提交应用都按稳定 `nodeId` 排序，避免异步调度导致不可复现状态；
-- `Condition / Validator / Join / Loop / Output` 默认可以并行；`Agent / Skill / Tool` 默认串行，只有节点显式声明 `config.parallelSafe=true` 才进入最多 8 路的并行池。该声明是能力而不是性能提示，设计者必须确认跨节点副作用和 Provider 限流允许并行；
-- 节点通过 `config.stateWrites` 声明 State Channel 写入，首版 Reducer 包含 `replace`、`append` 和 `merge_object`。Channel 名称、数量、valuePath、Reducer 一致性在 Flow 验证阶段检查；`replace` 通道只允许一个 writer；
-- `nodeOutputs` 与共享 `state` 分离：前者是边投影和 Join readiness 的不可混淆来源，后者仅由 Reducer 在已提交 superstep 中更新；失败批次不能泄漏一半共享状态；
-- Checkpoint summary 记录 ID、superstep、节点集合、Pending Write 数量、状态与时间；Run 响应保留最近 100 个 summary，活动 Checkpoint 则保留完整冻结输入和 Pending Writes，控制文档增长；
-- 进程中断时，活动 Checkpoint 和已经持久化的成功 Pending Write 会保留。Recovery HumanTask 显示 checkpoint/superstep/节点和完成数量；操作者明确重试后只为尚未成功的节点创建新 attempt，成功兄弟节点不会重放；
-- Pause 在活动 superstep 的提交边界生效；Cancel 会废弃未提交 checkpoint 并把活动 NodeRun 标记为 cancelled，不把部分结果合入 State；Approval 节点优先形成独立人工边界，不会和同批其他节点一起执行；
-- 多个 terminal Output 在同一个 superstep 到达时，以 `nodeId -> output` 对象形成确定性最终输出；单 Output 保持原有值形态。
-
-Phase 2B 的明确边界：当前 Checkpoint 作为 `FlowRun.document_json` 内的活动原子边界与有界历史摘要持久化，尚未拆成可长期查询、Replay/Fork 的独立 checkpoint/event 表；普通节点失败仍沿现有 error route 或 terminal failure 语义，动态 Agent Interrupt 和 AgentContinuation 恢复进入 Phase 3；显式 `parallelSafe` 尚未由 operation annotation 自动推导；跨进程分布式 worker、Exactly-once 外部副作用、ActivityReceipt 和补偿事务也不在本切片内。因此本阶段保证“已成功 Pending Write 不因服务中断而重放”，不宣称任意外部系统调用具备 Exactly-once。
-
-Phase 2B 退出条件：一个 fan-out/fan-in Flow 能在同一 superstep 并行执行安全节点；State reducer 的结果不受完成顺序影响；每个已提交批次有 Checkpoint summary；服务在批次中断后会进入 HumanTask，明确恢复时只执行没有成功 Pending Write 的节点；旧 Run 缺少新字段时按空 State、superstep 0 无损读取。
-
-2026-08-20 已完成后台真实 Topia 验收：使用隐藏的隔离 Server、独立数据库和正式 HTTP API 完成 Thread → FlowDraft → Validate → Simulate → Publish → WorkflowDeployment → Run 全链路。fan-out 的 `left`、`right` 在 superstep 2 形成同一 committed Checkpoint，记录 2 条 Pending Writes；整个 Run 以 4 个 Checkpoint 成功结束，共写入 2 个稳定排序的 `results` State 项。可重复执行入口为 `scripts/verify-flow-superstep.ps1`。
-
-后续阶段采用两层验收：自动化测试验证领域不变量、恢复和契约；随后在后台启动隔离的 Topia Server，通过真实 HTTP API 创建 Thread、Definition、Deployment 和 Run，并检查持久化结果。后台验收使用独立数据库、插件目录、runtime 目录和端口，服务窗口隐藏且按精确 PID 回收，不调用 Computer Use、不操纵用户前台。只有必须验证像素、焦点或桌面交互时才单独安排可见 UI 验收，不能用单元测试冒充真实运行，也不能用前台自动点击替代可后台完成的 API 测试。
-
-### Phase 3：HumanTask、Flow 中断与 Inbox
-
-#### Phase 3：已实现切片（Durable Interrupt + HumanTask Resume）
-
-本切片把 Flow Agent 内部产生的动态审批、补充输入、外部动作确认和副作用核对，从“节点失败”升级为可持久化、可审计、可恢复的工作流控制面：
-
-```text
-AgentTurnOutcome（Agent 本轮结果）
-        │
-        ▼
-Interrupt Adapter（中断适配器：把 Agent 等待态转换成工作流领域事件）
-        │
-        ▼
-InterruptRequest（中断请求：固定 Run、NodeRun、attempt、superstep 与 checkpoint）
-        │
-        ├── AgentContinuation（Agent 延续状态：保存待恢复模型/工具循环）
-        └── ActivityReceipt（活动回执：说明外部操作已知事实与幂等身份）
-        │
-        ▼
-WorkflowPendingWrite（工作流待提交写入：中断与节点结果同属检查点）
-        │
-        ▼
-HumanTask（人工任务：分派、认领、SLA、动作 schema 与证据）
-        │
-        ▼
-ResumeCommand（恢复命令：稳定 commandId + idempotencyKey）
-        │
-        ▼
-same WorkflowCheckpoint / same NodeRun（同一检查点 / 同一节点执行记录）
-        │
-        ▼
-AgentContinuation.resume（恢复 Agent 延续状态，不从节点开头重放）
-```
-
-图中的英文是领域和代码抽象，括号中的中文解释说明其职责。实现不变量如下：
-
-- Flow 状态机现在区分 `running -> waiting_human -> resuming -> running/succeeded`。显式 Approval 继续兼容 `waiting_approval`；动态中断统一进入 `waiting_human`，恢复中的精确状态保存在 Run 文档，数据库状态列继续使用兼容值，旧索引和旧数据无需破坏性迁移；
-- Agent/Skill 节点返回 `Completed` 或 `Interrupted`。审批、结构化输入、外部动作、效果核对都会产生 `WorkflowInterruptRequest`，并把 `AgentContinuationEnvelope`、NodeRun ID、attempt、superstep 和 Checkpoint ID 原子写入活动 Checkpoint；中断不计作节点失败；
-- 人工动作生成 `ResumeCommand`。同一 `humanTaskId + action + idempotencyKey` 使用稳定 UUID，客户端超时重试、Inbox 与 Run 内联入口重复提交都会得到同一个 command，而不是恢复两次；不同 key 或不同动作会冲突关闭；
-- 恢复执行继续使用原 NodeRun、原 attempt 和原 Checkpoint，只替换对应 Pending Write。恢复本身若发生可中断错误，会创建 `ResumeRetry` HumanTask，并继续携带同一 continuation 和上一个命令信号，不退回为一个全新的节点 attempt；
-- `HumanTask` 统一承载 approval、input request、reconnect、reconciliation、recovery 和 output review；同时保存 `actionSchema`、assignee、claimant、SLA/dueAt、checkpointId、continuationId、操作者、响应、note、commandId 和 idempotencyKey；
-- 全局 Inbox 使用服务端 HumanTask 列表作为单一任务源，支持筛选、详情、分派、认领和动作提交；Flow Run 就地面板按同一个 taskId 加载，因此两处界面不是两份队列，也不靠扫描所有会话拼接；
-- 生产 `WorkflowDeployment` 创建的 Run 默认 `outputReviewRequired=true`。Output 节点提交完成后先生成 OutputReview HumanTask，批准才进入 `succeeded`，拒绝进入 `cancelled`；Draft simulate 和非部署型内部运行保持 `false`，避免测试/预览被生产策略误阻塞。后续可把这个固定默认值提升为 Deployment ReviewPolicy；
-- 具有 material side effect 的顺序工具调用若 Provider 返回 `reconciliationRequired`，运行时不会自动重放，而是生成 Reconciliation HumanTask。HumanTask 展示 `ActivityReceipt`，包含 operation、effect status 与 idempotency key，要求操作者确认外部系统事实后再继续；
-- Effect Journal 的 v28 迁移把 `turn_id` 提升为逻辑 execution scope。普通 Agent 仍用 Turn ID，Flow Agent 使用 FlowRun ID，因此 Activity Receipt 不需要伪造 Turn。这里保证的是“有持久化事实和幂等身份的安全恢复”，不宣称第三方系统具有 Exactly-once；外部结果不确定时必须人工核对，不能自动重试写操作；
-- 进程重启时，带 ResumeCommand 的活动 Checkpoint 会恢复到 `resuming` 语义；没有 continuation 的旧式中断仍进入 Recovery HumanTask。所有路径都保持 fail closed，不能因为旧文档缺少新字段而扩大行为。
-
-首版 API 为 `GET /api/human-tasks`、`GET /api/human-tasks/{id}`、`POST /api/human-tasks/{id}/assign`、`POST /api/human-tasks/{id}/claim` 和 `POST /api/human-tasks/{id}/resolve`。`resolve` 接收 expectedRevision、action、idempotencyKey、note 和可选结构化 response；Run 与 HumanTask 通过同一个存储事务和 CAS 一起更新。
-
-Phase 3 的明确边界：本阶段已经验证动态 Agent interrupt 在同一 checkpoint/node attempt 上恢复，但后台真实 HTTP 验收采用确定性的显式 Approval + OutputReview，不依赖外部模型账号；生产输出复核目前是部署级固定默认值，尚未提供可配置 ReviewPolicy；当前本地部署的 claim actor 是 `local_operator`，组织身份、队列路由和升级策略将在企业身份层接入后扩展。Flow 图中每个 Agent 节点的独立身份和 Connection execution context 已由紧随其后的 Phase 3.1 补齐。
-
-Phase 3 退出条件：人工动作可从一致 checkpoint 恢复原 WorkflowRun；动态 Agent 不会从节点开头重放；Inbox 与 Run 内联入口共享同一 HumanTask；重复动作不会重复执行 continuation；具有不确定副作用的恢复先进入 reconciliation；生产部署输出必须经过人工复核，并记录完整命令、检查点、延续状态和活动回执。
-
-2026-08-20 已完成后台真实 Topia 验收：隐藏的隔离 Server 通过正式 HTTP API 完成 Thread → FlowDraft → Validate → Simulate → Publish → WorkflowDeployment → Run；Approval HumanTask 完成 assign、claim、approve 和同 key 重复提交，随后生产输出生成独立 OutputReview HumanTask并完成 claim、approve 和同 key 重复提交。两类重复动作均返回同一 commandId，最终 Run 为 `succeeded`、`outputReviewRequired=true`、`outputReviewed=true`，待处理任务为 0。可重复执行入口为 `scripts/verify-flow-human-tasks.ps1`；本次结果保存在 `.opentopia/evaluations/flow-human-tasks-502bf29616574795920c2478cd62027b/result.json`。同时重新执行 `scripts/verify-flow-superstep.ps1`，确认 Phase 2B 的 4 个 Checkpoint、并行 left/right 两条 Pending Write 和稳定 Reducer 结果在新增输出复核后保持成立。两次服务均使用独立数据库和端口、隐藏窗口，并按精确 PID 回收，未调用 Computer Use。
-
-### Phase 3.1：Per-node Agent Runtime（逐节点 Agent 运行时）
-
-Phase 3.1 解决“一个 Flow 中的多个 Agent 必须各自继承其 Agent Template，而不能共享根 Agent 身份或重新读取可变模板”的执行隔离问题。
-
-```text
-AgentTemplateVersion（Agent 模板版本）
-        │ Publish / 发布
-        ▼
-WorkflowCompiler（工作流编译器）
-        │ freeze identity + grants / 冻结身份与授权
-        ▼
-WorkflowAgentSpec（逐节点 Agent 快照）
-        │ included in / 写入
-        ▼
-DeploymentSnapshot（部署快照）
-        │ starts
-        ▼
-WorkflowRun（工作流运行）
-        │ per node / 每个节点分别投影
-        ▼
-ExecutionAuthority + ConnectionAuthority
-（执行权限 + Connection 操作权限）
-```
-
-实现不变量如下：
-
-- `WorkflowAgentSpec` 按节点冻结 templateId、templateVersion、template contentHash、名称、owner、instructions、CapabilityProjection、ModelPolicy、状态/输出 schema、风险等级、Connection bindings 和精确 operation authority；
-- Deployment Run 只使用 `DeploymentSnapshot` 中的 Agent 快照。Agent Harness 不再在运行时读取当前 Published Template；缺少编译快照的 Agent 节点直接 fail closed；
-- 含 Agent 节点的可变 Published Flow 不能直接运行，必须先创建 `WorkflowDeployment`，避免“验证时一个版本、执行时另一个版本”；
-- 每个节点的能力目录、ExecutionAuthority 和 ConnectionAuthority 同步原子收窄。结构化 Connection 按固定 `serverId + providerToolName + fingerprint` 调用，并在每次调用前重新检查账号、认证、状态和 active capability revision；
-- 不同 Agent 节点可以引用不同模板、说明、模型策略和 Connection operation。根 Flow Harness 只持有所有节点能力的执行上限，实际节点只能看到自身快照的交集；
-- Run 的 pause/resume、HumanTask resume 和进程恢复继续使用冻结快照，不回读当前模板或 thread MCP 开关；
-- Workspace 权限使用规范化路径身份比较；Windows 的普通路径与 `\\?\` verbatim 路径不会被误判为不同授权，也不会因字符串交集丢失权限。
-
-Phase 3.1 退出条件：一个 Deployment 中至少两个 Agent 节点能以不同的冻结模板身份执行；修改当前模板不会改变已部署或已启动 Run；缺少快照、模型不匹配、Connection 失效、operation 被移除或权限扩大都会在外部调用前 fail closed；直接运行可变 Agent Flow 被拒绝。
-
-2026-08-21 已完成后台真实 Topia 验收：隐藏的隔离 Server 使用 Mock Provider 和正式 HTTP API 创建两个具有不同 instructions 的 Published Agent Template、两个 Agent Instance、一个双 Agent Workflow 和 WorkflowDeployment；DeploymentSnapshot 固定两个 `WorkflowAgentSpec`，两个 Agent 节点均真实执行成功，OutputReview HumanTask 审批后 Run 为 `succeeded`。同时确认直接运行可变 Agent Flow 返回 HTTP 400。可重复执行入口为 `scripts/verify-flow-enterprise-surface.ps1`，本次成功结果保存在 `.opentopia/evaluations/flow-enterprise-39233fa6101e4d75b2dbb1eba23a2d32/result.json`。服务使用独立数据库、插件/runtime/artifact 目录、隐藏窗口和精确 PID 回收，未调用 Computer Use。
-
-### Phase 4：Agent / Workflow 企业 Surface
-
-- Flow 已从会话右侧 Tool Stage 升级为完整 Enterprise Surface；
-- 固定一级导航为 Overview、Inbox、Agents、Workflow Templates、Deployments、Runs、Connections、Trust 和 Knowledge。Connections 不再沉入 Library；
-- 左侧 Contextual Collection（上下文列表）随一级导航切换，分别显示 HumanTask、Agent、Workflow、Deployment、Run、Connection 或 Trust signal，不与会话条目混排；
-- Overview 由全局服务端查询聚合 Agent、Workflow、Deployment、Run、HumanTask 和 Connection 状态，不扫描所有 Conversation；
-- 新增全局 `GET /api/agent-instances` 与 `GET /api/flow-runs`，支持服务端状态筛选和 limit；Desktop 共享 Store 并行加载各产品集合，主页面和侧栏复用同一选择与缓存；
-- Workflow Templates 提供 Outcome、Agent Template、Approval 三类业务输入，并在内部生成 `Agent -> Approval? -> Output` Graph；用户可完成 Create Draft → Validate → Trial → Publish，不需要编写 Graph JSON；
-- Agent Template 的常用表单聚焦名称、职责、自然语言说明和结构化 Connection operation。resource/state/output schema、工具、Skill、Plugin、模型及委派设置收进 Advanced；
-- Deployment Run 默认只要求自然语言输入，并转换为稳定对象；原始 JSON override 留在 Advanced；
-- Runs 提供全局状态、节点进度和更新时间；Trust 聚合等待人工处理、失败 Run、Connection 重新认证/降级等可行动信号；
-- 新页面采用既有 Design Tokens、UI primitives、键盘焦点语义、可恢复 loading/error/empty 状态和 reduced-motion 规则。
-
-```text
-Primary Navigation（固定一级导航）
-        │
-        ├── Contextual Collection（上下文对象列表）
-        │
-        └── Enterprise Workspace（企业工作区主页面）
-                 │
-                 └── Shared Enterprise Store（共享数据与选择状态）
-                          │ parallel queries / 并行查询
-                          ├── Agents / Agent 实例
-                          ├── Workflows / 工作流模板
-                          ├── Deployments / 部署
-                          ├── Runs / 运行
-                          ├── HumanTasks / 人工任务
-                          └── Connections / 外部连接
-```
-
-退出条件：非开发用户不接触 JSON，也能完成 Agent、Workflow Template、Deployment、审查和 Run 追踪。
-
-2026-08-21 Phase 4 已完成：Desktop 自动化测试、类型检查、Design System 检查和 HTTP contract coverage 均通过；同一套后台真实 Topia 验收确认全局 Agents、Runs、Templates、Workflows、Deployments、Connections 和 pending HumanTasks API 从隔离数据库返回持久化对象，其中 Agents=2、Runs=1、Templates=2、Workflows=1、Deployments=1，最终 pending HumanTasks=0。
-
-### Phase 5：外部触发、输出与优化闭环
-
-Phase 5 把 Deployment 从“可手动运行的不可变快照”提升为完整 Automation Control Plane。Trigger endpoint 不直接绑定某个 Deployment，而是绑定稳定 Release Channel；这样 Canary、提升和回滚不会改变外部系统保存的 URL 或 Event Subscription ID。
-
-```text
-External Event（外部事件）
-  ├── Webhook（带 Token 的外部接口）
-  ├── Schedule（持久化定时触发）
-  └── Event Subscription（事件订阅）
-                         │
-                         ▼
-Release Channel（发布通道：稳定 triggerId + 环境）
-  ├── Primary Deployment（主部署）
-  ├── Canary Deployment（灰度部署 + 确定性流量比例）
-  └── Previous Primary（上一主版本：回滚目标）
-                         │ idempotencyKey hash / 幂等键确定性选路
-                         ▼
-TriggerInvocation（触发调用：固定输入哈希、部署与 FlowRun）
-                         │
-                         ▼
-WorkflowRun + DeploymentSnapshot（运行 + 不可变部署快照）
-                         │ OutputReview / 输出审查
-                         ▼
-Output Delivery（输出投递）
-  ├── Inbox（运行记录）
-  ├── Webhook（外部 Webhook）
-  ├── Connection Operation（App/MCP/消息操作）
-  └── HumanTask（人工业务交接）
-                         │
-                         ▼
-DeliveryReceipt（投递收据：CAS、attempt、状态、Provider 结果）
-  ├── Evaluation（评测）→ Failure Cluster（失败聚类）
-  └── Recovery HumanTask（恢复人工任务）→ Unified Inbox（统一收件箱）
-```
-
-图中英文名称对应产品、HTTP 和代码领域对象，括号中的中文解释说明其职责。实现不变量如下：
-
-- `WorkflowRelease` 是稳定发布通道，保存 `releaseKey / environment / threadId / trigger / primary / canary / previousPrimary / revision`。外部 Webhook URL 只包含稳定 `triggerId`；Canary、Promote 和 Rollback 使用 revision CAS，不原地修改 DeploymentSnapshot；
-- Canary 按 `releaseId + idempotencyKey` 的 SHA-256 桶确定性选路。同一个业务请求重试始终进入同一个 Deployment；比例只允许 1–99%，Canary 必须是同环境的 active Deployment；提升后保存上一 Primary，回滚前再次确认目标仍然 active；
-- `WorkflowTriggerInvocation` 对 `(releaseId, idempotencyKey)` 建唯一约束，固定输入哈希、选中的 Deployment 和 FlowRun。相同 key + 相同输入返回原 Run；相同 key + 不同输入返回 409，不能重复执行；
-- Webhook 使用独立 `x-opentopia-trigger-token`，服务端只持久化 `env:NAME` 引用并采用常量时间比较；公共 Hook 不要求本机 API Bearer，但不会绕过 Trigger 自身认证。每个 trigger 建立持久化的一分钟调用计数索引，默认 120 次/分钟；幂等重试不被限流阻断；
-- Schedule 的 `nextFireAt` 和 interval 属于 Release 文档。单例 worker 先用 revision CAS 原子推进下次触发时间，再创建带稳定 due-time key 的 TriggerInvocation；进程重启不会把同一时间片触发两次；
-- Event Subscription 通过受保护的事件分发 API 按 `source + eventType` 精确匹配 active Release；一个事件可以扇出到多个 Release，每个 Release 拥有独立幂等边界；
-- `DeploymentSnapshot.output` 冻结 Inbox、Webhook、ConnectionOperation 或 HumanTask 配置。Webhook 只保存 endpoint 与 credential reference；ConnectionOperation 保存固定 connection/revision/operation/server/nativeTool/fingerprint，调用前继续经过 live Connection gate 和 exact MCP route；
-- 输出只有在生产 `OutputReview` 批准、Run 成功后才会投递。投递前使用 Workflow output schema 校验值；向外部 Webhook/Connection 发送时执行 1 MiB payload 上限与 credential-like field DLP 检查，发现 password/secret/API key/access token 等字段会 fail closed，并要求改用 credential reference；
-- 每个 Run 只有一个稳定 `DeliveryReceipt`，Provider 调用前先用 revision CAS 认领 attempt，并携带稳定 idempotency key。Delivered/WaitingHuman/Cancelled 不自动重放；进程在外呼中断后把超过安全窗口的 Pending 标记为 indeterminate failure，创建 Recovery HumanTask，由操作者检查 Provider 后显式 Retry；
-- Webhook 只把有界响应摘要写入 Receipt；ConnectionOperation 的 Provider 结果经过类型化 MCP 结果序列化；HumanTask 输出创建 sourceKind=`delivery_receipt` 的业务交接任务。输出失败也创建同一来源的 Recovery HumanTask；
-- v29 将 HumanTask 来源升级为 `flow_run | delivery_receipt`，去掉 FlowRun-only 多态外键。统一 Inbox、分派、认领和 resolve API 使用同一个 humanTaskId；交接支持 Acknowledge/Cancel，恢复支持 Retry/Cancel，响应中的 FlowRun 和 DeliveryReceipt 均为按来源可选；
-- `WorkflowEvaluation` 对 `(runId, evaluator)` 幂等，保存 score/pass/labels/note；服务端按 Deployment 聚合 Run 状态、交付状态、pass rate、average score 和规范化 failure clusters。Evaluation 不修改历史 Run 或 Deployment；
-- Desktop 增加固定一级 `Automation / 自动化与投递`，按需加载 Release、Invocation、Receipt 和 Evaluation Summary，不增加其他 Flow 页面的启动请求；页面提供 Release 创建、Canary、Promote、Rollback、Disable、Delivery Retry 和失败聚类，Deployment 编辑器负责冻结 Inbox/Webhook/HumanTask output；
-- SQLite v29 为 Release、TriggerInvocation、DeliveryReceipt 和 Evaluation 建立独立表与查询索引；这些对象不是 Thread 消息投影，因此全局控制台无需扫描会话或反序列化所有 Run 才能显示待处理状态。
-
-Phase 5 的明确边界：当前 Schedule worker 是单进程 SQLite/CAS 调度器，适合本地优先 Desktop；多节点集群需引入 lease owner 和 heartbeat，而不能假设 SQLite CAS 等于分布式 leader election。Event Subscription 首版由受保护的统一事件入口接收，具体 CRM/ERP Provider 的订阅生命周期属于对应 IntegrationDefinition/Connection adapter。DLP 首版是输出 schema、大小边界、凭据字段阻断和人工 OutputReview；组织级字段分类规则、保留策略与法务策略引擎应作为后续 Trust Policy 扩展，不应硬编码进每个 Output adapter。
-
-退出条件：外部事件到结果交付具备认证、限流、幂等、DLP、操作级权限、持久化审计和人工恢复闭环；同一个幂等请求不产生第二个 Run 或第二次投递；Canary/Promote/Rollback 不改变 triggerId；非 Agent HumanTask 在统一 Inbox 中可处理。
-
-2026-08-21 已完成后台真实 Topia 验收：隐藏的隔离 Server 与本地 Webhook Sink 通过正式 HTTP API 验证公共 Webhook 独立 Token、错误 Token 拒绝、相同 key 复用同一 TriggerInvocation/Run、相同 key 不同输入返回 409、每分钟限流返回 429；OutputReview 后 Webhook 收到 credential reference 解析出的 Bearer 和稳定 DeliveryReceipt idempotency key。验收还完成 Evaluation 幂等与 pass-rate 聚合、25% Canary → Promote → Rollback、Event Subscription 幂等分发、Schedule 单次 due invocation、HumanTask Output 的非 Agent 统一 Inbox Acknowledge，以及 Webhook 首次 503 后 Recovery HumanTask 显式 Retry 成功。可重复执行入口为 `scripts/verify-flow-automation.ps1`，Webhook Sink 为 `scripts/workflow-webhook-sink.mjs`；结果保存在 `.opentopia/evaluations/flow-automation-b14c5ab4264740ac83303cda43c8184b/result.json`。两项进程均使用隐藏窗口、隔离数据库/runtime/plugin/artifact 目录并按精确 PID 回收，未调用 Computer Use。
-
-## 13. MVP 范围
-
-MVP 必须包含：
-
-- 单 EnterpriseWorkspace、多 OrgUnit；
-- Agent Template 版本和稳定 Agent 身份；
-- 同一个 Agent Template 可以创建独立 Agent 和派生 WorkflowAgentSpec；
-- 独立 Agent 可以直接对话，并自动拥有模板中的 Library、Connection 和工具；
-- MCP-first IntegrationDefinition、账号级 Connection、能力发现和最小权限；
-- WorkflowDefinition 包含 WorkflowAgentSpecs、Graph、Trigger 和 Output；
-- WorkflowDeployment、Release Channel、Webhook/Schedule/Event trigger 与类型化 Output；
-- HumanTask、中断恢复和全部输出人工审查；
-- WorkflowDefinition/Deployment 静态验证、Trial、发布和运行快照；
-- Overview、Agents、Workflow Templates、Deployments、Automation、Runs、Inbox、Connections；
-- 全链路 AuditEvent。
-
-MVP 暂不包含：
-
-- 任意拖拽工作流编辑器；
-- 无界循环或生产中任意 Graph Patch；
-- 自动扩大权限、自动发布模板或自动跳过人工审查；
-- 通用 RPA 和所有企业 App 适配；
-- 跨租户协作和通用分布式补偿事务；
-
-## 14. 验收标准
-
-### 领域与版本
-
-- AgentTemplate、Agent、WorkflowAgentSpec、WorkflowDefinition、WorkflowDeployment、WorkflowRun 和 HumanTask ID 不混用；
-- 已发布版本和运行快照不可原地修改；
-- Agent Template 保存 Library/Connection 引用和权限，但不保存明文凭证；
-- WorkflowDefinition 中的每个 WorkflowAgentSpec 都可追溯到 Agent Template 版本；
-- WorkflowDefinition 必须包含 Trigger 和 Output；
-- DeploymentSnapshot 固定 Agent bindings、Trigger endpoint、Output endpoint 和配置版本。
-
-### 权限与安全
-
-- Agent Template、WorkflowAgentSpec、节点和 DeploymentSnapshot 权限只能逐层收窄；
-- 每个 App 操作可以解释 Provider、登录账号、授权来源、资源范围和审批要求；
-- 同一个 MCP Server 登录不同账号时形成独立 Connection 和能力目录；
-- Connection 认证失效或能力减少时调用 fail closed，新增能力不会自动授予已有模板；
-- 设计态默认不能看见高风险生产写工具；
-- Trigger 具有认证、schema、幂等和限流；
-- Output 经过 schema、DLP、ReviewPolicy 和操作级鉴权。
-
-### 人工协同
-
-- 一个 WorkflowRun 可产生多个独立 HumanTask；
-- Inbox 可以聚合 Agent 和未来非 Agent 来源；
-- HumanTask 的 action_schema 能区分批准、补充输入、重新连接和故障恢复动作；
-- 人工动作记录操作者、输入、证据、变更、检查点和影响范围；
-- 当前 Run 的 HumanTaskPanel 与 Inbox 引用同一 human_task_id；
-- 重复提交动作不会重复恢复或重复执行副作用。
-
-### UI
-
-- Flow 是完整产品 Surface，不再只是 Tool Stage；
-- 非开发用户无需编辑 JSON；
-- 所有关键对象都有列表、详情、状态、版本和审计入口；
-- Flow 侧栏保持固定一级导航，Connections/Knowledge 作为一等入口；下方列表随入口切换对象类型并恢复各自筛选和选中状态；
-- 新建/编辑等复杂操作进入主工作区子页面；共享标题栏左侧提供返回按钮，并显示“一级模块 / 当前动作”路径；
-- 表单 Select/Input 只出现一层控件边框和一个焦点环，标签、提示与错误不额外绘制外层控件边框；
-- 权限 Diff、Deployment readiness、WorkflowRun 当前步骤和人工影响范围可见；
-- 键盘、焦点、对比度、加载和错误恢复满足现有设计系统要求。
-
-### 运行与恢复
-
-- 每个 WorkflowRun 固定 DeploymentSnapshot、WorkflowDefinition、Agent Template 和 Connection 版本；
-- WorkflowDefinition 在运行前编译为不可变 CompiledWorkflow，State Channel 和并行写入有明确 Reducer；
-- 每个已提交 superstep 有可寻址 WorkflowCheckpoint；并行执行中已经成功并持久化的节点不会因兄弟节点失败而重放；
-- Interrupt 与普通 Failure 分离，HumanTask 通过带 revision 的 ResumeCommand 恢复；
-- 暂停、审批、进程重启和人工核对后可以从一致检查点恢复；
-- Agent 节点从 AgentContinuation 安全点恢复；外部副作用有幂等键、ActivityReceipt 或人工处置路径；
-- Runtime 不包含第二套 Agent Harness。
-
-## 15. 需要尽快确认的产品决策
-
-1. `OrgUnit` 的 UI 是否统一称为“部门/项目”，还是由 Workspace 自定义；
-2. WorkflowAgentSpec 在 Deployment 中绑定已有 Agent 还是默认物化受管 Agent；本方案建议两者都支持，但必须显式选择；
-3. MVP 是否强制全部输出进入 Inbox；本方案建议是，但底层保留策略模型；
-4. 首批两个 Integration Provider 建议选“只读数据库 + 一个带读写操作的 CRM”，优先通过 MCP 接入，用于验证账号级能力发现和操作级权限；
-5. WorkflowDeployment 激活是否要求定义发布者与审批者职责分离；
-6. 是否允许同一 Agent 同时服务多个 OrgUnit；本方案建议默认禁止，跨单元必须显式授权；
-7. WorkflowAgentSpec 是否允许被提升为可独立对话的 Agent；本方案建议通过显式实例化创建，不能原地转换；
-8. 现有本地 `Project` 与 `OrgUnit` 是否需要显式映射，还是企业模式完全独立。
-
-## 16. 推荐的首个纵向切片
-
-不要先做完整 Graph 编辑器。建议用一个“客户线索审核”流程打通：
-
-```text
-Sales OrgUnit
-  -> CRM Reviewer AgentTemplate（包含 CRM Connection + Library）
-  -> 创建独立 CRM Reviewer Agent，验证可直接对话
-  -> 用同一 AgentTemplate 派生 WorkflowAgentSpec
-  -> Lead Review WorkflowDefinition v1
-  -> WorkflowAgentSpecs + Manual Trigger + Inbox Output
-  -> Trial 跑通
-  -> WorkflowDeployment v1
-  -> Trigger 创建 WorkflowRun
-  -> Output HumanTask
-  -> 人工通过
-  -> CRM update_status
-  -> DeliveryReceipt + AuditEvent
-```
-
-这个切片会同时验证同一 Agent Template 的两种出口、配置复用、操作级权限、WorkflowDefinition、Deployment、Trigger、WorkflowRun、Inbox、输出副作用和审计，能够暴露架构边界问题；单独做一个新 Graph 画布无法验证这些核心能力。
-
-## 17. 外部设计依据
-
-OpenAI 对 Frontier 的公开描述强调四个方向：共享业务上下文、生产 Agent 执行、基于真实工作的评测优化、身份权限与可审计治理。公开发布页展示的是分层平台架构和产品方向，没有提供足以逐像素复刻的完整管理后台；Workspace Agents 页面进一步明确了敏感操作审批门、运行日志和集中式管理。因此本方案借鉴这些可验证的交互原则，并结合 OpenTopia 现有侧栏形成自己的信息架构。
-
-Flow Runtime 参考 LangGraph 的持久化状态图、Checkpoint、pending writes、Interrupt、Command Resume、State History 和 Replay/Fork。LangGraph 官方同时明确说明动态 Interrupt 恢复时会重新进入节点，因此副作用必须幂等；OpenTopia 在此基础上增加 AgentContinuation 和 ActivityReceipt，满足企业外部操作不能任意重放的约束。
-
-- [Introducing OpenAI Frontier](https://openai.com/index/introducing-openai-frontier/)
-- [OpenAI Frontier enterprise platform](https://openai.com/business/frontier/)
-- [Workspace agents for business](https://openai.com/business/workspace-agents/)
-- [LangGraph Persistence](https://docs.langchain.com/oss/python/langgraph/persistence)
-- [LangGraph Interrupts](https://docs.langchain.com/oss/python/langgraph/interrupts)
-- [LangGraph Human-in-the-loop](https://docs.langchain.com/oss/python/langchain/human-in-the-loop)
-- [LangGraph repository](https://github.com/langchain-ai/langgraph)
+新迁移会删除旧自动化产品表和旧格式 Run。生产迁移前必须备份数据库；Demo Case 通过新 Flow API 重新导入。
+
+## 9. 当前核心范围与后续范围
+
+当前必须跑通：
+
+- 单 Agent 创建/配置和真实执行；
+- Flow 图创建、节点 Trigger、校验、模拟、Test Run 和激活；
+- `require_review` 与 `immediate` 两种事件入口；
+- Case 去重、冻结 Revision、人工启动并创建 Run；
+- Agent Final 订阅、分支/汇合、人工任务和 Inbox 输出；
+- 工伤/信贷独立 SAG、Connection、55 个 Demo Case 入队；
+- 至少一个 NowCoding `gpt-5.6-terra` 真实案例成功。
+
+不阻塞核心流程的后续能力：
+
+- 完整 OAuth 回调、Vault 自动轮转、远程 HTTP MCP；
+- MCP Resources/Prompts 发现和字段级权限；
+- Connection 影响分析索引与失效后自动 Reconnect HumanTask；
+- 长期 Event/Checkpoint 查询、Replay/Fork；
+- 分布式 Worker、Lease/Heartbeat；
+- 第三方副作用 Exactly-once 和通用补偿事务；
+- 企业组织、部门、队列路由、SLA、升级、DLP、法务和真正多租户治理；
+- 前台像素、焦点与完整人工交互验收。
+
+这些能力可以继续建立在 `Flow -> Case -> Run` 边界上，不应重新引入已经移除的独立部署层。

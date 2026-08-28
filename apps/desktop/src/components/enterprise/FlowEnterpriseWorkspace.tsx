@@ -3,9 +3,7 @@ import type { AppSettings } from "../../types";
 import type { FlowPrimaryView } from "../../workspaceNavigation";
 import { FlowLibraryPanel } from "../FlowLibraryPanel";
 import { LibraryPanel } from "../LibraryPanel";
-import { WorkflowDeploymentsPanel } from "../workflowDeployments";
 import { AgentsPage } from "./AgentsPage";
-import { AutomationPage } from "./automation/AutomationPage";
 import { FlowInboxPage } from "./FlowInboxPage";
 import { OverviewPage } from "./OverviewPage";
 import { RunsPage } from "./RunsPage";
@@ -52,22 +50,6 @@ export function FlowEnterpriseWorkspace({
       />
     );
   if (view === "inbox") return <FlowInboxPage client={client} />;
-  if (view === "deployments")
-    return (
-      <WorkflowDeploymentsPanel
-        activeFlowThreadId={threadId}
-        client={client}
-        onPageHeaderChange={onPageHeaderChange}
-      />
-    );
-  if (view === "automation")
-    return (
-      <AutomationPage
-        client={client}
-        onPageHeaderChange={onPageHeaderChange}
-        threadId={threadId}
-      />
-    );
   if (view === "runs") return <RunsPage client={client} />;
   if (view === "connections")
     return (

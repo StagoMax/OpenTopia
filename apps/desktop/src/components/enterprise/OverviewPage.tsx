@@ -4,7 +4,6 @@ import {
   Cable,
   Inbox,
   RefreshCw,
-  Rocket,
   Workflow,
 } from "lucide-react";
 import type { FlowPrimaryView } from "../../workspaceNavigation";
@@ -21,7 +20,7 @@ export function OverviewPage({
   onNavigate(view: Exclude<FlowPrimaryView, "conversation">): void;
 }) {
   const { snapshot, store } = useEnterpriseStore(client);
-  const pendingEvents = snapshot.invocations.filter(
+  const pendingEvents = snapshot.cases.filter(
     (item) => item.status === "accepted" && !item.flowRunId,
   );
   const metrics = [
@@ -33,9 +32,9 @@ export function OverviewPage({
       view: "agents" as const,
     },
     {
-      label: "Workflow Templates",
-      value: snapshot.workflows.length,
-      detail: `${snapshot.deployments.length} 个部署`,
+      label: "Flows",
+      value: snapshot.flows.length,
+      detail: `${snapshot.flows.filter((item) => item.status === "active").length} 个已激活`,
       icon: Workflow,
       view: "workflow-templates" as const,
     },
@@ -52,14 +51,6 @@ export function OverviewPage({
       detail: `${pendingEvents.length} 个事件待确认`,
       icon: Inbox,
       view: "inbox" as const,
-    },
-    {
-      label: "Deployments",
-      value: snapshot.deployments.filter((item) => item.status === "active")
-        .length,
-      detail: "当前激活",
-      icon: Rocket,
-      view: "deployments" as const,
     },
     {
       label: "Connections",
@@ -89,7 +80,7 @@ export function OverviewPage({
         }
       >
         <p className="enterprise-page__lede">
-          从模板、部署、运行到人工控制点的统一视图。所有数字来自服务端持久化对象，不扫描会话消息。
+          从 Flow、运行到人工控制点的统一视图。所有数字来自服务端持久化对象，不扫描会话消息。
         </p>
         {snapshot.error ? (
           <p className="enterprise-page__message is-error" role="alert">

@@ -24,4 +24,4 @@ include!("tests/migrations.rs");
 include!("tests/events_and_effects.rs");
 include!("tests/projects_and_flows.rs");
 include!("tests/connections.rs");
-include!("tests/workflow_deployments.rs");
+include!("tests/active_flows.rs");

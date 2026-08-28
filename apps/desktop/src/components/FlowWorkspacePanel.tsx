@@ -24,7 +24,7 @@ import {
 import type { ApiClient } from "../api/client";
 import type {
   AppSettings,
-  FlowDefinition,
+  ActiveFlow,
   FlowDraftView,
   FlowNodeKind,
   FlowRun,
@@ -101,7 +101,7 @@ function FlowReviewPanel({
   threadId,
 }: Pick<FlowWorkspacePanelProps, "client" | "threadId">) {
   const [drafts, setDrafts] = useState<FlowDraftView[]>([]);
-  const [library, setLibrary] = useState<FlowDefinition[]>([]);
+  const [library, setLibrary] = useState<ActiveFlow[]>([]);
   const [runs, setRuns] = useState<FlowRun[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
@@ -136,7 +136,7 @@ function FlowReviewPanel({
     try {
       const [nextDrafts, nextLibrary, nextRuns] = await Promise.all([
         client.listFlowDrafts(threadId),
-        client.searchFlows(query),
+        client.listFlows({ query }),
         client.listFlowRuns(threadId),
       ]);
       setDrafts(nextDrafts);
@@ -154,10 +154,10 @@ function FlowReviewPanel({
       );
       setRunDefinitionKey((current) =>
         current &&
-        nextLibrary.some((flow) => `${flow.flowId}@${flow.version}` === current)
+        nextLibrary.some((flow) => flow.flowId === current)
           ? current
           : nextLibrary[0]
-            ? `${nextLibrary[0].flowId}@${nextLibrary[0].version}`
+            ? nextLibrary[0].flowId
             : "",
       );
     } catch (refreshError) {
@@ -252,20 +252,16 @@ function FlowReviewPanel({
       setError(`Run input 不是有效 JSON：${readableError(parseError)}`);
       return;
     }
-    const separator = runDefinitionKey.lastIndexOf("@");
-    const flowId = runDefinitionKey.slice(0, separator);
-    const version = Number(runDefinitionKey.slice(separator + 1));
     await runAction(
       "run",
       async () => {
-        const run = await client.startFlowRun(threadId, {
-          flowId,
-          version,
+        const result = await client.invokeFlow(runDefinitionKey, {
+          idempotencyKey: `manual:${crypto.randomUUID()}`,
           input,
         });
-        setSelectedRunId(run.id);
+        if (result.run) setSelectedRunId(result.run.id);
       },
-      "Flow Run 已启动，Trace 会按节点边界持续更新。",
+      "Flow Case 已接收；立即入口会启动 Run，人工确认入口会进入 Inbox。",
     );
   }
 
@@ -313,7 +309,7 @@ function FlowReviewPanel({
         }
       >
         <TextField
-          label="搜索已发布 Flow"
+          label="搜索已激活 Flow"
           onChange={(event) => setQuery(event.target.value)}
           placeholder="名称、ID 或负责人"
           type="search"
@@ -352,15 +348,15 @@ function FlowReviewPanel({
         {library.length > 0 ? (
           <details className="flow-review-panel__library">
             <summary>
-              <Library aria-hidden="true" size={14} /> 已发布（{library.length}
+              <Library aria-hidden="true" size={14} /> 已激活（{library.length}
               ）
             </summary>
             <ul>
               {library.map((flow) => (
-                <li key={`${flow.flowId}@${flow.version}`}>
+                <li key={flow.flowId}>
                   <span>{flow.name}</span>
                   <code>
-                    {flow.flowId}@{flow.version}
+                    {flow.flowId}@{flow.activeRevision.compiledWorkflow.flowVersion}
                   </code>
                 </li>
               ))}
@@ -560,8 +556,8 @@ function FlowReviewPanel({
           ) : null}
 
           <TextField
-            hint="高风险 Flow 必须由 owner 之外的人发布。"
-            label="发布审批人"
+            hint="高风险 Flow 必须由 owner 之外的人激活。"
+            label="激活审批人"
             onChange={(event) => setPublisher(event.target.value)}
             placeholder="姓名或企业身份 ID"
             value={publisher}
@@ -572,13 +568,18 @@ function FlowReviewPanel({
               void runAction(
                 "publish",
                 () =>
-                  client!.publishFlowDraft(selected.draft.id, publisher.trim()),
-                "已发布不可变 Flow 版本。",
+                  client!.activateFlowDraft(selected.draft.id, {
+                    activatedBy: publisher.trim(),
+                    expectedFlowRevision: library.find(
+                      (flow) => flow.flowId === selected.draft.spec.flowId,
+                    )?.revision,
+                  }),
+                "已激活新的不可变 Flow Revision。",
               )
             }
             variant="primary"
           >
-            <Send aria-hidden="true" size={14} /> 发布 Flow
+            <Send aria-hidden="true" size={14} /> 激活 Flow
           </Button>
         </Panel>
       ) : null}
@@ -623,7 +624,7 @@ function GraphInspector({ spec }: { spec: FlowSpec }) {
 type FlowRuntimePanelProps = {
   busy: string | null;
   client: ApiClient | null;
-  library: FlowDefinition[];
+  library: ActiveFlow[];
   runs: FlowRun[];
   selectedRun: FlowRun | null;
   runDefinitionKey: string;
@@ -678,11 +679,11 @@ function FlowRuntimePanel({
       <div className="flow-runtime-panel__composer">
         <Select
           disabled={busy !== null || library.length === 0}
-          label="选择已发布 Flow"
+          label="选择已激活 Flow"
           onChange={onDefinitionChange}
           options={library.map((flow) => ({
-            value: `${flow.flowId}@${flow.version}`,
-            label: `${flow.name} · v${flow.version}`,
+            value: flow.flowId,
+            label: `${flow.name} · v${flow.activeRevision.compiledWorkflow.flowVersion}`,
           }))}
           value={runDefinitionKey}
         />
@@ -733,7 +734,7 @@ function FlowRuntimePanel({
         ))}
         {runs.length === 0 ? (
           <p className="flow-review-panel__empty">
-            发布 Flow 后可从这里启动。每个节点的输入、输出、重试和错误都会保存在
+            激活 Flow 后可从这里创建 Case。每个节点的输入、输出、重试和错误都会保存在
             Trace 中。
           </p>
         ) : null}

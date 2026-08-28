@@ -65,6 +65,10 @@ fn remove_post_legacy_agent_runtime_tables(conn: &Connection) {
         DROP TABLE IF EXISTS workflow_trigger_invocations;
         DROP TABLE IF EXISTS workflow_releases;
         DROP TABLE IF EXISTS workflow_deployments;
+        DROP TABLE IF EXISTS flow_evaluations;
+        DROP TABLE IF EXISTS flow_delivery_receipts;
+        DROP TABLE IF EXISTS flow_cases;
+        DROP TABLE IF EXISTS flows;
         DROP TABLE IF EXISTS connection_capability_revisions;
         DROP TABLE IF EXISTS connections;
         DROP TABLE IF EXISTS integration_definitions;

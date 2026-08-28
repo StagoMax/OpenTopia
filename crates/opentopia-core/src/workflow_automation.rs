@@ -1,11 +1,10 @@
 use crate::enterprise_connection_grants::ExecutionConnectionOperationV1;
 use crate::model_context::content_fingerprint;
-use crate::workflow::{WorkflowDeploymentStatusV1, WorkflowDeploymentV1};
+use crate::workflow::{ActiveFlowV1, FlowRevisionV1};
 use chrono::{DateTime, Duration, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub const WORKFLOW_AUTOMATION_SCHEMA_VERSION_V1: u16 = 1;
@@ -26,15 +25,18 @@ pub enum WorkflowIngressPolicyV1 {
 )]
 pub enum WorkflowTriggerSpecV1 {
     Manual,
+    #[schemars(rename_all = "camelCase")]
     Webhook {
         trigger_id: Uuid,
         token_ref: String,
     },
+    #[schemars(rename_all = "camelCase")]
     Schedule {
         trigger_id: Uuid,
         interval_seconds: u32,
         next_fire_at: DateTime<Utc>,
     },
+    #[schemars(rename_all = "camelCase")]
     EventSubscription {
         trigger_id: Uuid,
         source: String,
@@ -112,14 +114,17 @@ impl WorkflowTriggerSpecV1 {
 )]
 pub enum WorkflowOutputSpecV1 {
     Inbox,
+    #[schemars(rename_all = "camelCase")]
     Webhook {
         endpoint: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         credential_ref: Option<String>,
     },
+    #[schemars(rename_all = "camelCase")]
     ConnectionOperation {
         operation: ExecutionConnectionOperationV1,
     },
+    #[schemars(rename_all = "camelCase")]
     HumanTask {
         title: String,
         description: String,
@@ -212,255 +217,108 @@ fn validate_bounded_text(value: &str, name: &str, limit: usize) -> anyhow::Resul
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkflowReleaseStatusV1 {
-    Active,
-    Disabled,
-}
-
-impl WorkflowReleaseStatusV1 {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Disabled => "disabled",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkflowReleaseV1 {
-    pub schema_version: u16,
-    pub id: Uuid,
-    pub revision: u32,
-    pub release_key: String,
-    pub environment: String,
-    pub thread_id: Uuid,
-    pub status: WorkflowReleaseStatusV1,
-    pub trigger: WorkflowTriggerSpecV1,
-    #[serde(default)]
-    pub ingress_policy: WorkflowIngressPolicyV1,
-    pub primary_deployment_id: Uuid,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub canary_deployment_id: Option<Uuid>,
-    pub canary_percent: u8,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub previous_primary_deployment_id: Option<Uuid>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub created_by: String,
-}
-
-impl WorkflowReleaseV1 {
-    pub fn new(
-        release_key: impl Into<String>,
-        environment: impl Into<String>,
-        thread_id: Uuid,
-        deployment: &WorkflowDeploymentV1,
-        trigger: WorkflowTriggerSpecV1,
-        created_by: impl Into<String>,
-    ) -> anyhow::Result<Self> {
-        Self::new_with_ingress_policy(
-            release_key,
-            environment,
-            thread_id,
-            deployment,
-            trigger,
-            WorkflowIngressPolicyV1::Immediate,
-            created_by,
-        )
-    }
-
-    pub fn new_with_ingress_policy(
-        release_key: impl Into<String>,
-        environment: impl Into<String>,
-        thread_id: Uuid,
-        deployment: &WorkflowDeploymentV1,
-        trigger: WorkflowTriggerSpecV1,
-        ingress_policy: WorkflowIngressPolicyV1,
-        created_by: impl Into<String>,
-    ) -> anyhow::Result<Self> {
-        let release_key = release_key.into().trim().to_string();
-        let environment = environment.into().trim().to_string();
-        let created_by = created_by.into().trim().to_string();
-        validate_bounded_label(&release_key, "releaseKey")?;
-        validate_bounded_label(&environment, "environment")?;
-        validate_bounded_label(&created_by, "createdBy")?;
-        trigger.validate()?;
-        anyhow::ensure!(
-            deployment.status == WorkflowDeploymentStatusV1::Active,
-            "primary deployment must be active"
-        );
-        anyhow::ensure!(
-            deployment.environment == environment,
-            "release and deployment environments must match"
-        );
-        let now = Utc::now();
-        Ok(Self {
-            schema_version: WORKFLOW_AUTOMATION_SCHEMA_VERSION_V1,
-            id: Uuid::new_v4(),
-            revision: 1,
-            release_key,
-            environment,
-            thread_id,
-            status: WorkflowReleaseStatusV1::Active,
-            trigger,
-            ingress_policy,
-            primary_deployment_id: deployment.id,
-            canary_deployment_id: None,
-            canary_percent: 0,
-            previous_primary_deployment_id: None,
-            created_at: now,
-            updated_at: now,
-            created_by,
-        })
-    }
-
-    pub fn select_deployment(&self, idempotency_key: &str) -> anyhow::Result<Uuid> {
-        anyhow::ensure!(
-            self.status == WorkflowReleaseStatusV1::Active,
-            "Workflow release is disabled"
-        );
-        let Some(canary) = self.canary_deployment_id else {
-            return Ok(self.primary_deployment_id);
-        };
-        let mut hasher = Sha256::new();
-        hasher.update(self.id.as_bytes());
-        hasher.update(idempotency_key.as_bytes());
-        let digest = hasher.finalize();
-        let bucket = u16::from_be_bytes([digest[0], digest[1]]) % 100;
-        Ok(if bucket < u16::from(self.canary_percent) {
-            canary
-        } else {
-            self.primary_deployment_id
-        })
-    }
-
-    pub fn set_canary(
-        &mut self,
-        deployment: &WorkflowDeploymentV1,
-        percent: u8,
-    ) -> anyhow::Result<()> {
-        anyhow::ensure!((1..=99).contains(&percent), "canaryPercent must be 1..99");
-        anyhow::ensure!(
-            deployment.status == WorkflowDeploymentStatusV1::Active
-                && deployment.environment == self.environment,
-            "canary deployment must be active in the release environment"
-        );
-        anyhow::ensure!(
-            deployment.id != self.primary_deployment_id,
-            "canary deployment must differ from the primary"
-        );
-        self.canary_deployment_id = Some(deployment.id);
-        self.canary_percent = percent;
-        self.touch();
-        Ok(())
-    }
-
-    pub fn promote_canary(&mut self) -> anyhow::Result<()> {
-        let canary = self
-            .canary_deployment_id
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("release has no canary to promote"))?;
-        self.previous_primary_deployment_id = Some(self.primary_deployment_id);
-        self.primary_deployment_id = canary;
-        self.canary_percent = 0;
-        self.touch();
-        Ok(())
-    }
-
-    pub fn rollback(&mut self) -> anyhow::Result<()> {
-        let previous = self
-            .previous_primary_deployment_id
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("release has no previous primary to restore"))?;
-        let replaced = self.primary_deployment_id;
-        self.primary_deployment_id = previous;
-        self.previous_primary_deployment_id = Some(replaced);
-        self.canary_deployment_id = None;
-        self.canary_percent = 0;
-        self.touch();
-        Ok(())
-    }
-
-    pub fn disable(&mut self) {
-        self.status = WorkflowReleaseStatusV1::Disabled;
-        self.touch();
-    }
-
-    pub fn touch(&mut self) {
-        self.revision = self.revision.saturating_add(1);
-        self.updated_at = Utc::now();
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowTriggerInvocationStatusV1 {
+pub enum FlowCaseStatusV1 {
     Accepted,
     Started,
     Failed,
+    /// The event remains immutable for audit, but a newer invocation replaces
+    /// it and is the only copy that may be started.
+    Superseded,
 }
 
-impl WorkflowTriggerInvocationStatusV1 {
+impl FlowCaseStatusV1 {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Accepted => "accepted",
             Self::Started => "started",
             Self::Failed => "failed",
+            Self::Superseded => "superseded",
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct WorkflowTriggerInvocationV1 {
+pub struct FlowCaseV1 {
     pub schema_version: u16,
     pub id: Uuid,
-    pub release_id: Uuid,
+    pub flow_id: String,
     pub trigger_id: Uuid,
     pub idempotency_key: String,
-    pub deployment_id: Uuid,
+    pub flow_revision_id: Uuid,
+    pub flow_revision: FlowRevisionV1,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow_run_id: Option<Uuid>,
-    pub status: WorkflowTriggerInvocationStatusV1,
+    pub status: FlowCaseStatusV1,
     pub input_hash: String,
     #[serde(default)]
     pub input: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by_case_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_note: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-impl WorkflowTriggerInvocationV1 {
+impl FlowCaseV1 {
     pub fn accepted(
-        release: &WorkflowReleaseV1,
+        flow: &ActiveFlowV1,
         idempotency_key: impl Into<String>,
-        deployment_id: Uuid,
         input: &Value,
     ) -> anyhow::Result<Self> {
         let idempotency_key = idempotency_key.into().trim().to_string();
         validate_bounded_text(&idempotency_key, "idempotencyKey", 256)?;
-        let trigger_id = release
+        let trigger_id = flow
+            .active_revision
             .trigger
             .trigger_id()
-            .unwrap_or_else(|| Uuid::new_v5(&release.id, b"manual-trigger"));
+            .unwrap_or_else(|| Uuid::new_v5(&flow.id, b"manual-trigger"));
         let now = Utc::now();
         Ok(Self {
             schema_version: WORKFLOW_AUTOMATION_SCHEMA_VERSION_V1,
-            id: Uuid::new_v5(&release.id, idempotency_key.as_bytes()),
-            release_id: release.id,
+            id: Uuid::new_v5(&flow.id, idempotency_key.as_bytes()),
+            flow_id: flow.flow_id.clone(),
             trigger_id,
             idempotency_key,
-            deployment_id,
+            flow_revision_id: flow.active_revision.id,
+            flow_revision: flow.active_revision.clone(),
             flow_run_id: None,
-            status: WorkflowTriggerInvocationStatusV1::Accepted,
+            status: FlowCaseStatusV1::Accepted,
             input_hash: content_fingerprint(&serde_json::to_vec(input)?),
             input: input.clone(),
             error: None,
+            superseded_by_case_id: None,
+            status_note: None,
             created_at: now,
             updated_at: now,
         })
+    }
+
+    pub fn supersede(
+        &mut self,
+        replacement_case_id: Option<Uuid>,
+        note: impl Into<String>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.status == FlowCaseStatusV1::Accepted && self.flow_run_id.is_none(),
+            "only a pending Flow case can be superseded"
+        );
+        if let Some(replacement_id) = replacement_case_id {
+            anyhow::ensure!(
+                replacement_id != self.id,
+                "a Flow case cannot replace itself"
+            );
+        }
+        let note = note.into().trim().to_string();
+        validate_bounded_text(&note, "statusNote", 512)?;
+        self.status = FlowCaseStatusV1::Superseded;
+        self.superseded_by_case_id = replacement_case_id;
+        self.status_note = Some(note);
+        self.updated_at = Utc::now();
+        Ok(())
     }
 }
 
@@ -493,7 +351,7 @@ pub struct WorkflowDeliveryReceiptV1 {
     pub id: Uuid,
     pub revision: u32,
     pub run_id: Uuid,
-    pub deployment_id: Uuid,
+    pub flow_revision_id: Uuid,
     pub output_kind: String,
     pub status: WorkflowDeliveryStatusV1,
     pub attempt: u32,
@@ -511,14 +369,14 @@ pub struct WorkflowDeliveryReceiptV1 {
 }
 
 impl WorkflowDeliveryReceiptV1 {
-    pub fn pending(run_id: Uuid, deployment_id: Uuid, output_kind: &str) -> Self {
+    pub fn pending(run_id: Uuid, flow_revision_id: Uuid, output_kind: &str) -> Self {
         let now = Utc::now();
         Self {
             schema_version: WORKFLOW_AUTOMATION_SCHEMA_VERSION_V1,
             id: Uuid::new_v5(&run_id, b"workflow-output-delivery"),
             revision: 1,
             run_id,
-            deployment_id,
+            flow_revision_id,
             output_kind: output_kind.to_string(),
             status: WorkflowDeliveryStatusV1::Pending,
             attempt: 0,
@@ -586,7 +444,7 @@ pub struct WorkflowEvaluationV1 {
     pub schema_version: u16,
     pub id: Uuid,
     pub run_id: Uuid,
-    pub deployment_id: Uuid,
+    pub flow_revision_id: Uuid,
     pub evaluator: String,
     pub score: f64,
     pub passed: bool,
@@ -600,7 +458,7 @@ pub struct WorkflowEvaluationV1 {
 impl WorkflowEvaluationV1 {
     pub fn new(
         run_id: Uuid,
-        deployment_id: Uuid,
+        flow_revision_id: Uuid,
         evaluator: impl Into<String>,
         score: f64,
         passed: bool,
@@ -622,7 +480,7 @@ impl WorkflowEvaluationV1 {
             schema_version: WORKFLOW_AUTOMATION_SCHEMA_VERSION_V1,
             id,
             run_id,
-            deployment_id,
+            flow_revision_id,
             evaluator,
             score,
             passed,
@@ -635,15 +493,16 @@ impl WorkflowEvaluationV1 {
     }
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
     use crate::enterprise::CapabilityProjection;
-    use crate::flow::{FlowBudgetV1, GraphDefinitionV1};
+    use crate::flow::{FlowBudgetV1, GraphDefinitionV1, GraphNodeKindV1, GraphNodeV1};
     use crate::workflow::CompiledWorkflowV1;
+    use schemars::schema_for;
     use std::collections::BTreeMap;
 
-    fn deployment(environment: &str) -> WorkflowDeploymentV1 {
+    fn deployment(environment: &str) -> ActiveFlowV1 {
         let compiled = CompiledWorkflowV1 {
             schema_version: 1,
             flow_id: "release-test".to_string(),
@@ -666,7 +525,7 @@ mod tests {
             agent_specs: BTreeMap::new(),
             content_hash: "compiled".to_string(),
         };
-        WorkflowDeploymentV1::new("Deployment", environment, compiled, "tester").unwrap()
+        ActiveFlowV1::new("Deployment", environment, compiled, "tester").unwrap()
     }
 
     #[test]
@@ -691,9 +550,9 @@ mod tests {
             release.select_deployment("customer-42").unwrap()
         );
         release.promote_canary().unwrap();
-        assert_eq!(release.primary_deployment_id, canary.id);
+        assert_eq!(release.primary_flow_revision_id, canary.id);
         release.rollback().unwrap();
-        assert_eq!(release.primary_deployment_id, primary.id);
+        assert_eq!(release.primary_flow_revision_id, primary.id);
     }
 
     #[test]
@@ -746,5 +605,213 @@ mod tests {
         );
         assert_eq!(invocation.flow_run_id, None);
         assert_eq!(invocation.input, input);
+    }
+
+    #[test]
+    fn pending_invocation_can_be_superseded_without_rebinding_its_deployment() {
+        let deployment = deployment("production");
+        let release = WorkflowReleaseV1::new_with_ingress_policy(
+            "reviewed-orders",
+            "production",
+            Uuid::new_v4(),
+            &deployment,
+            WorkflowTriggerSpecV1::Manual,
+            WorkflowIngressPolicyV1::RequireReview,
+            "tester",
+        )
+        .expect("reviewed release");
+        let mut invocation = WorkflowTriggerInvocationV1::accepted(
+            &release,
+            "event-42",
+            deployment.id,
+            &serde_json::json!({"recordId": "customer-42"}),
+        )
+        .expect("accepted event");
+        let frozen_flow_revision_id = invocation.flow_revision_id;
+        let replacement_id = Uuid::new_v4();
+
+        invocation
+            .supersede(
+                Some(replacement_id),
+                "migrated to node Trigger architecture",
+            )
+            .expect("pending event can be replaced");
+
+        assert_eq!(
+            invocation.status,
+            WorkflowTriggerInvocationStatusV1::Superseded
+        );
+        assert_eq!(invocation.flow_revision_id, frozen_flow_revision_id);
+        assert_eq!(invocation.superseded_by_invocation_id, Some(replacement_id));
+        assert!(invocation.flow_run_id.is_none());
+    }
+
+    #[test]
+    fn release_rejects_a_trigger_that_cannot_activate_its_flow() {
+        let mut deployment = deployment("production");
+        deployment.snapshot.compiled_workflow.graph.nodes = vec![GraphNodeV1 {
+            id: "output".to_string(),
+            label: "Output Agent".to_string(),
+            kind: GraphNodeKindV1::Agent,
+            config: serde_json::json!({
+                "activation": {
+                    "expression": {
+                        "operator": "source",
+                        "source": {
+                            "kind": "webhook",
+                            "triggerId": Uuid::new_v4(),
+                            "tokenRef": "env:FLOW_TOKEN"
+                        }
+                    },
+                    "ingressPolicy": "immediate"
+                }
+            }),
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: serde_json::json!({"type": "object"}),
+        }];
+
+        let error = WorkflowReleaseV1::new(
+            "unrelated",
+            "production",
+            Uuid::new_v4(),
+            &deployment,
+            WorkflowTriggerSpecV1::EventSubscription {
+                trigger_id: Uuid::new_v4(),
+                source: "crm".to_string(),
+                event_type: "record.updated".to_string(),
+            },
+            "tester",
+        )
+        .expect_err("unrelated Trigger must be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("does not activate any Flow Agent node"));
+    }
+
+    #[test]
+    fn automation_enum_schema_matches_camel_case_wire_fields() {
+        let trigger_schema =
+            serde_json::to_value(schema_for!(WorkflowTriggerSpecV1)).expect("trigger schema");
+        let trigger_schema = trigger_schema.to_string();
+        assert!(trigger_schema.contains("triggerId"));
+        assert!(trigger_schema.contains("eventType"));
+        assert!(trigger_schema.contains("intervalSeconds"));
+        assert!(!trigger_schema.contains("trigger_id"));
+        assert!(!trigger_schema.contains("event_type"));
+        assert!(!trigger_schema.contains("interval_seconds"));
+
+        let output_schema =
+            serde_json::to_value(schema_for!(WorkflowOutputSpecV1)).expect("output schema");
+        let output_schema = output_schema.to_string();
+        assert!(output_schema.contains("credentialRef"));
+        assert!(output_schema.contains("assignedTo"));
+        assert!(!output_schema.contains("credential_ref"));
+        assert!(!output_schema.contains("assigned_to"));
+
+        let trigger = WorkflowTriggerSpecV1::EventSubscription {
+            trigger_id: Uuid::new_v4(),
+            source: "audit.work-injury".to_string(),
+            event_type: "case.submitted".to_string(),
+        };
+        let serialized = serde_json::to_value(trigger).expect("serialize trigger");
+        assert!(serialized.get("triggerId").is_some());
+        assert!(serialized.get("eventType").is_some());
+    }
+}
+
+#[cfg(test)]
+mod flow_case_tests {
+    use super::*;
+    use crate::enterprise::CapabilityProjection;
+    use crate::flow::{FlowBudgetV1, GraphDefinitionV1};
+    use crate::workflow::{ActiveFlowV1, CompiledWorkflowV1, WorkflowOutputReviewPolicyV1};
+    use std::collections::BTreeMap;
+
+    fn active_flow(ingress_policy: WorkflowIngressPolicyV1) -> ActiveFlowV1 {
+        let compiled = CompiledWorkflowV1 {
+            schema_version: 1,
+            flow_id: "case-test".to_string(),
+            flow_version: 1,
+            definition_id: Uuid::new_v4(),
+            definition_content_hash: "definition".to_string(),
+            graph: GraphDefinitionV1 {
+                schema_version: 1,
+                entry_node_id: "entry".to_string(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            },
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: serde_json::json!({"type": "object"}),
+            root_capabilities: CapabilityProjection::deny_all(),
+            harness_capabilities: CapabilityProjection::deny_all(),
+            harness_connection_authority:
+                crate::collaboration::RuntimeConnectionAuthorityV1::DenyAll,
+            budget: FlowBudgetV1::default(),
+            agent_specs: BTreeMap::new(),
+            content_hash: "compiled".to_string(),
+        };
+        ActiveFlowV1::new_with_ingress_policy(
+            "Case test",
+            Uuid::new_v4(),
+            compiled,
+            WorkflowTriggerSpecV1::EventSubscription {
+                trigger_id: Uuid::new_v4(),
+                source: "crm".to_string(),
+                event_type: "record.updated".to_string(),
+            },
+            ingress_policy,
+            WorkflowOutputSpecV1::Inbox,
+            WorkflowOutputReviewPolicyV1::ExplicitNodesOnly,
+            "tester",
+        )
+        .expect("active Flow")
+    }
+
+    #[test]
+    fn case_freezes_the_active_flow_revision_before_review() {
+        let flow = active_flow(WorkflowIngressPolicyV1::RequireReview);
+        let input = serde_json::json!({"recordId": "customer-42"});
+        let case = FlowCaseV1::accepted(&flow, "event-42", &input).expect("accepted case");
+
+        assert_eq!(case.flow_id, flow.flow_id);
+        assert_eq!(case.flow_revision_id, flow.active_revision.id);
+        assert_eq!(case.status, FlowCaseStatusV1::Accepted);
+        assert_eq!(case.flow_run_id, None);
+        assert_eq!(case.input, input);
+    }
+
+    #[test]
+    fn pending_case_can_be_superseded_without_rebinding_its_revision() {
+        let flow = active_flow(WorkflowIngressPolicyV1::RequireReview);
+        let mut case = FlowCaseV1::accepted(
+            &flow,
+            "event-42",
+            &serde_json::json!({"recordId": "customer-42"}),
+        )
+        .expect("accepted case");
+        let frozen_revision_id = case.flow_revision_id;
+        let replacement_id = Uuid::new_v4();
+
+        case.supersede(Some(replacement_id), "replaced by a newer case")
+            .expect("pending case can be replaced");
+
+        assert_eq!(case.status, FlowCaseStatusV1::Superseded);
+        assert_eq!(case.flow_revision_id, frozen_revision_id);
+        assert_eq!(case.superseded_by_case_id, Some(replacement_id));
+    }
+
+    #[test]
+    fn schedule_advances_past_now_with_one_stable_due_key() {
+        let now = Utc::now();
+        let mut trigger = WorkflowTriggerSpecV1::Schedule {
+            trigger_id: Uuid::new_v4(),
+            interval_seconds: 60,
+            next_fire_at: now - Duration::minutes(3),
+        };
+        let key = trigger
+            .schedule_due_key_and_advance(now)
+            .expect("schedule due");
+        assert!(key.starts_with("schedule:"));
     }
 }

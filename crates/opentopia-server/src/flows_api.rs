@@ -12,17 +12,19 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use opentopia_core::{
-    agent_model_context_with_runtime, definition_from_draft, experience_mode_module,
+    activation_root_node_ids, agent_model_context_with_runtime, default_graph_trigger,
+    definition_from_draft, experience_mode_module, graph_ingress_policy_for_trigger,
     prepare_flow_resume, resolve_flow_approval, simulate_flow, spawn_flow_run, validate_flow_spec,
-    AgentRunConfig, AgentRunIdentity, CapabilityProjection, ExecutionAuthority, ExperienceMode,
-    ExperienceSurfaceProfile, FlowDefinitionV1, FlowDraftStatusV1, FlowDraftV1, FlowRunStatusV1,
-    FlowRunV1, FlowSourceV1, FlowSpecV1, FlowStoreError, FlowTrialV1, HumanTaskActionV1,
-    HumanTaskStoreError, RuntimeConnectionAuthorityV1, RuntimeSurface, SessionStore,
-    ToolInvocationContext, ToolStateStore, TurnStatus, WorkflowAgentSpecV1,
+    ActiveFlowStoreError, ActiveFlowV1, AgentRunConfig, AgentRunIdentity, CapabilityProjection,
+    ExecutionAuthority, ExperienceMode, ExperienceSurfaceProfile, FlowDraftStatusV1, FlowDraftV1,
+    FlowRunStatusV1, FlowRunV1, FlowSourceV1, FlowSpecV1, FlowStatusV1, FlowStoreError,
+    FlowTrialV1, HumanTaskActionV1, HumanTaskStoreError, RuntimeConnectionAuthorityV1,
+    RuntimeSurface, SessionStore, ToolInvocationContext, ToolStateStore, TurnStatus,
+    WorkflowAgentSpecV1, WorkflowCompileError, WorkflowOutputReviewPolicyV1, WorkflowOutputSpecV1,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -55,13 +57,13 @@ pub(crate) fn router() -> Router<AppState> {
             post(start_flow_test_run),
         )
         .route(
-            "/api/flow-drafts/:draft_id/publish",
-            post(publish_flow_draft),
+            "/api/flow-drafts/:draft_id/activate",
+            post(activate_flow_draft),
         )
-        .route(
-            "/api/threads/:thread_id/flow-runs",
-            get(list_flow_runs).post(start_flow_run),
-        )
+        .route("/api/flows/:flow_id/pause", post(pause_flow))
+        .route("/api/flows/:flow_id/resume", post(resume_flow))
+        .route("/api/flows/:flow_id/copy", post(copy_flow))
+        .route("/api/threads/:thread_id/flow-runs", get(list_flow_runs))
         .route("/api/flow-runs", get(list_all_flow_runs))
         .route("/api/flow-runs/:run_id", get(get_flow_run))
         .route("/api/flow-runs/:run_id/pause", post(pause_flow_run))
@@ -72,26 +74,38 @@ pub(crate) fn router() -> Router<AppState> {
 async fn search_flows(
     State(state): State<AppState>,
     Query(query): Query<SearchFlowsQuery>,
-) -> Result<Json<Vec<FlowDefinitionV1>>, ApiError> {
+) -> Result<Json<Vec<ActiveFlowV1>>, ApiError> {
     ensure_enterprise(&state)?;
-    Ok(Json(
-        state
-            .store
-            .search_flow_definitions(query.query.as_deref().unwrap_or_default())
-            .map_err(flow_error)?,
-    ))
+    let needle = query
+        .query
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    let flows = state
+        .store
+        .list_active_flows(query.status)
+        .map_err(active_flow_error)?
+        .into_iter()
+        .filter(|flow| {
+            needle.is_empty()
+                || flow.flow_id.to_lowercase().contains(&needle)
+                || flow.name.to_lowercase().contains(&needle)
+                || flow.created_by.to_lowercase().contains(&needle)
+        })
+        .collect();
+    Ok(Json(flows))
 }
 
 async fn get_flow(
     State(state): State<AppState>,
     Path(flow_id): Path<String>,
-    Query(query): Query<FlowVersionQuery>,
-) -> Result<Json<FlowDefinitionV1>, ApiError> {
+) -> Result<Json<ActiveFlowV1>, ApiError> {
     ensure_enterprise(&state)?;
     state
         .store
-        .get_flow_definition(&flow_id, query.version)
-        .map_err(flow_error)?
+        .get_active_flow(&flow_id)
+        .map_err(active_flow_error)?
         .map(Json)
         .ok_or_else(|| ApiError::not_found("Flow not found"))
 }
@@ -293,11 +307,11 @@ async fn start_flow_test_run(
     Ok(Json(run))
 }
 
-async fn publish_flow_draft(
+async fn activate_flow_draft(
     State(state): State<AppState>,
     Path(draft_id): Path<Uuid>,
-    Json(request): Json<PublishFlowDraftRequest>,
-) -> Result<Json<FlowDefinitionV1>, ApiError> {
+    Json(request): Json<ActivateFlowDraftRequest>,
+) -> Result<Json<ActiveFlowV1>, ApiError> {
     ensure_enterprise(&state)?;
     let draft = state
         .store
@@ -305,15 +319,177 @@ async fn publish_flow_draft(
         .map_err(flow_error)?
         .ok_or_else(|| ApiError::not_found("Flow draft not found"))?;
     ensure_flow_thread(&state, draft.thread_id)?;
-    if request.published_by.trim().is_empty() {
-        return Err(ApiError::bad_request("publishedBy is required"));
+    if request.activated_by.trim().is_empty() {
+        return Err(ApiError::bad_request("activatedBy is required"));
     }
+    // Reject a stale activation before publishing the immutable definition.
+    // Publishing changes the draft permanently, so the mutable Flow CAS must
+    // be validated first even though the final update remains CAS-protected.
+    let existing = state
+        .store
+        .get_active_flow(&draft.spec.flow_id)
+        .map_err(active_flow_error)?;
+    if let Some(flow) = existing.as_ref() {
+        if request.expected_flow_revision != Some(flow.revision) {
+            return Err(ApiError::conflict(format!(
+                "Flow revision conflict; current revision is {}",
+                flow.revision
+            )));
+        }
+    }
+    let definition = state
+        .store
+        .publish_flow_draft(draft_id, request.activated_by.trim())
+        .map_err(flow_error)?;
+    let compiled = compile_published_workflow(&state.store, &definition)
+        .map_err(|error| ApiError::conflict(error.to_string()))?;
+    let trigger = default_graph_trigger(&compiled.graph);
+    trigger
+        .validate()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let ingress_policy = graph_ingress_policy_for_trigger(&compiled.graph, &trigger);
+    let output = request
+        .output
+        .or_else(|| {
+            existing
+                .as_ref()
+                .map(|flow| flow.active_revision.output.clone())
+        })
+        .unwrap_or(WorkflowOutputSpecV1::Inbox);
+    output
+        .validate()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let output_review_policy = request
+        .output_review_policy
+        .or_else(|| {
+            existing
+                .as_ref()
+                .map(|flow| flow.active_revision.output_review_policy)
+        })
+        .unwrap_or(WorkflowOutputReviewPolicyV1::ExplicitNodesOnly);
+
+    let flow = if let Some(mut flow) = existing {
+        let expected = flow.revision;
+        flow.apply_revision(
+            definition.name,
+            compiled,
+            trigger,
+            ingress_policy,
+            output,
+            output_review_policy,
+            request.activated_by,
+        )
+        .map_err(workflow_compile_error)?;
+        state
+            .store
+            .update_active_flow(&flow, expected)
+            .map_err(active_flow_error)?
+    } else {
+        let flow = ActiveFlowV1::new_with_ingress_policy(
+            definition.name,
+            draft.thread_id,
+            compiled,
+            trigger,
+            ingress_policy,
+            output,
+            output_review_policy,
+            request.activated_by,
+        )
+        .map_err(workflow_compile_error)?;
+        state
+            .store
+            .insert_active_flow(&flow)
+            .map_err(active_flow_error)?
+    };
+    Ok(Json(flow))
+}
+
+async fn pause_flow(
+    State(state): State<AppState>,
+    Path(flow_id): Path<String>,
+    Json(request): Json<ChangeFlowStatusRequest>,
+) -> Result<Json<ActiveFlowV1>, ApiError> {
+    let mut flow = active_flow_for_request(&state, &flow_id)?;
+    if flow.revision != request.expected_revision {
+        return Err(ApiError::conflict(format!(
+            "Flow revision conflict; current revision is {}",
+            flow.revision
+        )));
+    }
+    if flow.status == FlowStatusV1::Paused {
+        return Err(ApiError::conflict("Flow is already paused"));
+    }
+    flow.pause();
     Ok(Json(
         state
             .store
-            .publish_flow_draft(draft_id, request.published_by.trim())
-            .map_err(flow_error)?,
+            .update_active_flow(&flow, request.expected_revision)
+            .map_err(active_flow_error)?,
     ))
+}
+
+async fn resume_flow(
+    State(state): State<AppState>,
+    Path(flow_id): Path<String>,
+    Json(request): Json<ChangeFlowStatusRequest>,
+) -> Result<Json<ActiveFlowV1>, ApiError> {
+    let mut flow = active_flow_for_request(&state, &flow_id)?;
+    if flow.revision != request.expected_revision {
+        return Err(ApiError::conflict(format!(
+            "Flow revision conflict; current revision is {}",
+            flow.revision
+        )));
+    }
+    if flow.status == FlowStatusV1::Active {
+        return Err(ApiError::conflict("Flow is already active"));
+    }
+    flow.resume();
+    Ok(Json(
+        state
+            .store
+            .update_active_flow(&flow, request.expected_revision)
+            .map_err(active_flow_error)?,
+    ))
+}
+
+async fn copy_flow(
+    State(state): State<AppState>,
+    Path(flow_id): Path<String>,
+    Json(request): Json<CopyFlowRequest>,
+) -> Result<Json<FlowDraftView>, ApiError> {
+    let flow = active_flow_for_request(&state, &flow_id)?;
+    let new_flow_id = request.flow_id.trim();
+    let name = request.name.trim();
+    if new_flow_id.is_empty() || name.is_empty() || request.owner.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "flowId, name, and owner are required",
+        ));
+    }
+    if state
+        .store
+        .get_active_flow(new_flow_id)
+        .map_err(active_flow_error)?
+        .is_some()
+    {
+        return Err(ApiError::conflict("Flow already exists"));
+    }
+    let source = state
+        .store
+        .get_flow_definition(
+            &flow.flow_id,
+            Some(flow.active_revision.compiled_workflow.flow_version),
+        )
+        .map_err(flow_error)?
+        .ok_or_else(|| ApiError::not_found("Flow definition not found"))?;
+    let mut spec = source.to_spec();
+    spec.flow_id = new_flow_id.to_string();
+    spec.name = name.to_string();
+    spec.owner = request.owner.trim().to_string();
+    disable_automatic_ingress(&mut spec);
+    let capabilities = flow_capabilities(&state, flow.thread_id)?;
+    let draft = FlowDraftV1::new(flow.thread_id, spec, &capabilities);
+    let draft = state.store.create_flow_draft(&draft).map_err(flow_error)?;
+    Ok(Json(draft_view(&state, draft)?))
 }
 
 async fn list_flow_runs(
@@ -345,45 +521,6 @@ async fn get_flow_run(
 ) -> Result<Json<FlowRunV1>, ApiError> {
     ensure_enterprise(&state)?;
     Ok(Json(flow_run_for_request(&state, run_id)?))
-}
-
-async fn start_flow_run(
-    State(state): State<AppState>,
-    Path(thread_id): Path<Uuid>,
-    Json(request): Json<StartFlowRunRequest>,
-) -> Result<Json<FlowRunV1>, ApiError> {
-    let thread = ensure_flow_thread(&state, thread_id)?;
-    let definition = state
-        .store
-        .get_flow_definition(request.flow_id.trim(), request.version)
-        .map_err(flow_error)?
-        .ok_or_else(|| ApiError::not_found("published Flow not found"))?;
-    if definition
-        .graph
-        .nodes
-        .iter()
-        .any(|node| node.kind == opentopia_core::GraphNodeKindV1::Agent)
-    {
-        return Err(ApiError::bad_request(
-            "published Flows with Agent nodes must run through a WorkflowDeployment so every Agent identity is frozen",
-        ));
-    }
-    let (capabilities, connection_authority) = flow_execution_authority(&state, &thread)?;
-    let run = FlowRunV1::new_with_connection_authority(
-        thread_id,
-        &definition,
-        request.input,
-        &capabilities,
-        connection_authority,
-    )
-    .map_err(ApiError::from)?;
-    // Validate every mutable runtime dependency before publishing a durable
-    // Queued run. A revoked Connection is a recoverable precondition failure,
-    // not a FlowRun that the engine can ever start.
-    let context = flow_runtime_context(&state, &thread, &run).await?;
-    let run = state.store.insert_flow_run(&run).map_err(flow_error)?;
-    spawn_flow_run(run.id, context).map_err(ApiError::from)?;
-    Ok(Json(run))
 }
 
 async fn pause_flow_run(
@@ -539,6 +676,40 @@ fn flow_run_for_request(state: &AppState, run_id: Uuid) -> Result<FlowRunV1, Api
         .ok_or_else(|| ApiError::not_found("Flow run not found"))?;
     ensure_flow_thread(state, run.thread_id)?;
     Ok(run)
+}
+
+fn active_flow_for_request(state: &AppState, flow_id: &str) -> Result<ActiveFlowV1, ApiError> {
+    ensure_enterprise(state)?;
+    state
+        .store
+        .get_active_flow(flow_id)
+        .map_err(active_flow_error)?
+        .ok_or_else(|| ApiError::not_found("Flow not found"))
+}
+
+fn disable_automatic_ingress(spec: &mut FlowSpecV1) {
+    let mut roots = activation_root_node_ids(&spec.graph);
+    if roots.is_empty() {
+        roots.insert(spec.graph.entry_node_id.clone());
+    }
+    for node in &mut spec.graph.nodes {
+        if !roots.contains(&node.id) {
+            continue;
+        }
+        if !node.config.is_object() {
+            node.config = json!({});
+        }
+        node.config.as_object_mut().expect("object config").insert(
+            "activation".to_string(),
+            json!({
+                "expression": {
+                    "operator": "source",
+                    "source": { "kind": "manual" }
+                },
+                "ingressPolicy": "require_review"
+            }),
+        );
+    }
 }
 
 pub(crate) async fn flow_runtime_context(
@@ -742,14 +913,25 @@ pub(crate) fn flow_error(error: anyhow::Error) -> ApiError {
     ApiError::from(error)
 }
 
-#[derive(Debug, Deserialize)]
-struct SearchFlowsQuery {
-    query: Option<String>,
+fn workflow_compile_error(error: WorkflowCompileError) -> ApiError {
+    ApiError::bad_request(error.to_string())
+}
+
+fn active_flow_error(error: anyhow::Error) -> ApiError {
+    if let Some(error) = error.downcast_ref::<ActiveFlowStoreError>() {
+        return match error {
+            ActiveFlowStoreError::NotFound(_) => ApiError::not_found(error.to_string()),
+            ActiveFlowStoreError::RevisionConflict(_) => ApiError::conflict(error.to_string()),
+        };
+    }
+    ApiError::from(error)
 }
 
 #[derive(Debug, Deserialize)]
-struct FlowVersionQuery {
-    version: Option<u32>,
+struct SearchFlowsQuery {
+    query: Option<String>,
+    #[serde(default)]
+    status: Option<FlowStatusV1>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -786,18 +968,28 @@ struct StartFlowTestRunRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct PublishFlowDraftRequest {
-    published_by: String,
+struct ActivateFlowDraftRequest {
+    activated_by: String,
+    #[serde(default)]
+    expected_flow_revision: Option<u32>,
+    #[serde(default)]
+    output: Option<WorkflowOutputSpecV1>,
+    #[serde(default)]
+    output_review_policy: Option<WorkflowOutputReviewPolicyV1>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StartFlowRunRequest {
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ChangeFlowStatusRequest {
+    expected_revision: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CopyFlowRequest {
     flow_id: String,
-    #[serde(default)]
-    version: Option<u32>,
-    #[serde(default)]
-    input: Value,
+    name: String,
+    owner: String,
 }
 
 #[derive(Debug, Default, Deserialize)]

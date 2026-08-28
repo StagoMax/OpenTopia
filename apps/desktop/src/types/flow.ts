@@ -331,11 +331,12 @@ export type CompiledWorkflow = {
   contentHash: string;
 };
 
-export type DeploymentSnapshot = {
+export type FlowRevision = {
   schemaVersion: number;
   id: string;
   compiledWorkflow: CompiledWorkflow;
   trigger: WorkflowTrigger;
+  ingressPolicy: "immediate" | "require_review";
   output: WorkflowOutput;
   outputReviewPolicy: WorkflowOutputReviewPolicy;
   contentHash: string;
@@ -343,14 +344,15 @@ export type DeploymentSnapshot = {
   createdBy: string;
 };
 
-export type WorkflowDeployment = {
+export type ActiveFlow = {
   schemaVersion: number;
   id: string;
   revision: number;
+  flowId: string;
   name: string;
-  environment: string;
-  status: "active" | "disabled";
-  snapshot: DeploymentSnapshot;
+  threadId: string;
+  status: "active" | "paused";
+  activeRevision: FlowRevision;
   createdAt: string;
   updatedAt: string;
   createdBy: string;
@@ -451,13 +453,14 @@ export type FlowRun = {
   flowVersion: number;
   definitionId: string;
   definitionContentHash: string;
-  deploymentId?: string | null;
-  deploymentSnapshot?: DeploymentSnapshot | null;
+  flowRevisionId?: string | null;
+  flowRevision?: FlowRevision | null;
   testDraftId?: string | null;
   testDraftRevision?: number | null;
   revision: number;
   status: FlowRunStatus;
   input: unknown;
+  ingressTrigger?: WorkflowTrigger | null;
   output: unknown | null;
   graph: FlowSpec["graph"];
   effectiveCapabilities: CapabilityProjection;

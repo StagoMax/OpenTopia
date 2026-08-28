@@ -33,8 +33,6 @@ import {
   Pin,
   Plug,
   Plus,
-  Rocket,
-  RadioTower,
   Search,
   Settings,
   ShieldCheck,
@@ -83,26 +81,14 @@ const FLOW_NAVIGATION_ITEMS = [
   {
     view: "agents",
     label: "Agents",
-    description: "模板 / 身份",
+    description: "创建 / 配置",
     icon: Bot,
   },
   {
     view: "workflow-templates",
-    label: "Workflow Templates",
-    description: "编排 / 发布",
+    label: "Flows",
+    description: "创建 / 触发 / 运行",
     icon: Workflow,
-  },
-  {
-    view: "deployments",
-    label: "Deployments",
-    description: "部署 / 触发",
-    icon: Rocket,
-  },
-  {
-    view: "automation",
-    label: "Automation",
-    description: "触发 / 投递",
-    icon: RadioTower,
   },
   {
     view: "runs",

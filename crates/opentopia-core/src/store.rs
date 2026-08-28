@@ -18,7 +18,7 @@ use crate::model::{
     UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus,
 };
 use crate::work_form::{WorkForm, WorkScope};
-use crate::workflow::{WorkflowDeploymentStatusV1, WorkflowDeploymentV1};
+use crate::workflow::{ActiveFlowV1, FlowStatusV1};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use rusqlite::types::Type;
@@ -132,26 +132,20 @@ pub enum FlowStoreError {
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum WorkflowDeploymentStoreError {
-    #[error("Workflow deployment not found: {0}")]
-    NotFound(Uuid),
-    #[error("Workflow deployment revision conflict; current revision is {0}")]
+pub enum ActiveFlowStoreError {
+    #[error("active Flow not found: {0}")]
+    NotFound(String),
+    #[error("active Flow revision conflict; current revision is {0}")]
     RevisionConflict(u32),
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum WorkflowAutomationStoreError {
-    #[error("Workflow release not found: {0}")]
-    ReleaseNotFound(Uuid),
-    #[error("Workflow release revision conflict; current revision is {0}")]
-    ReleaseRevisionConflict(u32),
-    #[error("Workflow trigger invocation already exists with different input")]
-    InvocationInputConflict,
-    #[error("Workflow delivery receipt not found: {0}")]
+pub enum FlowOperationsStoreError {
+    #[error("Flow delivery receipt not found: {0}")]
     DeliveryReceiptNotFound(Uuid),
-    #[error("Workflow delivery receipt revision conflict; current revision is {0}")]
+    #[error("Flow delivery receipt revision conflict; current revision is {0}")]
     DeliveryReceiptRevisionConflict(u32),
-    #[error("Workflow evaluation already exists for this run and evaluator")]
+    #[error("Flow evaluation already exists for this run and evaluator")]
     EvaluationConflict,
 }
 
@@ -217,6 +211,23 @@ impl SessionStore for SqliteSessionStore {
     ) -> anyhow::Result<Option<AgentTemplateVersionV1>> {
         let template = SqliteSessionStore::get_agent_template_version(self, template_id, version)?;
         Ok(template.filter(|template| template.status == AgentTemplateStatusV1::Published))
+    }
+
+    fn create_agent_template_version(
+        &self,
+        template_id: String,
+        name: String,
+        owner: String,
+        spec: crate::enterprise::AgentTemplateSpecV1,
+    ) -> anyhow::Result<AgentTemplateVersionV1> {
+        SqliteSessionStore::create_agent_template_version(self, template_id, name, owner, spec)
+    }
+
+    fn list_agent_template_versions(
+        &self,
+        include_archived: bool,
+    ) -> anyhow::Result<Vec<AgentTemplateVersionV1>> {
+        SqliteSessionStore::list_agent_template_versions(self, include_archived)
     }
 
     fn insert_integration_definition(
@@ -627,135 +638,104 @@ impl SessionStore for SqliteSessionStore {
             .transpose()
     }
 
-    fn insert_workflow_deployment(
-        &self,
-        deployment: &WorkflowDeploymentV1,
-    ) -> anyhow::Result<WorkflowDeploymentV1> {
+    fn insert_active_flow(&self, flow: &ActiveFlowV1) -> anyhow::Result<ActiveFlowV1> {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
-        let workflow = &deployment.snapshot.compiled_workflow;
         conn.execute(
             r#"
-            INSERT INTO workflow_deployments (
-                id, revision, name, environment, status, flow_id, flow_version,
-                definition_id, snapshot_hash, document_json, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            INSERT INTO flows (
+                flow_id, id, revision, name, thread_id, status,
+                active_revision_id, document_json, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             "#,
             params![
-                deployment.id.to_string(),
-                i64::from(deployment.revision),
-                &deployment.name,
-                &deployment.environment,
-                deployment.status.as_str(),
-                &workflow.flow_id,
-                i64::from(workflow.flow_version),
-                workflow.definition_id.to_string(),
-                &deployment.snapshot.content_hash,
-                serde_json::to_string(deployment)?,
-                deployment.created_at.to_rfc3339(),
-                deployment.updated_at.to_rfc3339(),
+                &flow.flow_id,
+                flow.id.to_string(),
+                i64::from(flow.revision),
+                &flow.name,
+                flow.thread_id.to_string(),
+                flow.status.as_str(),
+                flow.active_revision.id.to_string(),
+                serde_json::to_string(flow)?,
+                flow.created_at.to_rfc3339(),
+                flow.updated_at.to_rfc3339(),
             ],
         )?;
-        Ok(deployment.clone())
+        Ok(flow.clone())
     }
 
-    fn get_workflow_deployment(
-        &self,
-        deployment_id: Uuid,
-    ) -> anyhow::Result<Option<WorkflowDeploymentV1>> {
+    fn get_active_flow(&self, flow_id: &str) -> anyhow::Result<Option<ActiveFlowV1>> {
         let conn = self.read_connection();
         let document = conn
             .query_row(
-                "SELECT document_json FROM workflow_deployments WHERE id = ?1",
-                params![deployment_id.to_string()],
-                deserialize_json_column::<WorkflowDeploymentV1>,
+                "SELECT document_json FROM flows WHERE flow_id = ?1",
+                params![flow_id],
+                deserialize_json_column::<ActiveFlowV1>,
             )
             .optional()?;
         Ok(document)
     }
 
-    fn list_workflow_deployments(
-        &self,
-        flow_id: Option<&str>,
-        status: Option<WorkflowDeploymentStatusV1>,
-    ) -> anyhow::Result<Vec<WorkflowDeploymentV1>> {
+    fn list_active_flows(&self, status: Option<FlowStatusV1>) -> anyhow::Result<Vec<ActiveFlowV1>> {
         let conn = self.read_connection();
-        match (flow_id, status) {
-            (Some(flow_id), Some(status)) => {
+        match status {
+            Some(status) => {
                 let mut statement = conn.prepare(
-                    "SELECT document_json FROM workflow_deployments WHERE flow_id = ?1 AND status = ?2 ORDER BY updated_at DESC",
-                )?;
-                let rows = statement.query_map(
-                    params![flow_id, status.as_str()],
-                    deserialize_json_column::<WorkflowDeploymentV1>,
-                )?;
-                collect_rows(rows)
-            }
-            (Some(flow_id), None) => {
-                let mut statement = conn.prepare(
-                    "SELECT document_json FROM workflow_deployments WHERE flow_id = ?1 ORDER BY updated_at DESC",
-                )?;
-                let rows = statement.query_map(
-                    params![flow_id],
-                    deserialize_json_column::<WorkflowDeploymentV1>,
-                )?;
-                collect_rows(rows)
-            }
-            (None, Some(status)) => {
-                let mut statement = conn.prepare(
-                    "SELECT document_json FROM workflow_deployments WHERE status = ?1 ORDER BY updated_at DESC",
+                    "SELECT document_json FROM flows WHERE status = ?1 ORDER BY updated_at DESC",
                 )?;
                 let rows = statement.query_map(
                     params![status.as_str()],
-                    deserialize_json_column::<WorkflowDeploymentV1>,
+                    deserialize_json_column::<ActiveFlowV1>,
                 )?;
                 collect_rows(rows)
             }
-            (None, None) => {
-                let mut statement = conn.prepare(
-                    "SELECT document_json FROM workflow_deployments ORDER BY updated_at DESC",
-                )?;
-                let rows =
-                    statement.query_map([], deserialize_json_column::<WorkflowDeploymentV1>)?;
+            None => {
+                let mut statement =
+                    conn.prepare("SELECT document_json FROM flows ORDER BY updated_at DESC")?;
+                let rows = statement.query_map([], deserialize_json_column::<ActiveFlowV1>)?;
                 collect_rows(rows)
             }
         }
     }
 
-    fn update_workflow_deployment(
+    fn update_active_flow(
         &self,
-        deployment: &WorkflowDeploymentV1,
+        flow: &ActiveFlowV1,
         expected_revision: u32,
-    ) -> anyhow::Result<WorkflowDeploymentV1> {
+    ) -> anyhow::Result<ActiveFlowV1> {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         let changed = conn.execute(
             r#"
-            UPDATE workflow_deployments
-            SET revision = ?2, status = ?3, document_json = ?4, updated_at = ?5
-            WHERE id = ?1 AND revision = ?6
+            UPDATE flows
+            SET revision = ?2, name = ?3, thread_id = ?4, status = ?5,
+                active_revision_id = ?6, document_json = ?7, updated_at = ?8
+            WHERE flow_id = ?1 AND revision = ?9
             "#,
             params![
-                deployment.id.to_string(),
-                i64::from(deployment.revision),
-                deployment.status.as_str(),
-                serde_json::to_string(deployment)?,
-                deployment.updated_at.to_rfc3339(),
+                &flow.flow_id,
+                i64::from(flow.revision),
+                &flow.name,
+                flow.thread_id.to_string(),
+                flow.status.as_str(),
+                flow.active_revision.id.to_string(),
+                serde_json::to_string(flow)?,
+                flow.updated_at.to_rfc3339(),
                 i64::from(expected_revision),
             ],
         )?;
         if changed == 0 {
             let current = conn
                 .query_row(
-                    "SELECT revision FROM workflow_deployments WHERE id = ?1",
-                    params![deployment.id.to_string()],
+                    "SELECT revision FROM flows WHERE flow_id = ?1",
+                    params![&flow.flow_id],
                     |row| row.get::<_, u32>(0),
                 )
                 .optional()?;
             return Err(match current {
-                Some(revision) => WorkflowDeploymentStoreError::RevisionConflict(revision).into(),
-                None => WorkflowDeploymentStoreError::NotFound(deployment.id).into(),
+                Some(revision) => ActiveFlowStoreError::RevisionConflict(revision).into(),
+                None => ActiveFlowStoreError::NotFound(flow.flow_id.clone()).into(),
             });
         }
-        Ok(deployment.clone())
+        Ok(flow.clone())
     }
 
     fn insert_flow_run(&self, run: &FlowRunV1) -> anyhow::Result<FlowRunV1> {

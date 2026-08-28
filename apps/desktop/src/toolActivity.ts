@@ -175,7 +175,7 @@ export function classifyToolCall(call: ToolCall): ToolActivityKind {
   ) {
     return "agent";
   }
-  if (["set_plan", "update_plan"].includes(call.name)) {
+  if (call.name === "update_plan") {
     return "plan";
   }
   if (["list_skills", "read_skill", "create_skill"].includes(call.name)) {
@@ -499,7 +499,7 @@ function buildToolActivityView(
     };
   }
 
-  if (["set_plan", "update_plan"].includes(call.name)) {
+  if (call.name === "update_plan") {
     return {
       kind,
       title: "更新执行计划",
