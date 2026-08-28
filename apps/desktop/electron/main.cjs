@@ -2639,7 +2639,10 @@ if (!singleInstance) {
     registerOpenTopiaProtocolClient();
     desktopBrowserHost = createDesktopBrowserHost({
       app,
+      Menu,
       WebContentsView,
+      clipboard,
+      dialog,
       nativeImage,
       getMainWindow: () => mainWindow,
       logger: (level, event, metadata) => logConsole(level, event, metadata),

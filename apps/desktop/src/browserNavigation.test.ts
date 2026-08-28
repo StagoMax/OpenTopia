@@ -5,6 +5,7 @@ const {
   STANDALONE_BROWSER_SESSION_ID,
   browserTabSessionId,
   browserSessionId,
+  initializeBrowserTabSession,
   navigateBrowserAddress,
   newBrowserTabSessionId,
   resolveAddressBarInput,
@@ -113,6 +114,51 @@ test("creates the standalone session before opening a URL", async () => {
     ["create", { sessionId: STANDALONE_BROWSER_SESSION_ID, visible: false }],
     ["navigate", STANDALONE_BROWSER_SESSION_ID, url],
   ]);
+});
+
+test("commits a person-created tab URL before the tab is rendered", async () => {
+  const calls: unknown[] = [];
+  const host = {
+    async createSession(input: unknown) {
+      calls.push(["create", input]);
+    },
+    async navigateFromAddressBar(sessionId: string, url: string) {
+      calls.push(["navigate", sessionId, url]);
+    },
+  };
+  const sessionId = browserTabSessionId("baidu-result-test");
+
+  const url = await initializeBrowserTabSession(
+    host,
+    sessionId,
+    "https://www.baidu.com/",
+  );
+
+  assert.equal(url, "https://www.baidu.com/");
+  assert.deepEqual(calls, [
+    ["create", { sessionId, visible: false }],
+    ["navigate", sessionId, "https://www.baidu.com/"],
+  ]);
+});
+
+test("creates an empty person-owned tab without inventing a navigation", async () => {
+  const calls: unknown[] = [];
+  const sessionId = browserTabSessionId("empty-tab-test");
+
+  const url = await initializeBrowserTabSession(
+    {
+      async createSession(input: unknown) {
+        calls.push(["create", input]);
+      },
+      async navigateFromAddressBar() {
+        calls.push(["navigate"]);
+      },
+    },
+    sessionId,
+  );
+
+  assert.equal(url, null);
+  assert.deepEqual(calls, [["create", { sessionId, visible: false }]]);
 });
 
 test("opens incomplete address input as a Google search", async () => {

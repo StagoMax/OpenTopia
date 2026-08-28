@@ -103,6 +103,8 @@ class FakeWebContents extends EventEmitter {
     this.navigationHistory = new FakeNavigationHistory(this);
     this.windowOpenHandler = null;
     this.pendingLoads = [];
+    this.commands = [];
+    this.downloadUrls = [];
   }
 
   isDestroyed() {
@@ -150,6 +152,26 @@ class FakeWebContents extends EventEmitter {
     load.reject(error);
   }
 
+  copyImageAt(x, y) {
+    this.commands.push(["copy-image", x, y]);
+  }
+
+  downloadURL(url) {
+    this.downloadUrls.push(url);
+  }
+
+  inspectElement(x, y) {
+    this.commands.push(["inspect", x, y]);
+  }
+
+  paste() {
+    this.commands.push(["paste"]);
+  }
+
+  reload() {
+    this.commands.push(["reload"]);
+  }
+
   close() {
     this.destroyed = true;
     this.emit("destroyed");
@@ -159,6 +181,9 @@ class FakeWebContents extends EventEmitter {
 function createHarness() {
   const views = [];
   const attachedViews = new Set();
+  const clipboardWrites = [];
+  const menus = [];
+  const saveDialogs = [];
   class FakeWebContentsView {
     constructor() {
       this.webContents = new FakeWebContents();
@@ -202,7 +227,29 @@ function createHarness() {
 
   const host = createDesktopBrowserHost({
     app: { getPath: () => "downloads" },
+    Menu: {
+      buildFromTemplate(template) {
+        const menu = { template, popupOptions: null };
+        menus.push(menu);
+        return {
+          popup(options) {
+            menu.popupOptions = options;
+          },
+        };
+      },
+    },
     WebContentsView: FakeWebContentsView,
+    clipboard: {
+      writeText(value) {
+        clipboardWrites.push(value);
+      },
+    },
+    dialog: {
+      async showSaveDialog(window, options) {
+        saveDialogs.push({ options, window });
+        return { canceled: false, filePath: "downloads/saved-resource.html" };
+      },
+    },
     nativeImage: null,
     getMainWindow: () => window,
   });
@@ -219,6 +266,9 @@ function createHarness() {
     host,
     window,
     attachedViews,
+    clipboardWrites,
+    menus,
+    saveDialogs,
     states,
     views,
     invoke(channel, ...args) {
@@ -622,6 +672,94 @@ test("a Baidu target-blank result requests a new app browser tab", async () => {
         },
       },
     );
+  } finally {
+    await host.close();
+  }
+});
+
+test("a link context menu opens a new app tab and copies its address", async () => {
+  const { clipboardWrites, host, invoke, menus, states, views, window } =
+    createHarness();
+  const sessionId = "browser:tab:context-menu-link-test";
+  try {
+    await invoke(IPC_CHANNELS.create, { sessionId, visible: false });
+    views[0].webContents.emit(
+      "context-menu",
+      {},
+      {
+        linkURL: "https://www.baidu.com/",
+        mediaType: "none",
+        suggestedFilename: "baidu.html",
+        x: 48,
+        y: 72,
+      },
+    );
+
+    assert.equal(menus.length, 1);
+    assert.equal(menus[0].popupOptions.window, window);
+    const copyLink = menus[0].template.find(
+      (item) => item.id === "copy-link-address",
+    );
+    const openLink = menus[0].template.find(
+      (item) => item.id === "open-link-new-tab",
+    );
+    assert.ok(copyLink);
+    assert.ok(openLink);
+    copyLink.click();
+    openLink.click();
+
+    assert.deepEqual(clipboardWrites, ["https://www.baidu.com/"]);
+    assert.deepEqual(
+      states.find(
+        ({ channel, state }) =>
+          channel === IPC_CHANNELS.newTabRequested &&
+          state.openerSessionId === sessionId,
+      ),
+      {
+        channel: IPC_CHANNELS.newTabRequested,
+        state: {
+          openerSessionId: sessionId,
+          url: "https://www.baidu.com/",
+        },
+      },
+    );
+  } finally {
+    await host.close();
+  }
+});
+
+test("a context-menu save uses the chosen path for the requested resource", async () => {
+  const { host, invoke, menus, saveDialogs, views, window } = createHarness();
+  const sessionId = "browser:tab:context-menu-save-test";
+  try {
+    await invoke(IPC_CHANNELS.create, { sessionId, visible: false });
+    const webContents = views[0].webContents;
+    webContents.emit(
+      "context-menu",
+      {},
+      {
+        linkURL: "https://example.test/report",
+        mediaType: "none",
+        suggestedFilename: "report.html",
+        x: 24,
+        y: 36,
+      },
+    );
+    menus[0].template.find((item) => item.id === "save-link-as").click();
+    await waitFor(() => webContents.downloadUrls.length === 1);
+
+    assert.equal(saveDialogs.length, 1);
+    assert.equal(saveDialogs[0].window, window);
+    assert.match(saveDialogs[0].options.defaultPath, /report\.html$/);
+    assert.deepEqual(webContents.downloadUrls, ["https://example.test/report"]);
+
+    let savePath = null;
+    const item = new EventEmitter();
+    item.setSavePath = (value) => {
+      savePath = value;
+    };
+    webContents.session.emit("will-download", {}, item, webContents);
+    assert.match(savePath, /saved-resource\.html$/);
   } finally {
     await host.close();
   }

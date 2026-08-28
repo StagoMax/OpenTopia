@@ -84,6 +84,24 @@ export async function navigateBrowserAddress(
   return url;
 }
 
+/**
+ * Creates a person-owned browser tab session and commits its optional initial
+ * address before the React tab is rendered. The native new-window request and
+ * the tab label must not be allowed to consume the URL while the browser view
+ * remains on its blank document.
+ */
+export async function initializeBrowserTabSession(
+  host: AddressBarBrowserHost,
+  sessionId: string,
+  initialUrl?: string,
+): Promise<string | null> {
+  if (initialUrl) {
+    return navigateBrowserAddress(host, sessionId, initialUrl);
+  }
+  await host.createSession({ sessionId, visible: false });
+  return null;
+}
+
 function parseHttpUrl(value: string): string | null {
   try {
     const parsed = new URL(value);

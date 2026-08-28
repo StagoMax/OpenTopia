@@ -3,6 +3,7 @@ const fs = require("node:fs");
 const http = require("node:http");
 const path = require("node:path");
 const { URL } = require("node:url");
+const { popupBrowserContextMenu } = require("./browser-context-menu.cjs");
 
 const IPC_CHANNELS = Object.freeze({
   create: "browser-host:create",
@@ -329,6 +330,19 @@ function safeFilename(filename) {
   return sanitized || "download";
 }
 
+function contextMenuFilename(rawUrl, suggestedFilename) {
+  if (typeof suggestedFilename === "string" && suggestedFilename.trim()) {
+    return safeFilename(suggestedFilename.trim());
+  }
+  try {
+    const parsed = new URL(rawUrl);
+    const candidate = decodeURIComponent(path.posix.basename(parsed.pathname));
+    return safeFilename(candidate || "download");
+  } catch {
+    return "download";
+  }
+}
+
 function navigationHistory(webContents) {
   return webContents.navigationHistory || webContents;
 }
@@ -535,7 +549,10 @@ function serializeError(error) {
 function createDesktopBrowserHost(options) {
   const {
     app,
+    Menu,
     WebContentsView,
+    clipboard,
+    dialog,
     nativeImage,
     getMainWindow,
     logger = () => {},
@@ -737,6 +754,131 @@ function createDesktopBrowserHost(options) {
     if (entry.dialogs.length > 32) entry.dialogs.shift();
   }
 
+  function requestNewBrowserTab(entry, rawUrl) {
+    if (entry.destroyed) return false;
+    const targetUrl = normalizeUrl(rawUrl);
+    const window = getMainWindow();
+    if (!window || window.isDestroyed() || window.webContents.isDestroyed()) {
+      return false;
+    }
+    window.webContents.send(IPC_CHANNELS.newTabRequested, {
+      openerSessionId: entry.sessionId,
+      url: targetUrl,
+    });
+    log("info", "browser.tab.open-requested", {
+      sessionId: entry.sessionId,
+      url: targetUrl,
+    });
+    return true;
+  }
+
+  async function saveContextMenuResource(entry, webContents, resource) {
+    if (!dialog || typeof dialog.showSaveDialog !== "function") return;
+    if (entry.pendingDownload || entry.pendingSaveAs) {
+      throw new BrowserHostError(
+        "download_in_progress",
+        "A download is already in progress.",
+        409,
+      );
+    }
+    const targetUrl = normalizeUrl(resource.url);
+    const suggestedFilename = contextMenuFilename(
+      targetUrl,
+      resource.suggestedFilename,
+    );
+    const window = getMainWindow();
+    const options = {
+      title: "另存为",
+      defaultPath: path.join(app.getPath("downloads"), suggestedFilename),
+    };
+    const result = window
+      ? await dialog.showSaveDialog(window, options)
+      : await dialog.showSaveDialog(options);
+    if (result.canceled || !result.filePath || entry.destroyed) return;
+    if (entry.pendingDownload || entry.pendingSaveAs) {
+      throw new BrowserHostError(
+        "download_in_progress",
+        "A download is already in progress.",
+        409,
+      );
+    }
+    const pendingSaveAs = {
+      savePath: path.resolve(result.filePath),
+      targetUrl,
+      timeout: null,
+    };
+    pendingSaveAs.timeout = setTimeout(() => {
+      if (entry.pendingSaveAs === pendingSaveAs) entry.pendingSaveAs = null;
+    }, MAX_WAIT_MS);
+    pendingSaveAs.timeout.unref?.();
+    entry.pendingSaveAs = pendingSaveAs;
+    try {
+      webContents.downloadURL(targetUrl);
+    } catch (error) {
+      clearTimeout(pendingSaveAs.timeout);
+      entry.pendingSaveAs = null;
+      throw error;
+    }
+  }
+
+  function contextMenuActions(entry, target, parameters) {
+    const webContents = target.view.webContents;
+    const state = sessionState(entry);
+    const editCommands = new Set([
+      "undo",
+      "redo",
+      "cut",
+      "copy",
+      "paste",
+      "pasteAndMatchStyle",
+      "delete",
+      "selectAll",
+    ]);
+    const recordFailure = (operation, error) => {
+      if (entry.destroyed) return;
+      entry.lastError = serializeError(error);
+      emitState(entry);
+      log("warn", `browser.context-menu.${operation}-failed`, {
+        sessionId: entry.sessionId,
+        error: serializeError(error),
+      });
+    };
+    const runNavigation = (direction) => {
+      void runExclusive(entry, () => {
+        beginUserControl(entry);
+        return navigateHistory(entry, direction);
+      }).catch((error) => recordFailure(direction, error));
+    };
+    return {
+      canGoBack: state.canGoBack,
+      canGoForward: state.canGoForward,
+      back: () => runNavigation("back"),
+      forward: () => runNavigation("forward"),
+      reload: () => {
+        beginUserControl(entry);
+        webContents.reload();
+      },
+      openNewTab: (url) => requestNewBrowserTab(entry, url),
+      copyText: (value) => clipboard?.writeText(String(value || "")),
+      copyImage: ({ x, y }) => webContents.copyImageAt(x, y),
+      saveResource: (resource) => {
+        void saveContextMenuResource(entry, webContents, resource).catch(
+          (error) => recordFailure("save", error),
+        );
+      },
+      searchSelection: (selection) => {
+        const search = new URL("https://www.google.com/search");
+        search.searchParams.set("q", selection);
+        requestNewBrowserTab(entry, search.toString());
+      },
+      edit: (command) => {
+        if (!editCommands.has(command)) return;
+        webContents[command]?.();
+      },
+      inspect: ({ x, y }) => webContents.inspectElement(x, y),
+    };
+  }
+
   function configureRemoteContents(entry, target) {
     const webContents = target.view.webContents;
     const browserSession = webContents.session;
@@ -793,21 +935,7 @@ function createDesktopBrowserHost(options) {
           return;
         }
         if (entry.sessionId.startsWith(USER_BROWSER_TAB_SESSION_PREFIX)) {
-          const window = getMainWindow();
-          if (
-            window &&
-            !window.isDestroyed() &&
-            !window.webContents.isDestroyed()
-          ) {
-            window.webContents.send(IPC_CHANNELS.newTabRequested, {
-              openerSessionId: entry.sessionId,
-              url: targetUrl,
-            });
-            log("info", "browser.tab.open-requested", {
-              sessionId: entry.sessionId,
-              url: targetUrl,
-            });
-          }
+          requestNewBrowserTab(entry, targetUrl);
           return;
         }
         const popupView = new WebContentsView({
@@ -868,6 +996,17 @@ function createDesktopBrowserHost(options) {
         }
       });
       return { action: "deny" };
+    });
+    webContents.on("context-menu", (_event, parameters) => {
+      if (entry.destroyed || !entry.targets.has(target.targetRef)) return;
+      const window = getMainWindow();
+      if (!window || window.isDestroyed()) return;
+      popupBrowserContextMenu(
+        Menu,
+        window,
+        parameters,
+        contextMenuActions(entry, target, parameters),
+      );
     });
     webContents.on("will-attach-webview", (event) => event.preventDefault());
     webContents.on("will-prevent-unload", (event) => {
@@ -975,10 +1114,26 @@ function createDesktopBrowserHost(options) {
     });
 
     browserSession.on("will-download", (_event, item, sourceContents) => {
-      if (sourceContents !== webContents || !entry.pendingDownload) return;
-      const pending = entry.pendingDownload;
-      entry.pendingDownload = null;
-      pending.accept(item);
+      if (sourceContents !== webContents) return;
+      if (entry.pendingDownload) {
+        const pending = entry.pendingDownload;
+        entry.pendingDownload = null;
+        pending.accept(item);
+        return;
+      }
+      if (!entry.pendingSaveAs) return;
+      const pending = entry.pendingSaveAs;
+      entry.pendingSaveAs = null;
+      clearTimeout(pending.timeout);
+      item.setSavePath(pending.savePath);
+      item.once("done", (_doneEvent, state) => {
+        log(state === "completed" ? "info" : "warn", "browser.save-as.done", {
+          sessionId: entry.sessionId,
+          state,
+          path: pending.savePath,
+          url: pending.targetUrl,
+        });
+      });
     });
   }
 
@@ -1054,6 +1209,7 @@ function createDesktopBrowserHost(options) {
       attached: false,
       destroyed: false,
       pendingDownload: null,
+      pendingSaveAs: null,
       activeDownloadItem: null,
       lastError: null,
       observations: new Map(),
@@ -2300,7 +2456,7 @@ function createDesktopBrowserHost(options) {
 
   async function download(entry, rawUrl) {
     const targetUrl = normalizeUrl(rawUrl);
-    if (entry.pendingDownload) {
+    if (entry.pendingDownload || entry.pendingSaveAs) {
       throw new BrowserHostError(
         "download_in_progress",
         "A download is already in progress.",
@@ -2446,6 +2602,8 @@ function createDesktopBrowserHost(options) {
     const entry = requireSession(sessionId);
     entry.requestedVisible = false;
     entry.pendingDownload = null;
+    clearTimeout(entry.pendingSaveAs?.timeout);
+    entry.pendingSaveAs = null;
     entry.activeDownloadItem?.cancel();
     entry.activeDownloadItem = null;
     detachEntry(entry);
