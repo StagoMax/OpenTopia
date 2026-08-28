@@ -237,6 +237,10 @@ mod tests {
                 AgentEventPayload::ProviderFirstTokenReceived { .. } => {
                     "provider_first_token_received"
                 }
+                AgentEventPayload::ProviderStreamProgress { .. } => "provider_stream_progress",
+                AgentEventPayload::ProviderResponseCommitStarted { .. } => {
+                    "provider_response_commit_started"
+                }
                 AgentEventPayload::ModelDelta { .. } => "model_delta",
                 AgentEventPayload::ProviderResponseReceived { .. } => "provider_response_received",
                 AgentEventPayload::AssistantMessage { .. } => "assistant_message",
@@ -252,6 +256,8 @@ mod tests {
                 "model_request",
                 "provider_request_sent",
                 "provider_first_token_received",
+                "provider_stream_progress",
+                "provider_response_commit_started",
                 "model_delta",
                 "provider_response_received",
                 "assistant_message",

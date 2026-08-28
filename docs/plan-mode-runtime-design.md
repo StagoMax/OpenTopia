@@ -2,12 +2,12 @@
 
 ## 产品语义
 
-Plan 是协作模式，不是执行计划状态，也不是 Goal 的草稿。它复用普通 Agent Runtime 做只读调查、结构化澄清和方案收敛，最终交付一个 `proposed_plan` 消息部件。Default / Goal 下的 `set_plan`、`update_plan`维护的是实施期间的 `WorkForm` 清单；两者没有共享状态，也不会互相转换。
+Plan 是协作模式，不是执行计划状态，也不是 Goal 的草稿。它复用普通 Agent Runtime 做只读调查、结构化澄清和方案收敛，最终交付一个 `proposed_plan` 消息部件。Default / Goal 下的 `update_plan`通过完整快照维护实施期间的 `WorkForm` 清单；两者没有共享状态，也不会互相转换。
 
 为避免对话中途切换模式时改变 provider tool catalog，根 Agent 在 Default、Plan、Goal 中看到同一组核心 schema。可调用性由运行时按当前模式校验：
 
 - `request_user_input`只有 Plan 可执行；Default / Goal 调用会失败；
-- `set_plan`、`update_plan`只有 Default / Goal 可执行；Plan 调用会以“execution checklist tool”错误失败；
+- `update_plan`只有 Default / Goal 可执行；Plan 调用会以“execution checklist tool”错误失败；
 - 子 Agent 仍看不到结构化提问和共享 WorkForm 工具。
 
 因此“schema 稳定”不等于“权限放宽”。模式提示告诉模型该用什么，工具执行入口是最终的确定性边界。
@@ -30,7 +30,7 @@ Plan 是协作模式，不是执行计划状态，也不是 Goal 的草稿。它
   -> Default 可按复杂度新建自己的 WorkForm 执行清单
 ```
 
-Plan 不创建 `GoalRecord`，不调用 `set_plan` / `update_plan`，也不产生 `WorkFormUpdated`。如果模型没有输出 `<proposed_plan>`，响应仍按普通文本消息保存，适合继续澄清而不是发布不完整方案。
+Plan 不创建 `GoalRecord`，不调用 `update_plan`，也不产生 `WorkFormUpdated`。如果模型没有输出 `<proposed_plan>`，响应仍按普通文本消息保存，适合继续澄清而不是发布不完整方案。
 
 ## 缓存边界
 

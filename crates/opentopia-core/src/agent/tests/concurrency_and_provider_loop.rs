@@ -260,7 +260,7 @@ async fn model_driven_direction_choice_resumes_and_executes_the_answer() {
         .expect("Plan mode");
     let catalog = agent.provider_tool_catalog();
     assert!(catalog.iter().any(|tool| tool.name == "request_user_input"));
-    assert!(catalog.iter().any(|tool| tool.name == "set_plan"));
+    assert!(catalog.iter().any(|tool| tool.name == "update_plan"));
 
     let initial = agent
         .run_turn_detailed_streaming(

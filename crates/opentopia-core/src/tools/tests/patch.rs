@@ -2,9 +2,9 @@ use super::*;
 
 #[test]
 fn plan_tools_describe_optional_memory_without_mandating_a_scheduler() {
-    assert!(Tool::description(&SetPlanTool).contains("external memory"));
+    assert!(Tool::description(&UpdatePlanTool).contains("complete"));
     assert!(Tool::description(&UpdatePlanTool).contains("atomically"));
-    assert!(Tool::description(&UpdatePlanTool).contains("optional"));
+    assert!(Tool::description(&UpdatePlanTool).contains("no prior plan"));
     assert!(!Tool::description(&UpdatePlanTool).contains("one step at a time"));
 }
 

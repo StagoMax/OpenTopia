@@ -651,7 +651,7 @@ mod request_user_input_tool;
 pub use request_user_input_tool::RequestUserInputTool;
 
 mod work_form_tools;
-pub use work_form_tools::{SetPlanTool, UpdatePlanTool};
+pub use work_form_tools::UpdatePlanTool;
 mod skill_tools;
 pub use skill_tools::{CreateSkillTool, ListSkillsTool, ReadSkillTool};
 #[cfg(test)]

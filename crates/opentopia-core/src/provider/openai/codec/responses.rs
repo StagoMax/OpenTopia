@@ -1,8 +1,6 @@
-use super::chat::{
-    legacy_tool_observation, openai_conversation_role, openai_strict_function_schema,
-    portable_function_tool_candidate, CompiledProviderTools,
-};
+use super::chat::{legacy_tool_observation, openai_conversation_role, CompiledProviderTools};
 use super::shared::responses_tool_result_output;
+use super::tool_schema::compile_openai_function_candidate;
 use crate::model_context::{ContextCacheScope, ContextRole};
 use crate::provider::{
     encode_base64, resource_fallback_text, CompiledToolContract, ModelConversationMessage,
@@ -58,23 +56,15 @@ pub(in crate::provider) fn compile_responses_tool_definitions(
                 ),
             });
         } else {
-            let candidate = portable_function_tool_candidate(candidate);
-            let strict_schema = (capabilities.strict_function_tools
-                == ProviderFeatureSupport::Supported)
-                .then(|| openai_strict_function_schema(&candidate.input_schema))
-                .flatten();
-            let strict = strict_schema.is_some();
-            let input_schema = strict_schema.unwrap_or_else(|| candidate.input_schema.clone());
-            contracts.push(CompiledToolContract {
-                name: candidate.name.clone(),
-                logical_input_schema: candidate.input_schema.clone(),
-                wire_input_schema: input_schema.clone(),
-            });
+            let compiled = compile_openai_function_candidate(candidate, capabilities);
+            let candidate = compiled.candidate;
+            let input_schema = compiled.contract.wire_input_schema.clone();
+            contracts.push(compiled.contract);
             definitions.push(ProviderToolDefinition::Function {
                 name: candidate.name,
                 description: candidate.description,
                 input_schema,
-                strict,
+                strict: compiled.strict,
             });
         }
     }

@@ -18,4 +18,4 @@ Clarify the goal, success criteria, scope, constraints, current state, important
 
 Present the complete plan inside one `<proposed_plan>` block. Keep it concise but implementation-ready, normally covering the summary, key implementation changes, tests, and important assumptions. Do not implement the plan and do not ask whether to proceed; the user can switch out of Plan mode when they want implementation.
 
-The provider tool schema may still include `set_plan` and `update_plan` to preserve prompt-cache stability across mode switches. They are execution-checklist tools and are unavailable in Plan mode; never call them to create or revise the proposed plan.
+The provider tool schema may still include `update_plan` to preserve prompt-cache stability across mode switches. It is an execution-checklist tool and is unavailable in Plan mode; never call it to create or revise the proposed plan.

@@ -3,6 +3,9 @@ use super::shared::{
     openai_message_content, openai_tool_call_message, openai_tool_image_companion,
     openai_tool_result_message,
 };
+use super::tool_schema::{
+    compile_openai_function_candidate, discriminated_union_key, schema_singleton_value,
+};
 use crate::model_context::{content_fingerprint, ContextRole};
 use crate::provider::{
     scoped_instruction_messages, CompiledToolContract, ModelConversationMessage,
@@ -619,33 +622,6 @@ pub(in crate::provider) fn openai_conversation_role(role: ModelConversationRole)
     }
 }
 
-pub(in crate::provider) const PORTABLE_APPLY_PATCH_DESCRIPTION: &str = "Apply workspace edits by passing exactly one JSON field named `patch`. The value must be a `*** Begin Patch` envelope ending with `*** End Patch`. For updates, use `*** Update File: relative/path` followed by one or more unified `@@` hunks. Do not send `path`, `diff`, or `operation` as separate fields, and do not use bare `SEARCH:`/`REPLACE:` labels.";
-
-pub(in crate::provider) fn portable_function_tool_candidate(
-    candidate: &ProviderToolCandidate,
-) -> ProviderToolCandidate {
-    if candidate.name != "apply_patch" {
-        return candidate.clone();
-    }
-    ProviderToolCandidate {
-        name: candidate.name.clone(),
-        description: PORTABLE_APPLY_PATCH_DESCRIPTION.to_string(),
-        input_schema: json!({
-            "type": "object",
-            "properties": {
-                "patch": {
-                    "type": "string",
-                    "description": "A complete *** Begin Patch ... *** End Patch envelope."
-                }
-            },
-            "required": ["patch"],
-            "additionalProperties": false
-        }),
-        disclosure: candidate.disclosure,
-        namespace: candidate.namespace.clone(),
-    }
-}
-
 #[cfg(test)]
 pub(in crate::provider) fn openai_tools(
     candidates: &[ProviderToolCandidate],
@@ -667,19 +643,13 @@ pub(in crate::provider) fn compile_openai_tools(
     let mut tools = Vec::with_capacity(candidates.len());
     let mut contracts = Vec::with_capacity(candidates.len());
     candidates.iter().for_each(|candidate| {
-        let candidate = portable_function_tool_candidate(candidate);
+        let compiled = compile_openai_function_candidate(candidate, capabilities);
+        let candidate = compiled.candidate;
         let strict_capable =
             capabilities.strict_function_tools == ProviderFeatureSupport::Supported;
-        let strict_schema = strict_capable
-            .then(|| openai_strict_function_schema(&candidate.input_schema))
-            .flatten();
-        let strict = strict_schema.is_some();
-        let input_schema = strict_schema.unwrap_or_else(|| candidate.input_schema.clone());
-        contracts.push(CompiledToolContract {
-            name: candidate.name.clone(),
-            logical_input_schema: candidate.input_schema.clone(),
-            wire_input_schema: input_schema.clone(),
-        });
+        let strict = compiled.strict;
+        let input_schema = compiled.contract.wire_input_schema.clone();
+        contracts.push(compiled.contract);
         let mut function = json!({
             "name": candidate.name,
             "description": candidate.description,
@@ -694,211 +664,6 @@ pub(in crate::provider) fn compile_openai_tools(
         }));
     });
     CompiledProviderTools { tools, contracts }
-}
-
-/// Lowers the provider-neutral Draft 7 schema into the conservative subset
-/// accepted by OpenAI strict function tools. Failure is per tool: callers keep
-/// the original schema and send `strict: false` rather than weakening every
-/// function definition for the connection.
-pub(in crate::provider) fn openai_strict_function_schema(schema: &Value) -> Option<Value> {
-    let mut lowered = schema.clone();
-    lower_openai_strict_schema_node(&mut lowered)?;
-    let root = lowered.as_object()?;
-    let root_is_object = root.get("type").is_some_and(schema_type_includes_object)
-        || root.get("properties").is_some();
-    root_is_object.then_some(lowered)
-}
-
-pub(in crate::provider) fn schema_type_includes_object(value: &Value) -> bool {
-    value.as_str() == Some("object")
-        || value
-            .as_array()
-            .is_some_and(|types| types.iter().any(|kind| kind.as_str() == Some("object")))
-}
-
-pub(in crate::provider) fn lower_openai_strict_schema_node(schema: &mut Value) -> Option<()> {
-    let object = schema.as_object_mut()?;
-    for annotation in ["$schema", "title", "default", "examples", "deprecated"] {
-        object.remove(annotation);
-    }
-    if let Some(branches) = object.remove("oneOf") {
-        let branches = branches.as_array()?;
-        if discriminated_union_key(branches).is_none() {
-            return None;
-        }
-        object.insert("anyOf".to_string(), Value::Array(branches.clone()));
-    }
-    if object.keys().any(|keyword| {
-        matches!(
-            keyword.as_str(),
-            "$ref"
-                | "$defs"
-                | "definitions"
-                | "oneOf"
-                | "allOf"
-                | "not"
-                | "if"
-                | "then"
-                | "else"
-                | "patternProperties"
-                | "unevaluatedProperties"
-                | "dependentSchemas"
-                | "dependencies"
-        )
-    }) {
-        return None;
-    }
-
-    if let Some(branches) = object.get_mut("anyOf") {
-        for branch in branches.as_array_mut()? {
-            lower_openai_strict_schema_node(branch)?;
-        }
-    }
-    if let Some(items) = object.get_mut("items") {
-        lower_openai_strict_schema_node(items)?;
-    }
-
-    // A root or nested object union owns its properties inside mutually
-    // exclusive branches. Adding an empty `properties` map plus
-    // `additionalProperties: false` to the union container would reject every
-    // field accepted by those branches.
-    if object.contains_key("anyOf") && !object.contains_key("properties") {
-        return Some(());
-    }
-
-    let is_object = object.get("type").is_some_and(schema_type_includes_object)
-        || object.get("properties").is_some();
-    if !is_object {
-        return Some(());
-    }
-
-    let originally_required = object
-        .get("required")
-        .and_then(Value::as_array)
-        .map(|required| {
-            required
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect::<HashSet<_>>()
-        })
-        .unwrap_or_default();
-    let properties = object
-        .entry("properties")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()?;
-    let property_names = properties.keys().cloned().collect::<Vec<_>>();
-    for (name, property_schema) in properties.iter_mut() {
-        lower_openai_strict_schema_node(property_schema)?;
-        if !originally_required.contains(name) {
-            make_openai_schema_nullable(property_schema)?;
-        }
-    }
-    object.insert("required".to_string(), json!(property_names));
-    object.insert("additionalProperties".to_string(), Value::Bool(false));
-    Some(())
-}
-
-/// A tagged union whose branches require distinct constant values is already
-/// mutually exclusive. OpenAI strict tools accept `anyOf` but not `oneOf`, so
-/// this proof lets the provider adapter lower the spelling without weakening
-/// the provider-neutral contract.
-pub(in crate::provider) fn discriminated_union_key(branches: &[Value]) -> Option<String> {
-    let first = branches.first()?.as_object()?;
-    let first_required = first.get("required")?.as_array()?;
-    let first_properties = first.get("properties")?.as_object()?;
-
-    first_required
-        .iter()
-        .filter_map(Value::as_str)
-        .find(|candidate| {
-            let mut seen = Vec::<Value>::new();
-            for branch in branches {
-                let Some(branch) = branch.as_object() else {
-                    return false;
-                };
-                let Some(required) = branch.get("required").and_then(Value::as_array) else {
-                    return false;
-                };
-                if !required
-                    .iter()
-                    .any(|value| value.as_str() == Some(*candidate))
-                {
-                    return false;
-                }
-                let Some(value) = branch
-                    .get("properties")
-                    .and_then(Value::as_object)
-                    .and_then(|properties| properties.get(*candidate))
-                    .and_then(schema_singleton_value)
-                else {
-                    return false;
-                };
-                if seen.contains(value) {
-                    return false;
-                }
-                seen.push(value.clone());
-            }
-            first_properties
-                .get(*candidate)
-                .and_then(schema_singleton_value)
-                .is_some()
-        })
-        .map(str::to_string)
-}
-
-pub(in crate::provider) fn schema_singleton_value(schema: &Value) -> Option<&Value> {
-    schema.get("const").or_else(|| {
-        let values = schema.get("enum")?.as_array()?;
-        (values.len() == 1).then(|| &values[0])
-    })
-}
-
-pub(in crate::provider) fn make_openai_schema_nullable(schema: &mut Value) -> Option<()> {
-    let object = schema.as_object_mut()?;
-    if object.get("type").is_some_and(|kind| {
-        kind.as_str() == Some("null")
-            || kind
-                .as_array()
-                .is_some_and(|types| types.iter().any(|value| value.as_str() == Some("null")))
-    }) || object
-        .get("anyOf")
-        .and_then(Value::as_array)
-        .is_some_and(|branches| {
-            branches
-                .iter()
-                .any(|branch| branch.get("type").and_then(Value::as_str) == Some("null"))
-        })
-    {
-        return Some(());
-    }
-
-    if object.contains_key("const") {
-        let original = std::mem::take(schema);
-        *schema = json!({ "anyOf": [original, { "type": "null" }] });
-        return Some(());
-    }
-    if let Some(kind) = object.get_mut("type") {
-        match kind {
-            Value::String(existing) => {
-                *kind = json!([existing.clone(), "null"]);
-            }
-            Value::Array(types) => types.push(Value::String("null".to_string())),
-            _ => return None,
-        }
-        if let Some(values) = object.get_mut("enum").and_then(Value::as_array_mut) {
-            values.push(Value::Null);
-        }
-        return Some(());
-    }
-    if let Some(branches) = object.get_mut("anyOf").and_then(Value::as_array_mut) {
-        branches.push(json!({ "type": "null" }));
-        return Some(());
-    }
-
-    let original = std::mem::take(schema);
-    *schema = json!({ "anyOf": [original, { "type": "null" }] });
-    Some(())
 }
 
 pub(in crate::provider) fn normalize_provider_tool_calls(

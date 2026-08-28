@@ -601,13 +601,26 @@ async fn responses_provider_prepares_redacted_body_and_collects_typed_stream() {
     assert_eq!(usage.total_tokens, 25);
     assert_eq!(usage.cached_input_tokens, Some(12));
     assert_eq!(usage.cache_write_tokens, Some(8));
+    assert!(transport.iter().any(|event| matches!(
+        event,
+        ProviderTransportEvent::ResponseHeaders { status: 200, .. }
+    )));
+    assert!(transport
+        .iter()
+        .any(|event| matches!(event, ProviderTransportEvent::OutputStarted { .. })));
+    assert!(transport
+        .iter()
+        .any(|event| matches!(event, ProviderTransportEvent::StreamProgress { .. })));
+    assert!(transport
+        .iter()
+        .any(|event| matches!(event, ProviderTransportEvent::ResponseCommitStarted { .. })));
     assert!(matches!(
-        transport.as_slice(),
-        [ProviderTransportEvent::Response {
+        transport.last(),
+        Some(ProviderTransportEvent::Response {
             status: Some(200),
             response_id: Some(response_id),
             ..
-        }] if response_id == "resp_123"
+        }) if response_id == "resp_123"
     ));
 }
 
@@ -881,4 +894,51 @@ fn strict_function_schema_preserves_root_discriminated_unions() {
     assert!(lowered.get("additionalProperties").is_none());
     assert_eq!(lowered["anyOf"][0]["additionalProperties"], false);
     assert_eq!(lowered["anyOf"][1]["additionalProperties"], false);
+}
+
+#[test]
+fn root_discriminated_tools_compile_to_portable_objects_across_openai_transports() {
+    let capabilities = ProviderToolProtocolCapabilities {
+        function_tools: ProviderFeatureSupport::Supported,
+        strict_function_tools: ProviderFeatureSupport::Supported,
+        ..ProviderToolProtocolCapabilities::default()
+    };
+    let tools: [&dyn Tool; 4] = [
+        &BackgroundOutputTool,
+        &DocumentTool,
+        &PdfTool,
+        &SpreadsheetTool,
+    ];
+    let candidates = tools
+        .iter()
+        .map(|tool| ProviderToolCandidate::direct(tool.name(), tool.description(), tool.schema()))
+        .collect::<Vec<_>>();
+
+    let chat = openai_tools(&candidates, capabilities);
+    let responses = responses_tools(&candidates, capabilities);
+    for ((tool, chat_tool), responses_tool) in tools.iter().zip(&chat).zip(&responses) {
+        let chat_function = &chat_tool["function"];
+        for function in [chat_function, responses_tool] {
+            let parameters = &function["parameters"];
+            assert_eq!(parameters["type"], "object", "{}", tool.name());
+            assert!(parameters["properties"].is_object(), "{}", tool.name());
+            assert!(parameters.get("oneOf").is_none(), "{}", tool.name());
+            assert!(parameters.get("anyOf").is_none(), "{}", tool.name());
+            assert!(
+                parameters["properties"]["action"]["enum"]
+                    .as_array()
+                    .is_some_and(|actions| actions.len() > 1),
+                "{}",
+                tool.name()
+            );
+            assert!(
+                parameters["required"]
+                    .as_array()
+                    .is_some_and(|required| required.contains(&json!("action"))),
+                "{}",
+                tool.name()
+            );
+            assert_eq!(function["strict"], false, "{}", tool.name());
+        }
+    }
 }

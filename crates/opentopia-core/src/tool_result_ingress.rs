@@ -159,8 +159,7 @@ pub(crate) fn provider_tool_result_content(result: &ToolResult) -> Vec<ModelCont
                 !(text.is_empty() || artifact_backed || result.output.contains(text))
             }
             ModelContentPart::Json { value } => {
-                output_json.as_ref() != Some(value)
-                    && !matches!(tool_name, Some("set_plan" | "update_plan"))
+                output_json.as_ref() != Some(value) && tool_name != Some("update_plan")
             }
             ModelContentPart::Image { .. } | ModelContentPart::Resource { .. } => true,
         })
@@ -188,7 +187,7 @@ pub(crate) fn provider_tool_result_metadata(tool_name: &str, metadata: &Value) -
             object.remove("locations");
         }
         "filesystem" => compact_filesystem_metadata(object),
-        "set_plan" | "update_plan" => {
+        "update_plan" => {
             object.remove("workForm");
             object.remove("formId");
             object.remove("completed");
@@ -198,7 +197,6 @@ pub(crate) fn provider_tool_result_metadata(tool_name: &str, metadata: &Value) -
             object.remove("status");
             object.remove("nextRunnableItem");
             object.remove("currentItemIndex");
-            object.remove("changedItemId");
         }
         "list_skills" | "list_agents" => {
             object.remove("count");

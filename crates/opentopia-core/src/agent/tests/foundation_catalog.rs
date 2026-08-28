@@ -787,14 +787,12 @@ fn release_gate_mode_bundles_project_flow_plan_task_and_goal_tools() {
     let code_names = names(&code);
     assert!(!code_names.iter().any(|name| name.starts_with("flow_")));
     assert!(code_names.contains("request_user_input"));
-    assert!(code_names.contains("set_plan"));
     assert!(code_names.contains("update_plan"));
     assert!(!code_names.contains("complete_task"));
 
     let mut child = AgentCore::default();
     child.set_agent_context(Uuid::new_v4(), 1);
     let child_names = names(&child);
-    assert!(!child_names.contains("set_plan"));
     assert!(!child_names.contains("update_plan"));
     assert!(!child_names.contains("complete_task"));
 
@@ -813,7 +811,6 @@ fn release_gate_mode_bundles_project_flow_plan_task_and_goal_tools() {
         .apply_collaboration_mode(CollaborationMode::Goal, Some(goal))
         .expect("Goal mode");
     let goal_names = names(&goal_agent);
-    assert!(goal_names.contains("set_plan"));
     assert!(goal_names.contains("update_plan"));
     assert!(!goal_names.contains("complete_task"));
     assert!(goal_names.contains("request_user_input"));
@@ -824,7 +821,6 @@ fn release_gate_mode_bundles_project_flow_plan_task_and_goal_tools() {
         .expect("Plan mode");
     let plan_names = names(&plan_agent);
     assert!(plan_names.contains("request_user_input"));
-    assert!(plan_names.contains("set_plan"));
     assert!(plan_names.contains("update_plan"));
     assert_eq!(plan_names, code_names);
     assert_eq!(

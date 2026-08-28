@@ -2,11 +2,10 @@ use super::{
     ApplyPatchTool, BackgroundOutputTool, BrowserTool, ComputerTool, CreateSkillTool, DocumentTool,
     FilesystemTool, FollowupAgentTaskTool, InterruptAgentTool, ListAgentsTool, ListSkillsTool,
     PdfTool, ReadArtifactTool, ReadAttachmentTool, ReadSkillTool, RegisteredTool,
-    RequestUserInputTool, SendAgentMessageTool, SetPlanTool, ShellTool, SpawnAgentTool,
-    SpreadsheetDescribeTool, SpreadsheetExecuteTool, SpreadsheetInspectTool, SpreadsheetTool, Tool,
-    ToolApprovalMode, ToolCapabilityDescriptor, ToolClass, ToolExecutionPolicy, ToolGovernance,
-    ToolModelVisibility, ToolRiskLevel, ToolSideEffect, ToolSource, UpdatePlanTool,
-    ViewAttachmentTool, WaitAgentTool,
+    RequestUserInputTool, SendAgentMessageTool, ShellTool, SpawnAgentTool, SpreadsheetDescribeTool,
+    SpreadsheetExecuteTool, SpreadsheetInspectTool, SpreadsheetTool, Tool, ToolApprovalMode,
+    ToolCapabilityDescriptor, ToolClass, ToolExecutionPolicy, ToolGovernance, ToolModelVisibility,
+    ToolRiskLevel, ToolSideEffect, ToolSource, UpdatePlanTool, ViewAttachmentTool, WaitAgentTool,
 };
 use crate::bundled_plugins::bundled_plugin_catalog;
 use crate::enterprise::DataClassification;
@@ -148,21 +147,16 @@ impl ToolRegistry {
                 DataClassification::Confidential,
             ),
         );
-        for tool in [
-            Arc::new(SetPlanTool) as Arc<dyn Tool>,
+        registry.register_core(
             Arc::new(UpdatePlanTool),
-        ] {
-            registry.register_core(
-                tool,
-                ToolClass::WorkForm,
-                governed(
-                    ToolRiskLevel::Medium,
-                    ToolSideEffect::SessionMutation,
-                    ToolApprovalMode::PolicyControlled,
-                    DataClassification::Confidential,
-                ),
-            );
-        }
+            ToolClass::WorkForm,
+            governed(
+                ToolRiskLevel::Medium,
+                ToolSideEffect::SessionMutation,
+                ToolApprovalMode::PolicyControlled,
+                DataClassification::Confidential,
+            ),
+        );
         for tool in [
             Arc::new(ListSkillsTool) as Arc<dyn Tool>,
             Arc::new(ReadSkillTool),
@@ -189,6 +183,9 @@ impl ToolRegistry {
             ),
         );
         for registration in crate::flow_tools::flow_tool_registrations() {
+            registry.register_entry(registration);
+        }
+        for registration in crate::agent_tools::agent_tool_registrations() {
             registry.register_entry(registration);
         }
         registry

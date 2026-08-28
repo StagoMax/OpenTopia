@@ -414,7 +414,7 @@ flowchart LR
 
 ### 5.3 Planning Tools 为什么不是一个独立控制器
 
-本节的完整独立说明见 [`planning-tools-architecture-current.md`](planning-tools-architecture-current.md)，包括工具可见模式、计划数据模型、修订冲突、步骤状态、需求覆盖、工具调用证据和收尾校验流程。
+本节的完整独立说明见 [`planning-tools-architecture-current.md`](planning-tools-architecture-current.md)，包括工具可见模式、全量快照语义、步骤状态、Goal 扩展字段和收尾校验流程。
 
 规划相关能力在代码中确实存在，但它不是 AgentCore 内部一个会“自动推进任务”的 `Planner Controller（规划控制器）`。真实关系是：主模型通过普通工具调用读写一份外部化、可验证的 `TaskPlan（任务计划）`；AgentCore 只负责把计划结果投影成事件、在后续调用中提供当前计划，并在客观边界处读取它。
 
@@ -422,27 +422,17 @@ flowchart LR
 flowchart LR
     MODEL["Main Model<br/>主模型"]
     ROUTER["Decision Router + Pending Queue<br/>决策路由 + 待执行队列"]
-    subgraph TASK_TOOLS["Task Tool Bundle<br/>任务执行工具包 · Default / Goal 共享"]
-        UPDATE["update_plan<br/>更新计划"]
-        COMPLETE["complete_task<br/>声明任务完成"]
-    end
-    subgraph GOAL_TOOLS["Goal Tool Bundle<br/>目标专属工具包"]
-        SET["set_plan<br/>设置完整目标计划"]
-    end
-    RESULT["Tool Result metadata.taskPlan<br/>工具结果中的计划元数据"]
-    COMPLETION["Tool Result metadata.taskCompletion<br/>工具结果中的完成声明"]
-    EVENT["PlanUpdated Event<br/>计划已更新事件"]
+    UPDATE["update_plan<br/>发布完整当前快照"]
+    RESULT["Tool Result metadata.workForm<br/>工具结果中的清单元数据"]
+    EVENT["WorkFormUpdated Event<br/>清单已更新事件"]
     STORE[("SessionStore Projection<br/>会话存储投影")]
     CURRENT["current_task_plan_for_tool<br/>为工具提供当前计划"]
     CHECKPOINT["Rollout Checkpoint<br/>长轮次检查点"]
     GUARD["Finalization Guard<br/>收尾守卫"]
 
     MODEL -->|"calls · 调用"| ROUTER
-    ROUTER --> TASK_TOOLS
-    ROUTER --> GOAL_TOOLS
-    SET --> RESULT
+    ROUTER --> UPDATE
     UPDATE --> RESULT
-    COMPLETE --> COMPLETION
     RESULT --> EVENT --> STORE
     EVENT --> CURRENT
     STORE --> CURRENT
@@ -451,18 +441,13 @@ flowchart LR
     STORE --> CHECKPOINT
     EVENT --> GUARD
     STORE --> GUARD
-    COMPLETION --> GUARD
     CHECKPOINT -->|"objective plan counts<br/>客观计划计数"| MODEL
     GUARD -->|"readiness blockers<br/>收尾就绪阻塞"| MODEL
 ```
 
-三类任务状态工具的职责不同：
+执行清单只有一个模型侧工具：`update_plan（更新计划）`。Default / Goal 共享这个 schema；每次调用都提交完整步骤和状态快照，第一次调用创建当前 Turn 的 WorkForm，后续调用整体替换。Goal Mode 使用服务器预先建立的 Goal WorkForm，并在替换步骤时保留服务器拥有的目标、约束和验收定义。模型不提供 revision 或运行时 scope ID。
 
-- `set_plan（设置计划）`：Default / Goal 共享，创建或替换带目标、需求、步骤、依赖和验收标准的完整执行清单；运行时分别选择当前 Turn scope 或服务器 Goal scope；
-- `update_plan（更新计划）`：Default / Goal 共享，用 revision（修订号）保护的增量操作创建或修改步骤、状态、需求覆盖和工具证据，并可用 `currentScopeComplete（当前范围已完成）`标记本次范围是否已经完整闭合；
-- `complete_task（声明任务完成）`：Default / Goal 共享。它不修改 `TaskPlan`，而是返回 `metadata.taskCompletion`中的摘要、验证和剩余工作；其中 `remainingWork（剩余工作）`参与最终 `Completed / Partial`分类。Goal Mode 下还会额外要求计划已经没有 Pending / In Progress Step。
-
-`set_plan / update_plan`返回的 Tool Result（工具结果）在 `metadata.taskPlan`携带新计划。AgentCore 识别该字段并产生 `PlanUpdated（计划已更新）`事件；服务端再把事件投影到持久 Goal / Plan 状态。后续工具执行前，AgentCore 会从本 Turn 最新事件或 Store（存储）读取当前计划放入 `ToolContext（工具上下文）`。
+`update_plan`返回的 Tool Result（工具结果）在 `metadata.workForm`携带新快照。Tool Runtime 识别该字段并产生 `WorkFormUpdated（清单已更新）`事件；服务端再把事件投影到持久 Goal / Turn 状态。后续工具执行前，AgentCore 会从本 Turn 最新事件或 Store（存储）读取当前 WorkForm 放入 `ToolContext（工具上下文）`。
 
 计划不是行动队列：`nextRunnableStep（下一可运行步骤）`只是建议，AgentCore 不会看见 Pending Step（待处理步骤）就自动执行某个工具。主模型仍然决定下一次工具调用。计划真正约束控制流的位置只有客观边界：
 
@@ -704,23 +689,23 @@ Finalization Guard 检查事实，不评价最终文本写得是否好。每次�
 
 1. 检查当前内存中的 Pending Tool Calls（待执行工具调用）；
 2. 查询 Store（存储）中的 Pending Approvals（待审批项）；
-3. 从本 Turn 最新 `PlanUpdated`事件、工具结果 `metadata.taskPlan`或 Store 中读取最新计划；
+3. 从本 Turn 最新 `WorkFormUpdated`事件、工具结果 `metadata.workForm`或 Store 中读取最新清单；
 4. Goal Mode（目标模式）没有 Durable Plan（持久计划）时加入 `plan_missing`；
 5. 非 Plan Mode 下仍有 In Progress / Pending Steps（进行中 / 待处理步骤）时加入 `plan_in_progress / plan_pending`；
 6. 若计划带 Coverage（覆盖信息），逐项验证需求是否映射到步骤、证据 revision 是否为当前版本、证据引用的步骤是否已完成、引用的 Provider Tool Call 是否有成功结果；
 7. 每个需求必须同时有 fulfillment evidence（实现或观察证据）和 verification evidence（验证证据）；
 8. 查询当前作用域的后代智能体和 mailbox；仍有运行中的后代或未交付消息时加入 `descendant_agents_unresolved`。
 
-这里的计划状态与模式工具面是两层：Default Mode 与 Goal Mode 都能通过 `set_plan / update_plan`写入执行期 `WorkForm`状态；Plan Mode 的交付物则是从 `<proposed_plan>`解析出的 `MessagePart::ProposedPlan`。为保持 prompt cache，根 Agent 的 schema 目录跨模式稳定，Plan 仍会看见执行清单工具，但工具执行入口会确定性拒绝；schema 暴露不代表模式授权。
+这里的计划状态与模式工具面是两层：Default Mode 与 Goal Mode 都能通过 `update_plan`的完整快照写入执行期 `WorkForm`状态；Plan Mode 的交付物则是从 `<proposed_plan>`解析出的 `MessagePart::ProposedPlan`。为保持 prompt cache，根 Agent 的 schema 目录跨模式稳定，Plan 仍会看见执行清单工具，但工具执行入口会确定性拒绝；schema 暴露不代表模式授权。
 
-Default 的复杂任务闭环由三部分组成：Base Prompt（基础提示词）要求非简单多步骤任务使用计划机制作为 Durable External Memory（持久外部记忆）；主模型根据语义判断任务复杂度，通过 `set_plan`创建 WorkForm，随后选择普通工具工作，并反复调用 `update_plan`把条目从 Pending / InProgress 推到终态；Finalization Guard 在仍有阻塞性未完成条目时阻止收尾。`nextRunnableItem`只提供依赖提示，不代替主模型调度。
+Default 的复杂任务闭环由三部分组成：Base Prompt（基础提示词）只在非简单多步骤任务确实需要外部进度记忆时建议使用清单；主模型根据语义判断任务复杂度，通过 `update_plan`发布第一份完整 WorkForm 快照，随后在状态变化时发布新的完整快照；Finalization Guard 在仍有阻塞性未完成条目时阻止收尾。`nextRunnableItem`只提供依赖提示，不代替主模型调度。
 
 证据检查也是 Referential Validation（引用校验），不是语义审判。主模型负责把抽象需求拆成 Requirement、Step 和 Acceptance Criteria；代码只检查需求覆盖集合、当前修订号、Completed Step 和成功 Tool Call ID 之间的关系。它不会执行自然语言验收标准，也不会重新阅读成功工具结果来判断内容是否真的支持证据摘要。完整细节见 [Planning Tools 当前架构与完整流程](./planning-tools-architecture-current.md)。
 
 若没有任何阻塞项，守卫返回 Ready（可收尾），但还没有决定一定是 Completed。接着 `finalization_outcome（终态分类）`按最新结构化事实区分：
 
 - 计划含 `Blocked Step（被阻塞步骤）` → `Blocked（被阻塞）`；
-- 有 Deferred / Cancelled Step（延后 / 取消步骤）且 `currentScopeComplete（当前范围完成）`不是 true，或工具元数据仍声明 `remainingWork（剩余工作）` → `Partial（部分完成）`；
+- WorkForm 为 Paused / Cancelled（暂停 / 取消）→ `Partial（部分完成）`；
 - 否则 → `Completed（已完成）`。
 
 这解释了为什么收尾守卫“没有未解决就绪阻塞”后仍可能得到 Partial 或 Blocked：守卫负责阻止不一致状态下过早退出，`finalization_outcome`负责给已经稳定的终态分类。比如一个步骤已被明确标成 Blocked，不再是 Pending，所以无需强迫模型无限重试，但整个 Turn 的业务结果仍是 Blocked。
@@ -924,8 +909,7 @@ AgentCore 对工具有三种不同问题：
 - `crates/opentopia-core/src/agent.rs:5656` — `build_model_request（构建模型请求）`
 - `crates/opentopia-core/src/agent.rs:6207` — `AgentTurnInput（智能体轮次输入）`
 - `crates/opentopia-core/src/tools.rs:1257` — `RequestUserInputTool（请求用户输入工具）`
-- `crates/opentopia-core/src/tools.rs:1606` — `SetPlanTool（设置计划工具）`
-- `crates/opentopia-core/src/tools.rs:1826` — `UpdatePlanTool（更新计划工具）`
+- `crates/opentopia-core/src/tools/work_form_tools.rs` — `UpdatePlanTool（完整快照式执行清单工具）`
 - `crates/opentopia-server/src/main.rs:7433` — `take_provider_cursor（取出提供商游标）`
 - `crates/opentopia-server/src/main.rs:7482` — `persist_provider_cursor（持久化提供商游标）`
 - `crates/opentopia-core/src/model_context.rs:234` — `CompiledModelContext（已编译模型上下文）`

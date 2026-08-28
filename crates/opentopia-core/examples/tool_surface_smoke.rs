@@ -21,7 +21,7 @@ use uuid::Uuid;
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 
-const EXPECTED_TOOLS: [&str; 18] = [
+const EXPECTED_TOOLS: [&str; 17] = [
     "apply_patch",
     "background_output",
     "create_skill",
@@ -33,7 +33,6 @@ const EXPECTED_TOOLS: [&str; 18] = [
     "read_attachment",
     "read_skill",
     "request_user_input",
-    "set_plan",
     "shell",
     "spreadsheet_describe",
     "spreadsheet_execute",
@@ -253,14 +252,13 @@ impl ModelProvider for SmokeProvider {
             8 => Self::one_call(8, "read_skill", json!({ "id": self.created_skill_id()? })),
             9 => Self::one_call(
                 9,
-                "set_plan",
+                "update_plan",
                 json!({
-                    "objective": "Exercise every default model-facing OpenTopia tool.",
-                    "explanation": "Create the smoke-test WorkForm.",
-                    "acceptance": ["Every default tool is dispatched."],
-                    "items": [{
+                    "explanation": "Publish the initial smoke-test checklist.",
+                    "plan": [{
                         "id": "exercise-tools",
                         "step": "Exercise the default tool surface",
+                        "status": "in_progress",
                         "acceptance": ["All tool calls finish without a structured error."]
                     }]
                 }),
@@ -270,9 +268,11 @@ impl ModelProvider for SmokeProvider {
                 "update_plan",
                 json!({
                     "explanation": "Record smoke-test evidence.",
-                    "items": [{
+                    "plan": [{
                         "id": "exercise-tools",
+                        "step": "Exercise the default tool surface",
                         "status": "completed",
+                        "acceptance": ["All tool calls finish without a structured error."],
                         "evidence_refs": ["smoke:default-tool-surface"]
                     }]
                 }),

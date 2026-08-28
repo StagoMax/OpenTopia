@@ -343,7 +343,6 @@ fn default_mode_exposes_work_memory_without_plan_only_input() {
     assert!(!tools.contains("search"));
     assert!(!tools.contains("git_diff"));
     assert!(tools.contains("request_user_input"));
-    assert!(tools.contains("set_plan"));
     assert!(tools.contains("update_plan"));
     assert!(!tools.contains("complete_task"));
     assert!(tools.contains("shell"));
@@ -399,10 +398,6 @@ fn request_user_input_is_available_only_to_the_root_plan_agent() {
         .provider_tool_catalog()
         .iter()
         .any(|tool| tool.name == "request_user_input"));
-    assert!(plan_agent
-        .provider_tool_catalog()
-        .iter()
-        .any(|tool| tool.name == "set_plan"));
     assert!(plan_agent
         .provider_tool_catalog()
         .iter()

@@ -1,25 +1,17 @@
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useState,
-  type Dispatch,
-  type SetStateAction,
-} from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Bot,
   GitCompareArrows,
   Plus,
   RefreshCw,
   ShieldAlert,
+  Sparkles,
   Trash2,
   UserRoundCog,
 } from "lucide-react";
 import type { ApiClient } from "../api/client";
 import type {
-  AgentConnectionBinding,
   AgentInstance,
-  AgentTemplateSpec,
   AgentTemplateVersionView,
   AppSettings,
   ExecutionResourceGrant,
@@ -33,9 +25,28 @@ import {
 import {
   AgentTemplateConnectionAccessSummary,
   AgentTemplateConnectionGrantsField,
-  normalizeConnectionBindings,
 } from "./agentTemplateConnectionGrants";
 import { AgentTemplateKnowledgeBindingField } from "./AgentTemplateKnowledgeBindingField";
+import { AgentConfigInspector } from "./AgentConfigInspector";
+import { generateAgentDraftWithModel } from "./agentAuthoring/generateAgentDraftWithModel";
+import {
+  agentDraftFromTemplate,
+  blankAgentDraft,
+  parseAgentDraftJson,
+  parseAgentDraftList,
+  parseAgentModelBindings,
+  setAgentDraftValue as setFormValue,
+  type AgentDraftForm,
+} from "./agentAuthoring/agentDraftForm";
+import {
+  AgentTextAreaField as TextAreaField,
+  agentCapabilitySummary as capabilitySummary,
+  agentChangeKindLabel as changeKindLabel,
+  agentInstanceStatusLabel as instanceStatusLabel,
+  agentRiskBadge as riskBadge,
+  agentRiskLabel as riskLabel,
+  shortAgentId as shortId,
+} from "./agentAuthoring/agentPresentation";
 import "../styles/agent-template-panel.css";
 
 type AgentTemplatePanelProps = {
@@ -44,29 +55,6 @@ type AgentTemplatePanelProps = {
   workspaceRoot: string | null;
   settings: AppSettings | null;
   onPageHeaderChange?: EnterprisePageHeaderChange;
-};
-
-type DraftForm = {
-  templateId: string;
-  name: string;
-  owner: string;
-  description: string;
-  instructions: string;
-  tools: string;
-  skills: string;
-  plugins: string;
-  legacyAllowAllMcpServers: boolean;
-  mcpServers: string;
-  connectionBindings: AgentConnectionBinding[];
-  knowledgeEnabled: boolean;
-  knowledgeNamespaces: string;
-  workspaceRoots: string;
-  models: string;
-  resourceGrants: string;
-  stateSchema: string;
-  outputSchema: string;
-  delegates: string;
-  riskClass: AgentTemplateSpec["riskClass"];
 };
 
 export function AgentTemplatePanel({
@@ -82,9 +70,10 @@ export function AgentTemplatePanel({
     null,
   );
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
-  const [form, setForm] = useState<DraftForm>(() =>
-    blankDraft(workspaceRoot, settings),
+  const [form, setForm] = useState<AgentDraftForm>(() =>
+    blankAgentDraft(workspaceRoot, settings),
   );
+  const [requirement, setRequirement] = useState("");
   const [editing, setEditing] = useState(false);
   const [initialState, setInitialState] = useState("{}");
   const [busy, setBusy] = useState<string | null>(null);
@@ -100,7 +89,7 @@ export function AgentTemplatePanel({
 
   const closeEditor = useCallback(() => setEditing(false), []);
   useEnterpriseSubpageHeader(onPageHeaderChange, editing, {
-    title: "Agents / 创建 Agent 模板",
+    title: "Agents / 创建 Agent",
     backLabel: "返回 Agents",
     onBack: closeEditor,
   });
@@ -182,7 +171,7 @@ export function AgentTemplatePanel({
   }, [client, connectionAccessRefresh, selected]);
 
   useEffect(() => {
-    if (!editing) setForm(blankDraft(workspaceRoot, settings));
+    if (!editing) setForm(blankAgentDraft(workspaceRoot, settings));
   }, [editing, settings, workspaceRoot]);
 
   async function createVersion() {
@@ -191,20 +180,26 @@ export function AgentTemplatePanel({
     setError(null);
     setNotice(null);
     try {
-      const resourceGrants = parseJson<ExecutionResourceGrant[]>(
+      const resourceGrants = parseAgentDraftJson<ExecutionResourceGrant[]>(
         form.resourceGrants,
         "资源绑定",
       );
       if (!Array.isArray(resourceGrants)) {
         throw new Error("资源绑定必须是 JSON 数组");
       }
-      const stateSchema = parseJson<unknown>(form.stateSchema, "状态 Schema");
-      const outputSchema = parseJson<unknown>(form.outputSchema, "输出 Schema");
-      const knowledgeNamespaces = parseList(form.knowledgeNamespaces);
+      const stateSchema = parseAgentDraftJson<unknown>(
+        form.stateSchema,
+        "状态 Schema",
+      );
+      const outputSchema = parseAgentDraftJson<unknown>(
+        form.outputSchema,
+        "输出 Schema",
+      );
+      const knowledgeNamespaces = parseAgentDraftList(form.knowledgeNamespaces);
       if (form.knowledgeEnabled && knowledgeNamespaces.length === 0) {
         throw new Error("启用 SAG 知识绑定后，至少需要一个 namespace");
       }
-      const tools = parseList(form.tools);
+      const tools = parseAgentDraftList(form.tools);
       if (form.knowledgeEnabled && !tools.includes("library_search")) {
         tools.push("library_search");
       }
@@ -219,13 +214,13 @@ export function AgentTemplatePanel({
             allowAllTools: false,
             tools,
             allowAllSkills: false,
-            skills: parseList(form.skills),
+            skills: parseAgentDraftList(form.skills),
             allowAllPlugins: false,
-            plugins: parseList(form.plugins),
+            plugins: parseAgentDraftList(form.plugins),
             allowAllMcpServers: form.legacyAllowAllMcpServers,
-            mcpServers: parseList(form.mcpServers),
+            mcpServers: parseAgentDraftList(form.mcpServers),
             allowAllWorkspaceRoots: false,
-            workspaceRoots: parseList(form.workspaceRoots),
+            workspaceRoots: parseAgentDraftList(form.workspaceRoots),
           },
           connectionBindings: form.connectionBindings,
           knowledgeBinding: form.knowledgeEnabled
@@ -234,12 +229,12 @@ export function AgentTemplatePanel({
           resourceGrants,
           modelPolicy: {
             allowAllModels: false,
-            allowedModels: parseModelBindings(form.models),
+            allowedModels: parseAgentModelBindings(form.models),
           },
           stateSchema,
           outputSchema,
           allowAllDelegates: false,
-          delegateTemplateIds: parseList(form.delegates),
+          delegateTemplateIds: parseAgentDraftList(form.delegates),
           budget: {
             maxTurns: 20,
             maxToolCalls: 40,
@@ -256,6 +251,33 @@ export function AgentTemplatePanel({
       setSelectedKey(templateKey(created));
     } catch (createError) {
       setError(readableError(createError));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function generateWithModel() {
+    if (!client || !threadId || busy || !requirement.trim()) return;
+    setBusy("generate");
+    setError(null);
+    setNotice(null);
+    try {
+      const generated = await generateAgentDraftWithModel({
+        client,
+        threadId,
+        requirement,
+        existingTemplates: templates,
+        settings,
+      });
+      setForm(agentDraftFromTemplate(generated, workspaceRoot, settings));
+      setSelectedKey(templateKey(generated));
+      setNotice(
+        `模型已生成 ${generated.template.name} 的实时配置；请在右侧审核后保存或直接返回列表发布。`,
+      );
+      await refresh();
+      setSelectedKey(templateKey(generated));
+    } catch (generationError) {
+      setError(readableError(generationError));
     } finally {
       setBusy(null);
     }
@@ -325,7 +347,7 @@ export function AgentTemplatePanel({
     setError(null);
     setNotice(null);
     try {
-      const state = parseJson<unknown>(initialState, "实例状态");
+      const state = parseAgentDraftJson<unknown>(initialState, "实例状态");
       const response = await client.createAgentInstance({
         templateId: selected.template.templateId,
         templateVersion: selected.template.version,
@@ -377,23 +399,24 @@ export function AgentTemplatePanel({
     setNotice(null);
     setForm(
       source
-        ? draftFromTemplate(source, workspaceRoot, settings)
-        : blankDraft(workspaceRoot, settings),
+        ? agentDraftFromTemplate(source, workspaceRoot, settings)
+        : blankAgentDraft(workspaceRoot, settings),
     );
+    setRequirement(source?.template.spec.description ?? "");
     setEditing(true);
   }
 
   return (
-    <div className="agent-template-panel" aria-label="Agent 模板与身份">
+    <div className="agent-template-panel" aria-label="Agent 配置与运行实例">
       {!editing ? (
         <Panel
-          title="Agent 模板"
+          title="Agents / Agent 配置"
           actions={
             <div className="agent-template-panel__header-actions">
               <Button
                 size="compact"
                 variant="quiet"
-                aria-label="刷新 Agent 模板"
+                aria-label="刷新 Agents"
                 disabled={!client || Boolean(busy)}
                 onClick={() => void refresh()}
               >
@@ -444,184 +467,240 @@ export function AgentTemplatePanel({
               })}
             </div>
           ) : (
-            <p className="agent-template-panel__empty">尚未创建 Agent 模板。</p>
+            <p className="agent-template-panel__empty">尚未创建 Agent。</p>
           )}
         </Panel>
       ) : null}
 
       {editing ? (
-        <Panel title="创建不可变版本">
-          <div className="agent-template-panel__form">
-            <TextField
-              label="模板 ID"
-              value={form.templateId}
-              onChange={(event) =>
-                setFormValue(setForm, "templateId", event.target.value)
-              }
-            />
-            <TextField
-              label="名称"
-              value={form.name}
-              onChange={(event) =>
-                setFormValue(setForm, "name", event.target.value)
-              }
-            />
-            <TextField
-              label="所有者"
-              value={form.owner}
-              onChange={(event) =>
-                setFormValue(setForm, "owner", event.target.value)
-              }
-            />
-            <TextField
-              label="说明"
-              value={form.description}
-              onChange={(event) =>
-                setFormValue(setForm, "description", event.target.value)
-              }
-            />
-            <TextAreaField
-              label="用自然语言描述 Agent 的角色、目标和工作方式"
-              value={form.instructions}
-              onChange={(value) => setFormValue(setForm, "instructions", value)}
-            />
-            <AgentTemplateConnectionGrantsField
-              client={client}
-              disabled={Boolean(busy)}
-              legacyAllowAllMcpServers={form.legacyAllowAllMcpServers}
-              legacyMcpServerIds={parseList(form.mcpServers)}
-              value={form.connectionBindings}
-              onChange={(connectionBindings) =>
-                setFormValue(setForm, "connectionBindings", connectionBindings)
-              }
-              onClearLegacyMcpServers={() =>
-                setForm((current) => ({
-                  ...current,
-                  legacyAllowAllMcpServers: false,
-                  mcpServers: "",
-                }))
-              }
-            />
-            <AgentTemplateKnowledgeBindingField
-              disabled={Boolean(busy)}
-              enabled={form.knowledgeEnabled}
-              namespaces={form.knowledgeNamespaces}
-              onEnabledChange={(knowledgeEnabled) =>
-                setFormValue(setForm, "knowledgeEnabled", knowledgeEnabled)
-              }
-              onNamespacesChange={(knowledgeNamespaces) =>
-                setFormValue(
-                  setForm,
-                  "knowledgeNamespaces",
-                  knowledgeNamespaces,
-                )
-              }
-            />
-            <SelectField
-              fieldClassName="agent-template-panel__field"
-              label="风险等级"
-              value={form.riskClass}
-              onChange={(value) =>
-                setFormValue(
-                  setForm,
-                  "riskClass",
-                  value as DraftForm["riskClass"],
-                )
-              }
-              options={[
-                { value: "low", label: "低" },
-                { value: "medium", label: "中" },
-                { value: "high", label: "高" },
-                { value: "critical", label: "关键" },
-              ]}
-            />
-            <details className="agent-template-panel__advanced">
-              <summary>Advanced / 高级能力与 JSON Schema</summary>
-              <div className="agent-template-panel__advanced-fields">
+        <Panel title="Create Agent / 创建 Agent">
+          <div className="agent-studio">
+            <main className="agent-studio__main">
+              <section className="agent-studio__composer">
+                <span>
+                  <strong>Describe the Agent / 描述你需要的 Agent</strong>
+                  <small>
+                    模型会通过受控的 agent_create 工具生成配置；Flow
+                    创建不使用这条自然语言路径。
+                  </small>
+                </span>
+                <textarea
+                  onChange={(event) => setRequirement(event.target.value)}
+                  placeholder="例如：当收到理赔案件参数时，查询案件详情和工伤政策知识库，输出结构化审核结论；金额异常时请求人工审批。"
+                  value={requirement}
+                />
+                <div className="agent-studio__composer-actions">
+                  <small>
+                    生成过程运行在当前 Flow 会话中；如果权限策略要求审批，请在
+                    Inbox 处理后继续。
+                  </small>
+                  <Button
+                    disabled={!threadId || !requirement.trim() || Boolean(busy)}
+                    onClick={() => void generateWithModel()}
+                    variant="primary"
+                  >
+                    <Sparkles aria-hidden="true" size={14} />
+                    {busy === "generate" ? "生成中…" : "生成 Agent 配置"}
+                  </Button>
+                </div>
+              </section>
+              <div className="agent-template-panel__form">
                 <TextField
-                  label="工具（逗号分隔）"
-                  value={form.tools}
+                  label="Agent ID"
+                  value={form.templateId}
                   onChange={(event) =>
-                    setFormValue(setForm, "tools", event.target.value)
+                    setFormValue(setForm, "templateId", event.target.value)
                   }
                 />
                 <TextField
-                  label="Skill（逗号分隔）"
-                  value={form.skills}
+                  label="名称"
+                  value={form.name}
                   onChange={(event) =>
-                    setFormValue(setForm, "skills", event.target.value)
+                    setFormValue(setForm, "name", event.target.value)
                   }
                 />
                 <TextField
-                  label="插件（逗号分隔）"
-                  value={form.plugins}
+                  label="所有者"
+                  value={form.owner}
                   onChange={(event) =>
-                    setFormValue(setForm, "plugins", event.target.value)
+                    setFormValue(setForm, "owner", event.target.value)
                   }
                 />
                 <TextField
-                  label="工作目录（逗号分隔）"
-                  value={form.workspaceRoots}
+                  label="说明"
+                  value={form.description}
                   onChange={(event) =>
-                    setFormValue(setForm, "workspaceRoots", event.target.value)
-                  }
-                />
-                <TextField
-                  label="模型（provider:model）"
-                  value={form.models}
-                  onChange={(event) =>
-                    setFormValue(setForm, "models", event.target.value)
+                    setFormValue(setForm, "description", event.target.value)
                   }
                 />
                 <TextAreaField
-                  label="资源绑定 JSON"
-                  value={form.resourceGrants}
+                  label="Instructions / Agent 提示词"
+                  value={form.instructions}
                   onChange={(value) =>
-                    setFormValue(setForm, "resourceGrants", value)
+                    setFormValue(setForm, "instructions", value)
                   }
-                  mono
                 />
-                <TextAreaField
-                  label="状态 Schema"
-                  value={form.stateSchema}
+                <AgentTemplateConnectionGrantsField
+                  client={client}
+                  disabled={Boolean(busy)}
+                  legacyAllowAllMcpServers={form.legacyAllowAllMcpServers}
+                  legacyMcpServerIds={parseAgentDraftList(form.mcpServers)}
+                  value={form.connectionBindings}
+                  onChange={(connectionBindings) =>
+                    setFormValue(
+                      setForm,
+                      "connectionBindings",
+                      connectionBindings,
+                    )
+                  }
+                  onClearLegacyMcpServers={() =>
+                    setForm((current) => ({
+                      ...current,
+                      legacyAllowAllMcpServers: false,
+                      mcpServers: "",
+                    }))
+                  }
+                />
+                <AgentTemplateKnowledgeBindingField
+                  disabled={Boolean(busy)}
+                  enabled={form.knowledgeEnabled}
+                  namespaces={form.knowledgeNamespaces}
+                  onEnabledChange={(knowledgeEnabled) =>
+                    setFormValue(setForm, "knowledgeEnabled", knowledgeEnabled)
+                  }
+                  onNamespacesChange={(knowledgeNamespaces) =>
+                    setFormValue(
+                      setForm,
+                      "knowledgeNamespaces",
+                      knowledgeNamespaces,
+                    )
+                  }
+                />
+                <SelectField
+                  fieldClassName="agent-template-panel__field"
+                  label="风险等级"
+                  value={form.riskClass}
                   onChange={(value) =>
-                    setFormValue(setForm, "stateSchema", value)
+                    setFormValue(
+                      setForm,
+                      "riskClass",
+                      value as AgentDraftForm["riskClass"],
+                    )
                   }
-                  mono
+                  options={[
+                    { value: "low", label: "低" },
+                    { value: "medium", label: "中" },
+                    { value: "high", label: "高" },
+                    { value: "critical", label: "关键" },
+                  ]}
                 />
-                <TextAreaField
-                  label="输出 Schema"
-                  value={form.outputSchema}
-                  onChange={(value) =>
-                    setFormValue(setForm, "outputSchema", value)
-                  }
-                  mono
-                />
-                <TextField
-                  label="可委派模板（逗号分隔）"
-                  value={form.delegates}
-                  onChange={(event) =>
-                    setFormValue(setForm, "delegates", event.target.value)
-                  }
-                />
+                <details className="agent-template-panel__advanced">
+                  <summary>Advanced / 高级能力与 JSON Schema</summary>
+                  <div className="agent-template-panel__advanced-fields">
+                    <TextField
+                      label="工具（逗号分隔）"
+                      value={form.tools}
+                      onChange={(event) =>
+                        setFormValue(setForm, "tools", event.target.value)
+                      }
+                    />
+                    <TextField
+                      label="Skill（逗号分隔）"
+                      value={form.skills}
+                      onChange={(event) =>
+                        setFormValue(setForm, "skills", event.target.value)
+                      }
+                    />
+                    <TextField
+                      label="插件（逗号分隔）"
+                      value={form.plugins}
+                      onChange={(event) =>
+                        setFormValue(setForm, "plugins", event.target.value)
+                      }
+                    />
+                    <TextField
+                      label="工作目录（逗号分隔）"
+                      value={form.workspaceRoots}
+                      onChange={(event) =>
+                        setFormValue(
+                          setForm,
+                          "workspaceRoots",
+                          event.target.value,
+                        )
+                      }
+                    />
+                    <TextField
+                      label="模型（provider:model）"
+                      value={form.models}
+                      onChange={(event) =>
+                        setFormValue(setForm, "models", event.target.value)
+                      }
+                    />
+                    <TextAreaField
+                      label="资源绑定 JSON"
+                      value={form.resourceGrants}
+                      onChange={(value) =>
+                        setFormValue(setForm, "resourceGrants", value)
+                      }
+                      mono
+                    />
+                    <TextAreaField
+                      label="状态 Schema"
+                      value={form.stateSchema}
+                      onChange={(value) =>
+                        setFormValue(setForm, "stateSchema", value)
+                      }
+                      mono
+                    />
+                    <TextAreaField
+                      label="输出 Schema"
+                      value={form.outputSchema}
+                      onChange={(value) =>
+                        setFormValue(setForm, "outputSchema", value)
+                      }
+                      mono
+                    />
+                    <TextField
+                      label="可委派 Agent（逗号分隔）"
+                      value={form.delegates}
+                      onChange={(event) =>
+                        setFormValue(setForm, "delegates", event.target.value)
+                      }
+                    />
+                  </div>
+                </details>
+                <div className="agent-template-panel__actions">
+                  <Button
+                    variant="quiet"
+                    disabled={Boolean(busy)}
+                    onClick={closeEditor}
+                  >
+                    取消
+                  </Button>
+                  <Button
+                    variant="primary"
+                    disabled={!client || busy === "create"}
+                    onClick={() => void createVersion()}
+                  >
+                    {busy === "create" ? "保存中…" : "保存 Agent 版本"}
+                  </Button>
+                </div>
               </div>
-            </details>
-            <div className="agent-template-panel__actions">
-              <Button
-                variant="quiet"
-                disabled={Boolean(busy)}
-                onClick={closeEditor}
-              >
-                取消
-              </Button>
-              <Button
-                variant="primary"
-                disabled={!client || busy === "create"}
-                onClick={() => void createVersion()}
-              >
-                {busy === "create" ? "创建中…" : "创建版本"}
-              </Button>
-            </div>
+            </main>
+            <AgentConfigInspector
+              generating={busy === "generate"}
+              preview={{
+                name: form.name,
+                instructions: form.instructions,
+                connectionCount: form.connectionBindings.length,
+                knowledgeNamespaces: form.knowledgeEnabled
+                  ? parseAgentDraftList(form.knowledgeNamespaces)
+                  : [],
+                riskClass: form.riskClass,
+                tools: parseAgentDraftList(form.tools),
+                outputSchema: form.outputSchema,
+              }}
+            />
           </div>
         </Panel>
       ) : null}
@@ -881,185 +960,10 @@ export function AgentTemplatePanel({
   );
 }
 
-function blankDraft(
-  workspaceRoot: string | null,
-  settings: AppSettings | null,
-): DraftForm {
-  const provider = settings?.providers.find(
-    (item) => item.id === settings.activeProviderId,
-  );
-  return {
-    templateId: "",
-    name: "",
-    owner: "enterprise-admin",
-    description: "",
-    instructions:
-      "只在当前 ExecutionContext 投影的能力范围内完成任务；无法确定时明确标记 unknown。",
-    tools: "filesystem, shell, list_skills, read_skill",
-    skills: "",
-    plugins: "",
-    legacyAllowAllMcpServers: false,
-    mcpServers: "",
-    connectionBindings: [],
-    knowledgeEnabled: false,
-    knowledgeNamespaces: "",
-    workspaceRoots: workspaceRoot ?? "",
-    models: provider ? `${provider.id}:${provider.model}` : "",
-    resourceGrants: "[]",
-    stateSchema:
-      '{"type":"object","properties":{},"additionalProperties":false}',
-    outputSchema: '{"type":"object"}',
-    delegates: "",
-    riskClass: "medium",
-  };
-}
-
-function draftFromTemplate(
-  view: AgentTemplateVersionView,
-  workspaceRoot: string | null,
-  settings: AppSettings | null,
-): DraftForm {
-  const template = view.template;
-  const fallback = blankDraft(workspaceRoot, settings);
-  return {
-    ...fallback,
-    templateId: template.templateId,
-    name: template.name,
-    owner: template.owner,
-    description: template.spec.description,
-    instructions: template.spec.instructions,
-    tools: template.spec.capabilities.tools.join(", "),
-    skills: template.spec.capabilities.skills.join(", "),
-    plugins: template.spec.capabilities.plugins.join(", "),
-    legacyAllowAllMcpServers: template.spec.capabilities.allowAllMcpServers,
-    mcpServers: template.spec.capabilities.mcpServers.join(", "),
-    connectionBindings: normalizeConnectionBindings(
-      template.spec.connectionBindings,
-    ),
-    knowledgeEnabled: Boolean(template.spec.knowledgeBinding),
-    knowledgeNamespaces:
-      template.spec.knowledgeBinding?.namespaces.join(", ") ?? "",
-    workspaceRoots: template.spec.capabilities.workspaceRoots.join(", "),
-    models: template.spec.modelPolicy.allowedModels
-      .map((model) => `${model.providerId}:${model.modelId}`)
-      .join(", "),
-    resourceGrants: JSON.stringify(template.spec.resourceGrants, null, 2),
-    stateSchema: JSON.stringify(template.spec.stateSchema, null, 2),
-    outputSchema: JSON.stringify(template.spec.outputSchema, null, 2),
-    delegates: template.spec.delegateTemplateIds.join(", "),
-    riskClass: template.spec.riskClass,
-  };
-}
-
-function TextAreaField({
-  label,
-  value,
-  onChange,
-  mono = false,
-}: {
-  label: string;
-  value: string;
-  onChange(value: string): void;
-  mono?: boolean;
-}) {
-  return (
-    <label className="agent-template-panel__field">
-      <span>{label}</span>
-      <textarea
-        className={mono ? "is-mono" : undefined}
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-      />
-    </label>
-  );
-}
-
-function setFormValue<K extends keyof DraftForm>(
-  setForm: Dispatch<SetStateAction<DraftForm>>,
-  key: K,
-  value: DraftForm[K],
-) {
-  setForm((current) => ({ ...current, [key]: value }));
-}
-
-function parseList(value: string): string[] {
-  return [
-    ...new Set(
-      value
-        .split(/[\n,]/)
-        .map((item) => item.trim())
-        .filter(Boolean),
-    ),
-  ];
-}
-
-function parseModelBindings(value: string) {
-  return parseList(value).map((binding) => {
-    const separator = binding.indexOf(":");
-    if (separator <= 0 || separator === binding.length - 1) {
-      throw new Error(`模型绑定格式无效：${binding}`);
-    }
-    return {
-      providerId: binding.slice(0, separator),
-      modelId: binding.slice(separator + 1),
-    };
-  });
-}
-
-function parseJson<T>(value: string, label: string): T {
-  try {
-    return JSON.parse(value) as T;
-  } catch {
-    throw new Error(`${label} 不是有效 JSON`);
-  }
-}
-
 function templateKey(view: AgentTemplateVersionView): string {
   return `${view.template.templateId}@${view.template.version}`;
 }
 
-function shortId(value: string): string {
-  return value.slice(0, 8);
-}
-
 function readableError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function capabilitySummary(values: string[]): string {
-  return values.length ? values.join(", ") : "无";
-}
-
-function riskLabel(risk: AgentTemplateSpec["riskClass"]): string {
-  return {
-    low: "低风险",
-    medium: "中风险",
-    high: "高风险",
-    critical: "关键风险",
-  }[risk];
-}
-
-function riskBadge(
-  risk: AgentTemplateSpec["riskClass"],
-): "neutral" | "warning" | "danger" {
-  if (risk === "critical") return "danger";
-  if (risk === "high") return "warning";
-  return "neutral";
-}
-
-function changeKindLabel(
-  kind: "added" | "removed" | "expanded" | "reduced",
-): string {
-  return { added: "新增", removed: "移除", expanded: "扩展", reduced: "收窄" }[
-    kind
-  ];
-}
-
-function instanceStatusLabel(status: AgentInstance["status"]): string {
-  return {
-    active: "运行中",
-    suspended: "已暂停",
-    completed: "已完成",
-    revoked: "已撤销",
-  }[status];
 }

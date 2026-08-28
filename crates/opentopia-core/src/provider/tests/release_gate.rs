@@ -161,6 +161,52 @@ fn compiled_contract_normalizes_the_selected_root_union_branch() {
 }
 
 #[test]
+fn root_union_wire_contract_is_widened_but_logical_validation_stays_exact() {
+    let tool = BackgroundOutputTool;
+    let candidate = ProviderToolCandidate::direct(
+        Tool::name(&tool),
+        Tool::description(&tool),
+        Tool::schema(&tool),
+    );
+    let capabilities = ProviderToolProtocolCapabilities {
+        function_tools: ProviderFeatureSupport::Supported,
+        strict_function_tools: ProviderFeatureSupport::Supported,
+        ..ProviderToolProtocolCapabilities::default()
+    };
+
+    let compiled = compile_openai_tools(&[candidate], capabilities);
+    let contract = &compiled.contracts[0];
+    assert!(contract.logical_input_schema.get("oneOf").is_some());
+    assert!(contract.wire_input_schema.get("oneOf").is_none());
+    assert!(contract.wire_input_schema.get("anyOf").is_none());
+    assert_eq!(contract.wire_input_schema["type"], "object");
+    assert_eq!(compiled.tools[0]["function"]["strict"], false);
+
+    // The widened provider shape allows all known action fields so a narrow
+    // endpoint can advertise it as one object. The original tagged union still
+    // rejects cross-action arguments before any tool executes.
+    let cross_action_arguments = json!({
+        "action": "list",
+        "jobId": "job-from-another-action"
+    });
+    assert_eq!(
+        tool_input_schema_error(
+            &contract.wire_input_schema,
+            &cross_action_arguments,
+            "arguments"
+        ),
+        None
+    );
+    assert!(tool_input_schema_error(
+        &contract.logical_input_schema,
+        &cross_action_arguments,
+        "arguments"
+    )
+    .is_some());
+    assert!(Tool::input_error(&tool, &cross_action_arguments).is_some());
+}
+
+#[test]
 fn spreadsheet_wire_contract_is_accepted_by_the_typed_runtime_contract() {
     let tool = SpreadsheetTool;
     let candidate = ProviderToolCandidate::direct(

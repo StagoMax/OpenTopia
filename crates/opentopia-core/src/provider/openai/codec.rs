@@ -1,6 +1,7 @@
 mod chat;
 mod responses;
 mod shared;
+mod tool_schema;
 
 pub(in crate::provider) use chat::{
     compile_openai_tools, legacy_tool_observation, normalize_provider_tool_calls,
@@ -10,9 +11,10 @@ pub(in crate::provider) use chat::{
 };
 #[cfg(test)]
 pub(in crate::provider) use chat::{
-    normalize_provider_arguments, openai_messages, openai_portable_messages,
-    openai_strict_function_schema, openai_tools,
+    normalize_provider_arguments, openai_messages, openai_portable_messages, openai_tools,
 };
+#[cfg(test)]
+pub(in crate::provider) use tool_schema::openai_strict_function_schema;
 
 #[cfg(test)]
 pub(in crate::provider) use responses::responses_tools;

@@ -34,7 +34,7 @@ export function AgentsPage({
     <div className="enterprise-page">
       {!templateEditorOpen ? (
         <Panel
-          title="Agent identities / Agent 身份"
+          title="Active Agent sessions / Agent 运行实例"
           actions={
             <Button
               aria-label="刷新 Agent 身份"
@@ -47,8 +47,8 @@ export function AgentsPage({
           }
         >
           <p className="enterprise-page__lede">
-            Agent 是从已发布模板创建的稳定执行身份；它的模板版本、Connection
-            操作和资源范围在创建时冻结。
+            产品中只展示 Agent；内部版本在发布后冻结 Instructions、Connection
+            操作、Knowledge 与权限，运行实例引用这个不可变版本。
           </p>
           <ol className="enterprise-card-list">
             {snapshot.agents.map((agent) => (
@@ -70,7 +70,9 @@ export function AgentsPage({
               </li>
             ))}
             {snapshot.agents.length === 0 ? (
-              <li className="enterprise-list__empty">尚未创建 Agent 身份。</li>
+              <li className="enterprise-list__empty">
+                尚无运行中的 Agent 实例。
+              </li>
             ) : null}
           </ol>
         </Panel>
