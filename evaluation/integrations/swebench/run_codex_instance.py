@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run local default-model Codex in one official SWE-bench task container."""
+"""Run configured local Codex in one official SWE-bench task container."""
 
 from __future__ import annotations
 
@@ -26,6 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--logs-dir", required=True, type=Path)
     parser.add_argument("--run-label", required=True)
     parser.add_argument("--run-timeout-seconds", type=int, default=1800)
+    parser.add_argument("--model")
+    parser.add_argument("--reasoning-effort")
     parser.add_argument("--prepare-only", action="store_true")
     return parser.parse_args()
 
@@ -76,6 +78,8 @@ def run_agent(
         controller_dir=args.logs_dir / "codex-controller",
         logs_dir=args.logs_dir,
         timeout_sec=args.run_timeout_seconds,
+        model=args.model,
+        reasoning_effort=args.reasoning_effort,
     )
     controlled = {
         **result.telemetry,
@@ -92,6 +96,8 @@ def main() -> None:
     args = parse_args()
     if args.run_timeout_seconds < 1:
         raise SystemExit("run timeout must be positive")
+    if bool(args.model) != bool(args.reasoning_effort):
+        raise SystemExit("--model and --reasoning-effort must be supplied together")
     instance = read_instance(args.instances, args.instance_id)
     args.logs_dir.mkdir(parents=True, exist_ok=True)
     client = docker.from_env(timeout=600)
@@ -133,7 +139,11 @@ def main() -> None:
             agent_finished_at = datetime.now(timezone.utc).isoformat()
             prediction = {
                 "instance_id": args.instance_id,
-                "model_name_or_path": "codex-account-default-no-model-flag",
+                "model_name_or_path": (
+                    f"codex-explicit-{args.model}-{args.reasoning_effort}"
+                    if args.model
+                    else "codex-account-default-no-model-flag"
+                ),
                 "model_patch": diff,
             }
             args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -149,6 +159,8 @@ def main() -> None:
                     "agentStartedAtUtc": agent_started_at,
                     "agentFinishedAtUtc": agent_finished_at,
                     "agentDurationSeconds": controlled["durationSeconds"],
+                    "configuredModel": args.model,
+                    "configuredReasoningEffort": args.reasoning_effort,
                 }
             )
     except Exception as error:

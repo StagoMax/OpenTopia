@@ -10,6 +10,10 @@ param(
     [ValidateRange(180, 3600)]
     [int]$RunTimeoutSeconds = 1800,
 
+    [string]$CodexModel = '',
+
+    [string]$CodexReasoningEffort = '',
+
     [string[]]$ExcludeInstance = @(),
 
     # Controllers pass a JSON list here when resuming several completed
@@ -21,6 +25,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$CodexModel = $CodexModel.Trim()
+$CodexReasoningEffort = $CodexReasoningEffort.Trim()
+if ([bool]$CodexModel -ne [bool]$CodexReasoningEffort) {
+    throw 'CodexModel and CodexReasoningEffort must be supplied together.'
+}
 $runner = Join-Path $PSScriptRoot 'run-swebench-codex-instance.ps1'
 if (-not (Test-Path -LiteralPath $runner)) { throw "SWE-bench Codex single-runner is missing: $runner" }
 $instances = @(
@@ -81,7 +90,9 @@ while ($pending.Count -gt 0 -or $active.Count -gt 0) {
             '-PlanRoot', $PlanRoot,
             '-Instance', $instance,
             '-RunsDirectoryName', $RunsDirectoryName,
-            '-RunTimeoutSeconds', $RunTimeoutSeconds
+            '-RunTimeoutSeconds', $RunTimeoutSeconds,
+            '-CodexModel', $CodexModel,
+            '-CodexReasoningEffort', $CodexReasoningEffort
         )
         $process = Start-Process -FilePath 'pwsh.exe' -ArgumentList $arguments `
             -WorkingDirectory (Get-Location).Path -WindowStyle Hidden `
@@ -109,7 +120,9 @@ while ($pending.Count -gt 0 -or $active.Count -gt 0) {
 
 [ordered]@{
     schemaVersion = 1
-    modelSelection = 'codex-account-default-no-model-flag'
+    modelSelection = if ($CodexModel) { "codex-explicit-$CodexModel" } else { 'codex-account-default-no-model-flag' }
+    reasoningEffort = if ($CodexReasoningEffort) { $CodexReasoningEffort } else { 'config-default' }
+    modelSelectionMode = if ($CodexModel) { 'explicit-cli-overrides' } else { 'no-explicit-cli-model-flag' }
     maxParallelTasks = $MaxParallelTasks
     runTimeoutSeconds = $RunTimeoutSeconds
     completed = @($completed)

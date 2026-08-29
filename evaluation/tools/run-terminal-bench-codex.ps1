@@ -10,6 +10,10 @@ param(
     [ValidateRange(180, 3600)]
     [int]$RunTimeoutSeconds = 1800,
 
+    [string]$CodexModel = '',
+
+    [string]$CodexReasoningEffort = '',
+
     [ValidateRange(240, 4800)]
     [int]$HarnessTimeoutSeconds = 2100,
 
@@ -24,6 +28,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$CodexModel = $CodexModel.Trim()
+$CodexReasoningEffort = $CodexReasoningEffort.Trim()
+if ([bool]$CodexModel -ne [bool]$CodexReasoningEffort) {
+    throw 'CodexModel and CodexReasoningEffort must be supplied together.'
+}
 $env:PYTHONUTF8 = '1'
 $sourceRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $env:PYTHONPATH = $sourceRoot
@@ -100,6 +109,12 @@ function Start-CodexTerminalTask {
         '--n-attempts', '1', '--n-concurrent', '1', '--env', 'docker',
         '--jobs-dir', $taskJobs, '--yes'
     )
+    if ($CodexModel) {
+        $arguments += @(
+            '--agent-kwarg', "model=$CodexModel",
+            '--agent-kwarg', "reasoning_effort=$CodexReasoningEffort"
+        )
+    }
     $process = Start-Process -FilePath $harbor -ArgumentList $arguments `
         -WorkingDirectory $sourceRoot -WindowStyle Hidden `
         -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
@@ -143,7 +158,9 @@ while ($pending.Count -gt 0 -or $active.Count -gt 0) {
 
 [ordered]@{
     schemaVersion = 1
-    modelSelection = 'codex-account-default-no-model-flag'
+    modelSelection = if ($CodexModel) { "codex-explicit-$CodexModel" } else { 'codex-account-default-no-model-flag' }
+    reasoningEffort = if ($CodexReasoningEffort) { $CodexReasoningEffort } else { 'config-default' }
+    modelSelectionMode = if ($CodexModel) { 'explicit-cli-overrides' } else { 'no-explicit-cli-model-flag' }
     maxParallelTasks = $MaxParallelTasks
     runTimeoutSeconds = $RunTimeoutSeconds
     completed = @($completed)

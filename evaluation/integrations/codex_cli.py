@@ -74,19 +74,25 @@ def run_container_task(
     controller_dir: Path,
     logs_dir: Path,
     timeout_sec: int,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> CodexRunResult:
-    """Run one default-model Codex turn and retain JSONL-only telemetry.
+    """Run one configured Codex turn and retain JSONL-only telemetry.
 
-    No ``--model`` argument is supplied: this intentionally evaluates the
-    model selected by the user's logged-in Codex account.  The JSONL stream is
-    persisted for audit, while all metadata returned to a harness excludes
-    model and tool bodies.
+    When no explicit model is supplied, Codex uses the logged-in account's
+    default.  Otherwise both the model and reasoning effort are passed as
+    explicit CLI overrides.  The JSONL stream is persisted for audit, while
+    all metadata returned to a harness excludes model and tool bodies.
     """
 
     if timeout_sec < 1:
         raise ValueError("timeout_sec must be positive")
     if not container_id.strip() or not workspace.strip() or not user.strip():
         raise ValueError("container id, workspace, and user are required")
+    model = _optional_setting(model)
+    reasoning_effort = _optional_setting(reasoning_effort)
+    if bool(model) != bool(reasoning_effort):
+        raise ValueError("model and reasoning_effort must be supplied together")
 
     final = _run_container_task_once(
         instruction=instruction,
@@ -96,6 +102,8 @@ def run_container_task(
         controller_dir=controller_dir,
         logs_dir=logs_dir,
         timeout_sec=timeout_sec,
+        model=model,
+        reasoning_effort=reasoning_effort,
     )
     telemetry = {
         **final.telemetry,
@@ -113,6 +121,8 @@ def _run_container_task_once(
     controller_dir: Path,
     logs_dir: Path,
     timeout_sec: int,
+    model: str | None,
+    reasoning_effort: str | None,
 ) -> CodexRunResult:
     """Perform one invocation; transport-only retries are managed above."""
 
@@ -144,8 +154,11 @@ def _run_container_task_once(
         str(controller_dir),
         "--output-last-message",
         str(final_path),
-        prompt,
     ]
+    if model:
+        command.extend(["--model", model])
+        command.extend(["--config", f'model_reasoning_effort="{reasoning_effort}"'])
+    command.append(prompt)
 
     started = time.monotonic()
     started_at = datetime.now(timezone.utc).isoformat()
@@ -175,7 +188,15 @@ def _run_container_task_once(
     telemetry.update(
         {
             "executionRuntime": "local-codex-cli-to-official-container",
-            "modelSelection": "codex-account-default-no-model-flag",
+            "modelSelection": (
+                f"codex-explicit-{model}"
+                if model
+                else "codex-account-default-no-model-flag"
+            ),
+            "reasoningEffort": reasoning_effort or "config-default",
+            "modelSelectionMode": (
+                "explicit-cli-overrides" if model else "no-explicit-cli-model-flag"
+            ),
             "containerId": container_id,
             "workspace": workspace,
             "taskUser": user,
@@ -196,6 +217,15 @@ def _run_container_task_once(
         usage=usage,
         telemetry=telemetry,
     )
+
+
+def _optional_setting(value: str | None) -> str | None:
+    """Normalize a CLI configuration value without broadening its meaning."""
+
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
 
 
 def _ensure_git_repository(path: Path) -> None:

@@ -16,15 +16,28 @@ from evaluation.integrations.codex_cli import CodexRunResult, run_container_task
 
 
 class CodexContainerAgent(BaseAgent):
-    """Run the user's default local Codex model against a Harbor task."""
+    """Run a controlled local Codex configuration against a Harbor task."""
 
     SUPPORTS_RESUME = False
 
-    def __init__(self, *args: Any, run_timeout_sec: int = 1800, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        run_timeout_sec: int = 1800,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         if run_timeout_sec < 1:
             raise ValueError("run_timeout_sec must be positive")
+        model = model.strip() if model else None
+        reasoning_effort = reasoning_effort.strip() if reasoning_effort else None
+        if bool(model) != bool(reasoning_effort):
+            raise ValueError("model and reasoning_effort must be supplied together")
         self._run_timeout_sec = run_timeout_sec
+        self._model = model
+        self._reasoning_effort = reasoning_effort
         self._container_id: str | None = None
         self._workdir: str | None = None
         self._task_user: str | None = None
@@ -49,7 +62,17 @@ class CodexContainerAgent(BaseAgent):
             json.dumps(
                 {
                     "executionRuntime": "local-codex-cli-to-official-container",
-                    "modelSelection": "codex-account-default-no-model-flag",
+                    "modelSelection": (
+                        f"codex-explicit-{self._model}"
+                        if self._model
+                        else "codex-account-default-no-model-flag"
+                    ),
+                    "reasoningEffort": self._reasoning_effort or "config-default",
+                    "modelSelectionMode": (
+                        "explicit-cli-overrides"
+                        if self._model
+                        else "no-explicit-cli-model-flag"
+                    ),
                     "containerId": self._container_id,
                     "workspace": self._workdir,
                     "taskUser": self._task_user,
@@ -80,6 +103,8 @@ class CodexContainerAgent(BaseAgent):
             controller_dir=self.logs_dir / "codex-controller",
             logs_dir=self.logs_dir,
             timeout_sec=self._run_timeout_sec,
+            model=self._model,
+            reasoning_effort=self._reasoning_effort,
         )
         self._apply_result(context, result, time.monotonic() - started)
 

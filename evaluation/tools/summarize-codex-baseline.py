@@ -60,6 +60,9 @@ def terminal_entries(root: Path) -> list[dict[str, Any]]:
                 "outputTokens": _integer(agent.get("n_output_tokens")),
                 "reasoningTokens": _integer(metadata.get("reasoningTokens")),
                 "commandExecutions": _integer(metadata.get("commandExecutionsFinished")),
+                "modelSelection": metadata.get("modelSelection"),
+                "reasoningEffort": metadata.get("reasoningEffort"),
+                "modelSelectionMode": metadata.get("modelSelectionMode"),
                 "errorType": (exception or {}).get("exception_type") if isinstance(exception, dict) else None,
             }
         )
@@ -93,6 +96,9 @@ def swe_entries(root: Path) -> list[dict[str, Any]]:
                 "reasoningTokens": _integer(usage.get("reasoningTokens")),
                 "commandExecutions": _integer(controlled.get("commandExecutionsFinished")),
                 "runStatus": run.get("status"),
+                "modelSelection": controlled.get("modelSelection"),
+                "reasoningEffort": controlled.get("reasoningEffort"),
+                "modelSelectionMode": controlled.get("modelSelectionMode"),
             }
         )
     return entries
@@ -144,13 +150,31 @@ def aggregate(entries: list[dict[str, Any]], *, success_key: str) -> dict[str, A
     return summary
 
 
+def shared_configuration(
+    terminal: list[dict[str, Any]], swe: list[dict[str, Any]]
+) -> dict[str, str | None]:
+    """Return one auditable configuration only when every scored run agrees."""
+
+    valid = [
+        entry
+        for entry in [*terminal, *swe]
+        if entry["validOfficialResult"]
+    ]
+    configuration: dict[str, str | None] = {}
+    for key in ("modelSelection", "reasoningEffort", "modelSelectionMode"):
+        values = {entry.get(key) for entry in valid if isinstance(entry.get(key), str)}
+        configuration[key] = values.pop() if len(values) == 1 else None
+    return configuration
+
+
 def main() -> None:
     args = parse_args()
     terminal = terminal_entries(args.terminal_root)
     swe = swe_entries(args.swe_root)
+    configuration = shared_configuration(terminal, swe)
     report = {
         "schemaVersion": 1,
-        "modelSelection": "codex-account-default-no-model-flag",
+        **configuration,
         "terminalBench": {"summary": aggregate(terminal, success_key="reward"), "tasks": terminal},
         "sweBenchVerified": {"summary": aggregate(swe, success_key="resolved"), "instances": swe},
     }

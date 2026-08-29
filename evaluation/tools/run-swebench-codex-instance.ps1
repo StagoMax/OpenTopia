@@ -8,10 +8,19 @@ param(
     [string]$RunsDirectoryName = 'swebench-codex-account-default-20260828',
 
     [ValidateRange(180, 3600)]
-    [int]$RunTimeoutSeconds = 1800
+    [int]$RunTimeoutSeconds = 1800,
+
+    [string]$CodexModel = '',
+
+    [string]$CodexReasoningEffort = ''
 )
 
 $ErrorActionPreference = 'Stop'
+$CodexModel = $CodexModel.Trim()
+$CodexReasoningEffort = $CodexReasoningEffort.Trim()
+if ([bool]$CodexModel -ne [bool]$CodexReasoningEffort) {
+    throw 'CodexModel and CodexReasoningEffort must be supplied together.'
+}
 $env:PYTHONUTF8 = '1'
 $sourceRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $env:PYTHONPATH = $sourceRoot
@@ -26,7 +35,7 @@ foreach ($path in @($python, $instances, $agentRunner, $officialScorer)) {
 $instanceDir = Join-Path (Join-Path $PlanRoot $RunsDirectoryName) $Instance
 $logsDir = Join-Path $instanceDir 'agent-logs'
 $prediction = Join-Path $instanceDir 'prediction.jsonl'
-$runLabel = "codex-default-$Instance"
+$runLabel = if ($CodexModel) { "codex-$CodexModel-$CodexReasoningEffort-$Instance" } else { "codex-default-$Instance" }
 $score = Join-Path $instanceDir 'official-score-lf-fixed.json'
 New-Item -ItemType Directory -Force -Path $instanceDir | Out-Null
 
@@ -39,6 +48,9 @@ $agentArguments = @(
     '--run-label', $runLabel,
     '--run-timeout-seconds', $RunTimeoutSeconds
 )
+if ($CodexModel) {
+    $agentArguments += @('--model', $CodexModel, '--reasoning-effort', $CodexReasoningEffort)
+}
 & $python @agentArguments 1>> (Join-Path $instanceDir 'agent.stdout.log') 2>> (Join-Path $instanceDir 'agent.stderr.log')
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
