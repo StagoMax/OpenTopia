@@ -10,11 +10,14 @@ param(
     [ValidateRange(180, 3600)]
     [int]$RunTimeoutSeconds = 1800,
 
+    [ValidateRange(0.1, 10.0)]
+    [double]$VerifierTimeoutMultiplier = 1.0,
+
     [string]$CodexModel = '',
 
     [string]$CodexReasoningEffort = '',
 
-    [ValidateRange(240, 4800)]
+    [ValidateRange(240, 9000)]
     [int]$HarnessTimeoutSeconds = 2100,
 
     [string[]]$ExcludeTask = @(),
@@ -28,6 +31,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$VerifierTimeoutMultiplierText = $VerifierTimeoutMultiplier.ToString([System.Globalization.CultureInfo]::InvariantCulture)
 $CodexModel = $CodexModel.Trim()
 $CodexReasoningEffort = $CodexReasoningEffort.Trim()
 if ([bool]$CodexModel -ne [bool]$CodexReasoningEffort) {
@@ -107,6 +111,7 @@ function Start-CodexTerminalTask {
         '--agent-kwarg', "run_timeout_sec=$RunTimeoutSeconds",
         '--include-task-name', "terminal-bench/$Task",
         '--n-attempts', '1', '--n-concurrent', '1', '--env', 'docker',
+        '--verifier-timeout-multiplier', $VerifierTimeoutMultiplierText,
         '--jobs-dir', $taskJobs, '--yes'
     )
     if ($CodexModel) {
@@ -163,6 +168,8 @@ while ($pending.Count -gt 0 -or $active.Count -gt 0) {
     modelSelectionMode = if ($CodexModel) { 'explicit-cli-overrides' } else { 'no-explicit-cli-model-flag' }
     maxParallelTasks = $MaxParallelTasks
     runTimeoutSeconds = $RunTimeoutSeconds
+    verifierTimeoutMultiplier = $VerifierTimeoutMultiplier
+    harnessTimeoutSeconds = $HarnessTimeoutSeconds
     completed = @($completed)
 } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $jobsRoot 'manifest.json') -Encoding utf8
 
