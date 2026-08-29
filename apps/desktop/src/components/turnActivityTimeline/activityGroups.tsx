@@ -56,15 +56,11 @@ export function ActivityEntryView({
 }) {
   if (entry.kind === "tool-group") {
     return (
-      <ToolActivityGroup
-        group={entry.group}
-        executions={entry.executions}
-        defaultExpanded={isActive}
-      />
+      <ToolActivityGroup group={entry.group} executions={entry.executions} />
     );
   }
   if (entry.kind === "file-group") {
-    return <FileActivityGroup files={entry.files} defaultExpanded={isActive} />;
+    return <FileActivityGroup files={entry.files} />;
   }
   if (entry.kind === "reasoning") {
     return null;
@@ -173,11 +169,9 @@ export function ActivityEntryView({
 function ToolActivityGroup({
   group,
   executions,
-  defaultExpanded,
 }: {
   group: ToolGroupKey;
   executions: ToolExecution[];
-  defaultExpanded: boolean;
 }) {
   const state = toolActivityGroupStatus(
     executions.map((execution) => execution.result),
@@ -189,9 +183,7 @@ function ToolActivityGroup({
     .reverse()
     .find((execution) => !execution.result);
   const timing = formatExecutionGroupTiming(executions, running, now);
-  const [expanded, setExpanded] = useState(
-    !commandBatch && (defaultExpanded || running),
-  );
+  const [expanded, setExpanded] = useState(!commandBatch && running);
   const wasRunning = useRef(running);
 
   useEffect(() => {
@@ -316,14 +308,8 @@ function ToolExecutionItem({
   );
 }
 
-function FileActivityGroup({
-  files,
-  defaultExpanded,
-}: {
-  files: ActivityFile[];
-  defaultExpanded: boolean;
-}) {
-  const [expanded, setExpanded] = useState(defaultExpanded);
+function FileActivityGroup({ files }: { files: ActivityFile[] }) {
+  const [expanded, setExpanded] = useState(false);
   const timing = formatFileGroupTiming(files);
   return (
     <div className="activity-group" data-state="complete">

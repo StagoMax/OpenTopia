@@ -24,6 +24,7 @@ import {
 import type { ToolCall, ToolResult } from "../types";
 import {
   buildToolActivity,
+  buildToolActivitySummary,
   type ToolActivityBody,
   type ToolActivityChip,
   type ToolActivityIconKind,
@@ -62,7 +63,7 @@ export function ActivityCallCard({
   timing?: string;
   streaming?: boolean;
   defaultExpanded?: boolean;
-  children: ReactNode;
+  children: ReactNode | (() => ReactNode);
 }) {
   const running = state === "running";
   const [expanded, setExpanded] = useState(defaultExpanded);
@@ -115,7 +116,11 @@ export function ActivityCallCard({
           {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
         </span>
       </button>
-      {expanded && <div className="tool-activity-body">{children}</div>}
+      {expanded && (
+        <div className="tool-activity-body">
+          {typeof children === "function" ? children() : children}
+        </div>
+      )}
     </div>
   );
 }
@@ -143,7 +148,10 @@ export const ToolActivityCard = memo(function ToolActivityCard({
   streaming = false,
   defaultExpanded = false,
 }: ToolActivityCardProps) {
-  const view = useMemo(() => buildToolActivity(call, result), [call, result]);
+  const view = useMemo(
+    () => getCachedToolActivityView(call, result, "summary"),
+    [call, result],
+  );
   const running = !result;
   const chips = useMemo<ToolActivityChip[]>(
     () =>
@@ -180,10 +188,62 @@ export const ToolActivityCard = memo(function ToolActivityCard({
       streaming={streaming}
       defaultExpanded={defaultExpanded}
     >
-      <ToolActivityBodyView body={view.body} view={view} />
+      {() => <ToolActivityDetails call={call} result={result} />}
     </ActivityCallCard>
   );
 }, toolActivityCardPropsEqual);
+
+function ToolActivityDetails({
+  call,
+  result,
+}: {
+  call: ToolCall;
+  result?: ToolResult;
+}) {
+  const view = useMemo(
+    () => getCachedToolActivityView(call, result, "details"),
+    [call, result],
+  );
+  return <ToolActivityBodyView body={view.body} view={view} />;
+}
+
+type ToolActivityViewMode = "summary" | "details";
+
+type ToolActivityViewCacheEntry = {
+  result?: ToolResult;
+  summary?: ToolActivityView;
+  details?: ToolActivityView;
+};
+
+// Session controllers preserve event object identity while cached. Keeping the
+// derived views in a WeakMap means returning to a task reuses prior parsing
+// without retaining calls after their events are released.
+const toolActivityViewCache = new WeakMap<
+  ToolCall,
+  ToolActivityViewCacheEntry
+>();
+
+function getCachedToolActivityView(
+  call: ToolCall,
+  result: ToolResult | undefined,
+  mode: ToolActivityViewMode,
+): ToolActivityView {
+  let cached = toolActivityViewCache.get(call);
+  if (!cached || cached.result !== result) {
+    cached = { result };
+    toolActivityViewCache.set(call, cached);
+  }
+
+  const existing = cached[mode];
+  if (existing) return existing;
+
+  const view =
+    mode === "summary"
+      ? buildToolActivitySummary(call, result)
+      : buildToolActivity(call, result);
+  cached[mode] = view;
+  return view;
+}
 
 function toolActivityCardPropsEqual(
   previous: ToolActivityCardProps,

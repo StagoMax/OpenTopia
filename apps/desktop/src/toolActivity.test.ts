@@ -9,6 +9,7 @@ const toolActivity: typeof ToolActivityModule = await import(
 
 const {
   buildToolActivity,
+  buildToolActivitySummary,
   displayPath,
   groupSearchHits,
   parsePatchLines,
@@ -175,6 +176,32 @@ test("builds a terminal body for shell calls", () => {
   if (view.body.type === "terminal") {
     assert.equal(view.body.streams.stdout, "hello");
   }
+});
+
+test("builds collapsed tool summaries without reading large result bodies", () => {
+  const summary = buildToolActivitySummary(
+    call("shell", { command: "cargo test --workspace" }),
+    {
+      callId: "call-1",
+      get output(): string {
+        throw new Error("collapsed summaries must not read tool output");
+      },
+      metadata: {
+        command: "cargo test --workspace",
+        exitCode: 0,
+        stdout: "x".repeat(100_000),
+        success: true,
+        truncated: true,
+      },
+    },
+  );
+
+  assert.equal(summary.title, "cargo test --workspace");
+  assert.equal(summary.body.type, "pending");
+  assert.deepEqual(
+    summary.chips.map((chip) => chip.label),
+    ["成功", "输出已截断"],
+  );
 });
 
 test("uses the spreadsheet action as the activity title without a redundant type prefix", () => {

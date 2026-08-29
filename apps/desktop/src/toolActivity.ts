@@ -205,7 +205,23 @@ export function buildToolActivity(
   call: ToolCall,
   result?: ToolResult,
 ): ToolActivityView {
-  const view = buildToolActivityView(call, result);
+  return ensureFailureChip(buildToolActivityView(call, result, true));
+}
+
+/**
+ * Build only the information needed by a collapsed activity row. Tool results
+ * can contain tens of thousands of characters, so parsing their body while a
+ * timeline mounts would make task navigation compete with the renderer's
+ * interaction work. The full body is built on demand by the expanded card.
+ */
+export function buildToolActivitySummary(
+  call: ToolCall,
+  result?: ToolResult,
+): ToolActivityView {
+  return ensureFailureChip(buildToolActivityView(call, result, false));
+}
+
+function ensureFailureChip(view: ToolActivityView): ToolActivityView {
   // A failure the tool did not explain otherwise still has to read as one.
   if (view.failed && !view.chips.some((chip) => chip.tone === "danger")) {
     return {
@@ -218,30 +234,36 @@ export function buildToolActivity(
 
 function buildToolActivityView(
   call: ToolCall,
-  result?: ToolResult,
+  result: ToolResult | undefined,
+  includeBody: boolean,
 ): ToolActivityView {
   const kind = classifyToolCall(call);
   const input = asRecord(call.input) ?? {};
   const metadata = asRecord(result?.metadata) ?? {};
   const failed = toolResultFailed(result);
-  const rawOutput = stripArtifactMarker(result?.output ?? "");
+  const rawOutput = includeBody
+    ? stripArtifactMarker(result?.output ?? "")
+    : "";
   const output =
-    call.name === "view_attachment" || call.name === "read_attachment"
+    includeBody &&
+    (call.name === "view_attachment" || call.name === "read_attachment")
       ? stripAttachmentBoundary(rawOutput)
       : rawOutput;
 
   if (call.name === "shell") {
-    const streams = parseShellStreams(
-      output,
-      metadata,
-      stringField(input, "command"),
-    );
+    const fallbackCommand = stringField(input, "command");
+    const streams = includeBody
+      ? parseShellStreams(output, metadata, fallbackCommand)
+      : shellStreamSummary(metadata, fallbackCommand);
     const parsed = parseShellCommand(streams.command);
     return {
       kind,
       title: shellCommandTitle(parsed, streams.command),
       chips: shellChips(streams, result),
-      body: result ? { type: "terminal", streams } : { type: "pending" },
+      body:
+        includeBody && result
+          ? { type: "terminal", streams }
+          : { type: "pending" },
       failed: failed || (streams.exitCode !== null && streams.exitCode !== 0),
     };
   }
@@ -251,7 +273,7 @@ function buildToolActivityView(
       kind,
       title: "查看 Git 变更",
       chips: [],
-      body: result ? patchBody(output) : { type: "pending" },
+      body: includeBody && result ? patchBody(output) : { type: "pending" },
       failed,
     };
   }
@@ -294,14 +316,15 @@ function buildToolActivityView(
           : attachment.title,
       detail: name || undefined,
       chips,
-      body: bodyFromFields(input, output, result, ["attachmentId", "action"]),
+      body: includeBody
+        ? bodyFromFields(input, output, result, ["attachmentId", "action"])
+        : { type: "pending" },
       failed,
     };
   }
 
   if (call.name === "apply_patch") {
     const patch = stringField(input, "patch");
-    const body = patchBody(patch);
     const targets = patchTargets(patch);
     return {
       kind,
@@ -313,7 +336,7 @@ function buildToolActivityView(
             : "应用补丁",
       detail: targets.length > 1 ? targets.join("、") : undefined,
       chips: [],
-      body,
+      body: includeBody ? patchBody(patch) : { type: "pending" },
       failed,
     };
   }
@@ -357,8 +380,9 @@ function buildToolActivityView(
           : numberField(metadata, "count") !== undefined
             ? [{ label: `${numberField(metadata, "count")} 项` }]
             : [],
-      body:
-        content && operation === "write"
+      body: !includeBody
+        ? { type: "pending" }
+        : content && operation === "write"
           ? { type: "file", path: displayPath(path), text: clampText(content) }
           : result
             ? operation === "read"
@@ -385,8 +409,10 @@ function buildToolActivityView(
           ? [{ label: formatBytes(numberField(metadata, "bytes") ?? 0) }]
           : [],
       body: content
-        ? { type: "file", path: displayPath(path), text: clampText(content) }
-        : result
+        ? includeBody
+          ? { type: "file", path: displayPath(path), text: clampText(content) }
+          : { type: "pending" }
+        : includeBody && result
           ? { type: "text", text: output }
           : { type: "pending" },
       failed,
@@ -399,22 +425,27 @@ function buildToolActivityView(
       kind,
       title: `读取 ${displayPath(path) || "文件"}`,
       chips: bytesChip(numberField(metadata, "bytes")),
-      body: result
-        ? { type: "file", path: displayPath(path), text: clampText(output) }
-        : { type: "pending" },
+      body:
+        includeBody && result
+          ? { type: "file", path: displayPath(path), text: clampText(output) }
+          : { type: "pending" },
       failed,
     };
   }
 
   if (call.name === "list_files") {
     const path = stringField(input, "path") || ".";
-    const entries = splitLines(output).slice(0, maxEntries);
-    const total = numberField(metadata, "count") ?? entries.length;
+    const entries = includeBody ? splitLines(output).slice(0, maxEntries) : [];
+    const total =
+      numberField(metadata, "count") ?? (includeBody ? entries.length : null);
     return {
       kind,
       title: `列出 ${displayPath(path)}`,
-      chips: result ? [{ label: `${total} 项` }] : [],
-      body: result ? { type: "entries", entries, total } : { type: "pending" },
+      chips: result && total !== null ? [{ label: `${total} 项` }] : [],
+      body:
+        includeBody && result
+          ? { type: "entries", entries, total: total ?? entries.length }
+          : { type: "pending" },
       failed,
     };
   }
@@ -425,13 +456,14 @@ function buildToolActivityView(
       stringField(input, "query") ||
       stringField(input, "pattern");
     const path = stringField(input, "path") || stringField(metadata, "path");
-    const groups = groupSearchHits(parseSearchHits(output));
+    const groups = includeBody ? groupSearchHits(parseSearchHits(output)) : [];
     const total =
       numberField(metadata, "returnedMatches") ??
-      groups.reduce((sum, group) => sum + group.hits.length, 0);
-    const chips: ToolActivityChip[] = result
-      ? [{ label: `${total} 处匹配` }]
-      : [];
+      (includeBody
+        ? groups.reduce((sum, group) => sum + group.hits.length, 0)
+        : null);
+    const chips: ToolActivityChip[] =
+      result && total !== null ? [{ label: `${total} 处匹配` }] : [];
     if (metadata.truncated === true) {
       chips.push({ label: "结果已截断", tone: "warning" });
     }
@@ -440,11 +472,12 @@ function buildToolActivityView(
       title: `搜索 ${query || "内容"}`,
       detail: path ? displayPath(path) : undefined,
       chips,
-      body: result
-        ? groups.length > 0
-          ? { type: "matches", groups, total }
-          : { type: "text", text: output || "没有匹配结果。" }
-        : { type: "pending" },
+      body:
+        includeBody && result
+          ? groups.length > 0
+            ? { type: "matches", groups, total: total ?? 0 }
+            : { type: "text", text: output || "没有匹配结果。" }
+          : { type: "pending" },
       failed,
     };
   }
@@ -460,7 +493,9 @@ function buildToolActivityView(
       title: `${call.name === "browser" ? "浏览器" : "计算机"} · ${action}`,
       detail: target ? truncateLine(target, 90) : undefined,
       chips: [],
-      body: bodyFromFields(input, output, result, ["action"]),
+      body: includeBody
+        ? bodyFromFields(input, output, result, ["action"])
+        : { type: "pending" },
       failed,
     };
   }
@@ -475,7 +510,9 @@ function buildToolActivityView(
           stringField(input, "path") || stringField(input, "outputPath"),
         ) || undefined,
       chips: [],
-      body: bodyFromFields(input, output, result, ["action"]),
+      body: includeBody
+        ? bodyFromFields(input, output, result, ["action"])
+        : { type: "pending" },
       failed,
     };
   }
@@ -494,7 +531,9 @@ function buildToolActivityView(
       kind,
       title: agentToolTitle(call.name, input),
       chips: [],
-      body: bodyFromFields(input, output, result),
+      body: includeBody
+        ? bodyFromFields(input, output, result)
+        : { type: "pending" },
       failed,
     };
   }
@@ -504,7 +543,9 @@ function buildToolActivityView(
       kind,
       title: "更新执行计划",
       chips: [],
-      body: bodyFromFields(input, output, result),
+      body: includeBody
+        ? bodyFromFields(input, output, result)
+        : { type: "pending" },
       failed,
     };
   }
@@ -520,7 +561,9 @@ function buildToolActivityView(
               "name",
             )}`.trim(),
       chips: [],
-      body: bodyFromFields(input, output, result),
+      body: includeBody
+        ? bodyFromFields(input, output, result)
+        : { type: "pending" },
       failed,
     };
   }
@@ -531,7 +574,9 @@ function buildToolActivityView(
       kind,
       title: `${mcp.server} · ${mcp.tool}`,
       chips: [{ label: "MCP" }],
-      body: bodyFromFields(input, output, result),
+      body: includeBody
+        ? bodyFromFields(input, output, result)
+        : { type: "pending" },
       failed,
     };
   }
@@ -540,7 +585,9 @@ function buildToolActivityView(
     kind,
     title: call.name,
     chips: [],
-    body: bodyFromFields(input, output, result),
+    body: includeBody
+      ? bodyFromFields(input, output, result)
+      : { type: "pending" },
     failed,
   };
 }
@@ -886,6 +933,19 @@ export function parseShellStreams(
     stderr: clampText(envelope.stderr),
     exitCode,
     truncated,
+  };
+}
+
+function shellStreamSummary(
+  metadata: Record<string, unknown>,
+  fallbackCommand: string,
+): ShellStreams {
+  return {
+    command: stringField(metadata, "command") || fallbackCommand,
+    stdout: "",
+    stderr: "",
+    exitCode: numberField(metadata, "exitCode") ?? null,
+    truncated: metadata.truncated === true,
   };
 }
 

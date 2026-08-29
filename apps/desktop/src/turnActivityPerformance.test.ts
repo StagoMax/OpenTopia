@@ -10,6 +10,13 @@ const toolCardSource = readFileSync(
   new URL("./components/ToolActivityCard.tsx", import.meta.url),
   "utf8",
 );
+const activityGroupsSource = readFileSync(
+  new URL(
+    "./components/turnActivityTimeline/activityGroups.tsx",
+    import.meta.url,
+  ),
+  "utf8",
+);
 const messageListSource = readFileSync(
   new URL("./features/conversation/MessageList.tsx", import.meta.url),
   "utf8",
@@ -77,12 +84,35 @@ test("keeps the one-second clock out of the full activity timeline render", () =
   assert.doesNotMatch(timelineRender, /useTimelineClock\(/);
 });
 
-test("memoizes tool activity parsing by stable call and result objects", () => {
+test("defers tool result parsing until a card is expanded and caches both views", () => {
   assert.match(toolCardSource, /memo\(function ToolActivityCard/);
   assert.match(
     toolCardSource,
-    /useMemo\(\(\) => buildToolActivity\(call, result\), \[call, result\]\)/,
+    /getCachedToolActivityView\(call, result, "summary"\)/,
   );
+  assert.match(toolCardSource, /function ToolActivityDetails/);
+  assert.match(
+    toolCardSource,
+    /getCachedToolActivityView\(call, result, "details"\)/,
+  );
+  assert.match(toolCardSource, /new WeakMap<\s*ToolCall/);
+  assert.match(
+    toolCardSource,
+    /typeof children === "function" \? children\(\)/,
+  );
+});
+
+test("keeps completed activity groups behind progressive disclosure", () => {
+  assert.doesNotMatch(
+    activityGroupsSource,
+    /<ToolActivityGroup[\s\S]{0,160}defaultExpanded/,
+  );
+  assert.doesNotMatch(
+    activityGroupsSource,
+    /<FileActivityGroup[\s\S]{0,160}defaultExpanded/,
+  );
+  assert.match(activityGroupsSource, /useState\(!commandBatch && running\)/);
+  assert.match(activityGroupsSource, /useState\(false\)/);
 });
 
 test("does not force a synchronous scroll layout for every event batch", () => {
