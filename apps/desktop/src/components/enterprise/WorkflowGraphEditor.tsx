@@ -1,83 +1,66 @@
-import { Bot, Braces, CircleDot, Plus, RadioTower, Trash2 } from "lucide-react";
-import type { AgentTemplateVersionView } from "../../types";
-import { Button, IconButton } from "../ui";
 import {
-  activationAgentFinalNodeIds,
+  Bot,
+  Braces,
+  CircleDot,
+  Inbox,
+  Plus,
+  RadioTower,
+  ShieldCheck,
+  Trash2,
+} from "lucide-react";
+import type { AgentTemplateVersionView } from "../../types";
+import { Button, IconButton, Popover } from "../ui";
+import {
   activationLabel,
-  createFinalActivation,
-  createManualActivation,
+  activationSourceNodeIds,
   templateKey,
-  type WorkflowAgentSelection,
 } from "./flowActivation";
+import {
+  addWorkflowNode,
+  removeWorkflowNode,
+  workflowNodeLabel,
+  type AddableWorkflowNodeKind,
+  type WorkflowNodeSelection,
+} from "./workflowNodeSelection";
 import "./workflow-graph.css";
 
-const NODE_WIDTH = 252;
-const NODE_HEIGHT = 176;
-const COLUMN_GAP = 96;
-const ROW_GAP = 72;
-const CANVAS_PADDING = 32;
+const NODE_WIDTH = 260;
+const NODE_HEIGHT = 156;
+const COLUMN_GAP = 80;
+const CANVAS_PADDING = 48;
 
 export function WorkflowGraphEditor({
   disabled,
   onChange,
-  onEditAgent,
   onEditTrigger,
+  onSelectNode,
   selections,
+  selectedNodeId,
   templates,
 }: {
   disabled?: boolean;
-  onChange(selections: WorkflowAgentSelection[]): void;
-  onEditAgent(nodeId: string): void;
+  onChange(selections: WorkflowNodeSelection[]): void;
   onEditTrigger(nodeId: string): void;
-  selections: WorkflowAgentSelection[];
+  onSelectNode(nodeId: string): void;
+  selections: WorkflowNodeSelection[];
+  selectedNodeId: string | null;
   templates: AgentTemplateVersionView[];
 }) {
   const positions = layoutNodes(selections);
-  const rows = Math.max(1, Math.ceil(selections.length / 3));
-  const columns = Math.max(1, Math.min(3, selections.length));
   const width =
-    CANVAS_PADDING * 2 + columns * NODE_WIDTH + (columns - 1) * COLUMN_GAP;
-  const height = CANVAS_PADDING * 2 + rows * NODE_HEIGHT + (rows - 1) * ROW_GAP;
+    CANVAS_PADDING * 2 +
+    selections.length * NODE_WIDTH +
+    Math.max(0, selections.length - 1) * COLUMN_GAP;
+  const height = CANVAS_PADDING * 2 + NODE_HEIGHT;
   const edges = selections.flatMap((target) =>
-    activationAgentFinalNodeIds(target.activation).map((sourceId) => ({
+    activationSourceNodeIds(target.activation).map((sourceId) => ({
       sourceId,
       targetId: target.id,
     })),
   );
 
-  function addAgent() {
-    const option = templates[0];
-    if (!option) return;
-    const previous = selections.at(-1);
-    onChange([
-      ...selections,
-      {
-        id: `agent-${crypto.randomUUID()}`,
-        templateKey: templateKey(option),
-        activation: previous
-          ? createFinalActivation(previous.id)
-          : createManualActivation(),
-      },
-    ]);
-  }
-
-  function removeAgent(id: string) {
-    const remaining = selections.filter((item) => item.id !== id);
-    onChange(
-      remaining.map((item, index) => {
-        const referencesRemoved = activationAgentFinalNodeIds(
-          item.activation,
-        ).includes(id);
-        if (!referencesRemoved) return item;
-        const previous = remaining[index - 1];
-        return {
-          ...item,
-          activation: previous
-            ? createFinalActivation(previous.id)
-            : createManualActivation(),
-        };
-      }),
-    );
+  function addNode(kind: AddableWorkflowNodeKind) {
+    onChange(addWorkflowNode(selections, kind, templates[0]));
   }
 
   return (
@@ -86,22 +69,61 @@ export function WorkflowGraphEditor({
         <span>
           <strong>Flow graph / Flow 图</strong>
           <small>
-            连线表示 Agent Final 订阅；每个节点仍可拥有独立的外部 Trigger。
+            Agent、Approval 与 Output 都是 Flow Node；连线表示上游 Final 订阅。
           </small>
         </span>
-        <Button
-          disabled={disabled || templates.length === 0}
-          onClick={addAgent}
-          size="compact"
-          variant="quiet"
+        <Popover
+          align="end"
+          label="选择要添加的节点类型"
+          placement="bottom"
+          trigger={(props) => (
+            <Button
+              {...props}
+              disabled={disabled}
+              size="compact"
+              variant="secondary"
+            >
+              <Plus aria-hidden="true" size={14} /> 添加节点
+            </Button>
+          )}
         >
-          <Plus aria-hidden="true" size={14} /> 添加 Agent
-        </Button>
+          {({ close }) => (
+            <div className="workflow-node-picker">
+              <button
+                disabled={templates.length === 0}
+                onClick={() => {
+                  addNode("agent");
+                  close();
+                }}
+                type="button"
+              >
+                <Bot aria-hidden="true" size={16} />
+                <span>
+                  <strong>Agent</strong>
+                  <small>运行一个已发布的 Agent 模板</small>
+                </span>
+              </button>
+              <button
+                onClick={() => {
+                  addNode("approval");
+                  close();
+                }}
+                type="button"
+              >
+                <ShieldCheck aria-hidden="true" size={16} />
+                <span>
+                  <strong>Approval</strong>
+                  <small>暂停流程并等待人工审批</small>
+                </span>
+              </button>
+            </div>
+          )}
+        </Popover>
       </header>
       <div className="workflow-graph__viewport">
         <div
           className="workflow-graph__canvas"
-          style={{ height, minWidth: width }}
+          style={{ minHeight: height, minWidth: width }}
         >
           <svg
             aria-hidden="true"
@@ -117,7 +139,7 @@ export function WorkflowGraphEditor({
               const startX = source.x + NODE_WIDTH;
               const startY = source.y + NODE_HEIGHT / 2;
               const endX = target.x;
-              const endY = target.y + 28;
+              const endY = target.y + NODE_HEIGHT / 2;
               const bend = Math.max(36, Math.abs(endX - startX) / 2);
               return (
                 <path
@@ -129,60 +151,100 @@ export function WorkflowGraphEditor({
           </svg>
           {selections.map((selection) => {
             const position = positions.get(selection.id)!;
-            const template = templates.find(
-              (item) => templateKey(item) === selection.templateKey,
-            );
+            const label = workflowNodeLabel(selection, templates);
+            const template =
+              selection.kind === "agent"
+                ? templates.find(
+                    (item) => templateKey(item) === selection.templateKey,
+                  )
+                : null;
+            const NodeIcon =
+              selection.kind === "agent"
+                ? Bot
+                : selection.kind === "approval"
+                  ? ShieldCheck
+                  : Inbox;
             return (
               <article
-                className="workflow-node"
+                className={`workflow-node workflow-node--${selection.kind}${
+                  selectedNodeId === selection.id ? " is-selected" : ""
+                }`}
                 key={selection.id}
                 style={{ left: position.x, top: position.y }}
               >
+                {selection.kind === "output" ? (
+                  <div className="workflow-node__trigger">
+                    <RadioTower aria-hidden="true" size={14} />
+                    <span>
+                      <small>Input / 输入</small>
+                      <strong>
+                        {activationLabel(
+                          selection.activation,
+                          selections,
+                          templates,
+                        )}
+                      </strong>
+                    </span>
+                  </div>
+                ) : (
+                  <button
+                    className="workflow-node__trigger"
+                    disabled={disabled}
+                    onClick={() => onEditTrigger(selection.id)}
+                    type="button"
+                  >
+                    <RadioTower aria-hidden="true" size={14} />
+                    <span>
+                      <small>Trigger / 触发器</small>
+                      <strong>
+                        {activationLabel(
+                          selection.activation,
+                          selections,
+                          templates,
+                        )}
+                      </strong>
+                    </span>
+                  </button>
+                )}
                 <button
-                  className="workflow-node__trigger"
-                  onClick={() => onEditTrigger(selection.id)}
+                  aria-pressed={selectedNodeId === selection.id}
+                  className="workflow-node__body"
+                  onClick={() => onSelectNode(selection.id)}
                   type="button"
                 >
-                  <RadioTower aria-hidden="true" size={14} />
+                  <NodeIcon aria-hidden="true" size={17} />
                   <span>
-                    <small>Trigger / 触发器</small>
-                    <strong>
-                      {activationLabel(
-                        selection.activation,
-                        selections,
-                        templates,
-                      )}
-                    </strong>
-                  </span>
-                </button>
-                <button
-                  className="workflow-node__agent"
-                  onClick={() => onEditAgent(selection.id)}
-                  type="button"
-                >
-                  <Bot aria-hidden="true" size={17} />
-                  <span>
-                    <strong>{template?.template.name ?? "选择 Agent"}</strong>
+                    <strong>{label}</strong>
                     <small>
-                      {template
+                      {selection.kind === "agent" && template
                         ? `${template.template.templateId}@${template.template.version}`
-                        : "未绑定"}
+                        : `${selection.kind} node`}
                     </small>
                   </span>
-                  <Braces aria-hidden="true" size={14} />
+                  {selection.kind === "agent" ? (
+                    <Braces aria-hidden="true" size={14} />
+                  ) : null}
                 </button>
                 <footer className="workflow-node__final">
                   <CircleDot aria-hidden="true" size={12} />
-                  <span>Final / 完成通知</span>
-                  <IconButton
-                    aria-label={`移除 ${template?.template.name ?? "Agent"}`}
-                    disabled={disabled || selections.length === 1}
-                    onClick={() => removeAgent(selection.id)}
-                    size="compact"
-                    variant="danger"
-                  >
-                    <Trash2 aria-hidden="true" size={13} />
-                  </IconButton>
+                  <span>
+                    {selection.kind === "output"
+                      ? "Terminal / 流程输出"
+                      : "Final / 完成通知"}
+                  </span>
+                  {selection.kind !== "output" ? (
+                    <IconButton
+                      aria-label={`移除 ${label}`}
+                      disabled={disabled}
+                      onClick={() =>
+                        onChange(removeWorkflowNode(selections, selection.id))
+                      }
+                      size="compact"
+                      variant="danger"
+                    >
+                      <Trash2 aria-hidden="true" size={13} />
+                    </IconButton>
+                  ) : null}
                 </footer>
               </article>
             );
@@ -193,13 +255,13 @@ export function WorkflowGraphEditor({
   );
 }
 
-function layoutNodes(selections: readonly WorkflowAgentSelection[]) {
+function layoutNodes(selections: readonly WorkflowNodeSelection[]) {
   return new Map(
     selections.map((selection, index) => [
       selection.id,
       {
-        x: CANVAS_PADDING + (index % 3) * (NODE_WIDTH + COLUMN_GAP),
-        y: CANVAS_PADDING + Math.floor(index / 3) * (NODE_HEIGHT + ROW_GAP),
+        x: CANVAS_PADDING + index * (NODE_WIDTH + COLUMN_GAP),
+        y: CANVAS_PADDING,
       },
     ]),
   );

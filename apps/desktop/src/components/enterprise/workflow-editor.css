@@ -1,0 +1,373 @@
+.enterprise-workflow-editor-page {
+  align-content: stretch;
+  block-size: 100%;
+  overflow: hidden;
+  gap: var(--space-0);
+  padding: var(--space-0);
+}
+
+.workflow-editor {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-block-size: 0;
+  block-size: 100%;
+  background: var(--surface);
+}
+
+.workflow-editor__toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-6);
+  min-block-size: calc(var(--control-height-lg) + var(--space-6));
+  border-bottom: 1px solid var(--border);
+  padding: var(--space-3) var(--space-6);
+}
+
+.workflow-editor__summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-inline-size: 0;
+}
+
+.workflow-editor__summary > span:last-child {
+  display: grid;
+  min-inline-size: 0;
+  gap: var(--space-1);
+}
+
+.workflow-editor__summary strong,
+.workflow-editor__summary small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workflow-editor__summary small {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.workflow-editor__actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  overflow-x: auto;
+}
+
+.workflow-editor__actions .ot-button {
+  flex: 0 0 auto;
+}
+
+.workflow-editor__body {
+  display: grid;
+  grid-template-columns:
+    minmax(0, 1fr)
+    calc(var(--popover-width-compact) + var(--space-16));
+  min-block-size: 0;
+}
+
+.flow-editor-inspector {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-inline-size: 0;
+  min-block-size: 0;
+  border-left: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.flow-editor-inspector__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  min-block-size: calc(var(--control-height-lg) + var(--space-6));
+  border-bottom: 1px solid var(--border);
+  padding: var(--space-3) var(--space-4);
+}
+
+.flow-editor-inspector__title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-inline-size: 0;
+}
+
+.flow-editor-inspector__title > span {
+  display: grid;
+  min-inline-size: 0;
+  gap: var(--space-1);
+}
+
+.flow-editor-inspector__title strong,
+.flow-editor-inspector__title small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.flow-editor-inspector__title small {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.flow-editor-inspector__body {
+  display: grid;
+  align-content: start;
+  gap: var(--space-6);
+  overflow: auto;
+  min-block-size: 0;
+  padding: var(--space-5);
+}
+
+.flow-editor-inspector__section {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.flow-editor-inspector__section + .flow-editor-inspector__section {
+  border-top: 1px solid var(--border-subtle);
+  padding-top: var(--space-5);
+}
+
+.flow-editor-inspector__section > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.flow-editor-inspector__textarea,
+.flow-create-dialog__outcome {
+  display: grid;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.flow-editor-inspector__textarea textarea,
+.flow-create-dialog__outcome textarea {
+  inline-size: 100%;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  padding: var(--space-3);
+  color: var(--text);
+  font: inherit;
+  line-height: var(--line-height-body);
+}
+
+.flow-editor-inspector__textarea textarea:focus-visible,
+.flow-create-dialog__outcome textarea:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.flow-editor-inspector__activation {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface-subtle);
+  padding: var(--space-3);
+}
+
+.flow-editor-inspector__activation > span {
+  display: grid;
+  min-inline-size: 0;
+  gap: var(--space-1);
+}
+
+.flow-editor-inspector__activation small,
+.flow-editor-inspector__note {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.flow-editor-inspector__activation strong {
+  overflow-wrap: anywhere;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+}
+
+.flow-editor-inspector__note {
+  margin: 0;
+  line-height: var(--line-height-relaxed);
+}
+
+.flow-editor-progress {
+  display: grid;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.flow-editor-progress li {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+}
+
+.flow-editor-progress li.is-done {
+  color: var(--success);
+}
+
+.flow-editor-inspector__advanced {
+  border-top: 1px solid var(--border-subtle);
+  padding-top: var(--space-4);
+}
+
+.flow-editor-inspector__advanced summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.flow-editor-inspector__advanced pre {
+  overflow: auto;
+  max-block-size: calc(var(--control-height-lg) * 8);
+  margin: var(--space-3) 0 0;
+  background: var(--surface-subtle);
+  padding: var(--space-3);
+  color: var(--text-secondary);
+  font: var(--font-size-xs) / var(--line-height-relaxed) var(--font-mono);
+}
+
+.flow-create-dialog__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  display: grid;
+  place-items: center;
+  background: var(--overlay-scrim);
+  padding: var(--space-12);
+}
+
+.flow-create-dialog {
+  display: grid;
+  gap: var(--space-6);
+  inline-size: min(
+    calc(var(--popover-width-compact) * 2),
+    calc(100vw - var(--space-12) * 2)
+  );
+  max-block-size: calc(100vh - var(--space-12) * 2);
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-overlay);
+  padding: var(--space-6);
+}
+
+.flow-create-dialog > header,
+.flow-create-dialog > footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.flow-create-dialog > footer {
+  justify-content: flex-end;
+  border-top: 1px solid var(--border-subtle);
+  padding-top: var(--space-5);
+}
+
+.flow-create-dialog__heading {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+}
+
+.flow-create-dialog__heading > span:last-child {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.flow-create-dialog__heading strong {
+  font-size: var(--font-size-lg);
+}
+
+.flow-create-dialog__heading small,
+.flow-create-dialog__outcome small {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.flow-create-dialog__icon {
+  display: grid;
+  place-items: center;
+  inline-size: var(--control-height-lg);
+  block-size: var(--control-height-lg);
+  border-radius: var(--radius-md);
+  background: var(--accent-subtle);
+  color: var(--accent);
+}
+
+.flow-create-dialog__grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-5);
+}
+
+.flow-create-dialog__wide,
+.flow-create-dialog__outcome {
+  grid-column: 1 / -1;
+}
+
+@media (max-width: 64rem) {
+  .workflow-editor__body {
+    grid-template-columns: minmax(0, 1fr) var(--popover-width-compact);
+  }
+
+  .workflow-editor__summary small {
+    display: none;
+  }
+}
+
+@media (max-width: 48rem) {
+  .workflow-editor__toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .workflow-editor__actions {
+    justify-content: flex-start;
+  }
+
+  .workflow-editor__body {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(calc(var(--control-height-lg) * 8), 1fr) auto;
+    overflow: auto;
+  }
+
+  .flow-editor-inspector {
+    border-top: 1px solid var(--border);
+    border-left: 0;
+  }
+
+  .flow-create-dialog__grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .flow-create-dialog__wide,
+  .flow-create-dialog__outcome {
+    grid-column: auto;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workflow-node {
+    transition: none;
+  }
+}

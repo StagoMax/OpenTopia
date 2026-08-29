@@ -1,89 +1,99 @@
-import { Bot, RefreshCw } from "lucide-react";
-import { useCallback, useState } from "react";
+import { FileText } from "lucide-react";
+import { useEffect } from "react";
 import type { ApiClient } from "../../api/client";
-import type { AppSettings } from "../../types";
-import { AgentTemplatePanel } from "../AgentTemplatePanel";
-import { Badge, Button, Panel } from "../ui";
-import { shortId } from "./model";
+import { Badge } from "../ui";
 import { useEnterpriseStore } from "./store";
-import type { EnterprisePageHeaderChange } from "./pageHeader";
+import {
+  templateKeyForAgent,
+  useFlowAgentSelection,
+} from "./flowAgentSelection";
 
-export function AgentsPage({
-  client,
-  threadId,
-  workspaceRoot,
-  settings,
-  onPageHeaderChange,
-}: {
-  client: ApiClient;
-  threadId: string | null;
-  workspaceRoot: string | null;
-  settings: AppSettings | null;
-  onPageHeaderChange?: EnterprisePageHeaderChange;
-}) {
-  const { snapshot, store } = useEnterpriseStore(client);
-  const [templateEditorOpen, setTemplateEditorOpen] = useState(false);
-  const handlePageHeaderChange = useCallback<EnterprisePageHeaderChange>(
-    (header) => {
-      setTemplateEditorOpen(Boolean(header));
-      onPageHeaderChange?.(header);
-    },
-    [onPageHeaderChange],
-  );
+export function AgentsPage({ client }: { client: ApiClient }) {
+  const { snapshot } = useEnterpriseStore(client);
+  const selection = useFlowAgentSelection();
+  const requestedTemplateKey = selection?.selectedTemplateKey ?? null;
+  const selectedTemplate = requestedTemplateKey
+    ? (snapshot.templates.find(
+        (view) =>
+          templateKeyForAgent(
+            view.template.templateId,
+            view.template.version,
+          ) === requestedTemplateKey,
+      ) ?? null)
+    : (snapshot.templates[0] ?? null);
+  const selectedTemplateKey = selectedTemplate
+    ? templateKeyForAgent(
+        selectedTemplate.template.templateId,
+        selectedTemplate.template.version,
+      )
+    : null;
+
+  useEffect(() => {
+    if (selection && !requestedTemplateKey && selectedTemplateKey) {
+      selection.setSelectedTemplateKey(selectedTemplateKey);
+    }
+  }, [requestedTemplateKey, selectedTemplateKey, selection]);
+
   return (
-    <div className="enterprise-page">
-      {!templateEditorOpen ? (
-        <Panel
-          title="Active Agent sessions / Agent 运行实例"
-          actions={
-            <Button
-              aria-label="刷新 Agent 身份"
-              onClick={() => void store.load(true)}
-              size="compact"
-              variant="quiet"
-            >
-              <RefreshCw aria-hidden="true" size={14} /> 刷新
-            </Button>
-          }
+    <div className="enterprise-page enterprise-agents-page">
+      {selectedTemplate ? (
+        <article
+          aria-labelledby="enterprise-agent-prompt-title"
+          className="enterprise-agent-prompt"
         >
-          <p className="enterprise-page__lede">
-            产品中只展示 Agent；内部版本在发布后冻结 Instructions、Connection
-            操作、Knowledge 与权限，运行实例引用这个不可变版本。
-          </p>
-          <ol className="enterprise-card-list">
-            {snapshot.agents.map((agent) => (
-              <li key={agent.id}>
-                <Bot aria-hidden="true" size={17} />
-                <span>
-                  <strong>
-                    {agent.templateId}@{agent.templateVersion}
-                  </strong>
-                  <small>
-                    Agent {shortId(agent.id)} · Thread {shortId(agent.threadId)}
-                  </small>
-                </span>
-                <Badge
-                  variant={agent.status === "active" ? "success" : "neutral"}
-                >
-                  {agent.status}
-                </Badge>
-              </li>
-            ))}
-            {snapshot.agents.length === 0 ? (
-              <li className="enterprise-list__empty">
-                尚无运行中的 Agent 实例。
-              </li>
+          <header className="enterprise-agent-prompt__header">
+            <div className="enterprise-agent-prompt__title-row">
+              <h2 id="enterprise-agent-prompt-title">
+                {selectedTemplate.template.name}
+              </h2>
+              <Badge
+                variant={
+                  selectedTemplate.template.status === "published"
+                    ? "success"
+                    : "warning"
+                }
+              >
+                {selectedTemplate.template.status === "published"
+                  ? "已发布"
+                  : "草稿"}
+              </Badge>
+            </div>
+            <div className="enterprise-agent-prompt__metadata">
+              <FileText aria-hidden="true" size={14} />
+              <span>
+                {selectedTemplate.template.templateId}@
+                {selectedTemplate.template.version}
+              </span>
+              <span aria-hidden="true">·</span>
+              <span>System prompt / 系统提示词</span>
+            </div>
+            {selectedTemplate.template.spec.description ? (
+              <p>{selectedTemplate.template.spec.description}</p>
             ) : null}
-          </ol>
-        </Panel>
-      ) : null}
-      <AgentTemplatePanel
-        client={client}
-        onPageHeaderChange={handlePageHeaderChange}
-        settings={settings}
-        threadId={threadId}
-        workspaceRoot={workspaceRoot}
-      />
+          </header>
+          <pre>
+            {selectedTemplate.template.spec.instructions || "暂无系统提示词"}
+          </pre>
+        </article>
+      ) : (
+        <div className="enterprise-agent-prompt-empty" role="status">
+          <span>
+            <FileText aria-hidden="true" size={20} />
+          </span>
+          <strong>
+            {snapshot.status === "loading"
+              ? "正在加载 Agent"
+              : requestedTemplateKey
+                ? "正在同步 Agent"
+                : "尚未配置 Agent"}
+          </strong>
+          <p>
+            {snapshot.status === "error"
+              ? snapshot.error || "Agent 加载失败，请稍后重试。"
+              : "从左侧选择 Agent，或使用新建按钮创建一个 Agent。"}
+          </p>
+        </div>
+      )}
     </div>
   );
 }

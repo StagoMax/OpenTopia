@@ -7,9 +7,13 @@ import {
   editableTriggerInputs,
   templateKey,
   type EditableTriggerInput,
+  type FlowNodeActivation,
   type FlowTriggerSource,
-  type WorkflowAgentSelection,
 } from "./flowActivation";
+import {
+  workflowNodeLabel,
+  type WorkflowNodeSelection,
+} from "./workflowNodeSelection";
 
 export function FlowTriggerConfigPage({
   node,
@@ -17,9 +21,9 @@ export function FlowTriggerConfigPage({
   selections,
   templates,
 }: {
-  node: WorkflowAgentSelection;
-  onChange(activation: WorkflowAgentSelection["activation"]): void;
-  selections: WorkflowAgentSelection[];
+  node: WorkflowNodeSelection;
+  onChange(activation: FlowNodeActivation): void;
+  selections: WorkflowNodeSelection[];
   templates: AgentTemplateVersionView[];
 }) {
   const editable = useMemo(
@@ -31,9 +35,10 @@ export function FlowTriggerConfigPage({
   const [ingressPolicy, setIngressPolicy] = useState(
     node.activation.ingressPolicy,
   );
-  const template = templates.find(
-    (item) => templateKey(item) === node.templateKey,
-  );
+  const template =
+    node.kind === "agent"
+      ? templates.find((item) => templateKey(item) === node.templateKey)
+      : null;
   const sourceOptions = [
     { value: "manual", label: "Manual / 手动" },
     { value: "webhook", label: "API / Webhook" },
@@ -42,15 +47,10 @@ export function FlowTriggerConfigPage({
     { value: "flow_input", label: "Flow.input / 当前事件" },
     ...selections
       .filter((item) => item.id !== node.id)
-      .map((item) => {
-        const itemTemplate = templates.find(
-          (candidate) => templateKey(candidate) === item.templateKey,
-        );
-        return {
-          value: `agent_final:${item.id}`,
-          label: `${itemTemplate?.template.name ?? item.id}.Final`,
-        };
-      }),
+      .map((item) => ({
+        value: `agent_final:${item.id}`,
+        label: `${workflowNodeLabel(item, templates)}.Final`,
+      })),
   ];
 
   function updateInputs(next: EditableTriggerInput[]) {
@@ -85,9 +85,12 @@ export function FlowTriggerConfigPage({
           <RadioTower aria-hidden="true" size={18} />
         </span>
         <span>
-          <strong>{template?.template.name ?? "Agent"} · Trigger</strong>
+          <strong>
+            {template?.template.name ?? workflowNodeLabel(node, templates)} ·
+            Trigger
+          </strong>
           <small>
-            Trigger 决定这个 Agent 何时被激活；Agent Final
+            Trigger 决定这个节点何时被激活；Node Final
             是完成通知订阅，不是新造的运行事件。
           </small>
         </span>

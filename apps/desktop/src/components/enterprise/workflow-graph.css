@@ -1,9 +1,10 @@
 .workflow-graph {
   display: grid;
-  gap: var(--space-3);
+  grid-template-rows: auto minmax(0, 1fr);
   min-inline-size: 0;
-  border-top: 1px solid var(--border-subtle);
-  padding-top: var(--space-4);
+  min-block-size: 0;
+  block-size: 100%;
+  background: var(--surface);
 }
 
 .workflow-graph__header {
@@ -11,6 +12,9 @@
   align-items: center;
   justify-content: space-between;
   gap: var(--space-4);
+  min-block-size: var(--control-height-lg);
+  border-bottom: 1px solid var(--border);
+  padding: var(--space-4) var(--space-6);
 }
 
 .workflow-graph__header > span {
@@ -24,15 +28,14 @@
 }
 
 .workflow-graph__viewport {
-  min-block-size: calc(var(--control-height-lg) * 5);
+  min-block-size: 0;
   overflow: auto;
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
   background: var(--surface-subtle);
 }
 
 .workflow-graph__canvas {
   position: relative;
+  block-size: 100%;
   background-image:
     linear-gradient(var(--border-subtle) 1px, transparent 1px),
     linear-gradient(90deg, var(--border-subtle) 1px, transparent 1px);
@@ -55,12 +58,18 @@
 .workflow-node {
   position: absolute;
   display: grid;
-  inline-size: 15.75rem;
+  inline-size: var(--popover-width-compact);
   overflow: hidden;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-md);
   background: var(--surface);
-  box-shadow: var(--shadow-float);
+  transition: border-color var(--motion-fast) var(--ease-standard);
+}
+
+.workflow-node.is-selected {
+  border-color: var(--accent);
+  outline: 1px solid var(--accent);
+  outline-offset: -2px;
 }
 
 .workflow-node button:focus-visible {
@@ -69,7 +78,7 @@
 }
 
 .workflow-node__trigger,
-.workflow-node__agent {
+.workflow-node__body {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
@@ -78,6 +87,7 @@
   border: 0;
   background: transparent;
   color: var(--text);
+  cursor: pointer;
   text-align: start;
 }
 
@@ -89,34 +99,95 @@
   color: var(--accent);
 }
 
-.workflow-node__agent {
+.workflow-node__trigger:disabled {
+  cursor: default;
+  opacity: 1;
+}
+
+.workflow-node--approval .workflow-node__trigger {
+  background: var(--warning-subtle);
+  color: var(--warning);
+}
+
+.workflow-node--output .workflow-node__trigger {
+  background: var(--success-subtle);
+  color: var(--success);
+}
+
+.workflow-node__body {
   min-block-size: calc(var(--control-height-lg) * 1.5);
   padding: var(--space-4);
 }
 
 .workflow-node__trigger:hover,
-.workflow-node__agent:hover {
+.workflow-node__body:hover {
   background: var(--surface-hover);
 }
 
 .workflow-node__trigger > span,
-.workflow-node__agent > span {
+.workflow-node__body > span {
   display: grid;
   min-inline-size: 0;
   gap: var(--space-1);
 }
 
 .workflow-node__trigger strong,
-.workflow-node__agent strong,
-.workflow-node__agent small {
+.workflow-node__body strong,
+.workflow-node__body small {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .workflow-node__trigger small,
-.workflow-node__agent small,
+.workflow-node__body small,
 .workflow-node__final {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.workflow-node-picker {
+  display: grid;
+  gap: var(--space-2);
+  inline-size: var(--popover-width-compact);
+}
+
+.workflow-node-picker > button {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: var(--space-3);
+  inline-size: 100%;
+  min-block-size: var(--control-height-lg);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  padding: var(--space-3) var(--space-4);
+  color: var(--text);
+  cursor: pointer;
+  text-align: start;
+}
+
+.workflow-node-picker > button:hover {
+  background: var(--surface-hover);
+}
+
+.workflow-node-picker > button:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+.workflow-node-picker > button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.workflow-node-picker > button > span {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.workflow-node-picker small {
   color: var(--text-muted);
   font-size: var(--font-size-xs);
 }

@@ -71,25 +71,34 @@ test("guided workflow pins reusable Agents and derives graph edges from Final su
     name: "Review flow",
     owner: "ops",
     outcome: "Review incoming records",
-    agents: [
+    nodes: [
       {
-        selection: {
-          id: "agent-reviewer",
-          templateKey: "reviewer@3",
-          activation: createManualActivation(),
-        },
-        template: reviewer,
+        id: "agent-reviewer",
+        kind: "agent",
+        templateKey: "reviewer@3",
+        activation: createManualActivation(),
       },
       {
-        selection: {
-          id: "agent-writer",
-          templateKey: "writer@2",
-          activation: createFinalActivation("agent-reviewer"),
-        },
-        template: writer,
+        id: "agent-writer",
+        kind: "agent",
+        templateKey: "writer@2",
+        activation: createFinalActivation("agent-reviewer"),
+      },
+      {
+        id: "review",
+        kind: "approval",
+        label: "Human review / 人工审查",
+        instructions: "Review the output",
+        activation: createFinalActivation("agent-writer"),
+      },
+      {
+        id: "output",
+        kind: "output",
+        label: "Inbox output / 收件箱输出",
+        activation: createFinalActivation("review"),
       },
     ],
-    requireApproval: true,
+    templates: [reviewer, writer],
   });
   assert.deepEqual(spec.graph.nodes[0]?.config, {
     reference: "reviewer",

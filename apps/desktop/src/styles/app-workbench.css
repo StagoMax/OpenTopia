@@ -226,6 +226,22 @@
   .workspace.with-tool-stage.tool-only {
     grid-template-columns: var(--workspace-left-width, 210px) 0 minmax(0, 1fr);
   }
+
+  .workspace.with-tool-stage:has(.flow-agent-config-panel) {
+    grid-template-columns:
+      var(--workspace-left-width, 252px) 0 minmax(0, 1fr) 0
+      var(--workspace-right-width, 360px);
+  }
+
+  .workspace.with-tool-stage:has(.flow-agent-config-panel) .center-pane {
+    display: flex;
+  }
+
+  .workspace.with-tool-stage:has(.flow-agent-config-panel)
+    .right-panel.flow-agent-config-panel {
+    display: flex;
+    grid-column: 5;
+  }
 }
 
 @media (max-width: 760px) {

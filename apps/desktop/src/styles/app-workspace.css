@@ -10,6 +10,44 @@
   background-size: 100vw 100vh;
 }
 
+/* Flow Agents uses the same persistent right-hand workbench as Code. The
+ * center stays readable for the selected system prompt while configuration
+ * remains available without leaving the page. */
+.workspace.with-tool-stage:has(.flow-agent-config-panel) {
+  grid-template-columns:
+    var(--workspace-left-width, 264px) 0 minmax(420px, 1fr) 0
+    var(--workspace-right-width, 520px);
+}
+
+.workspace.with-tool-stage:has(.flow-agent-config-panel) .center-pane {
+  border-right: 1px solid var(--border);
+}
+
+.flow-agent-config-panel {
+  display: flex;
+  min-inline-size: 0;
+  min-block-size: 0;
+  flex-direction: column;
+  margin: 0;
+  border-width: 0 0 0 1px;
+  border-radius: 0;
+  background: var(--surface);
+  box-shadow: none;
+  overflow: hidden;
+  padding: 0;
+}
+
+.flow-agent-config-panel > .agent-template-panel {
+  min-block-size: 0;
+  overflow: auto;
+  padding: 0;
+}
+
+.flow-agent-config-panel .agent-template-panel__template-list {
+  max-block-size: 14rem;
+  overflow: auto;
+}
+
 .workspace:not(.sidebar-collapsed) > .center-pane,
 .workspace:not(.sidebar-collapsed) > .center-pane > .thread-header {
   border-start-start-radius: var(--radius-lg);
@@ -696,7 +734,8 @@
   inset-inline-end: var(--space-2);
   width: var(--control-height-sm);
   height: var(--control-height-sm);
-  border: 1px solid color-mix(in srgb, var(--overlay-control-fg) 24%, transparent);
+  border: 1px solid
+    color-mix(in srgb, var(--overlay-control-fg) 24%, transparent);
   background: var(--overlay-control-bg);
   color: var(--overlay-control-fg);
 }

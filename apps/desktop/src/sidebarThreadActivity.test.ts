@@ -9,7 +9,9 @@ const sidebarStyles = readFileSync(
 
 test("replaces the selected processing indicator with the task menu on hover", () => {
   const hoverStyles = sidebarStyles.slice(
-    sidebarStyles.indexOf(".thread-row-wrap:hover .thread-row-status"),
+    sidebarStyles.indexOf(
+      ".thread-row-wrap.has-actions:hover .thread-row-status",
+    ),
     sidebarStyles.indexOf(".thread-row-wrap:focus-within .thread-row-more"),
   );
 

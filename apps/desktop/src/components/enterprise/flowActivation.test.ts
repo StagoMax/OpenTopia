@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  activationAgentFinalNodeIds,
+  activationSourceNodeIds,
   activationFromEditableInputs,
   createFinalActivation,
   createManualActivation,
@@ -11,7 +11,7 @@ import {
 
 test("a downstream Agent subscribes to the existing upstream Final", () => {
   const activation = createFinalActivation("agent-a");
-  assert.deepEqual(activationAgentFinalNodeIds(activation), ["agent-a"]);
+  assert.deepEqual(activationSourceNodeIds(activation), ["agent-a"]);
   assert.equal(workflowTriggersFromActivation(activation).length, 0);
 });
 
@@ -30,10 +30,7 @@ test("AND OR NOT expressions retain source semantics", () => {
   ];
   const activation = activationFromEditableInputs(inputs, "and", "immediate");
   assert.equal(activation.expression.operator, "and");
-  assert.deepEqual(activationAgentFinalNodeIds(activation), [
-    "agent-a",
-    "blocked",
-  ]);
+  assert.deepEqual(activationSourceNodeIds(activation), ["agent-a", "blocked"]);
 });
 
 test("Flow entry policy and external Trigger remain node-owned", () => {

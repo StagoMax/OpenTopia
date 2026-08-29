@@ -1,6 +1,7 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+import { FlowAgentSelectionProvider } from "./components/enterprise/flowAgentSelection";
 import { EditableTextContextMenu } from "./components/ui";
 import { applyAppearance, readAppearanceSettings } from "./appearance";
 import { startSolarChromeClock } from "./solarChrome";
@@ -20,6 +21,8 @@ if (!root) throw new Error("Root element not found");
 createRoot(root).render(
   <React.StrictMode>
     <EditableTextContextMenu />
-    <App />
+    <FlowAgentSelectionProvider>
+      <App />
+    </FlowAgentSelectionProvider>
   </React.StrictMode>,
 );

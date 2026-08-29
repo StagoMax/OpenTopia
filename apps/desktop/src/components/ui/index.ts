@@ -24,6 +24,12 @@ export {
 export { Select, type SelectOption, type SelectProps } from "./Select";
 export { SelectField, type SelectFieldProps } from "./SelectField";
 export { ShimmerText, type ShimmerTextProps } from "./ShimmerText";
+export {
+  SidebarRow,
+  type SidebarRowProps,
+  type SidebarRowStatus,
+  type SidebarRowStatusTone,
+} from "./SidebarRow";
 export { Slider, type SliderProps } from "./Slider";
 export { Switch, type SwitchProps } from "./Switch";
 export { TextField, type TextFieldProps } from "./TextField";

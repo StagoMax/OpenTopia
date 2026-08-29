@@ -22,6 +22,7 @@ import {
   PreviewHost,
 } from "../../components/PreviewHost";
 import { RightContextRail } from "../../components/RightContextRail";
+import { AgentTemplatePanel } from "../../components/AgentTemplatePanel";
 import { UsageLogDashboard } from "../../components/UsageLogDashboard";
 import { WebPreviewSurface } from "../../components/WebPreviewSurface";
 import {
@@ -81,6 +82,7 @@ export function RightPanel({
   client,
   conversationRegistry,
   experienceMode,
+  flowAgentsOpen,
   threads,
   toolTabs,
   activeToolTab,
@@ -170,6 +172,7 @@ export function RightPanel({
   client: ApiClient | null;
   conversationRegistry: ConversationSessionRegistry | null;
   experienceMode: ExperienceMode;
+  flowAgentsOpen: boolean;
   threads: Thread[];
   toolTabs: ToolTab[];
   activeToolTab: ToolTab | null;
@@ -350,6 +353,25 @@ export function RightPanel({
       onGetArtifact={onGetArtifact}
     />
   );
+
+  if (flowAgentsOpen) {
+    return (
+      <aside
+        className="right-panel flow-agent-config-panel"
+        id="workspace-right-panel"
+        aria-label="Agent 配置"
+      >
+        <AgentTemplatePanel
+          client={client}
+          settings={settings}
+          showTemplateCollection={false}
+          threadId={thread?.id ?? null}
+          variant="rail"
+          workspaceRoot={workspaceRoot}
+        />
+      </aside>
+    );
+  }
 
   if (toolStageOpen) {
     return (

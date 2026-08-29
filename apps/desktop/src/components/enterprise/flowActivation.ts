@@ -33,12 +33,6 @@ export type FlowNodeActivation = {
   ingressPolicy: WorkflowIngressPolicy;
 };
 
-export type WorkflowAgentSelection = {
-  id: string;
-  templateKey: string;
-  activation: FlowNodeActivation;
-};
-
 export type EditableTriggerInput = {
   id: string;
   source: FlowTriggerSource;
@@ -109,7 +103,7 @@ export function activationFromEditableInputs(
   };
 }
 
-export function activationAgentFinalNodeIds(
+export function activationSourceNodeIds(
   activation: FlowNodeActivation,
 ): string[] {
   const ids = new Set<string>();
@@ -149,18 +143,24 @@ export function workflowTriggersFromActivation(
 
 export function activationLabel(
   activation: FlowNodeActivation,
-  agents: readonly WorkflowAgentSelection[],
+  nodes: readonly import("./workflowNodeSelection").WorkflowNodeSelection[],
   templates: readonly AgentTemplateVersionView[],
 ): string {
   const labels: string[] = [];
   visitExpression(activation.expression, (source, negated) => {
     let label: string;
     if (source.kind === "agent_final") {
-      const agent = agents.find((item) => item.id === source.nodeId);
-      const template = agent
-        ? templates.find((item) => templateKey(item) === agent.templateKey)
-        : null;
-      label = `${template?.template.name ?? source.nodeId}.Final`;
+      const node = nodes.find((item) => item.id === source.nodeId);
+      const template =
+        node?.kind === "agent"
+          ? templates.find((item) => templateKey(item) === node.templateKey)
+          : null;
+      label = `${
+        template?.template.name ??
+        (node?.kind === "approval" || node?.kind === "output"
+          ? node.label
+          : source.nodeId)
+      }.Final`;
     } else if (source.kind === "event_subscription") {
       label = `${source.source}.${source.eventType}`;
     } else if (source.kind === "webhook") {

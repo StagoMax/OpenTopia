@@ -607,8 +607,6 @@
 .thread-row-wrap {
   grid-template-columns: minmax(0, 1fr) var(--control-height-sm) 0;
   border-radius: var(--radius-sm);
-  margin-left: calc(-1 * var(--project-task-indent));
-  padding-left: var(--project-task-indent);
   transition: background var(--motion-fast) var(--ease-standard);
 }
 
@@ -620,6 +618,11 @@
 .project-tasks {
   --project-task-indent: calc(var(--space-12) - var(--space-3));
 
+  padding-left: var(--project-task-indent);
+}
+
+.project-tasks > .thread-row-wrap {
+  margin-left: calc(-1 * var(--project-task-indent));
   padding-left: var(--project-task-indent);
 }
 
@@ -646,9 +649,9 @@
   color: var(--text);
 }
 
-.thread-row-wrap:hover .thread-row-status,
-.thread-row-wrap:focus-within .thread-row-status,
-.thread-row-wrap.menu-open .thread-row-status {
+.thread-row-wrap.has-actions:hover .thread-row-status,
+.thread-row-wrap.has-actions:focus-within .thread-row-status,
+.thread-row-wrap.has-actions.menu-open .thread-row-status {
   visibility: hidden;
 }
 
@@ -690,12 +693,20 @@
   color: var(--text-muted);
 }
 
-.thread-row-status.is-processing {
-  color: var(--text-secondary);
+.thread-row-status.is-info {
+  color: var(--accent);
 }
 
-.thread-row-status.is-succeeded {
-  color: var(--accent);
+.thread-row-status.is-success {
+  color: var(--success);
+}
+
+.thread-row-status.is-warning {
+  color: var(--warning);
+}
+
+.thread-row-status.is-danger {
+  color: var(--danger);
 }
 
 .thread-status-spinner {
@@ -714,15 +725,6 @@
   to {
     transform: translate3d(0, 0, 0) rotate(360deg);
   }
-}
-
-.thread-row-status.is-approval,
-.thread-row-status.is-user_action {
-  color: var(--warning);
-}
-
-.thread-row-status.is-failed {
-  color: var(--danger);
 }
 
 .thread-hover-card {

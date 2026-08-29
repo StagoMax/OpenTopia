@@ -467,7 +467,8 @@ button:disabled {
   grid-row: 3 / 5;
   min-inline-size: var(--space-0);
   min-block-size: var(--space-0);
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .project-heading {

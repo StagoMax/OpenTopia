@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Bot,
   GitCompareArrows,
@@ -22,6 +22,7 @@ import {
   useEnterpriseSubpageHeader,
   type EnterprisePageHeaderChange,
 } from "./enterprise/pageHeader";
+import { useFlowAgentSelection } from "./enterprise/flowAgentSelection";
 import {
   AgentTemplateConnectionAccessSummary,
   AgentTemplateConnectionGrantsField,
@@ -55,6 +56,8 @@ type AgentTemplatePanelProps = {
   workspaceRoot: string | null;
   settings: AppSettings | null;
   onPageHeaderChange?: EnterprisePageHeaderChange;
+  showTemplateCollection?: boolean;
+  variant?: "default" | "rail";
 };
 
 export function AgentTemplatePanel({
@@ -63,13 +66,16 @@ export function AgentTemplatePanel({
   workspaceRoot,
   settings,
   onPageHeaderChange,
+  showTemplateCollection = true,
+  variant = "default",
 }: AgentTemplatePanelProps) {
+  const selection = useFlowAgentSelection();
   const [templates, setTemplates] = useState<AgentTemplateVersionView[]>([]);
   const [instances, setInstances] = useState<AgentInstance[]>([]);
   const [boundInstance, setBoundInstance] = useState<AgentInstance | null>(
     null,
   );
-  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const [localSelectedKey, setLocalSelectedKey] = useState<string | null>(null);
   const [form, setForm] = useState<AgentDraftForm>(() =>
     blankAgentDraft(workspaceRoot, settings),
   );
@@ -86,6 +92,11 @@ export function AgentTemplatePanel({
     string | null
   >(null);
   const [connectionAccessRefresh, setConnectionAccessRefresh] = useState(0);
+  const createAgentRequest = selection?.createAgentRequest ?? 0;
+  const viewAgentRequest = selection?.viewAgentRequest ?? 0;
+  const handledCreateAgentRequest = useRef(createAgentRequest);
+  const handledViewAgentRequest = useRef(viewAgentRequest);
+  const notifyAgentDataChanged = selection?.notifyAgentDataChanged;
 
   const closeEditor = useCallback(() => setEditing(false), []);
   useEnterpriseSubpageHeader(onPageHeaderChange, editing, {
@@ -94,10 +105,33 @@ export function AgentTemplatePanel({
     onBack: closeEditor,
   });
 
+  const sharedSetSelectedKey = selection?.setSelectedTemplateKey;
+  const selectedKey = selection?.selectedTemplateKey ?? localSelectedKey;
+  const selectedKeyRef = useRef(selectedKey);
+  selectedKeyRef.current = selectedKey;
+  const setSelectedKey = useCallback(
+    (key: string | null) => {
+      if (sharedSetSelectedKey) sharedSetSelectedKey(key);
+      else setLocalSelectedKey(key);
+    },
+    [sharedSetSelectedKey],
+  );
   const selected = useMemo(
     () => templates.find((view) => templateKey(view) === selectedKey) ?? null,
     [selectedKey, templates],
   );
+
+  useEffect(() => {
+    if (createAgentRequest <= handledCreateAgentRequest.current) return;
+    handledCreateAgentRequest.current = createAgentRequest;
+    startNewVersion();
+  }, [createAgentRequest]);
+
+  useEffect(() => {
+    if (viewAgentRequest <= handledViewAgentRequest.current) return;
+    handledViewAgentRequest.current = viewAgentRequest;
+    closeEditor();
+  }, [closeEditor, viewAgentRequest]);
 
   const refresh = useCallback(async () => {
     if (!client) {
@@ -121,23 +155,30 @@ export function AgentTemplatePanel({
       setInstances(nextInstances);
       setBoundInstance(nextBound);
       setConnectionAccessRefresh((current) => current + 1);
-      setSelectedKey((current) => {
+      const currentSelectedKey = selectedKeyRef.current;
+      const nextSelectedKey = (() => {
         if (
-          current &&
-          nextTemplates.some((view) => templateKey(view) === current)
+          currentSelectedKey &&
+          nextTemplates.some((view) => templateKey(view) === currentSelectedKey)
         ) {
-          return current;
+          return currentSelectedKey;
         }
         return nextTemplates[0] ? templateKey(nextTemplates[0]) : null;
-      });
+      })();
+      setSelectedKey(nextSelectedKey);
     } catch (refreshError) {
       setError(readableError(refreshError));
     }
-  }, [client, threadId]);
+  }, [client, setSelectedKey, threadId]);
 
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  const refreshAfterMutation = useCallback(async () => {
+    await refresh();
+    notifyAgentDataChanged?.();
+  }, [notifyAgentDataChanged, refresh]);
 
   useEffect(() => {
     if (!client || !selected) {
@@ -247,7 +288,7 @@ export function AgentTemplatePanel({
       setNotice(
         `已创建 ${created.template.templateId}@${created.template.version}`,
       );
-      await refresh();
+      await refreshAfterMutation();
       setSelectedKey(templateKey(created));
     } catch (createError) {
       setError(readableError(createError));
@@ -274,7 +315,7 @@ export function AgentTemplatePanel({
       setNotice(
         `模型已生成 ${generated.template.name} 的实时配置；请在右侧审核后保存或直接返回列表发布。`,
       );
-      await refresh();
+      await refreshAfterMutation();
       setSelectedKey(templateKey(generated));
     } catch (generationError) {
       setError(readableError(generationError));
@@ -298,7 +339,7 @@ export function AgentTemplatePanel({
         },
       );
       setNotice("版本已发布并锁定");
-      await refresh();
+      await refreshAfterMutation();
     } catch (publishError) {
       setError(readableError(publishError));
     } finally {
@@ -317,7 +358,7 @@ export function AgentTemplatePanel({
         selected.template.version,
       );
       setNotice("草稿版本已删除");
-      await refresh();
+      await refreshAfterMutation();
     } catch (deleteError) {
       setError(readableError(deleteError));
     } finally {
@@ -333,7 +374,7 @@ export function AgentTemplatePanel({
     try {
       await client.archiveAgentTemplate(selected.template.templateId);
       setNotice("模板已归档；现有实例不会被自动扩权或重建");
-      await refresh();
+      await refreshAfterMutation();
     } catch (archiveError) {
       setError(readableError(archiveError));
     } finally {
@@ -356,7 +397,7 @@ export function AgentTemplatePanel({
         bindToThread: true,
       });
       setNotice(`已创建并绑定 Agent ${shortId(response.instance.id)}`);
-      await refresh();
+      await refreshAfterMutation();
     } catch (instantiateError) {
       setError(readableError(instantiateError));
     } finally {
@@ -371,7 +412,7 @@ export function AgentTemplatePanel({
     try {
       await client.bindThreadAgentInstance(threadId, instanceId);
       setNotice(`已切换有效 Agent 为 ${shortId(instanceId)}`);
-      await refresh();
+      await refreshAfterMutation();
     } catch (bindError) {
       setError(readableError(bindError));
     } finally {
@@ -386,7 +427,7 @@ export function AgentTemplatePanel({
     try {
       await client.updateAgentInstance(instanceId, { status: "revoked" });
       setNotice(`已撤销 Agent ${shortId(instanceId)}`);
-      await refresh();
+      await refreshAfterMutation();
     } catch (revokeError) {
       setError(readableError(revokeError));
     } finally {
@@ -407,8 +448,11 @@ export function AgentTemplatePanel({
   }
 
   return (
-    <div className="agent-template-panel" aria-label="Agent 配置与运行实例">
-      {!editing ? (
+    <div
+      className={`agent-template-panel agent-template-panel--${variant}`}
+      aria-label="Agent 配置与运行实例"
+    >
+      {!editing && showTemplateCollection ? (
         <Panel
           title="Agents / Agent 配置"
           actions={

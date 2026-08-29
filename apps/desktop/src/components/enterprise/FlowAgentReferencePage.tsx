@@ -1,7 +1,8 @@
 import { Bot, Cable, Database, ShieldCheck } from "lucide-react";
 import type { AgentTemplateVersionView } from "../../types";
 import { Badge, SelectField } from "../ui";
-import { templateKey, type WorkflowAgentSelection } from "./flowActivation";
+import { templateKey } from "./flowActivation";
+import type { WorkflowAgentSelection } from "./workflowNodeSelection";
 
 export function FlowAgentReferencePage({
   node,

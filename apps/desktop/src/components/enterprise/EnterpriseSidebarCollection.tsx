@@ -1,16 +1,14 @@
-import {
-  Activity,
-  Bot,
-  Inbox,
-  LayoutDashboard,
-  Library,
-  ShieldCheck,
-  Workflow,
-} from "lucide-react";
+import { Plus } from "lucide-react";
+import { useEffect } from "react";
 import type { ApiClient } from "../../api/client";
 import type { FlowPrimaryView } from "../../workspaceNavigation";
-import { Badge } from "../ui";
+import { IconButton, SidebarRow } from "../ui";
+import { enterpriseSidebarStatus } from "./enterpriseSidebarStatus";
 import { shortId, trustSignals } from "./model";
+import {
+  templateKeyForAgent,
+  useFlowAgentSelection,
+} from "./flowAgentSelection";
 import { useEnterpriseStore } from "./store";
 
 export function EnterpriseSidebarCollection({
@@ -20,15 +18,26 @@ export function EnterpriseSidebarCollection({
   client: ApiClient;
   view: FlowPrimaryView;
 }) {
-  const { snapshot } = useEnterpriseStore(client);
+  const { snapshot, store } = useEnterpriseStore(client);
+  const selection = useFlowAgentSelection();
+  const agentDataRevision = selection?.agentDataRevision ?? 0;
+  const selectedFlowId = snapshot.flows.some(
+    (flow) => flow.flowId === selection?.selectedFlowId,
+  )
+    ? selection?.selectedFlowId
+    : snapshot.flows[0]?.flowId;
+
+  useEffect(() => {
+    if (agentDataRevision > 0) void store.load(true);
+  }, [agentDataRevision, store]);
+
   const rows =
     view === "agents"
-      ? snapshot.agents.slice(0, 40).map((agent) => ({
-          id: agent.id,
-          title: `${agent.templateId}@${agent.templateVersion}`,
-          detail: shortId(agent.id),
-          status: agent.status,
-          icon: Bot,
+      ? snapshot.templates.slice(0, 40).map(({ template }) => ({
+          id: templateKeyForAgent(template.templateId, template.version),
+          title: template.name,
+          detail: `${template.templateId}@${template.version}`,
+          status: template.status,
         }))
       : view === "inbox"
         ? snapshot.tasks.slice(0, 40).map((task) => ({
@@ -36,51 +45,45 @@ export function EnterpriseSidebarCollection({
             title: task.title,
             detail: task.taskType.replaceAll("_", " "),
             status: task.status,
-            icon: Inbox,
           }))
         : view === "workflow-templates"
           ? snapshot.flows.slice(0, 40).map((flow) => ({
-              id: flow.id,
+              id: flow.flowId,
               title: flow.name,
               detail: `${flow.flowId}@${flow.activeRevision.compiledWorkflow.flowVersion}`,
               status: flow.status,
-              icon: Workflow,
             }))
           : view === "runs"
-              ? snapshot.runs.slice(0, 40).map((run) => ({
-                  id: run.id,
-                  title: run.flowId,
-                  detail: shortId(run.id),
-                  status: run.status,
-                  icon: Activity,
+            ? snapshot.runs.slice(0, 40).map((run) => ({
+                id: run.id,
+                title: run.flowId,
+                detail: shortId(run.id),
+                status: run.status,
+              }))
+            : view === "trust"
+              ? trustSignals(snapshot).map((signal) => ({
+                  id: signal.id,
+                  title: signal.title,
+                  detail: signal.detail,
+                  status: signal.level,
                 }))
-              : view === "trust"
-                ? trustSignals(snapshot).map((signal) => ({
-                    id: signal.id,
-                    title: signal.title,
-                    detail: signal.detail,
-                    status: signal.level,
-                    icon: ShieldCheck,
-                  }))
-                : view === "knowledge"
-                  ? [
-                      {
-                        id: "knowledge",
-                        title: "Knowledge catalog",
-                        detail: "Libraries · RAG sources",
-                        status: "ready",
-                        icon: Library,
-                      },
-                    ]
-                  : [
-                      {
-                        id: "overview",
-                        title: "Operations overview",
-                        detail: "Agents · Workflows · Runs",
-                        status: "live",
-                        icon: LayoutDashboard,
-                      },
-                    ];
+              : view === "knowledge"
+                ? [
+                    {
+                      id: "knowledge",
+                      title: "Knowledge catalog",
+                      detail: "Libraries · RAG sources",
+                      status: "ready",
+                    },
+                  ]
+                : [
+                    {
+                      id: "overview",
+                      title: "Operations overview",
+                      detail: "Agents · Workflows · Runs",
+                      status: "live",
+                    },
+                  ];
   return (
     <section
       className="enterprise-sidebar-collection"
@@ -88,24 +91,56 @@ export function EnterpriseSidebarCollection({
     >
       <header>
         <strong>{sidebarTitle(view)}</strong>
-        <small>{rows.length}</small>
+        {view === "agents" || view === "workflow-templates" ? (
+          <IconButton
+            aria-label={view === "agents" ? "新建 Agent" : "新建 Flow"}
+            className="enterprise-sidebar-collection__create"
+            onClick={() => {
+              if (view === "agents") {
+                selection?.requestCreateAgent();
+              } else {
+                selection?.setSelectedFlowId(null);
+                selection?.requestCreateFlow();
+              }
+            }}
+            size="compact"
+            title={view === "agents" ? "新建 Agent" : "新建 Flow"}
+          >
+            <Plus aria-hidden="true" size={14} />
+          </IconButton>
+        ) : (
+          <small>{rows.length}</small>
+        )}
       </header>
       <ol>
         {rows.map((row) => {
-          const Icon = row.icon;
+          const isAgentRow = view === "agents";
+          const isFlowRow = view === "workflow-templates";
+          const isSelected = isAgentRow
+            ? row.id === selection?.selectedTemplateKey
+            : isFlowRow && row.id === selectedFlowId;
           return (
             <li key={row.id}>
-              <Icon aria-hidden="true" size={14} />
-              <span>
-                <strong>{row.title}</strong>
-                <small>{row.detail}</small>
-              </span>
-              <Badge variant="neutral">{row.status}</Badge>
+              <SidebarRow
+                active={isSelected}
+                description={row.detail}
+                onSelect={
+                  isAgentRow
+                    ? () => selection?.requestViewAgent(row.id)
+                    : isFlowRow
+                      ? () => selection?.setSelectedFlowId(row.id)
+                      : undefined
+                }
+                status={enterpriseSidebarStatus(view, row.status)}
+                title={row.title}
+              />
             </li>
           );
         })}
         {rows.length === 0 ? (
-          <li className="enterprise-list__empty">暂无条目</li>
+          <li className="enterprise-list__empty">
+            {view === "agents" ? "尚未创建 Agent" : "暂无条目"}
+          </li>
         ) : null}
       </ol>
     </section>

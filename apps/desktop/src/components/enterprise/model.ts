@@ -1,9 +1,9 @@
 import type { AgentTemplateVersionView, FlowSpec } from "../../types";
 import {
-  activationAgentFinalNodeIds,
+  activationSourceNodeIds,
   activationHasIngress,
-  type WorkflowAgentSelection,
 } from "./flowActivation.ts";
+import type { WorkflowNodeSelection } from "./workflowNodeSelection.ts";
 import type { EnterpriseSnapshot } from "./store";
 
 export type TrustSignal = {
@@ -89,7 +89,8 @@ export function trustSignals(snapshot: EnterpriseSnapshot): TrustSignal[] {
       id: "draft-templates",
       level: "attention",
       title: `${draftTemplates} 个 Agent 模板版本尚未发布`,
-      detail: "只有已发布且固定 content hash 的 Agent 版本能进入 Flow Revision。",
+      detail:
+        "只有已发布且固定 content hash 的 Agent 版本能进入 Flow Revision。",
     });
   }
   return signals;
@@ -104,50 +105,51 @@ export function guidedWorkflowSpec(input: {
   name: string;
   owner: string;
   outcome: string;
-  agents: Array<{
-    selection: WorkflowAgentSelection;
-    template: AgentTemplateVersionView;
-  }>;
-  requireApproval: boolean;
+  nodes: WorkflowNodeSelection[];
+  templates: AgentTemplateVersionView[];
 }): FlowSpec {
   const objectSchema = { type: "object" };
-  const approvalId = "review";
-  const outputId = "output";
-  const agentIds = input.agents.map((agent) => agent.selection.id);
-  const nodes: FlowSpec["graph"]["nodes"] = input.agents.map(
-    ({ selection, template }) => ({
+  const nodes: FlowSpec["graph"]["nodes"] = input.nodes.map((selection) => {
+    if (selection.kind === "agent") {
+      const template = input.templates.find(
+        (item) =>
+          `${item.template.templateId}@${item.template.version}` ===
+          selection.templateKey,
+      );
+      if (!template) {
+        throw new Error(
+          `Agent template ${selection.templateKey} is unavailable`,
+        );
+      }
+      return {
+        id: selection.id,
+        label: template.template.name,
+        kind: selection.kind,
+        config: {
+          reference: template.template.templateId,
+          templateVersion: template.template.version,
+          activation: selection.activation,
+        },
+        inputSchema: objectSchema,
+        outputSchema: objectSchema,
+      };
+    }
+    return {
       id: selection.id,
-      label: template.template.name,
-      kind: "agent",
+      label: selection.label,
+      kind: selection.kind,
       config: {
-        reference: template.template.templateId,
-        templateVersion: template.template.version,
         activation: selection.activation,
+        ...(selection.kind === "approval"
+          ? { instructions: selection.instructions }
+          : {}),
       },
       inputSchema: objectSchema,
       outputSchema: objectSchema,
-    }),
-  );
-  if (input.requireApproval) {
-    nodes.push({
-      id: approvalId,
-      label: "Human review / 人工审查",
-      kind: "approval",
-      config: {},
-      inputSchema: objectSchema,
-      outputSchema: objectSchema,
-    });
-  }
-  nodes.push({
-    id: outputId,
-    label: "Inbox output / 收件箱输出",
-    kind: "output",
-    config: {},
-    inputSchema: objectSchema,
-    outputSchema: objectSchema,
+    };
   });
-  const subscriptionEdges = input.agents.flatMap(({ selection }) =>
-    activationAgentFinalNodeIds(selection.activation).map((from) => ({
+  const edges = input.nodes.flatMap((selection) =>
+    activationSourceNodeIds(selection.activation).map((from) => ({
       from,
       to: selection.id,
       condition: null,
@@ -157,40 +159,11 @@ export function guidedWorkflowSpec(input: {
       loopPolicy: null,
     })),
   );
-  const sourceIds = new Set(subscriptionEdges.map((edge) => edge.from));
-  const terminalAgentIds = agentIds.filter((id) => !sourceIds.has(id));
-  const terminalIds = terminalAgentIds.length
-    ? terminalAgentIds
-    : agentIds.slice(-1);
-  const terminalTarget = input.requireApproval ? approvalId : outputId;
-  const terminalEdges = terminalIds.map((from) => ({
-    from,
-    to: terminalTarget,
-    condition: null,
-    allowedFields: [],
-    dataClassification: "internal" as const,
-    onError: null,
-    loopPolicy: null,
-  }));
-  const controlEdges = input.requireApproval
-    ? [
-        {
-          from: approvalId,
-          to: outputId,
-          condition: null,
-          allowedFields: [],
-          dataClassification: "internal" as const,
-          onError: null,
-          loopPolicy: null,
-        },
-      ]
-    : [];
   const entryNodeId =
-    input.agents.find(({ selection }) =>
-      activationHasIngress(selection.activation),
-    )?.selection.id ??
-    agentIds[0] ??
-    outputId;
+    input.nodes.find((selection) => activationHasIngress(selection.activation))
+      ?.id ??
+    input.nodes[0]?.id ??
+    "output";
   return {
     flowId: input.flowId,
     name: input.name,
@@ -204,7 +177,7 @@ export function guidedWorkflowSpec(input: {
       schemaVersion: 1,
       entryNodeId,
       nodes,
-      edges: [...subscriptionEdges, ...terminalEdges, ...controlEdges],
+      edges,
     },
     requestedCapabilities: {
       allowAllTools: false,
