@@ -59,8 +59,10 @@ export function resolveAddressBarInput(value: string): string {
   if (absolute) return absolute;
 
   if (looksLikeHost(input)) {
-    const scheme = isLocalHost(input) ? "http" : "https";
-    const hostUrl = parseHttpUrl(`${scheme}://${input}`);
+    const local = isLocalHost(input);
+    const scheme = local ? "http" : "https";
+    const hostInput = local ? input : withDefaultWww(input);
+    const hostUrl = parseHttpUrl(`${scheme}://${hostInput}`);
     if (hostUrl) return hostUrl;
   }
 
@@ -131,6 +133,25 @@ function looksLikeHost(value: string): boolean {
     ) &&
       !hostname.endsWith("."))
   );
+}
+
+/**
+ * Treat a two-label public hostname as a bare domain and use the conventional
+ * www host for it. More deeply nested names are usually intentional subdomains
+ * (for example, docs.example.com), so leave them unchanged.
+ */
+function withDefaultWww(value: string): string {
+  const authority = value.split(/[/?#]/, 1)[0] ?? "";
+  const hostname = authority.replace(/:\d+$/, "");
+  const labels = hostname.split(".");
+  if (
+    labels.length !== 2 ||
+    labels.some((label) => label.length === 0) ||
+    hostname.toLowerCase().startsWith("www.")
+  ) {
+    return value;
+  }
+  return `www.${value}`;
 }
 
 function isLocalHost(value: string): boolean {

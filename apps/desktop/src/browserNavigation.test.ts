@@ -39,6 +39,10 @@ test("keeps absolute HTTP and HTTPS URLs", () => {
     "https://example.com/a?b=1",
   );
   assert.equal(
+    resolveAddressBarInput("https://google.com"),
+    "https://google.com/",
+  );
+  assert.equal(
     resolveAddressBarInput("http://example.com"),
     "http://example.com/",
   );
@@ -47,7 +51,26 @@ test("keeps absolute HTTP and HTTPS URLs", () => {
 test("adds a secure scheme to public hosts", () => {
   assert.equal(
     resolveAddressBarInput("example.com/docs?q=browser"),
-    "https://example.com/docs?q=browser",
+    "https://www.example.com/docs?q=browser",
+  );
+  assert.equal(
+    resolveAddressBarInput("google.com"),
+    "https://www.google.com/",
+  );
+  assert.equal(
+    resolveAddressBarInput("baidu.com:8443/search"),
+    "https://www.baidu.com:8443/search",
+  );
+});
+
+test("keeps explicit www hosts and intentional subdomains unchanged", () => {
+  assert.equal(
+    resolveAddressBarInput("www.example.com/docs"),
+    "https://www.example.com/docs",
+  );
+  assert.equal(
+    resolveAddressBarInput("docs.example.com/guide"),
+    "https://docs.example.com/guide",
   );
   assert.equal(
     resolveAddressBarInput("192.0.2.10:8080/status"),
@@ -109,7 +132,7 @@ test("creates the standalone session before opening a URL", async () => {
     "example.com/docs",
   );
 
-  assert.equal(url, "https://example.com/docs");
+  assert.equal(url, "https://www.example.com/docs");
   assert.deepEqual(calls, [
     ["create", { sessionId: STANDALONE_BROWSER_SESSION_ID, visible: false }],
     ["navigate", STANDALONE_BROWSER_SESSION_ID, url],
