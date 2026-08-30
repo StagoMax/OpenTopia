@@ -1,42 +1,159 @@
-import { CheckCircle2, RefreshCw, ShieldAlert, ShieldCheck, TriangleAlert } from "lucide-react";
+import {
+  CheckCircle2,
+  RefreshCw,
+  ShieldAlert,
+  ShieldCheck,
+  TriangleAlert,
+} from "lucide-react";
+import { useEffect } from "react";
 import type { ApiClient } from "../../api/client";
-import { Badge, Button, Panel } from "../ui";
+import { IconButton } from "../ui";
+import {
+  FlowInspectorPanel,
+  FlowInspectorSection,
+  type FlowInspectorStatusVariant,
+} from "./FlowInspectorPanel";
+import {
+  FlowInspectorPortal,
+  useFlowWorkspaceSelection,
+  useFlowWorkspaceTitle,
+} from "./flowAgentSelection";
 import { trustSignals } from "./model";
 import { useEnterpriseStore } from "./store";
 
 export function TrustPage({ client }: { client: ApiClient }) {
   const { snapshot, store } = useEnterpriseStore(client);
+  const workspace = useFlowWorkspaceSelection();
   const signals = trustSignals(snapshot);
+  const signal =
+    signals.find((item) => item.id === workspace?.selectedTrustSignalId) ??
+    signals[0] ??
+    null;
+
+  useEffect(() => {
+    if (signal && signal.id !== workspace?.selectedTrustSignalId) {
+      workspace?.setSelectedTrustSignalId(signal.id);
+    }
+  }, [signal, workspace]);
+
+  useFlowWorkspaceTitle(signal?.title ?? "Trust center / 信任中心");
+  const SignalIcon =
+    signal?.level === "healthy"
+      ? CheckCircle2
+      : signal?.level === "warning"
+        ? ShieldAlert
+        : TriangleAlert;
+
   return (
-    <div className="enterprise-page enterprise-trust">
-      <Panel
-        title="Trust center / 信任中心"
-        actions={<Button aria-label="刷新信任状态" onClick={() => void store.load(true)} size="compact" variant="quiet"><RefreshCw aria-hidden="true" size={14} />刷新</Button>}
-      >
-        <p className="enterprise-page__lede">
-          聚合 Connection 健康、运行失败、HumanTask 和未激活草稿。执行权限仍由不可变 Flow Revision 与调用时 live gate 决定，本页不替代授权边界。
-        </p>
-        <ol className="enterprise-trust-signals">
-          {signals.map((signal) => {
-            const Icon = signal.level === "healthy" ? CheckCircle2 : signal.level === "warning" ? ShieldAlert : TriangleAlert;
-            return (
-              <li className={`is-${signal.level}`} key={signal.id}>
-                <Icon aria-hidden="true" size={18} />
-                <span><strong>{signal.title}</strong><small>{signal.detail}</small></span>
-                <Badge variant={signal.level === "healthy" ? "success" : signal.level === "warning" ? "danger" : "warning"}>{signal.level}</Badge>
-              </li>
-            );
-          })}
-        </ol>
-      </Panel>
-      <Panel title="Execution invariants / 执行不变量">
+    <div className="enterprise-page enterprise-trust enterprise-core-detail">
+      {signal ? (
+        <section
+          className={`enterprise-core-detail__summary is-${signal.level}`}
+        >
+          <span className="enterprise-core-detail__icon" aria-hidden="true">
+            <SignalIcon size={22} />
+          </span>
+          <div>
+            <small>Trust signal / 信任信号</small>
+            <h2>{signal.title}</h2>
+            <p>{signal.detail}</p>
+          </div>
+        </section>
+      ) : null}
+
+      <section className="enterprise-core-detail__payload">
+        <header>
+          <strong>Execution invariants / 执行不变量</strong>
+        </header>
         <ul className="enterprise-invariants">
-          <li><ShieldCheck aria-hidden="true" size={16} /><span><strong>Immutable identity / 不可变身份</strong><small>每个 Workflow Agent 节点固定模板版本、content hash 与 Connection 操作。</small></span></li>
-          <li><ShieldCheck aria-hidden="true" size={16} /><span><strong>Least privilege / 最小权限</strong><small>节点权限只能从 Agent 配置与 Flow Revision 逐层收窄，不能从 Thread MCP 状态扩权。</small></span></li>
-          <li><ShieldCheck aria-hidden="true" size={16} /><span><strong>Durable control points / 持久化控制点</strong><small>审批、补输入、重连、效果核对和输出审查统一形成 HumanTask。</small></span></li>
-          <li><ShieldCheck aria-hidden="true" size={16} /><span><strong>Fail closed / 失败关闭</strong><small>认证过期、能力移除、描述变更或快照缺失都会在外部调用前拒绝。</small></span></li>
+          <Invariant
+            detail="每个 Workflow Agent 节点固定模板版本、content hash 与 Connection 操作。"
+            title="Immutable identity / 不可变身份"
+          />
+          <Invariant
+            detail="节点权限只能从 Agent 配置与 Flow Revision 逐层收窄，不能从 Thread MCP 状态扩权。"
+            title="Least privilege / 最小权限"
+          />
+          <Invariant
+            detail="审批、补输入、重连、效果核对和输出审查统一形成 HumanTask。"
+            title="Durable control points / 持久化控制点"
+          />
+          <Invariant
+            detail="认证过期、能力移除、描述变更或快照缺失都会在外部调用前拒绝。"
+            title="Fail closed / 失败关闭"
+          />
         </ul>
-      </Panel>
+      </section>
+
+      <FlowInspectorPortal>
+        <FlowInspectorPanel
+          actions={
+            <IconButton
+              aria-label="刷新信任状态"
+              disabled={snapshot.status === "loading"}
+              onClick={() => void store.load(true)}
+              size="compact"
+            >
+              <RefreshCw aria-hidden="true" size={14} />
+            </IconButton>
+          }
+          status={signal?.level ?? snapshot.status}
+          statusVariant={trustVariant(signal?.level)}
+          subtitle={signal?.id}
+          title="Trust center"
+        >
+          {snapshot.error ? (
+            <p className="enterprise-page__message is-error" role="alert">
+              {snapshot.error}
+            </p>
+          ) : null}
+          <FlowInspectorSection title="Current signal / 当前信号">
+            <p>{signal?.detail ?? "当前没有信任信号。"}</p>
+          </FlowInspectorSection>
+          <FlowInspectorSection title="Snapshot / 状态快照">
+            <dl className="flow-inspector-facts">
+              <div>
+                <dt>Connections</dt>
+                <dd>{snapshot.connections.length}</dd>
+              </div>
+              <div>
+                <dt>Runs</dt>
+                <dd>{snapshot.runs.length}</dd>
+              </div>
+              <div>
+                <dt>Human tasks</dt>
+                <dd>{snapshot.tasks.length}</dd>
+              </div>
+              <div>
+                <dt>Refreshed</dt>
+                <dd>
+                  {snapshot.refreshedAt
+                    ? new Date(snapshot.refreshedAt).toLocaleString()
+                    : "Not loaded"}
+                </dd>
+              </div>
+            </dl>
+          </FlowInspectorSection>
+        </FlowInspectorPanel>
+      </FlowInspectorPortal>
     </div>
   );
+}
+
+function Invariant({ detail, title }: { detail: string; title: string }) {
+  return (
+    <li>
+      <ShieldCheck aria-hidden="true" size={16} />
+      <span>
+        <strong>{title}</strong>
+        <small>{detail}</small>
+      </span>
+    </li>
+  );
+}
+
+function trustVariant(level: string | undefined): FlowInspectorStatusVariant {
+  if (level === "healthy") return "success";
+  if (level === "warning") return "danger";
+  return "warning";
 }

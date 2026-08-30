@@ -10,20 +10,18 @@
   background-size: 100vw 100vh;
 }
 
-/* Flow Agents uses the same persistent right-hand workbench as Code. The
- * center stays readable for the selected system prompt while configuration
- * remains available without leaving the page. */
-.workspace.with-tool-stage:has(.flow-agent-config-panel) {
+/* Flow primary pages share one persistent inspector rail. */
+.workspace.with-flow-inspector {
   grid-template-columns:
-    var(--workspace-left-width, 264px) 0 minmax(420px, 1fr) 0
-    var(--workspace-right-width, 520px);
+    var(--workspace-left-width) 0 minmax(0, 1fr) 0
+    var(--workspace-right-width);
 }
 
-.workspace.with-tool-stage:has(.flow-agent-config-panel) .center-pane {
+.workspace.with-flow-inspector .center-pane {
   border-right: 1px solid var(--border);
 }
 
-.flow-agent-config-panel {
+.flow-inspector-panel {
   display: flex;
   min-inline-size: 0;
   min-block-size: 0;
@@ -37,15 +35,12 @@
   padding: 0;
 }
 
-.flow-agent-config-panel > .agent-template-panel {
+.flow-inspector-host {
+  display: block;
+  flex: 1 1 auto;
+  min-inline-size: 0;
   min-block-size: 0;
-  overflow: auto;
-  padding: 0;
-}
-
-.flow-agent-config-panel .agent-template-panel__template-list {
-  max-block-size: 14rem;
-  overflow: auto;
+  overflow: hidden;
 }
 
 .workspace:not(.sidebar-collapsed) > .center-pane,

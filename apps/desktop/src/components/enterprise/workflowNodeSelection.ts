@@ -135,8 +135,14 @@ export function workflowNodeLabel(
 }
 
 export function workflowNodesFromSpec(spec: FlowSpec): WorkflowNodeSelection[] {
-  const selections = spec.graph.nodes.flatMap<WorkflowNodeSelection>((node) => {
-    const incoming = spec.graph.edges.find((edge) => edge.to === node.id);
+  return workflowNodesFromGraph(spec.graph);
+}
+
+export function workflowNodesFromGraph(
+  graph: FlowSpec["graph"],
+): WorkflowNodeSelection[] {
+  const selections = graph.nodes.flatMap<WorkflowNodeSelection>((node) => {
+    const incoming = graph.edges.find((edge) => edge.to === node.id);
     const activation =
       readNodeActivation(node) ??
       (incoming

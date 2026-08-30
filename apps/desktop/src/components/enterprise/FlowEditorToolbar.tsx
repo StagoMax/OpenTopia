@@ -25,6 +25,8 @@ export function FlowEditorToolbar({
   onRefresh,
   onTestRun,
   onValidate,
+  passedDryRun,
+  successfulTestRun,
   threadReady,
   validated,
 }: {
@@ -44,9 +46,47 @@ export function FlowEditorToolbar({
   onRefresh(): void;
   onTestRun(): void;
   onValidate(): void;
+  passedDryRun: boolean;
+  successfulTestRun: boolean;
   threadReady: boolean;
   validated: boolean;
 }) {
+  const nextAction = !draftExists
+    ? {
+        disabled: !canCreateDraft,
+        icon: Plus,
+        label: busy === "create" ? "创建中…" : "保存草稿",
+        onClick: onCreateDraft,
+      }
+    : !validated
+      ? {
+          disabled: false,
+          icon: ShieldCheck,
+          label: busy === "validate" ? "验证中…" : "验证",
+          onClick: onValidate,
+        }
+      : !passedDryRun
+        ? {
+            disabled: !canDryRun,
+            icon: Play,
+            label: busy === "simulate" ? "Dry Run…" : "Dry Run",
+            onClick: onDryRun,
+          }
+        : !successfulTestRun
+          ? {
+              disabled: !canTestRun || activeTestRun,
+              icon: FlaskConical,
+              label: busy === "test-run" ? "启动中…" : "Test Run",
+              onClick: onTestRun,
+            }
+          : {
+              disabled: !canActivate,
+              icon: Send,
+              label: busy === "activate" ? "激活中…" : "激活 Flow",
+              onClick: onActivate,
+            };
+  const NextIcon = nextAction.icon;
+
   return (
     <header className="workflow-editor__toolbar">
       <span className="workflow-editor__summary">
@@ -72,37 +112,6 @@ export function FlowEditorToolbar({
       </span>
       <div className="workflow-editor__actions">
         <Button
-          disabled={!canCreateDraft || Boolean(busy)}
-          onClick={onCreateDraft}
-          size="compact"
-          variant={draftExists ? "secondary" : "primary"}
-        >
-          <Plus aria-hidden="true" size={14} />
-          {busy === "create" ? "创建中…" : "创建草稿"}
-        </Button>
-        <Button
-          disabled={!draftExists || Boolean(busy)}
-          onClick={onValidate}
-          size="compact"
-        >
-          <ShieldCheck aria-hidden="true" size={14} /> 验证
-        </Button>
-        <Button
-          disabled={!canDryRun || Boolean(busy)}
-          onClick={onDryRun}
-          size="compact"
-        >
-          <Play aria-hidden="true" size={14} /> Dry Run
-        </Button>
-        <Button
-          disabled={!canTestRun || Boolean(busy) || activeTestRun}
-          onClick={onTestRun}
-          size="compact"
-        >
-          <FlaskConical aria-hidden="true" size={14} />
-          {activeTestRun ? "测试运行中…" : "Test Run"}
-        </Button>
-        <Button
           disabled={!draftExists || Boolean(busy)}
           onClick={onRefresh}
           size="compact"
@@ -111,12 +120,12 @@ export function FlowEditorToolbar({
           <RefreshCw aria-hidden="true" size={14} /> 刷新
         </Button>
         <Button
-          disabled={!canActivate || Boolean(busy)}
-          onClick={onActivate}
+          disabled={nextAction.disabled || Boolean(busy) || activeTestRun}
+          onClick={nextAction.onClick}
           size="compact"
-          variant={canActivate ? "primary" : "secondary"}
+          variant="primary"
         >
-          <Send aria-hidden="true" size={14} /> 激活 Flow
+          <NextIcon aria-hidden="true" size={14} /> {nextAction.label}
         </Button>
       </div>
     </header>

@@ -8,7 +8,10 @@
 
 .agent-template-panel--rail {
   display: grid;
+  align-content: start;
   gap: 0;
+  block-size: 100%;
+  overflow: auto;
   padding: 0;
 }
 
@@ -22,6 +25,13 @@
 .agent-template-panel--rail > .ot-panel > .ot-panel__header {
   min-block-size: var(--control-height-lg);
   padding-inline: var(--space-6);
+}
+
+.agent-template-panel--rail > .ot-panel:first-child > .ot-panel__header {
+  position: sticky;
+  z-index: var(--z-sticky);
+  top: 0;
+  background: var(--surface);
 }
 
 .agent-template-panel--rail > .ot-panel > .ot-panel__body {

@@ -6,7 +6,7 @@ import {
   type MouseEventHandler,
   type ReactNode,
 } from "react";
-import { Circle, CircleAlert, Loader2 } from "lucide-react";
+import { Circle, Loader2 } from "lucide-react";
 import { threadTitleScrollDurationMs } from "../../threadTitleScroll";
 
 export type SidebarRowStatusTone =
@@ -156,8 +156,6 @@ function SidebarRowStatusIndicator({ status }: { status: SidebarRowStatus }) {
           size={14}
           strokeWidth={2.5}
         />
-      ) : status.tone === "danger" ? (
-        <CircleAlert aria-hidden="true" size={14} />
       ) : (
         <Circle aria-hidden="true" fill="currentColor" size={9} />
       )}

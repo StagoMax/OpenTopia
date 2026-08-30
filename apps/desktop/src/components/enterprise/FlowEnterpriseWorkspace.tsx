@@ -31,7 +31,15 @@ export function FlowEnterpriseWorkspace({
 }) {
   if (view === "overview")
     return <OverviewPage client={client} onNavigate={onNavigate} />;
-  if (view === "agents") return <AgentsPage client={client} />;
+  if (view === "agents")
+    return (
+      <AgentsPage
+        client={client}
+        settings={settings}
+        threadId={threadId}
+        workspaceRoot={workspaceRoot}
+      />
+    );
   if (view === "workflow-templates")
     return (
       <WorkflowTemplatesPage

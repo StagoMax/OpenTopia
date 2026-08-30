@@ -3,6 +3,7 @@ import type {
   HumanTaskAction,
   HumanTaskStatus,
   HumanTaskType,
+  UserInputRequest,
 } from "./types";
 
 export type HumanTaskActionPresentation = {
@@ -119,6 +120,19 @@ export function orderedHumanTaskActions(
   return order.filter((action) => allowed.has(action));
 }
 
+export function humanTaskInputRequest(
+  task: Pick<HumanTask, "payload" | "taskType">,
+): UserInputRequest | null {
+  if (task.taskType !== "input_request") return null;
+  const request = asRecord(task.payload)?.request;
+  const record = asRecord(request);
+  return record &&
+    typeof record.requestId === "string" &&
+    Array.isArray(record.questions)
+    ? (request as UserInputRequest)
+    : null;
+}
+
 export function sortPendingHumanTasks(
   tasks: readonly HumanTask[],
 ): HumanTask[] {
@@ -144,4 +158,10 @@ export function reconcileHumanTaskSelection(
     return preferredId;
   }
   return tasks[0]?.id ?? null;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
 }

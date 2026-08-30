@@ -6,6 +6,7 @@ import type * as HumanTasksModule from "./humanTasks";
 
 const {
   humanTaskActionPresentation,
+  humanTaskInputRequest,
   humanTaskStatusLabel,
   humanTaskTypeLabel,
   orderedHumanTaskActions,
@@ -75,6 +76,26 @@ test("orders only actions allowed by the task", () => {
       }),
     ),
     ["acknowledge", "cancel"],
+  );
+});
+
+test("reads structured input requests without guessing from other tasks", () => {
+  const request = {
+    requestId: "request-1",
+    questions: [],
+  };
+  assert.deepEqual(
+    humanTaskInputRequest(
+      task("input", {
+        taskType: "input_request",
+        payload: { request },
+      }),
+    ),
+    request,
+  );
+  assert.equal(
+    humanTaskInputRequest(task("approval", { payload: { request } })),
+    null,
   );
 });
 

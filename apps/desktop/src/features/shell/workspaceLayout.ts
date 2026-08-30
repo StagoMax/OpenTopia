@@ -2,10 +2,10 @@ export type WorkspaceLayoutPreferences = {
   left?: number;
   contextRight?: number;
   toolRight?: number;
-  agentRight?: number;
+  inspectorRight?: number;
 };
 
-export type WorkspaceRightPanelKind = "context" | "tool" | "agent";
+export type WorkspaceRightPanelKind = "context" | "tool" | "inspector";
 
 export type WorkspaceLayout = {
   left: number;
@@ -32,7 +32,9 @@ export function readWorkspaceLayoutPreferences(): WorkspaceLayoutPreferences {
       left: validStoredPanelSize(parsed.left),
       contextRight: validStoredPanelSize(parsed.contextRight),
       toolRight: validStoredPanelSize(parsed.toolRight),
-      agentRight: validStoredPanelSize(parsed.agentRight),
+      inspectorRight: validStoredPanelSize(
+        parsed.inspectorRight ?? parsed.agentRight,
+      ),
     };
   } catch {
     return {};
@@ -75,7 +77,11 @@ export function resolveWorkspaceLayout(
   const compactMainMin = hasDockedPanel ? 560 : 440;
   const centerMin = hasDockedPanel ? 360 : 480;
   const rightMin =
-    rightPanelKind === "tool" ? 360 : rightPanelKind === "agent" ? 280 : 240;
+    rightPanelKind === "tool"
+      ? 360
+      : rightPanelKind === "inspector"
+        ? 280
+        : 240;
   const rightCap = rightPanelKind === "tool" ? 1200 : 520;
   const leftMax = Math.max(
     workspaceLeftMin,
@@ -96,14 +102,14 @@ export function resolveWorkspaceLayout(
   const defaultRight =
     rightPanelKind === "tool"
       ? width - left - clampPanelSize(width * 0.31, centerMin, 600)
-      : rightPanelKind === "agent"
+      : rightPanelKind === "inspector"
         ? 360
         : 286;
   const preferredRight =
     rightPanelKind === "tool"
       ? preferences.toolRight
-      : rightPanelKind === "agent"
-        ? preferences.agentRight
+      : rightPanelKind === "inspector"
+        ? preferences.inspectorRight
         : preferences.contextRight;
 
   return {

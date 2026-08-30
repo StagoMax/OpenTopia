@@ -1,13 +1,11 @@
-import {
-  Activity,
-  Bot,
-  Cable,
-  Inbox,
-  RefreshCw,
-  Workflow,
-} from "lucide-react";
+import { Activity, Bot, Cable, Inbox, RefreshCw, Workflow } from "lucide-react";
 import type { FlowPrimaryView } from "../../workspaceNavigation";
-import { Badge, Button, Panel } from "../ui";
+import { Badge, IconButton, Panel } from "../ui";
+import { FlowInspectorPanel, FlowInspectorSection } from "./FlowInspectorPanel";
+import {
+  FlowInspectorPortal,
+  useFlowWorkspaceTitle,
+} from "./flowAgentSelection";
 import { activeRunCount, latestPublishedTemplateCount, shortId } from "./model";
 import { useEnterpriseStore } from "./store";
 import type { ApiClient } from "../../api/client";
@@ -20,6 +18,7 @@ export function OverviewPage({
   onNavigate(view: Exclude<FlowPrimaryView, "conversation">): void;
 }) {
   const { snapshot, store } = useEnterpriseStore(client);
+  useFlowWorkspaceTitle("Operations overview / 运行总览");
   const pendingEvents = snapshot.cases.filter(
     (item) => item.status === "accepted" && !item.flowRunId,
   );
@@ -64,23 +63,10 @@ export function OverviewPage({
 
   return (
     <div className="enterprise-page enterprise-overview">
-      <Panel
-        title="Operations overview / 运行总览"
-        actions={
-          <Button
-            aria-label="刷新企业运行总览"
-            disabled={snapshot.status === "loading"}
-            onClick={() => void store.load(true)}
-            size="compact"
-            variant="quiet"
-          >
-            <RefreshCw aria-hidden="true" size={14} />
-            刷新
-          </Button>
-        }
-      >
+      <Panel title="System state / 系统态势">
         <p className="enterprise-page__lede">
-          从 Flow、运行到人工控制点的统一视图。所有数字来自服务端持久化对象，不扫描会话消息。
+          从
+          Flow、运行到人工控制点的统一视图。所有数字来自服务端持久化对象，不扫描会话消息。
         </p>
         {snapshot.error ? (
           <p className="enterprise-page__message is-error" role="alert">
@@ -111,19 +97,17 @@ export function OverviewPage({
 
       <div className="enterprise-page__columns">
         <Panel title="Recent runs / 最近运行">
-          <ol className="enterprise-list">
+          <ol className="enterprise-card-list">
             {snapshot.runs.slice(0, 8).map((run) => (
               <li key={run.id}>
-                <button onClick={() => onNavigate("runs")} type="button">
-                  <Activity aria-hidden="true" size={15} />
-                  <span>
-                    <strong>{run.flowId}</strong>
-                    <small>
-                      {shortId(run.id)} · {formatTime(run.updatedAt)}
-                    </small>
-                  </span>
-                  <Badge variant={runVariant(run.status)}>{run.status}</Badge>
-                </button>
+                <Activity aria-hidden="true" size={15} />
+                <span>
+                  <strong>{run.flowId}</strong>
+                  <small>
+                    {shortId(run.id)} · {formatTime(run.updatedAt)}
+                  </small>
+                </span>
+                <Badge variant={runVariant(run.status)}>{run.status}</Badge>
               </li>
             ))}
             {snapshot.runs.length === 0 ? (
@@ -132,31 +116,27 @@ export function OverviewPage({
           </ol>
         </Panel>
         <Panel title="Attention / 待处理">
-          <ol className="enterprise-list">
+          <ol className="enterprise-card-list">
             {snapshot.tasks.slice(0, 8).map((task) => (
               <li key={task.id}>
-                <button onClick={() => onNavigate("inbox")} type="button">
-                  <Inbox aria-hidden="true" size={15} />
-                  <span>
-                    <strong>{task.title}</strong>
-                    <small>{task.taskType.replaceAll("_", " ")}</small>
-                  </span>
-                  <Badge variant="warning">pending</Badge>
-                </button>
+                <Inbox aria-hidden="true" size={15} />
+                <span>
+                  <strong>{task.title}</strong>
+                  <small>{task.taskType.replaceAll("_", " ")}</small>
+                </span>
+                <Badge variant="warning">pending</Badge>
               </li>
             ))}
             {pendingEvents
               .slice(0, Math.max(0, 8 - snapshot.tasks.length))
               .map((event) => (
                 <li key={event.id}>
-                  <button onClick={() => onNavigate("inbox")} type="button">
-                    <Inbox aria-hidden="true" size={15} />
-                    <span>
-                      <strong>Workflow event / 工作流事件</strong>
-                      <small>{event.idempotencyKey}</small>
-                    </span>
-                    <Badge variant="warning">review</Badge>
-                  </button>
+                  <Inbox aria-hidden="true" size={15} />
+                  <span>
+                    <strong>Workflow event / 工作流事件</strong>
+                    <small>{event.idempotencyKey}</small>
+                  </span>
+                  <Badge variant="warning">review</Badge>
                 </li>
               ))}
             {snapshot.tasks.length === 0 && pendingEvents.length === 0 ? (
@@ -165,6 +145,53 @@ export function OverviewPage({
           </ol>
         </Panel>
       </div>
+
+      <FlowInspectorPortal>
+        <FlowInspectorPanel
+          actions={
+            <IconButton
+              aria-label="刷新企业运行总览"
+              disabled={snapshot.status === "loading"}
+              onClick={() => void store.load(true)}
+              size="compact"
+            >
+              <RefreshCw aria-hidden="true" size={14} />
+            </IconButton>
+          }
+          status={snapshot.status}
+          statusVariant={
+            snapshot.status === "ready"
+              ? "success"
+              : snapshot.status === "error"
+                ? "danger"
+                : "info"
+          }
+          title="Workspace status"
+        >
+          {snapshot.error ? (
+            <p className="enterprise-page__message is-error" role="alert">
+              {snapshot.error}
+            </p>
+          ) : null}
+          <FlowInspectorSection title="Inventory / 对象统计">
+            <dl className="flow-inspector-facts">
+              {metrics.map((metric) => (
+                <div key={metric.label}>
+                  <dt>{metric.label}</dt>
+                  <dd>{metric.value}</dd>
+                </div>
+              ))}
+            </dl>
+          </FlowInspectorSection>
+          <FlowInspectorSection title="Freshness / 数据时间">
+            <p>
+              {snapshot.refreshedAt
+                ? new Date(snapshot.refreshedAt).toLocaleString()
+                : "Waiting for the first server snapshot."}
+            </p>
+          </FlowInspectorSection>
+        </FlowInspectorPanel>
+      </FlowInspectorPortal>
     </div>
   );
 }

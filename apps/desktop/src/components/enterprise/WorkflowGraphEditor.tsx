@@ -34,14 +34,16 @@ export function WorkflowGraphEditor({
   onChange,
   onEditTrigger,
   onSelectNode,
+  readOnly = false,
   selections,
   selectedNodeId,
   templates,
 }: {
   disabled?: boolean;
-  onChange(selections: WorkflowNodeSelection[]): void;
-  onEditTrigger(nodeId: string): void;
+  onChange?(selections: WorkflowNodeSelection[]): void;
+  onEditTrigger?(nodeId: string): void;
   onSelectNode(nodeId: string): void;
+  readOnly?: boolean;
   selections: WorkflowNodeSelection[];
   selectedNodeId: string | null;
   templates: AgentTemplateVersionView[];
@@ -60,7 +62,7 @@ export function WorkflowGraphEditor({
   );
 
   function addNode(kind: AddableWorkflowNodeKind) {
-    onChange(addWorkflowNode(selections, kind, templates[0]));
+    onChange?.(addWorkflowNode(selections, kind, templates[0]));
   }
 
   return (
@@ -72,53 +74,55 @@ export function WorkflowGraphEditor({
             Agent、Approval 与 Output 都是 Flow Node；连线表示上游 Final 订阅。
           </small>
         </span>
-        <Popover
-          align="end"
-          label="选择要添加的节点类型"
-          placement="bottom"
-          trigger={(props) => (
-            <Button
-              {...props}
-              disabled={disabled}
-              size="compact"
-              variant="secondary"
-            >
-              <Plus aria-hidden="true" size={14} /> 添加节点
-            </Button>
-          )}
-        >
-          {({ close }) => (
-            <div className="workflow-node-picker">
-              <button
-                disabled={templates.length === 0}
-                onClick={() => {
-                  addNode("agent");
-                  close();
-                }}
-                type="button"
+        {!readOnly ? (
+          <Popover
+            align="end"
+            label="选择要添加的节点类型"
+            placement="bottom"
+            trigger={(props) => (
+              <Button
+                {...props}
+                disabled={disabled}
+                size="compact"
+                variant="secondary"
               >
-                <Bot aria-hidden="true" size={16} />
-                <span>
-                  <strong>Agent</strong>
-                  <small>运行一个已发布的 Agent 模板</small>
-                </span>
-              </button>
-              <button
-                onClick={() => {
-                  addNode("approval");
-                  close();
-                }}
-                type="button"
-              >
-                <ShieldCheck aria-hidden="true" size={16} />
-                <span>
-                  <strong>Approval</strong>
-                  <small>暂停流程并等待人工审批</small>
-                </span>
-              </button>
-            </div>
-          )}
-        </Popover>
+                <Plus aria-hidden="true" size={14} /> 添加节点
+              </Button>
+            )}
+          >
+            {({ close }) => (
+              <div className="workflow-node-picker">
+                <button
+                  disabled={templates.length === 0}
+                  onClick={() => {
+                    addNode("agent");
+                    close();
+                  }}
+                  type="button"
+                >
+                  <Bot aria-hidden="true" size={16} />
+                  <span>
+                    <strong>Agent</strong>
+                    <small>运行一个已发布的 Agent 模板</small>
+                  </span>
+                </button>
+                <button
+                  onClick={() => {
+                    addNode("approval");
+                    close();
+                  }}
+                  type="button"
+                >
+                  <ShieldCheck aria-hidden="true" size={16} />
+                  <span>
+                    <strong>Approval</strong>
+                    <small>暂停流程并等待人工审批</small>
+                  </span>
+                </button>
+              </div>
+            )}
+          </Popover>
+        ) : null}
       </header>
       <div className="workflow-graph__viewport">
         <div
@@ -172,7 +176,7 @@ export function WorkflowGraphEditor({
                 key={selection.id}
                 style={{ left: position.x, top: position.y }}
               >
-                {selection.kind === "output" ? (
+                {selection.kind === "output" || readOnly ? (
                   <div className="workflow-node__trigger">
                     <RadioTower aria-hidden="true" size={14} />
                     <span>
@@ -190,7 +194,7 @@ export function WorkflowGraphEditor({
                   <button
                     className="workflow-node__trigger"
                     disabled={disabled}
-                    onClick={() => onEditTrigger(selection.id)}
+                    onClick={() => onEditTrigger?.(selection.id)}
                     type="button"
                   >
                     <RadioTower aria-hidden="true" size={14} />
@@ -232,12 +236,12 @@ export function WorkflowGraphEditor({
                       ? "Terminal / 流程输出"
                       : "Final / 完成通知"}
                   </span>
-                  {selection.kind !== "output" ? (
+                  {!readOnly && selection.kind !== "output" ? (
                     <IconButton
                       aria-label={`移除 ${label}`}
                       disabled={disabled}
                       onClick={() =>
-                        onChange(removeWorkflowNode(selections, selection.id))
+                        onChange?.(removeWorkflowNode(selections, selection.id))
                       }
                       size="compact"
                       variant="danger"

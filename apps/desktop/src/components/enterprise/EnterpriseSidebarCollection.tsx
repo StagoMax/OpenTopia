@@ -26,6 +26,9 @@ export function EnterpriseSidebarCollection({
   )
     ? selection?.selectedFlowId
     : snapshot.flows[0]?.flowId;
+  const pendingCases = snapshot.cases.filter(
+    (item) => item.status === "accepted" && !item.flowRunId,
+  );
 
   useEffect(() => {
     if (agentDataRevision > 0) void store.load(true);
@@ -40,12 +43,22 @@ export function EnterpriseSidebarCollection({
           status: template.status,
         }))
       : view === "inbox"
-        ? snapshot.tasks.slice(0, 40).map((task) => ({
-            id: task.id,
-            title: task.title,
-            detail: task.taskType.replaceAll("_", " "),
-            status: task.status,
-          }))
+        ? [
+            ...snapshot.tasks.map((task) => ({
+              id: `task:${task.id}`,
+              title: task.title,
+              detail: task.taskType.replaceAll("_", " "),
+              status: task.status,
+            })),
+            ...pendingCases.map((flowCase) => ({
+              id: `case:${flowCase.id}`,
+              title:
+                snapshot.flows.find((flow) => flow.flowId === flowCase.flowId)
+                  ?.name ?? flowCase.flowId,
+              detail: "pending event",
+              status: "pending",
+            })),
+          ].slice(0, 40)
         : view === "workflow-templates"
           ? snapshot.flows.slice(0, 40).map((flow) => ({
               id: flow.flowId,
@@ -116,9 +129,22 @@ export function EnterpriseSidebarCollection({
         {rows.map((row) => {
           const isAgentRow = view === "agents";
           const isFlowRow = view === "workflow-templates";
+          const isInboxRow = view === "inbox";
+          const isRunRow = view === "runs";
+          const isTrustRow = view === "trust";
           const isSelected = isAgentRow
-            ? row.id === selection?.selectedTemplateKey
-            : isFlowRow && row.id === selectedFlowId;
+            ? !selection?.creatingAgent &&
+              row.id === selection?.selectedTemplateKey
+            : isFlowRow
+              ? !selection?.creatingFlow && row.id === selectedFlowId
+              : isInboxRow
+                ? row.id === (selection?.selectedInboxItemId ?? rows[0]?.id)
+                : isRunRow
+                  ? row.id === (selection?.selectedRunId ?? rows[0]?.id)
+                  : isTrustRow
+                    ? row.id ===
+                      (selection?.selectedTrustSignalId ?? rows[0]?.id)
+                    : view === "overview";
           return (
             <li key={row.id}>
               <SidebarRow
@@ -129,7 +155,13 @@ export function EnterpriseSidebarCollection({
                     ? () => selection?.requestViewAgent(row.id)
                     : isFlowRow
                       ? () => selection?.setSelectedFlowId(row.id)
-                      : undefined
+                      : isInboxRow
+                        ? () => selection?.setSelectedInboxItemId(row.id)
+                        : isRunRow
+                          ? () => selection?.setSelectedRunId(row.id)
+                          : isTrustRow
+                            ? () => selection?.setSelectedTrustSignalId(row.id)
+                            : undefined
                 }
                 status={enterpriseSidebarStatus(view, row.status)}
                 title={row.title}

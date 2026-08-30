@@ -1,109 +1,252 @@
-import { Activity, Clock3, RefreshCw, ShieldAlert } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import {
+  Activity,
+  Clock3,
+  PauseCircle,
+  PlayCircle,
+  RefreshCw,
+  ShieldAlert,
+  XCircle,
+} from "lucide-react";
+import { useEffect, useState } from "react";
 import type { ApiClient } from "../../api/client";
 import type { FlowRun } from "../../types";
-import { Badge, Button, Panel, Select } from "../ui";
-import { shortId } from "./model";
+import { Badge, Button, IconButton } from "../ui";
+import {
+  FlowInspectorPortal,
+  useFlowWorkspaceSelection,
+  useFlowWorkspaceTitle,
+} from "./flowAgentSelection";
+import { FlowInspectorPanel, FlowInspectorSection } from "./FlowInspectorPanel";
 import { useEnterpriseStore } from "./store";
-
-type RunFilter = "all" | "active" | "waiting" | "failed" | "succeeded";
 
 export function RunsPage({ client }: { client: ApiClient }) {
   const { snapshot, store } = useEnterpriseStore(client);
-  const [filter, setFilter] = useState<RunFilter>("all");
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const runs = useMemo(
-    () => snapshot.runs.filter((run) => matchesFilter(run, filter)),
-    [filter, snapshot.runs],
-  );
-  const selected = runs.find((run) => run.id === selectedId) ?? runs[0] ?? null;
+  const selection = useFlowWorkspaceSelection();
+  const selected =
+    snapshot.runs.find((run) => run.id === selection?.selectedRunId) ??
+    snapshot.runs[0] ??
+    null;
+  const [busy, setBusy] = useState<"pause" | "resume" | "cancel" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
   useEffect(() => {
-    if (selected && selected.id !== selectedId) setSelectedId(selected.id);
-  }, [selected, selectedId]);
+    if (selected && selected.id !== selection?.selectedRunId) {
+      selection?.setSelectedRunId(selected.id);
+    }
+  }, [selected, selection]);
+
+  useFlowWorkspaceTitle(
+    selected ? `${selected.flowId}@${selected.flowVersion}` : "Runs / 运行追踪",
+  );
+
+  async function runAction(
+    action: "pause" | "resume" | "cancel",
+    operation: () => Promise<FlowRun>,
+  ) {
+    if (busy) return;
+    setBusy(action);
+    setError(null);
+    try {
+      await operation();
+      await store.load(true);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  if (!selected) {
+    return (
+      <div className="enterprise-agent-prompt-empty" role="status">
+        <Activity aria-hidden="true" size={20} />
+        <strong>尚无 Workflow Run</strong>
+        <p>Flow 开始运行后会在左侧显示。</p>
+      </div>
+    );
+  }
+
+  const canPause = ["queued", "running", "resuming"].includes(selected.status);
+  const canResume = ["paused", "waiting_approval", "waiting_human"].includes(
+    selected.status,
+  );
+  const canCancel = !["succeeded", "failed", "cancelled"].includes(
+    selected.status,
+  );
 
   return (
-    <div className="enterprise-page enterprise-runs">
-      <Panel
-        title="Workflow runs / 工作流运行"
-        actions={
-          <div className="enterprise-actions">
-            <Select<RunFilter>
-              label="筛选 Workflow Run"
-              onChange={setFilter}
-              options={[
-                { value: "all", label: "全部" },
-                { value: "active", label: "运行中" },
-                { value: "waiting", label: "等待人工" },
-                { value: "failed", label: "失败" },
-                { value: "succeeded", label: "成功" },
-              ]}
-              value={filter}
-            />
-            <Button aria-label="刷新 Workflow Runs" onClick={() => void store.load(true)} size="compact" variant="quiet">
-              <RefreshCw aria-hidden="true" size={14} /> 刷新
-            </Button>
-          </div>
-        }
-      >
-        <div className="enterprise-master-detail">
-          <ol className="enterprise-run-list" aria-label="Workflow Run 列表">
-            {runs.map((run) => (
-              <li key={run.id}>
-                <button
-                  aria-pressed={selected?.id === run.id}
-                  className={selected?.id === run.id ? "is-active" : undefined}
-                  onClick={() => setSelectedId(run.id)}
-                  type="button"
+    <>
+      <FlowInspectorPortal>
+        <FlowInspectorPanel
+          actions={
+            <>
+              <IconButton
+                aria-label="刷新 Workflow Run"
+                disabled={Boolean(busy)}
+                onClick={() => void store.load(true)}
+                size="compact"
+              >
+                <RefreshCw aria-hidden="true" size={14} />
+              </IconButton>
+              {canPause ? (
+                <Button
+                  disabled={Boolean(busy)}
+                  onClick={() =>
+                    void runAction("pause", () =>
+                      client.pauseFlowRun(selected.id),
+                    )
+                  }
+                  size="compact"
+                  variant="primary"
                 >
-                  <Activity aria-hidden="true" size={16} />
-                  <span><strong>{run.flowId}@{run.flowVersion}</strong><small>{shortId(run.id)} · {formatTime(run.updatedAt)}</small></span>
-                  <RunBadge run={run} />
-                </button>
-              </li>
-            ))}
-            {runs.length === 0 ? <li className="enterprise-list__empty">此筛选下没有 Run。</li> : null}
-          </ol>
-          {selected ? <RunDetails run={selected} /> : <div className="enterprise-empty-detail">选择一个 Run 查看持久化 Trace。</div>}
-        </div>
-      </Panel>
-    </div>
+                  <PauseCircle aria-hidden="true" size={14} />
+                  {busy === "pause" ? "暂停中…" : "暂停"}
+                </Button>
+              ) : canResume ? (
+                <Button
+                  disabled={Boolean(busy)}
+                  onClick={() =>
+                    void runAction("resume", () =>
+                      client.resumeFlowRun(selected.id),
+                    )
+                  }
+                  size="compact"
+                  variant="primary"
+                >
+                  <PlayCircle aria-hidden="true" size={14} />
+                  {busy === "resume" ? "恢复中…" : "恢复"}
+                </Button>
+              ) : null}
+            </>
+          }
+          status={selected.status.replaceAll("_", " ")}
+          statusVariant={runVariant(selected.status)}
+          subtitle={selected.id}
+          title="Run 状态"
+        >
+          <FlowInspectorSection title="运行信息">
+            <dl className="enterprise-facts flow-inspector-facts">
+              <div>
+                <dt>Thread</dt>
+                <dd>{selected.threadId}</dd>
+              </div>
+              <div>
+                <dt>Supersteps</dt>
+                <dd>{selected.superstep}</dd>
+              </div>
+              <div>
+                <dt>Node executions</dt>
+                <dd>
+                  {selected.nodeExecutions}/{selected.budget.maxNodeExecutions}
+                </dd>
+              </div>
+              <div>
+                <dt>Tool calls</dt>
+                <dd>
+                  {selected.toolCalls}/{selected.budget.maxToolCalls}
+                </dd>
+              </div>
+              <div>
+                <dt>Updated</dt>
+                <dd>{formatTime(selected.updatedAt)}</dd>
+              </div>
+            </dl>
+          </FlowInspectorSection>
+          {canCancel ? (
+            <FlowInspectorSection title="运行控制">
+              <Button
+                disabled={Boolean(busy)}
+                onClick={() =>
+                  void runAction("cancel", () =>
+                    client.cancelFlowRun(selected.id),
+                  )
+                }
+                size="compact"
+                variant="danger"
+              >
+                <XCircle aria-hidden="true" size={14} />
+                {busy === "cancel" ? "取消中…" : "取消运行"}
+              </Button>
+            </FlowInspectorSection>
+          ) : null}
+          {error ? (
+            <p className="enterprise-page__message is-error" role="alert">
+              {error}
+            </p>
+          ) : null}
+        </FlowInspectorPanel>
+      </FlowInspectorPortal>
+      <div className="enterprise-page enterprise-runs enterprise-run-core">
+        <RunTrace run={selected} />
+      </div>
+    </>
   );
 }
 
-function RunDetails({ run }: { run: FlowRun }) {
+function RunTrace({ run }: { run: FlowRun }) {
   return (
-    <article className="enterprise-run-detail" aria-label={`Run ${run.id} 详情`}>
+    <article
+      className="enterprise-run-detail"
+      aria-label={`Run ${run.id} 详情`}
+    >
       <header>
-        <span><Activity aria-hidden="true" size={18} /><strong>{run.flowId}@{run.flowVersion}</strong></span>
-        <RunBadge run={run} />
+        <span>
+          <Activity aria-hidden="true" size={18} />
+          <strong>
+            {run.flowId}@{run.flowVersion}
+          </strong>
+        </span>
+        <Badge variant={runVariant(run.status)}>
+          {run.status.replaceAll("_", " ")}
+        </Badge>
       </header>
-      <dl className="enterprise-facts">
-        <div><dt>Run ID</dt><dd><code>{run.id}</code></dd></div>
-        <div><dt>Thread</dt><dd><code>{run.threadId}</code></dd></div>
-        <div><dt>Supersteps</dt><dd>{run.superstep}</dd></div>
-        <div><dt>Node executions</dt><dd>{run.nodeExecutions}/{run.budget.maxNodeExecutions}</dd></div>
-        <div><dt>Tool calls</dt><dd>{run.toolCalls}/{run.budget.maxToolCalls}</dd></div>
-        <div><dt>Updated</dt><dd>{formatTime(run.updatedAt)}</dd></div>
-      </dl>
-      {run.error ? <p className="enterprise-page__message is-error" role="alert"><ShieldAlert aria-hidden="true" size={15} />{run.error}</p> : null}
+      {run.error ? (
+        <p className="enterprise-page__message is-error" role="alert">
+          <ShieldAlert aria-hidden="true" size={15} />
+          {run.error}
+        </p>
+      ) : null}
       <h3>Checkpoint timeline / 检查点</h3>
       <ol className="enterprise-trace">
         {run.checkpointHistory.toReversed().map((checkpoint) => (
           <li key={checkpoint.id}>
             <Clock3 aria-hidden="true" size={15} />
-            <span><strong>Superstep {checkpoint.superstep}</strong><small>{checkpoint.nodeIds.join(", ") || "no nodes"} · {checkpoint.pendingWriteCount} writes</small></span>
-            <Badge variant={checkpoint.status === "committed" ? "success" : checkpoint.status === "failed" ? "danger" : "neutral"}>{checkpoint.status}</Badge>
+            <span>
+              <strong>Superstep {checkpoint.superstep}</strong>
+              <small>
+                {checkpoint.nodeIds.join(", ") || "no nodes"} ·{" "}
+                {checkpoint.pendingWriteCount} writes
+              </small>
+            </span>
+            <Badge
+              variant={
+                checkpoint.status === "committed"
+                  ? "success"
+                  : checkpoint.status === "failed"
+                    ? "danger"
+                    : "neutral"
+              }
+            >
+              {checkpoint.status}
+            </Badge>
           </li>
         ))}
-        {run.checkpointHistory.length === 0 ? <li className="enterprise-list__empty">尚未提交 Checkpoint。</li> : null}
       </ol>
       <h3>Node trace / 节点轨迹</h3>
       <ol className="enterprise-trace">
         {run.nodeRuns.toReversed().map((node) => (
           <li key={node.id}>
             <Activity aria-hidden="true" size={15} />
-            <span><strong>{node.nodeId} · attempt {node.attempt}</strong><small>{node.toolCalls} tool calls · {node.completedAt ? formatTime(node.completedAt) : "running"}</small></span>
-            <Badge variant={node.status === "succeeded" ? "success" : node.status === "failed" ? "danger" : node.status.includes("waiting") ? "warning" : "info"}>{node.status}</Badge>
+            <span>
+              <strong>
+                {node.nodeId} · attempt {node.attempt}
+              </strong>
+              <small>
+                {node.toolCalls} tool calls ·{" "}
+                {node.completedAt ? formatTime(node.completedAt) : "running"}
+              </small>
+            </span>
+            <Badge variant={runVariant(node.status)}>{node.status}</Badge>
           </li>
         ))}
       </ol>
@@ -111,16 +254,16 @@ function RunDetails({ run }: { run: FlowRun }) {
   );
 }
 
-function matchesFilter(run: FlowRun, filter: RunFilter): boolean {
-  if (filter === "all") return true;
-  if (filter === "active") return ["queued", "running", "resuming", "pause_requested", "cancel_requested"].includes(run.status);
-  if (filter === "waiting") return ["waiting_approval", "waiting_human", "paused"].includes(run.status);
-  return run.status === filter;
+function runVariant(
+  status: string,
+): "success" | "danger" | "warning" | "info" | "neutral" {
+  if (status === "succeeded" || status === "committed") return "success";
+  if (status === "failed" || status === "cancelled") return "danger";
+  if (status.includes("waiting") || status === "paused") return "warning";
+  if (["queued", "running", "resuming"].includes(status)) return "info";
+  return "neutral";
 }
 
-function RunBadge({ run }: { run: FlowRun }) {
-  const variant = run.status === "succeeded" ? "success" : run.status === "failed" || run.status === "cancelled" ? "danger" : run.status.includes("waiting") || run.status === "paused" ? "warning" : run.status === "running" || run.status === "resuming" ? "info" : "neutral";
-  return <Badge variant={variant}>{run.status.replaceAll("_", " ")}</Badge>;
+function formatTime(value: string): string {
+  return new Date(value).toLocaleString();
 }
-
-function formatTime(value: string): string { return new Date(value).toLocaleString(); }

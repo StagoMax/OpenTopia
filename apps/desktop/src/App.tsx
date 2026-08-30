@@ -36,7 +36,10 @@ import {
   EnterpriseSidebarCollection,
   FlowEnterpriseWorkspace,
 } from "./components/enterprise";
-import { FlowAgentSelectionProvider } from "./components/enterprise/flowAgentSelection";
+import {
+  FlowWorkspaceProvider,
+  FlowWorkspaceTitle,
+} from "./components/enterprise/flowAgentSelection";
 import type { EnterprisePageHeader } from "./components/enterprise/pageHeader";
 import {
   SettingsPanel as RedesignedSettingsPanel,
@@ -459,8 +462,10 @@ export function App() {
   function navigateFlowPrimaryView(view: FlowPrimaryView) {
     setFlowPageHeader(null);
     setFlowPrimaryView(view);
-    setToolStageOpen(view === "agents");
-    if (view === "agents") setActiveToolTabId(null);
+    if (view !== "conversation") {
+      setToolStageOpen(false);
+      setActiveToolTabId(null);
+    }
     setConversationCollapsed(false);
   }
   const [flowLibraryBindings, setFlowLibraryBindings] = useState<
@@ -862,14 +867,15 @@ export function App() {
   );
   const flowPrimarySurface =
     experienceMode === "flow" && flowPrimaryView !== "conversation";
-  const flowAgentsOpen = flowPrimarySurface && flowPrimaryView === "agents";
-  const workspaceRightPanelKind: WorkspaceRightPanelKind = flowAgentsOpen
-    ? "agent"
+  const flowInspectorOpen =
+    flowPrimarySurface && flowPrimaryView !== "knowledge";
+  const workspaceRightPanelKind: WorkspaceRightPanelKind = flowInspectorOpen
+    ? "inspector"
     : toolStageOpen
       ? "tool"
       : "context";
   const rightResizePreferenceKey: keyof WorkspaceLayoutPreferences =
-    flowAgentsOpen ? "agentRight" : "toolRight";
+    flowInspectorOpen ? "inspectorRight" : "toolRight";
   const sidebarDestination = resolveSidebarDestination({
     experienceMode,
     flowPrimaryView,
@@ -3866,10 +3872,10 @@ export function App() {
         )}
         <main
           ref={workspaceRef}
-          className={`workspace ${settingsOpen ? "is-settings-hidden" : ""} ${toolStageOpen ? "with-tool-stage" : ""} ${toolStageCoversConversation ? "tool-only" : ""} ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${workspaceResizeSide ? "is-resizing" : ""}`}
+          className={`workspace ${settingsOpen ? "is-settings-hidden" : ""} ${toolStageOpen ? "with-tool-stage" : ""} ${flowInspectorOpen ? "with-flow-inspector" : ""} ${toolStageCoversConversation ? "tool-only" : ""} ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${workspaceResizeSide ? "is-resizing" : ""}`}
           style={workspaceStyle}
         >
-          <FlowAgentSelectionProvider>
+          <FlowWorkspaceProvider>
             <Sidebar
               projects={projects}
               threads={threads}
@@ -3986,67 +3992,74 @@ export function App() {
               onDragLeave={conversationFileDrop.onDragLeave}
               onDrop={conversationFileDrop.onDrop}
             >
-              <ThreadHeader
-                thread={flowPrimarySurface ? null : activeThread}
-                backLabel={flowPageHeader?.backLabel}
-                headingIcon={
-                  flowPrimarySurface
-                    ? flowPrimaryHeadingIcon(flowPrimaryView)
-                    : undefined
-                }
-                title={
-                  flowPrimarySurface
-                    ? (flowPageHeader?.title ??
-                      flowPrimaryHeadingTitle(flowPrimaryView))
-                    : undefined
-                }
-                onBack={flowPrimarySurface ? flowPageHeader?.onBack : undefined}
-                showThreadControls={!flowPrimarySurface}
-                toolStageOpen={toolStageOpen}
-                contextRailOpen={contextRailVisible}
-                onOpenLocation={() =>
-                  activeThread &&
-                  void openWorkspaceRoot(activeThread.workspaceRoot)
-                }
-                onOpenTool={openToolTab}
-                onToggleContextRail={() => {
-                  if (toolStageOpen) {
-                    setToolStageOpen(false);
-                    setContextRailCollapsed(false);
-                    setContextRailOpen(true);
-                    return;
-                  }
-                  if (contextRailAutoVisible) {
-                    setContextRailOpen(false);
-                    setContextRailCollapsed((current) => !current);
-                    return;
-                  }
-                  setContextRailCollapsed(false);
-                  setContextRailOpen((current) => !current);
-                }}
-                onToggleToolStage={() => {
-                  setConversationCollapsed(false);
-                  if (
-                    !toolStageOpen &&
-                    activeThread?.experienceMode === "flow"
-                  ) {
-                    openToolTab("flow");
-                    return;
-                  }
-                  setToolStageOpen((current) => !current);
-                }}
-                onRename={() =>
-                  activeThread &&
-                  setRenameTarget({
-                    kind: "thread",
-                    id: activeThread.id,
-                    name: activeThread.title,
-                  })
-                }
-                onArchive={() =>
-                  activeThread && void archiveThread(activeThread)
-                }
-              />
+              <FlowWorkspaceTitle
+                fallback={flowPrimaryHeadingTitle(flowPrimaryView)}
+              >
+                {(workspaceTitle) => (
+                  <ThreadHeader
+                    thread={flowPrimarySurface ? null : activeThread}
+                    backLabel={flowPageHeader?.backLabel}
+                    headingIcon={
+                      flowPrimarySurface
+                        ? flowPrimaryHeadingIcon(flowPrimaryView)
+                        : undefined
+                    }
+                    title={
+                      flowPrimarySurface
+                        ? (flowPageHeader?.title ?? workspaceTitle)
+                        : undefined
+                    }
+                    onBack={
+                      flowPrimarySurface ? flowPageHeader?.onBack : undefined
+                    }
+                    showThreadControls={!flowPrimarySurface}
+                    toolStageOpen={toolStageOpen}
+                    contextRailOpen={contextRailVisible}
+                    onOpenLocation={() =>
+                      activeThread &&
+                      void openWorkspaceRoot(activeThread.workspaceRoot)
+                    }
+                    onOpenTool={openToolTab}
+                    onToggleContextRail={() => {
+                      if (toolStageOpen) {
+                        setToolStageOpen(false);
+                        setContextRailCollapsed(false);
+                        setContextRailOpen(true);
+                        return;
+                      }
+                      if (contextRailAutoVisible) {
+                        setContextRailOpen(false);
+                        setContextRailCollapsed((current) => !current);
+                        return;
+                      }
+                      setContextRailCollapsed(false);
+                      setContextRailOpen((current) => !current);
+                    }}
+                    onToggleToolStage={() => {
+                      setConversationCollapsed(false);
+                      if (
+                        !toolStageOpen &&
+                        activeThread?.experienceMode === "flow"
+                      ) {
+                        openToolTab("flow");
+                        return;
+                      }
+                      setToolStageOpen((current) => !current);
+                    }}
+                    onRename={() =>
+                      activeThread &&
+                      setRenameTarget({
+                        kind: "thread",
+                        id: activeThread.id,
+                        name: activeThread.title,
+                      })
+                    }
+                    onArchive={() =>
+                      activeThread && void archiveThread(activeThread)
+                    }
+                  />
+                )}
+              </FlowWorkspaceTitle>
               {conversationFileDrop.isDraggingFiles ? (
                 <ConversationFileDropTarget />
               ) : null}
@@ -4292,7 +4305,7 @@ export function App() {
                 />
               )}
             </section>
-            {toolStageOpen && !settingsOpen ? (
+            {(toolStageOpen || flowInspectorOpen) && !settingsOpen ? (
               <div
                 className={`workspace-resizer workspace-resizer-right ${workspaceResizeSide === "right" ? "active" : ""}`}
                 role="separator"
@@ -4325,7 +4338,7 @@ export function App() {
               client={client}
               conversationRegistry={conversationRegistry}
               experienceMode={experienceMode}
-              flowAgentsOpen={flowAgentsOpen}
+              flowInspectorOpen={flowInspectorOpen}
               threads={threads}
               toolTabs={toolTabs}
               activeToolTab={activeToolTab}
@@ -4441,7 +4454,7 @@ export function App() {
                 void interruptAgent(agentThreadId)
               }
             />
-          </FlowAgentSelectionProvider>
+          </FlowWorkspaceProvider>
         </main>
         {settingsOpen && (
           <RedesignedSettingsPanel

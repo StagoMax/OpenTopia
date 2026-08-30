@@ -80,7 +80,7 @@ export function AgentTemplatePanel({
     blankAgentDraft(workspaceRoot, settings),
   );
   const [requirement, setRequirement] = useState("");
-  const [editing, setEditing] = useState(false);
+  const [editing, setEditing] = useState(Boolean(selection?.creatingAgent));
   const [initialState, setInitialState] = useState("{}");
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -98,7 +98,11 @@ export function AgentTemplatePanel({
   const handledViewAgentRequest = useRef(viewAgentRequest);
   const notifyAgentDataChanged = selection?.notifyAgentDataChanged;
 
-  const closeEditor = useCallback(() => setEditing(false), []);
+  const cancelCreateAgent = selection?.cancelCreateAgent;
+  const closeEditor = useCallback(() => {
+    setEditing(false);
+    cancelCreateAgent?.();
+  }, [cancelCreateAgent]);
   useEnterpriseSubpageHeader(onPageHeaderChange, editing, {
     title: "Agents / 创建 Agent",
     backLabel: "返回 Agents",
@@ -457,6 +461,7 @@ export function AgentTemplatePanel({
           title="Agents / Agent 配置"
           actions={
             <div className="agent-template-panel__header-actions">
+              <Badge variant="warning">Draft</Badge>
               <Button
                 size="compact"
                 variant="quiet"
@@ -517,7 +522,29 @@ export function AgentTemplatePanel({
       ) : null}
 
       {editing ? (
-        <Panel title="Create Agent / 创建 Agent">
+        <Panel
+          title="Create Agent / 创建 Agent"
+          actions={
+            <div className="agent-template-panel__header-actions">
+              <Button
+                disabled={Boolean(busy)}
+                onClick={closeEditor}
+                size="compact"
+                variant="quiet"
+              >
+                取消
+              </Button>
+              <Button
+                disabled={!client || busy === "create"}
+                onClick={() => void createVersion()}
+                size="compact"
+                variant="primary"
+              >
+                {busy === "create" ? "保存中…" : "保存版本"}
+              </Button>
+            </div>
+          }
+        >
           <div className="agent-studio">
             <main className="agent-studio__main">
               <section className="agent-studio__composer">
@@ -713,22 +740,6 @@ export function AgentTemplatePanel({
                     />
                   </div>
                 </details>
-                <div className="agent-template-panel__actions">
-                  <Button
-                    variant="quiet"
-                    disabled={Boolean(busy)}
-                    onClick={closeEditor}
-                  >
-                    取消
-                  </Button>
-                  <Button
-                    variant="primary"
-                    disabled={!client || busy === "create"}
-                    onClick={() => void createVersion()}
-                  >
-                    {busy === "create" ? "保存中…" : "保存 Agent 版本"}
-                  </Button>
-                </div>
               </div>
             </main>
             <AgentConfigInspector
@@ -753,9 +764,44 @@ export function AgentTemplatePanel({
         <Panel
           title={`${selected.template.name} · v${selected.template.version}`}
           actions={
-            <Badge variant={riskBadge(selected.template.spec.riskClass)}>
-              {riskLabel(selected.template.spec.riskClass)}
-            </Badge>
+            <div className="agent-template-panel__header-actions">
+              <Badge
+                variant={
+                  selected.template.status === "published"
+                    ? "success"
+                    : "warning"
+                }
+              >
+                {selected.template.status === "published"
+                  ? "Published"
+                  : "Draft"}
+              </Badge>
+              <Badge variant={riskBadge(selected.template.spec.riskClass)}>
+                {riskLabel(selected.template.spec.riskClass)}
+              </Badge>
+              {selected.template.status === "draft" ? (
+                <Button
+                  disabled={Boolean(busy)}
+                  onClick={() => void publishSelected()}
+                  size="compact"
+                  variant="primary"
+                >
+                  {selected.diff.widensCapabilities ? (
+                    <ShieldAlert size={14} aria-hidden="true" />
+                  ) : null}
+                  发布
+                </Button>
+              ) : (
+                <Button
+                  disabled={Boolean(busy)}
+                  onClick={() => void archiveSelected()}
+                  size="compact"
+                  variant="quiet"
+                >
+                  归档
+                </Button>
+              )}
+            </div>
           }
         >
           <dl className="agent-template-panel__facts">
@@ -865,35 +911,15 @@ export function AgentTemplatePanel({
               基于此版本新建
             </Button>
             {selected.template.status === "draft" ? (
-              <>
-                <Button
-                  variant="danger"
-                  disabled={Boolean(busy)}
-                  onClick={() => void deleteSelected()}
-                >
-                  <Trash2 size={14} aria-hidden="true" />
-                  删除草稿
-                </Button>
-                <Button
-                  variant="primary"
-                  disabled={Boolean(busy)}
-                  onClick={() => void publishSelected()}
-                >
-                  {selected.diff.widensCapabilities ? (
-                    <ShieldAlert size={14} aria-hidden="true" />
-                  ) : null}
-                  发布并锁定
-                </Button>
-              </>
-            ) : (
               <Button
-                variant="quiet"
+                variant="danger"
                 disabled={Boolean(busy)}
-                onClick={() => void archiveSelected()}
+                onClick={() => void deleteSelected()}
               >
-                归档模板
+                <Trash2 size={14} aria-hidden="true" />
+                删除草稿
               </Button>
-            )}
+            ) : null}
           </div>
         </Panel>
       ) : null}

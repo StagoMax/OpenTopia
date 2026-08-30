@@ -22,7 +22,7 @@ import {
   PreviewHost,
 } from "../../components/PreviewHost";
 import { RightContextRail } from "../../components/RightContextRail";
-import { AgentTemplatePanel } from "../../components/AgentTemplatePanel";
+import { FlowInspectorHost } from "../../components/enterprise/flowAgentSelection";
 import { UsageLogDashboard } from "../../components/UsageLogDashboard";
 import { WebPreviewSurface } from "../../components/WebPreviewSurface";
 import {
@@ -82,7 +82,7 @@ export function RightPanel({
   client,
   conversationRegistry,
   experienceMode,
-  flowAgentsOpen,
+  flowInspectorOpen,
   threads,
   toolTabs,
   activeToolTab,
@@ -172,7 +172,7 @@ export function RightPanel({
   client: ApiClient | null;
   conversationRegistry: ConversationSessionRegistry | null;
   experienceMode: ExperienceMode;
-  flowAgentsOpen: boolean;
+  flowInspectorOpen: boolean;
   threads: Thread[];
   toolTabs: ToolTab[];
   activeToolTab: ToolTab | null;
@@ -354,21 +354,14 @@ export function RightPanel({
     />
   );
 
-  if (flowAgentsOpen) {
+  if (flowInspectorOpen) {
     return (
       <aside
-        className="right-panel flow-agent-config-panel"
+        className="right-panel flow-inspector-panel"
         id="workspace-right-panel"
-        aria-label="Agent 配置"
+        aria-label="Flow 配置"
       >
-        <AgentTemplatePanel
-          client={client}
-          settings={settings}
-          showTemplateCollection={false}
-          threadId={thread?.id ?? null}
-          variant="rail"
-          workspaceRoot={workspaceRoot}
-        />
+        <FlowInspectorHost />
       </aside>
     );
   }

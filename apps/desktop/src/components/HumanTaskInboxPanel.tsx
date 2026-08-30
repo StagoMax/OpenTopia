@@ -23,6 +23,7 @@ import {
 import type { ApiClient } from "../api/client";
 import {
   humanTaskActionPresentation,
+  humanTaskInputRequest,
   humanTaskStatusLabel,
   humanTaskTypeLabel,
   orderedHumanTaskActions,
@@ -34,7 +35,6 @@ import type {
   HumanTaskAction,
   HumanTaskResolutionResult,
   HumanTaskType,
-  UserInputRequest,
   UserInputResponse,
 } from "../types";
 import { PlanChoiceCard } from "./PlanChoiceCard";
@@ -675,17 +675,6 @@ function TaskActionIcon({ action }: { action: HumanTaskAction }) {
     return <CheckCircle2 aria-hidden="true" size={14} />;
   }
   return <Square aria-hidden="true" size={14} />;
-}
-
-function humanTaskInputRequest(task: HumanTask): UserInputRequest | null {
-  if (task.taskType !== "input_request") return null;
-  const request = asRecord(task.payload)?.request;
-  const record = asRecord(request);
-  return record &&
-    typeof record.requestId === "string" &&
-    Array.isArray(record.questions)
-    ? (request as UserInputRequest)
-    : null;
 }
 
 function humanTaskActivityReceipt(
