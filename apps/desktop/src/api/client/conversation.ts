@@ -22,6 +22,7 @@ import type {
   ScmRemoteConnectorResponse,
   Thread,
   ThreadModelSelection,
+  ToolResult,
   TurnCancelResult,
   TurnStatus,
 } from "../../types";
@@ -485,6 +486,18 @@ export class ConversationApi extends ExtensionsApi {
         limit: page?.limit,
         view: "conversation",
       })}`,
+      signal,
+    );
+  }
+
+  async getToolResultDetail(
+    threadId: string,
+    eventId: string,
+    signal?: AbortSignal,
+  ): Promise<ToolResult> {
+    return this.get(
+      "getToolResultDetail",
+      `/api/threads/${encodeURIComponent(threadId)}/events/${encodeURIComponent(eventId)}/tool-result`,
       signal,
     );
   }

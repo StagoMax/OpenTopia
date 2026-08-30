@@ -134,6 +134,7 @@ pub(super) fn load_goal_snapshot(
 }
 
 pub(super) fn conversation_payload_json(
+    event_id: Uuid,
     payload: &AgentEventPayload,
     full_payload_json: &str,
 ) -> anyhow::Result<Option<String>> {
@@ -224,11 +225,7 @@ pub(super) fn conversation_payload_json(
         }),
         AgentEventPayload::ToolCallFinished { result } => serde_json::json!({
             "type": "tool_call_finished",
-            "result": {
-                "callId": result.call_id,
-                "output": &result.output,
-                "metadata": &result.metadata,
-            },
+            "result": result.conversation_summary(event_id),
         }),
         _ => return Ok(Some(full_payload_json.to_string())),
     };

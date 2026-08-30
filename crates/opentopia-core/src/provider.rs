@@ -57,6 +57,7 @@ use openai::{
     responses_tools, OpenAiStreamAccumulator, ResponsesStreamAccumulator,
     INVALID_TOOL_ARGUMENTS_JSON_KEY, OPENAI_CHAT_ASSISTANT_STATE_TYPE,
     OPENAI_CHAT_NATIVE_TRANSCRIPT_FORMAT, OPENAI_CHAT_PORTABLE_TRANSCRIPT_FORMAT,
+    OPENAI_RESPONSES_COMPLETED_TRANSCRIPT_FORMAT, OPENAI_RESPONSES_REQUEST_TRANSCRIPT_FORMAT,
 };
 
 use transport::{
@@ -207,12 +208,15 @@ pub(crate) fn provider_item_is_internal_transcript(item: &Value) -> bool {
 pub fn split_provider_transcript_state(
     items: Vec<Value>,
 ) -> (Option<ProviderWireTranscript>, Vec<Value>) {
+    // A completed provider response may contribute a newer exact transcript
+    // candidate during the active turn. Promote the newest internal transcript
+    // regardless of whether it has already crossed the durable cursor boundary;
+    // otherwise codecs lose the candidate while the filter below removes it
+    // from native replay state.
     let transcript = items
         .iter()
         .rev()
-        .find(|item| {
-            item.get("type").and_then(Value::as_str) == Some(PROVIDER_TRANSCRIPT_STATE_TYPE)
-        })
+        .find(|item| provider_item_is_internal_transcript(item))
         .and_then(provider_wire_transcript);
     let provider_items = items
         .into_iter()
@@ -405,6 +409,13 @@ pub enum ModelStreamDelta {
         name: Option<String>,
         arguments_delta: String,
     },
+    /// A provider output item has finished and now represents an executable
+    /// tool call. Unlike argument deltas, this is a semantic commit point and
+    /// is delivered immediately even when the rest of the response is atomic.
+    ToolCallDone {
+        index: usize,
+        call: ProviderToolCall,
+    },
     Usage {
         usage: ModelUsage,
     },
@@ -424,8 +435,13 @@ impl ModelStreamDelta {
                     || name.as_deref().is_some_and(|value| !value.is_empty())
                     || !arguments_delta.is_empty()
             }
+            Self::ToolCallDone { .. } => true,
             Self::Usage { .. } => false,
         }
+    }
+
+    pub fn is_tool_call_done(&self) -> bool {
+        matches!(self, Self::ToolCallDone { .. })
     }
 }
 
@@ -754,7 +770,7 @@ pub trait ModelProvider: Send + Sync {
         let response = {
             let mut observed_delta = |delta| {
                 telemetry.observe(&delta, on_transport)?;
-                if atomic_response {
+                if atomic_response && !delta.is_tool_call_done() {
                     provisional_deltas.push(delta);
                     Ok(())
                 } else {
@@ -795,6 +811,10 @@ pub trait ModelProvider: Send + Sync {
                 id: Some(call.id.clone()),
                 name: Some(call.name.clone()),
                 arguments_delta: call.arguments.to_string(),
+            })?;
+            on_delta(ModelStreamDelta::ToolCallDone {
+                index,
+                call: call.clone(),
             })?;
         }
         if let Some(usage) = &response.usage {

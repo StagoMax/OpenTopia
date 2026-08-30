@@ -17,6 +17,13 @@ const activityGroupsSource = readFileSync(
   ),
   "utf8",
 );
+const activityEntryListSource = readFileSync(
+  new URL(
+    "./components/turnActivityTimeline/ActivityEntryList.tsx",
+    import.meta.url,
+  ),
+  "utf8",
+);
 const messageListSource = readFileSync(
   new URL("./features/conversation/MessageList.tsx", import.meta.url),
   "utf8",
@@ -93,13 +100,24 @@ test("defers tool result parsing until a card is expanded and caches both views"
   assert.match(toolCardSource, /function ToolActivityDetails/);
   assert.match(
     toolCardSource,
-    /getCachedToolActivityView\(call, result, "details"\)/,
+    /getCachedToolActivityView\(call, resolvedResult, "details"\)/,
   );
   assert.match(toolCardSource, /new WeakMap<\s*ToolCall/);
   assert.match(
     toolCardSource,
     /typeof children === "function" \? children\(\)/,
   );
+  assert.match(toolCardSource, /toolResultDetailRequests = new WeakMap/);
+  assert.match(toolCardSource, /onLoadResultDetail\(detailRef\.eventId\)/);
+});
+
+test("mounts only nearby variable-height activity chunks", () => {
+  assert.match(timelineSource, /<ActivityEntryList/);
+  assert.doesNotMatch(timelineSource, /entries\.map\(/);
+  assert.match(activityEntryListSource, /new IntersectionObserver/);
+  assert.match(activityEntryListSource, /new ResizeObserver/);
+  assert.match(activityEntryListSource, /rootMargin: "800px 0px"/);
+  assert.match(activityEntryListSource, /focusedRef\.current/);
 });
 
 test("keeps completed activity groups behind progressive disclosure", () => {

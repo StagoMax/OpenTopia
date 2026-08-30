@@ -1603,7 +1603,7 @@ impl SessionStore for SqliteSessionStore {
             event.seq = first_seq + i64::try_from(offset)?;
             let payload_json = serde_json::to_string(&event.payload)?;
             let conversation_payload_json =
-                conversation_payload_json(&event.payload, &payload_json)?;
+                conversation_payload_json(event.id, &event.payload, &payload_json)?;
             tx.execute(
                 r#"
                 INSERT INTO events (id, thread_id, turn_id, seq, kind, payload_json, created_at)
@@ -2075,6 +2075,21 @@ impl SessionStore for SqliteSessionStore {
             map_event,
         )?;
         collect_rows(rows)
+    }
+
+    fn get_event(&self, thread_id: Uuid, event_id: Uuid) -> anyhow::Result<Option<AgentEvent>> {
+        let conn = self.read_connection();
+        conn.query_row(
+            r#"
+            SELECT id, thread_id, turn_id, seq, payload_json, created_at
+            FROM events
+            WHERE thread_id = ?1 AND id = ?2
+            "#,
+            params![thread_id.to_string(), event_id.to_string()],
+            map_event,
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     fn prepare_effect(&self, intent: &EffectIntent) -> anyhow::Result<EffectJournalRecord> {

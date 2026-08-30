@@ -1,4 +1,6 @@
+import { useLayoutEffect } from "react";
 import type { ConversationSessionRegistry } from "../../conversationSessionController";
+import type { AgentEvent } from "../../types";
 import { useConversationSession } from "../../useConversationSession";
 import { useThreadRunState } from "../../useThreadActivityStore";
 import { MessageList, type MessageListProps } from "./MessageList";
@@ -63,8 +65,7 @@ export function LiveConversationMessageList({
         controller?.loadOlderMessages() ?? Promise.resolve()
       }
       onRetrySync={() => controller?.retry()}
+      onLoadToolResultDetail={controller?.loadToolResultDetail}
     />
   );
 }
-import { useLayoutEffect } from "react";
-import type { AgentEvent } from "../../types";

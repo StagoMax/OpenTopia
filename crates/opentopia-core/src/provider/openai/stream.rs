@@ -652,6 +652,40 @@ impl ResponsesStreamAccumulator {
                             call.name = "apply_patch".to_string();
                         }
                     }
+                    if event_type == "response.output_item.done"
+                        && matches!(
+                            item.get("type").and_then(Value::as_str),
+                            Some("function_call" | "custom_tool_call" | "apply_patch_call")
+                        )
+                    {
+                        let call = self.tool_calls.get(&index).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "provider tool-call protocol error: completed Responses tool call {index} was missing its accumulated state"
+                            )
+                        })?;
+                        if call.name.is_empty() {
+                            anyhow::bail!(
+                                "provider tool-call protocol error: completed Responses tool call {index} was missing a function name"
+                            );
+                        }
+                        let arguments = parse_required_tool_arguments(
+                            Some(&Value::String(call.arguments.clone())),
+                            "completed Responses function_call.arguments",
+                            Some(&call.name),
+                        )?;
+                        on_delta(ModelStreamDelta::ToolCallDone {
+                            index,
+                            call: ProviderToolCall {
+                                id: if call.id.is_empty() {
+                                    format!("call_{index}")
+                                } else {
+                                    call.id.clone()
+                                },
+                                name: call.name.clone(),
+                                arguments,
+                            },
+                        })?;
+                    }
                 }
             }
             "response.function_call_arguments.delta" => {

@@ -320,7 +320,7 @@ impl AnthropicMessagesProvider {
         let decoded = {
             let mut observed_delta = |delta| {
                 telemetry.observe(&delta, on_transport)?;
-                if atomic_response {
+                if atomic_response && !delta.is_tool_call_done() {
                     provisional_deltas.push(delta);
                     Ok(())
                 } else {
@@ -670,6 +670,37 @@ impl AnthropicStreamAccumulator {
                         })?;
                     }
                     _ => {}
+                }
+            }
+            "content_block_stop" => {
+                let index = event.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                if let Some(call) = self.tool_calls.get(&index) {
+                    if call.name.is_empty() {
+                        anyhow::bail!(
+                            "provider tool-call protocol error: completed Anthropic tool call {index} was missing a name"
+                        );
+                    }
+                    let arguments = if call.arguments.trim().is_empty() {
+                        json!({})
+                    } else {
+                        parse_required_tool_arguments(
+                            Some(&Value::String(call.arguments.clone())),
+                            "completed Anthropic tool_use input",
+                            Some(&call.name),
+                        )?
+                    };
+                    on_delta(ModelStreamDelta::ToolCallDone {
+                        index,
+                        call: ProviderToolCall {
+                            id: if call.id.is_empty() {
+                                format!("call_{index}")
+                            } else {
+                                call.id.clone()
+                            },
+                            name: call.name.clone(),
+                            arguments,
+                        },
+                    })?;
                 }
             }
             "message_delta" => {

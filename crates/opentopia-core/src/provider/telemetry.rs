@@ -148,6 +148,9 @@ fn output_bytes(delta: &ModelStreamDelta) -> usize {
                 + name.as_deref().map_or(0, str::len)
                 + arguments_delta.len()
         }
+        ModelStreamDelta::ToolCallDone { call, .. } => {
+            call.id.len() + call.name.len() + call.arguments.to_string().len()
+        }
         ModelStreamDelta::Usage { .. } => 0,
     }
 }

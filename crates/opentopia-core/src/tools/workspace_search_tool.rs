@@ -26,6 +26,12 @@ const DEFAULT_SEARCH_MAX_RESULTS: usize = 100;
 const SEARCH_MAX_RESULTS_LIMIT: usize = 1_000;
 const FALLBACK_MAX_FILE_BYTES: u64 = 1_048_576;
 
+fn search_path(path: Option<&str>) -> &str {
+    path.map(str::trim)
+        .filter(|path| !path.is_empty())
+        .unwrap_or(".")
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SearchInput {
@@ -65,12 +71,12 @@ impl TypedTool for WorkspaceSearchTool {
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
         ToolExecutionPolicy::read_only(vec![tool_resource_key(
             "tree",
-            input.path.as_deref().unwrap_or("."),
+            search_path(input.path.as_deref()),
         )])
     }
 
     fn execution_intent(&self, input: &Self::Input, _workspace_root: &Path) -> ToolExecutionIntent {
-        ToolExecutionIntent::observation([PathBuf::from(input.path.as_deref().unwrap_or("."))])
+        ToolExecutionIntent::observation([PathBuf::from(search_path(input.path.as_deref()))])
             .with_process_lifetime(ProcessLifetime::OneShot)
     }
 
@@ -82,12 +88,7 @@ impl TypedTool for WorkspaceSearchTool {
     ) -> anyhow::Result<ToolResult> {
         let query = input.query.trim();
         anyhow::ensure!(!query.is_empty(), "search requires a query");
-        let relative = input
-            .path
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(".");
+        let relative = search_path(input.path.as_deref());
         let max_results = input
             .max_results
             .filter(|value| *value > 0)

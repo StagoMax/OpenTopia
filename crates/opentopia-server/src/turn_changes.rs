@@ -695,6 +695,24 @@ impl FileMutationObserver for TurnChangeManager {
                 == normalize_workspace_key(&scope.workspace_root),
             "file mutation workspace does not match the active turn"
         );
+        // Turn-change capture is an optional undo facility, not a prerequisite
+        // for normal file tools. Remote/container workspaces and ordinary
+        // non-Git directories cannot currently provide the Git object store
+        // used by this journal. `begin_capture` persists that capability
+        // failure with no repository or recorded files; let the mutation
+        // commit in that specific state while preserving the failed change set
+        // so the UI continues to report that undo is unavailable.
+        if change_set.status == TurnChangeSetStatus::Failed
+            && change_set.repo_root.is_none()
+            && change_set.files.is_empty()
+        {
+            info!(
+                turn_id = %scope.turn_id,
+                error = ?change_set.error,
+                "turn file mutation proceeding without unavailable change journal"
+            );
+            return Ok(());
+        }
         anyhow::ensure!(
             change_set.status == TurnChangeSetStatus::Capturing,
             "turn file mutation arrived after capture finalized"
@@ -1884,6 +1902,45 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unavailable_non_git_journal_does_not_reject_file_mutations() {
+        let root = std::env::temp_dir().join(format!("opentopia-turn-no-git-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let store = Arc::new(SqliteSessionStore::open(":memory:").unwrap());
+        let thread = store.create_thread(None, root.clone()).unwrap();
+        let manager = TurnChangeManager::new(store.clone());
+        let turn_id = insert_turn(&store, thread.id);
+
+        let capture = manager
+            .begin_capture(turn_id, thread.id, &root)
+            .await
+            .unwrap();
+        assert_eq!(capture.status, TurnChangeSetStatus::Failed);
+        assert!(capture.repo_root.is_none());
+
+        manager
+            .record_file_mutations(
+                &FileMutationScope {
+                    thread_id: thread.id,
+                    turn_id,
+                    agent_path: "/root".to_string(),
+                    workspace_root: root.clone(),
+                },
+                &[PreparedFileMutation::write(
+                    root.join("notes.txt"),
+                    None,
+                    b"written without undo capture".to_vec(),
+                )],
+            )
+            .await
+            .unwrap();
+
+        let persisted = store.get_turn_change_set(turn_id).unwrap().unwrap();
+        assert_eq!(persisted.status, TurnChangeSetStatus::Failed);
+        assert!(persisted.files.is_empty());
+        let _ = fs::remove_dir_all(root);
     }
 
     async fn journal_write(

@@ -22,6 +22,7 @@ pub mod connection_operation_runtime;
 pub mod context_runtime;
 pub mod context_sources;
 pub mod contribution_hosts;
+pub mod conversation_event_projection;
 pub mod database_maintenance;
 mod delimited;
 pub mod desktop_browser;
@@ -187,6 +188,7 @@ pub use contribution_hosts::{
     MAX_MEDIA_HANDLER_OUTPUT_BYTES, MEDIA_HANDLER_INVOCATION_API_VERSION,
     MEDIA_HANDLER_RESULT_API_VERSION,
 };
+pub use conversation_event_projection::CONVERSATION_TOOL_DETAIL_METADATA_KEY;
 pub use database_maintenance::{compact_database_copy, DatabaseCompactionReport};
 pub use desktop_browser::{DesktopBrowserRuntime, DesktopBrowserRuntimeConfig};
 pub use document::{

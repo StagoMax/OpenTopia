@@ -283,8 +283,6 @@ fn action_driven_tools_expose_only_action_specific_fields() {
     );
     assert_discriminated_action_schema(&PdfTool, &["inspect", "extract", "render", "validate"]);
     assert_discriminated_action_schema(&DocumentTool, &["inspect", "extract", "validate"]);
-    assert_discriminated_action_schema(&BackgroundOutputTool, &["read", "list", "write", "stop"]);
-
     let spreadsheet = SpreadsheetTool.schema();
     let fill_template = &action_schema_branch(&spreadsheet, "fill_template")["properties"];
     assert!(fill_template.get("dataPath").is_some());
@@ -404,6 +402,12 @@ fn action_driven_tools_reject_cross_action_or_incomplete_inputs() {
     assert!(BackgroundOutputTool
         .input_error(&json!({ "action": "read" }))
         .is_some());
+    assert!(BackgroundOutputTool
+        .input_error(&json!({
+            "action": "write",
+            "data": "hello"
+        }))
+        .is_some());
 
     assert!(SpreadsheetTool
         .input_error(&json!({
@@ -458,6 +462,22 @@ fn action_driven_tools_reject_cross_action_or_incomplete_inputs() {
             "jobId": Uuid::new_v4(),
             "data": "hello",
             "appendNewline": true
+        }))
+        .is_none());
+    assert!(BackgroundOutputTool
+        .input_error(&json!({
+            "action": "read",
+            "jobId": Uuid::new_v4(),
+            "timeoutMs": 0,
+            "data": null,
+            "appendNewline": false
+        }))
+        .is_none());
+    assert!(BackgroundOutputTool
+        .input_error(&json!({
+            "action": "stop",
+            "jobId": Uuid::new_v4(),
+            "timeoutMs": 0
         }))
         .is_none());
 }

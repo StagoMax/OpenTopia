@@ -567,6 +567,34 @@ fn conversation_stream_projection_keeps_first_token_metrics() {
 }
 
 #[test]
+fn conversation_stream_projection_replaces_tool_body_with_detail_reference() {
+    let event = AgentEvent::new(
+        Uuid::new_v4(),
+        Some(Uuid::new_v4()),
+        7,
+        AgentEventPayload::ToolCallFinished {
+            result: ToolResult::text(
+                Uuid::new_v4(),
+                "large output".repeat(1_000),
+                json!({ "command": "cargo test", "stdout": "x".repeat(20_000) }),
+            ),
+        },
+    );
+    let event_id = event.id;
+
+    let projected = project_conversation_event(event).expect("project tool event");
+    assert!(matches!(
+        projected.payload,
+        AgentEventPayload::ToolCallFinished { result }
+            if result.content.is_empty()
+                && result.output.len() < 12_000
+                && result.metadata.get("stdout").is_none()
+                && result.metadata[opentopia_core::CONVERSATION_TOOL_DETAIL_METADATA_KEY]
+                    ["eventId"] == json!(event_id)
+    ));
+}
+
+#[test]
 fn stream_payload_batches_merge_only_adjacent_compatible_deltas() {
     let payloads = compact_stream_payload_batch(vec![
         AgentEventPayload::ModelDelta {

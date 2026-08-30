@@ -14,6 +14,7 @@ import {
   type ToolActivityIconKind,
 } from "../../toolActivity";
 import { toolExecutionDurationMs } from "../../toolExecutionTiming";
+import type { ToolResult } from "../../types";
 import { ToolActivityCard, toolActivityIcon } from "../ToolActivityCard";
 import {
   ActivityNotice,
@@ -46,6 +47,7 @@ export function ActivityEntryView({
   traceTurnId,
   formatError,
   onOpenMarkdownLink,
+  onLoadToolResultDetail,
 }: {
   entry: ActivityEntry;
   isActive: boolean;
@@ -53,10 +55,15 @@ export function ActivityEntryView({
   traceTurnId?: string | null;
   formatError(message: string): string;
   onOpenMarkdownLink?(href: string): void;
+  onLoadToolResultDetail?(eventId: string): Promise<ToolResult>;
 }) {
   if (entry.kind === "tool-group") {
     return (
-      <ToolActivityGroup group={entry.group} executions={entry.executions} />
+      <ToolActivityGroup
+        group={entry.group}
+        executions={entry.executions}
+        onLoadToolResultDetail={onLoadToolResultDetail}
+      />
     );
   }
   if (entry.kind === "file-group") {
@@ -169,9 +176,11 @@ export function ActivityEntryView({
 function ToolActivityGroup({
   group,
   executions,
+  onLoadToolResultDetail,
 }: {
   group: ToolGroupKey;
   executions: ToolExecution[];
+  onLoadToolResultDetail?(eventId: string): Promise<ToolResult>;
 }) {
   const state = toolActivityGroupStatus(
     executions.map((execution) => execution.result),
@@ -196,12 +205,23 @@ function ToolActivityGroup({
   }, [commandBatch, running]);
 
   if (executions.length === 1) {
-    return <ToolExecutionItem execution={executions[0]} now={now} />;
+    return (
+      <ToolExecutionItem
+        execution={executions[0]}
+        now={now}
+        onLoadToolResultDetail={onLoadToolResultDetail}
+      />
+    );
   }
 
   if (commandBatch && running && runningCommand) {
     return (
-      <ToolExecutionItem execution={runningCommand} now={now} currentCommand />
+      <ToolExecutionItem
+        execution={runningCommand}
+        now={now}
+        currentCommand
+        onLoadToolResultDetail={onLoadToolResultDetail}
+      />
     );
   }
 
@@ -230,6 +250,7 @@ function ToolActivityGroup({
               key={execution.call.id}
               execution={execution}
               now={now}
+              onLoadToolResultDetail={onLoadToolResultDetail}
             />
           ))}
         </div>
@@ -283,10 +304,12 @@ function ToolExecutionItem({
   execution,
   now,
   currentCommand = false,
+  onLoadToolResultDetail,
 }: {
   execution: ToolExecution;
   now: number;
   currentCommand?: boolean;
+  onLoadToolResultDetail?(eventId: string): Promise<ToolResult>;
 }) {
   const running = !execution.result;
   const timing = formatActivityTiming(
@@ -304,6 +327,7 @@ function ToolExecutionItem({
       timing={timing}
       sandbox={formatToolSandbox(execution.result)}
       streaming={currentCommand}
+      onLoadResultDetail={onLoadToolResultDetail}
     />
   );
 }

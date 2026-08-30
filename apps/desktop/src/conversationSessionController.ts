@@ -17,6 +17,7 @@ import type {
   InlineMessageContentPart,
   LibraryProviderId,
   Message,
+  ToolResult,
   UserInputResponse,
 } from "./types";
 import { ThreadActivityStore } from "./threadActivityStore.ts";
@@ -84,6 +85,9 @@ export class ConversationSessionController {
     this.eventListeners.add(listener);
     return () => this.eventListeners.delete(listener);
   }
+
+  loadToolResultDetail = (eventId: string): Promise<ToolResult> =>
+    this.client.getToolResultDetail(this.threadId, eventId);
 
   retain(): () => void {
     this.retainCount += 1;

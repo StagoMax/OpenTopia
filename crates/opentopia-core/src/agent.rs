@@ -118,6 +118,7 @@ mod proposed_plan;
 mod provider_round;
 mod provider_turn_loop;
 mod run_config;
+mod streaming_tool_execution;
 mod tool_disclosure;
 mod tool_scheduler;
 mod turn_control;
@@ -2610,7 +2611,7 @@ fn workspace_scope_instruction(
         .effective_readable_roots(&workspace_root)
         .into_iter()
         .filter(|root| root != &workspace_root)
-        .map(|root| root.display().to_string())
+        .map(|root| model_visible_filesystem_path(&root))
         .collect::<Vec<_>>();
     let additional_roots = if additional_roots.is_empty() {
         "none".to_string()
@@ -2623,14 +2624,29 @@ fn workspace_scope_instruction(
         ""
     };
     let shell_dialect = ShellDialect::current();
+    let workspace_root = model_visible_filesystem_path(&workspace_root);
     format!(
         "The thread workspace root is '{}'. Resolve every relative file path and shell working directory against this root; the default shell working directory is this root. Runtime platform: {}-{}. Runtime shell dialect: {}. {} Begin with the workspace and complete the task there whenever it contains enough information. Do not list, search, read, or probe parent directories or unrelated absolute paths for context. Access outside the workspace only when the user explicitly requests it or the path is an additional configured readable root. Configured additional readable roots: {additional_roots}.{full_access_note}",
-        workspace_root.display(),
+        workspace_root,
         std::env::consts::OS,
         std::env::consts::ARCH,
         shell_dialect.id(),
         shell_dialect.model_guidance(),
     )
+}
+
+fn model_visible_filesystem_path(path: &Path) -> String {
+    let display = path.as_os_str().to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(path) = display.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{path}");
+        }
+        if let Some(path) = display.strip_prefix(r"\\?\") {
+            return path.to_string();
+        }
+    }
+    display.into_owned()
 }
 
 fn provider_tool_approval_action(call: &ProviderToolCall) -> String {

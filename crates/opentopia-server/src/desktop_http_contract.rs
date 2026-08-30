@@ -143,6 +143,7 @@ struct DesktopHttpResponsesV1 {
     cancel_turn: TurnCancelResult,
     list_events: Vec<opentopia_core::AgentEvent>,
     list_conversation_events: Vec<opentopia_core::AgentEvent>,
+    get_tool_result_detail: opentopia_core::ToolResult,
     start_terminal_command: terminal_api::TerminalStartResponse,
     cancel_terminal_command: terminal_api::TerminalCancelResponse,
     list_terminal_history: Vec<opentopia_core::TerminalEvent>,

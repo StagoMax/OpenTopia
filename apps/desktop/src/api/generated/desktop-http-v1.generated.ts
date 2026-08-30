@@ -423,6 +423,35 @@ export type CapabilityUnavailableReason =
   | {
       missing_permissions: PluginPermission[];
     };
+/**
+ * A typed unit of model input or tool output.
+ *
+ * Text is the portable baseline for providers and tools, while the other variants retain information that would otherwise be flattened into a prompt string. `Image` stores the original bytes so provider adapters can choose their native multimodal representation at the last possible point.
+ */
+export type ModelContentPart =
+  | {
+      text: string;
+      type: "text";
+      [k: string]: unknown;
+    }
+  | {
+      type: "json";
+      value: unknown;
+      [k: string]: unknown;
+    }
+  | {
+      content_type: string;
+      data: number[];
+      type: "image";
+      [k: string]: unknown;
+    }
+  | {
+      content_type?: string | null;
+      name?: string | null;
+      type: "resource";
+      uri: string;
+      [k: string]: unknown;
+    };
 export type TurnFileChangeKind = "added" | "modified" | "deleted" | "renamed";
 export type TurnChangeSetStatus = "capturing" | "ready" | "empty" | "failed";
 export type TurnStatus =
@@ -796,35 +825,6 @@ export type AgentEventPayload =
  */
 export type ContextAuthority = "system" | "developer" | "user" | "assistant" | "tool" | "data";
 export type ContextCacheScope = "stable" | "thread" | "turn" | "round" | "none";
-/**
- * A typed unit of model input or tool output.
- *
- * Text is the portable baseline for providers and tools, while the other variants retain information that would otherwise be flattened into a prompt string. `Image` stores the original bytes so provider adapters can choose their native multimodal representation at the last possible point.
- */
-export type ModelContentPart =
-  | {
-      text: string;
-      type: "text";
-      [k: string]: unknown;
-    }
-  | {
-      type: "json";
-      value: unknown;
-      [k: string]: unknown;
-    }
-  | {
-      content_type: string;
-      data: number[];
-      type: "image";
-      [k: string]: unknown;
-    }
-  | {
-      content_type?: string | null;
-      name?: string | null;
-      type: "resource";
-      uri: string;
-      [k: string]: unknown;
-    };
 export type ContextItemKind =
   | (
       | "base_instructions"
@@ -1073,6 +1073,7 @@ export interface DesktopHttpResponsesV1 {
   getTerminalSession?: TerminalSessionResponse | null;
   getThreadCapabilities: ThreadCapabilitiesResponse;
   getThreadFlowDraft?: FlowDraftView | null;
+  getToolResultDetail: ToolResult;
   getTurnChanges: TurnChangeSet;
   getTurnFileDiffPreview: TurnFileDiffPreview;
   getTurnStatus?: TurnRecord | null;
@@ -3160,6 +3161,21 @@ export interface UnavailableContribution {
   reason: CapabilityUnavailableReason;
   [k: string]: unknown;
 }
+export interface ToolResult {
+  callId: string;
+  content?: ModelContentPart[];
+  /**
+   * Tool-specific metadata is also the forward-compatible place for context and artifact hints, such as truncated/originalBytes/maxResults.
+   */
+  metadata: {
+    [k: string]: unknown;
+  };
+  /**
+   * Legacy text output. New tools should populate `content`; consumers can use `content_or_legacy_text` while callers migrate.
+   */
+  output: string;
+  [k: string]: unknown;
+}
 export interface TurnChangeSet {
   additions: number;
   afterTree?: string | null;
@@ -3591,21 +3607,6 @@ export interface ToolCall {
   id: string;
   input: unknown;
   name: string;
-  [k: string]: unknown;
-}
-export interface ToolResult {
-  callId: string;
-  content?: ModelContentPart[];
-  /**
-   * Tool-specific metadata is also the forward-compatible place for context and artifact hints, such as truncated/originalBytes/maxResults.
-   */
-  metadata: {
-    [k: string]: unknown;
-  };
-  /**
-   * Legacy text output. New tools should populate `content`; consumers can use `content_or_legacy_text` while callers migrate.
-   */
-  output: string;
   [k: string]: unknown;
 }
 export interface UserInputRequest {

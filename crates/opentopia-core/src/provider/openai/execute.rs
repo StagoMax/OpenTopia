@@ -2,7 +2,7 @@ use super::super::{
     apply_provider_auth, provider_error_is_quota_exhausted, provider_rejected_image_input,
     provider_transcript_candidate_item, rejected_chat_profile_capability, request_image_part_count,
     truncate_observation_text, ModelFinishReason, ModelResponse, ModelStreamCallback,
-    PreparedProviderRequest, ProviderAdapterError, ProviderResponseCommitMode,
+    ModelStreamDelta, PreparedProviderRequest, ProviderAdapterError, ProviderResponseCommitMode,
     ProviderTransportCallback, ProviderTransportEvent,
 };
 use super::recovery::{
@@ -13,7 +13,7 @@ use super::stream::provider_stream_rate_limit;
 use super::{
     decode_openai_chat_response, decode_openai_responses_response, model_response_observation,
     normalize_provider_tool_calls, tool_call_protocol_error_observation, OpenAiCompatibleProvider,
-    OpenAiResponsesProvider, ResponsesRequestError,
+    OpenAiResponsesProvider, ResponsesRequestError, OPENAI_RESPONSES_COMPLETED_TRANSCRIPT_FORMAT,
 };
 use crate::provider::telemetry::{emit_response_headers, ProviderStreamTelemetry};
 use crate::provider::transport::{
@@ -91,10 +91,13 @@ impl OpenAiCompatibleProvider {
             let atomic_stream = streamed && atomic_response;
             let mut telemetry = ProviderStreamTelemetry::new(prepared.request_id, attempt);
             let mut provisional_deltas = Vec::new();
+            let mut tool_call_committed = false;
             let decoded = {
-                let mut observed_delta = |delta| {
+                let mut observed_delta = |mut delta| {
+                    normalize_stream_tool_call(&mut delta, &prepared);
+                    tool_call_committed |= delta.is_tool_call_done();
                     telemetry.observe(&delta, on_transport)?;
-                    if atomic_response {
+                    if atomic_response && !delta.is_tool_call_done() {
                         provisional_deltas.push(delta);
                         Ok(())
                     } else {
@@ -113,6 +116,15 @@ impl OpenAiCompatibleProvider {
             telemetry.finish_progress(on_transport)?;
             let (mut response, response_attempt, response_status, commit_deltas) = match decoded {
                 Ok(response) => (response, attempt, status.as_u16(), provisional_deltas),
+                Err(error) if tool_call_committed => {
+                    on_transport(ProviderTransportEvent::Response {
+                        attempt,
+                        status: Some(status.as_u16()),
+                        response_id: None,
+                        body: stream_decode_error_observation(&error),
+                    })?;
+                    return Err(error);
+                }
                 Err(error) if atomic_stream && provider_stream_rate_limit(&error).is_some() => {
                     let retry_after =
                         provider_stream_rate_limit(&error).and_then(|error| error.retry_after());
@@ -144,6 +156,10 @@ impl OpenAiCompatibleProvider {
                     return Err(error);
                 }
                 Err(error) if atomic_stream => {
+                    let mut recovered_delta = |mut delta| {
+                        normalize_stream_tool_call(&mut delta, &prepared);
+                        on_delta(delta)
+                    };
                     let RecoveredToolResponse {
                         response,
                         attempt,
@@ -157,7 +173,7 @@ impl OpenAiCompatibleProvider {
                         attempt,
                         status.as_u16(),
                         &error,
-                        on_delta,
+                        &mut recovered_delta,
                         on_transport,
                     )
                     .await?;
@@ -265,10 +281,13 @@ impl OpenAiResponsesProvider {
             let atomic_stream = streamed && atomic_response;
             let mut telemetry = ProviderStreamTelemetry::new(prepared.request_id, attempt);
             let mut provisional_deltas = Vec::new();
+            let mut tool_call_committed = false;
             let decoded = {
-                let mut observed_delta = |delta| {
+                let mut observed_delta = |mut delta| {
+                    normalize_stream_tool_call(&mut delta, &prepared);
+                    tool_call_committed |= delta.is_tool_call_done();
                     telemetry.observe(&delta, on_transport)?;
-                    if atomic_response {
+                    if atomic_response && !delta.is_tool_call_done() {
                         provisional_deltas.push(delta);
                         Ok(())
                     } else {
@@ -287,6 +306,15 @@ impl OpenAiResponsesProvider {
             telemetry.finish_progress(on_transport)?;
             let (mut response, response_attempt, response_status, commit_deltas) = match decoded {
                 Ok(response) => (response, attempt, status.as_u16(), provisional_deltas),
+                Err(error) if tool_call_committed => {
+                    on_transport(ProviderTransportEvent::Response {
+                        attempt,
+                        status: Some(status.as_u16()),
+                        response_id: None,
+                        body: stream_decode_error_observation(&error),
+                    })?;
+                    return Err(error);
+                }
                 Err(error) if atomic_stream && provider_stream_rate_limit(&error).is_some() => {
                     let retry_after =
                         provider_stream_rate_limit(&error).and_then(|error| error.retry_after());
@@ -318,6 +346,10 @@ impl OpenAiResponsesProvider {
                     return Err(error);
                 }
                 Err(error) if atomic_stream => {
+                    let mut recovered_delta = |mut delta| {
+                        normalize_stream_tool_call(&mut delta, &prepared);
+                        on_delta(delta)
+                    };
                     let RecoveredToolResponse {
                         response,
                         attempt,
@@ -331,7 +363,7 @@ impl OpenAiResponsesProvider {
                         attempt,
                         status.as_u16(),
                         &error,
-                        on_delta,
+                        &mut recovered_delta,
                         on_transport,
                     )
                     .await?;
@@ -361,9 +393,33 @@ impl OpenAiResponsesProvider {
                 response_id: response.response_id.clone(),
                 body: model_response_observation(&response),
             })?;
+            attach_completed_responses_transcript(&mut response, &prepared);
             return Ok(response);
         }
     }
+}
+
+fn normalize_stream_tool_call(delta: &mut ModelStreamDelta, prepared: &PreparedProviderRequest) {
+    let ModelStreamDelta::ToolCallDone { call, .. } = delta else {
+        return;
+    };
+    normalize_provider_tool_calls(std::slice::from_mut(call), &prepared.tool_contracts);
+}
+
+fn attach_completed_responses_transcript(
+    response: &mut ModelResponse,
+    prepared: &PreparedProviderRequest,
+) {
+    let Some(mut transcript) = prepared.wire_transcript.clone() else {
+        return;
+    };
+    transcript.format = OPENAI_RESPONSES_COMPLETED_TRANSCRIPT_FORMAT.to_string();
+    transcript
+        .items
+        .extend(response.provider_items.iter().cloned());
+    response
+        .provider_items
+        .push(provider_transcript_candidate_item(&transcript));
 }
 
 fn stream_decode_error_observation(error: &anyhow::Error) -> Value {
@@ -422,5 +478,55 @@ mod tests {
         assert_eq!(completed.items[..transcript.items.len()], transcript.items);
         assert_eq!(completed.items.last().unwrap()["role"], "assistant");
         assert_eq!(completed.items.last().unwrap()["content"], "answer");
+    }
+
+    #[test]
+    fn completed_responses_response_extends_the_exact_request_transcript() {
+        let transcript = ProviderWireTranscript {
+            format: "openai_responses_request_input_v1".to_string(),
+            items: vec![json!({ "role": "user", "content": "question" })],
+        };
+        let prepared = PreparedProviderRequest {
+            request_id: Uuid::nil(),
+            adapter: "openai_responses".to_string(),
+            method: "POST".to_string(),
+            endpoint: "https://example.test/responses".to_string(),
+            body: json!({}),
+            observation_body: json!({}),
+            cache_trace: None,
+            logical_request: ModelRequest {
+                instructions: Default::default(),
+                input: Default::default(),
+                tool_candidates: Vec::new(),
+                previous_response_items: Vec::new(),
+                provider_transcript: None,
+                previous_response_id: None,
+                prompt_cache_breakpoint_policy: Default::default(),
+                final_output_json_schema: None,
+            },
+            wire_transcript: Some(transcript.clone()),
+            tool_contracts: Vec::new(),
+            response_commit: ProviderResponseCommitMode::Atomic,
+        };
+        let provider_item = json!({
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "lookup",
+            "arguments": "{}",
+        });
+        let mut response = ModelResponse::text("");
+        response.provider_items.push(provider_item.clone());
+
+        attach_completed_responses_transcript(&mut response, &prepared);
+
+        assert_eq!(response.provider_items[0], provider_item);
+        let completed = provider_wire_transcript(response.provider_items.last().unwrap())
+            .expect("Responses transcript candidate");
+        assert_eq!(
+            completed.format,
+            OPENAI_RESPONSES_COMPLETED_TRANSCRIPT_FORMAT
+        );
+        assert_eq!(completed.items[..transcript.items.len()], transcript.items);
+        assert_eq!(completed.items.last(), Some(&provider_item));
     }
 }

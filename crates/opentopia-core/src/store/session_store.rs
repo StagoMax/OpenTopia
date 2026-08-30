@@ -169,6 +169,7 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         thread_id: Uuid,
         after_seq: Option<i64>,
     ) -> anyhow::Result<Vec<AgentEvent>>;
+    fn get_event(&self, thread_id: Uuid, event_id: Uuid) -> anyhow::Result<Option<AgentEvent>>;
     fn prepare_effect(&self, intent: &EffectIntent) -> anyhow::Result<EffectJournalRecord>;
     fn get_effect(&self, effect_id: Uuid) -> anyhow::Result<Option<EffectJournalRecord>>;
     fn get_effect_by_idempotency_key(

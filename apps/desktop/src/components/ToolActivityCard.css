@@ -143,6 +143,16 @@
   color: var(--text-muted);
 }
 
+.tool-panel-detail-status {
+  min-height: var(--control-height-lg);
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-5);
+  color: var(--danger);
+}
+
 .tool-panel-head {
   display: flex;
   min-height: var(--control-height-sm);

@@ -3,13 +3,19 @@ use super::shared::responses_tool_result_output;
 use super::tool_schema::compile_openai_function_candidate;
 use crate::model_context::{ContextCacheScope, ContextRole};
 use crate::provider::{
-    encode_base64, resource_fallback_text, CompiledToolContract, ModelConversationMessage,
-    ModelConversationRole, ModelInputContent, ModelRequest, PromptCacheBreakpointPolicy,
-    ProviderToolCandidate, ProviderToolDefinition, ProviderToolDisclosure,
+    encode_base64, provider_item_is_internal_transcript, provider_wire_transcript,
+    resource_fallback_text, CompiledToolContract, ModelConversationMessage, ModelConversationRole,
+    ModelInputContent, ModelRequest, PromptCacheBreakpointPolicy, ProviderToolCandidate,
+    ProviderToolDefinition, ProviderToolDisclosure, ProviderToolResult,
 };
 use crate::settings::{ProviderFeatureSupport, ProviderToolProtocolCapabilities};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+
+pub(in crate::provider) const OPENAI_RESPONSES_REQUEST_TRANSCRIPT_FORMAT: &str =
+    "openai_responses_request_input_v1";
+pub(in crate::provider) const OPENAI_RESPONSES_COMPLETED_TRANSCRIPT_FORMAT: &str =
+    "openai_responses_completed_input_v1";
 
 pub(in crate::provider) struct CompiledResponseToolDefinitions {
     definitions: Vec<ProviderToolDefinition>,
@@ -163,8 +169,20 @@ pub(in crate::provider) fn compile_responses_tools(
 
 pub(in crate::provider) fn responses_input(request: &ModelRequest) -> Vec<Value> {
     let replay_full_prefix = request.previous_response_id.is_none();
-    let mut input = Vec::new();
-    if replay_full_prefix {
+    let cached_transcript = replay_full_prefix
+        .then_some(request.provider_transcript.as_ref())
+        .flatten()
+        .filter(|transcript| {
+            matches!(
+                transcript.format.as_str(),
+                OPENAI_RESPONSES_REQUEST_TRANSCRIPT_FORMAT
+                    | OPENAI_RESPONSES_COMPLETED_TRANSCRIPT_FORMAT
+            ) && !transcript.items.is_empty()
+        });
+    let mut input = cached_transcript
+        .map(|transcript| transcript.items.clone())
+        .unwrap_or_default();
+    if replay_full_prefix && cached_transcript.is_none() {
         input.extend(responses_scoped_instruction_input(request, true));
         input.extend(
             request
@@ -175,54 +193,104 @@ pub(in crate::provider) fn responses_input(request: &ModelRequest) -> Vec<Value>
                 .flat_map(|(index, message)| responses_conversation_items(message, index)),
         );
     }
-    input.push(json!({
-        "role": "user",
-        "content": responses_message_content(
-            ModelConversationRole::User,
-            &request.input.current_user.message,
-            &request.input.current_user.content,
-        ),
-    }));
 
-    // Volatile turn/round context follows the user cache anchor. It remains
-    // visible to the model but cannot split the append-only history prefix on
-    // the next turn.
+    // Only a completed provider response with live calls continues the same
+    // model turn. A request checkpoint represents an interrupted/failed prior
+    // request; the next turn must keep it as the exact prefix and append the
+    // new user message after it.
+    let continues_active_turn = cached_transcript.is_some_and(|transcript| {
+        transcript.format == OPENAI_RESPONSES_COMPLETED_TRANSCRIPT_FORMAT
+            && !request.input.tool_calls.is_empty()
+    });
+    if !continues_active_turn {
+        input.push(json!({
+            "role": "user",
+            "content": responses_message_content(
+                ModelConversationRole::User,
+                &request.input.current_user.message,
+                &request.input.current_user.content,
+            ),
+        }));
+    }
+
+    // Volatile turn/round context is emitted for every model round. With an
+    // exact transcript it extends the prior request instead of being rebuilt
+    // inside it, so updated runtime guidance remains visible without splitting
+    // the cached prefix.
     input.extend(responses_scoped_instruction_input(request, false));
 
-    if request.previous_response_items.is_empty() {
-        input.extend(request.input.tool_calls.iter().map(|call| {
-            json!({
+    // A transcript candidate already embeds every provider item that preceded
+    // it. Runtime-owned observations may have been appended afterwards, while
+    // a durable cursor can retain encrypted reasoning alongside the transcript.
+    // Extend only with items that are not already present so replay stays
+    // byte-for-byte append-only.
+    for item in request
+        .previous_response_items
+        .iter()
+        .filter(|item| !provider_item_is_internal_transcript(item))
+    {
+        if !input.iter().any(|existing| existing == item) {
+            input.push(item.clone());
+        }
+    }
+
+    // Provider output items normally own the exact native call representation.
+    // Runtime observations and legacy recovery state may only have the logical
+    // call ledger, so append a function call when no native item represents it.
+    for call in &request.input.tool_calls {
+        if responses_tool_call_kind(&input, &call.id).is_none() {
+            input.push(json!({
                 "type": "function_call",
                 "call_id": &call.id,
                 "name": &call.name,
                 "arguments": call.arguments.to_string(),
-            })
-        }));
-    } else {
-        input.extend(request.previous_response_items.iter().cloned());
-    }
-    input.extend(request.input.tool_results.iter().map(|result| {
-        let output = responses_tool_result_output(result);
-        match responses_tool_call_kind(&request.previous_response_items, &result.call_id) {
-            Some(ResponsesToolCallKind::ApplyPatch) => json!({
-                "type": "apply_patch_call_output",
-                "call_id": &result.call_id,
-                "status": if result.is_error { "failed" } else { "completed" },
-                "output": output,
-            }),
-            Some(ResponsesToolCallKind::Custom) => json!({
-                "type": "custom_tool_call_output",
-                "call_id": &result.call_id,
-                "output": output,
-            }),
-            Some(ResponsesToolCallKind::Function) | None => json!({
-                "type": "function_call_output",
-                "call_id": &result.call_id,
-                "output": output,
-            }),
+            }));
         }
-    }));
+    }
+
+    let mut emitted_results = input
+        .iter()
+        .filter_map(responses_tool_output_call_id)
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    for result in &request.input.tool_results {
+        if emitted_results.insert(result.call_id.clone()) {
+            let item = responses_tool_result_item(&input, result);
+            input.push(item);
+        }
+    }
     input
+}
+
+fn responses_tool_output_call_id(item: &Value) -> Option<&str> {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("function_call_output" | "custom_tool_call_output" | "apply_patch_call_output")
+    )
+    .then(|| item.get("call_id").and_then(Value::as_str))
+    .flatten()
+}
+
+fn responses_tool_result_item(items: &[Value], result: &ProviderToolResult) -> Value {
+    let output = responses_tool_result_output(result);
+    match responses_tool_call_kind(items, &result.call_id) {
+        Some(ResponsesToolCallKind::ApplyPatch) => json!({
+            "type": "apply_patch_call_output",
+            "call_id": &result.call_id,
+            "status": if result.is_error { "failed" } else { "completed" },
+            "output": output,
+        }),
+        Some(ResponsesToolCallKind::Custom) => json!({
+            "type": "custom_tool_call_output",
+            "call_id": &result.call_id,
+            "output": output,
+        }),
+        Some(ResponsesToolCallKind::Function) | None => json!({
+            "type": "function_call_output",
+            "call_id": &result.call_id,
+            "output": output,
+        }),
+    }
 }
 
 pub(in crate::provider) fn responses_conversation_items(
@@ -339,6 +407,11 @@ pub(in crate::provider) fn responses_tool_call_kind(
     call_id: &str,
 ) -> Option<ResponsesToolCallKind> {
     items.iter().find_map(|item| {
+        if let Some(transcript) = provider_wire_transcript(item) {
+            if let Some(kind) = responses_tool_call_kind(&transcript.items, call_id) {
+                return Some(kind);
+            }
+        }
         let matches_call = item
             .get("call_id")
             .or_else(|| item.get("id"))

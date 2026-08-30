@@ -20,6 +20,7 @@ pub(in crate::provider) use tool_schema::openai_strict_function_schema;
 pub(in crate::provider) use responses::responses_tools;
 pub(in crate::provider) use responses::{
     add_responses_prompt_cache_breakpoint, compile_responses_tools, responses_input,
+    OPENAI_RESPONSES_COMPLETED_TRANSCRIPT_FORMAT, OPENAI_RESPONSES_REQUEST_TRANSCRIPT_FORMAT,
 };
 
 #[cfg(test)]

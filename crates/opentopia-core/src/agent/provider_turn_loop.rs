@@ -978,6 +978,8 @@ impl AgentCore {
                 .complete_provider_round(
                     thread_id,
                     user_message_id,
+                    &workspace_root,
+                    permission_mode,
                     &mut context_summary,
                     &mut conversation,
                     &mut budget,
@@ -990,7 +992,7 @@ impl AgentCore {
                     cancellation.as_ref(),
                     &model_user_message,
                     &model_user_content,
-                    &tool_candidates,
+                    &mut tool_candidates,
                     &mut provider_tool_calls,
                     &mut provider_tool_results,
                     &mut pending_tool_calls,

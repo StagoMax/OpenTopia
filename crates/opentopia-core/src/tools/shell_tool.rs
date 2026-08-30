@@ -76,8 +76,7 @@ pub(super) enum BackgroundOutputActionInput {
 #[serde(
     tag = "action",
     rename_all = "snake_case",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
+    rename_all_fields = "camelCase"
 )]
 pub(super) enum BackgroundOutputInput {
     #[schemars(rename_all = "camelCase")]

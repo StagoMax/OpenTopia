@@ -51,6 +51,7 @@ impl AgentCore {
         request: CanonicalModelRequest,
         round: usize,
         provider_compatibility_hash: &str,
+        streaming_tools: &mut super::streaming_tool_execution::StreamingToolExecution,
         events: &mut TurnEvents,
         cancellation: Option<&CancellationToken>,
     ) -> anyhow::Result<ModelResponse> {
@@ -260,6 +261,34 @@ impl AgentCore {
                     latest_usage = Some(usage);
                 }
                 ModelStreamDelta::ToolCall { .. } => {}
+                ModelStreamDelta::ToolCallDone {
+                    index: _,
+                    mut call,
+                } => {
+                    if let Some(schema) = tool_input_schemas.get(&call.name) {
+                        let normalized = normalize_tool_argument_keys(schema, &mut call.arguments);
+                        if !normalized.is_empty() {
+                            events.push(AgentEventPayload::ContextWarning {
+                                stage: "tool_argument_key_normalization".to_string(),
+                                message: format!(
+                                    "Normalized tool argument key spelling to the advertised schema: {}",
+                                    normalized
+                                        .into_iter()
+                                        .map(|normalization| format!(
+                                            "{}:{} ({}→{})",
+                                            call.name,
+                                            normalization.path,
+                                            normalization.from,
+                                            normalization.to
+                                        ))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ),
+                            });
+                        }
+                    }
+                    streaming_tools.dispatch(call)?;
+                }
             }
             Ok(())
         };

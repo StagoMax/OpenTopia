@@ -477,7 +477,7 @@ fn system_prompt_prioritizes_workspace_and_limits_parent_discovery() {
 
     assert!(prompt.contains(&format!(
         "The thread workspace root is '{}'",
-        workspace.canonicalize().unwrap().display()
+        model_visible_filesystem_path(&workspace.canonicalize().unwrap())
     )));
     assert!(prompt.contains("default shell working directory is this root"));
     assert!(prompt.contains(&format!(
@@ -501,6 +501,19 @@ fn system_prompt_prioritizes_workspace_and_limits_parent_discovery() {
 
     fs::remove_dir_all(workspace).unwrap();
     fs::remove_dir_all(additional_root).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn model_visible_paths_do_not_expose_windows_verbatim_prefixes() {
+    assert_eq!(
+        model_visible_filesystem_path(Path::new(r"\\?\C:\workspace")),
+        r"C:\workspace"
+    );
+    assert_eq!(
+        model_visible_filesystem_path(Path::new(r"\\?\UNC\server\share\workspace")),
+        r"\\server\share\workspace"
+    );
 }
 
 #[tokio::test]

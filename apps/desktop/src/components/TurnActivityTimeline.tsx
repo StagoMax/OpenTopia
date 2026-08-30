@@ -1,13 +1,12 @@
 import { memo, useEffect, useId, useMemo, useState } from "react";
 import { ChevronDown, ChevronRight } from "lucide-react";
-import type { AgentEvent } from "../types";
+import type { AgentEvent, ToolResult } from "../types";
 import { shouldShowRecordedTurnChanges } from "../turnChangeOwnership";
 import type { ActiveTurnPhase } from "../turnActivityStatus";
 import { ShimmerText } from "./ui";
-import { ActivityEntryView } from "./turnActivityTimeline/activityGroups";
+import { ActivityEntryList } from "./turnActivityTimeline/ActivityEntryList";
 import {
   activityEntryIsRunning,
-  activityEntryKey,
   activityState,
   buildActivityEntries,
   type ActivityState,
@@ -30,12 +29,14 @@ export const TurnActivityTimeline = memo(function TurnActivityTimeline({
   standalone = false,
   formatError = (message) => message,
   onOpenMarkdownLink,
+  onLoadToolResultDetail,
 }: {
   events: AgentEvent[];
   isActive: boolean;
   standalone?: boolean;
   formatError?(message: string): string;
   onOpenMarkdownLink?(href: string): void;
+  onLoadToolResultDetail?(eventId: string): Promise<ToolResult>;
 }) {
   const entries = useMemo(
     () =>
@@ -99,17 +100,17 @@ export const TurnActivityTimeline = memo(function TurnActivityTimeline({
   if (!isActive && entries.length === 0 && !changeSet && !hasTurnLifecycle) {
     return null;
   }
-  const entryViews = entries.map((entry) => (
-    <ActivityEntryView
-      key={activityEntryKey(entry)}
-      entry={entry}
+  const entryList = (
+    <ActivityEntryList
+      entries={entries}
       isActive={isActive}
       traceThreadId={traceEvent?.threadId}
       traceTurnId={traceEvent?.turnId}
       formatError={formatError}
       onOpenMarkdownLink={onOpenMarkdownLink}
+      onLoadToolResultDetail={onLoadToolResultDetail}
     />
-  ));
+  );
 
   if (standalone) {
     return (
@@ -122,7 +123,7 @@ export const TurnActivityTimeline = memo(function TurnActivityTimeline({
           className="turn-activity-body"
           aria-live={isActive ? "polite" : undefined}
         >
-          {entryViews}
+          {entryList}
         </div>
       </section>
     );
@@ -161,7 +162,7 @@ export const TurnActivityTimeline = memo(function TurnActivityTimeline({
           id={bodyId}
           aria-live={isActive ? "polite" : undefined}
         >
-          {entryViews}
+          {entryList}
         </div>
       )}
     </section>

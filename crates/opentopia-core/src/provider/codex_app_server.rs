@@ -466,6 +466,10 @@ impl ModelProvider for CodexAppServerProvider {
                 name: Some(call.name.clone()),
                 arguments_delta: call.arguments.to_string(),
             })?;
+            on_delta(ModelStreamDelta::ToolCallDone {
+                index,
+                call: call.clone(),
+            })?;
         }
         if let Some(usage) = &response.usage {
             on_delta(ModelStreamDelta::Usage {

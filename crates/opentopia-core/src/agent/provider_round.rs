@@ -24,6 +24,8 @@ impl AgentCore {
         &self,
         thread_id: Uuid,
         user_message_id: Uuid,
+        workspace_root: &std::path::Path,
+        permission_mode: super::PermissionMode,
         context_summary: &mut Option<String>,
         conversation: &mut Vec<ModelConversationMessage>,
         budget: &mut Option<ContextBudget>,
@@ -36,7 +38,7 @@ impl AgentCore {
         cancellation: Option<&CancellationToken>,
         model_user_message: &str,
         model_user_content: &[ModelContentPart],
-        tool_candidates: &[ProviderToolCandidate],
+        tool_candidates: &mut Vec<ProviderToolCandidate>,
         provider_tool_calls: &mut Vec<ProviderToolCall>,
         provider_tool_results: &mut Vec<ProviderToolResult>,
         pending_tool_calls: &mut Vec<ProviderToolCall>,
@@ -156,16 +158,44 @@ impl AgentCore {
             )
             .await?;
         let rejected_request = request.logical().clone();
-        let response = match self
+        let mut streaming_tools = super::streaming_tool_execution::StreamingToolExecution::new(
+            self,
+            thread_id,
+            user_message_id,
+            workspace_root.to_path_buf(),
+            permission_mode,
+            runtime_state,
+            store.cloned(),
+            cancellation.cloned(),
+            conversation,
+            model_user_message,
+            model_user_content,
+            model_context,
+            events,
+        )?;
+        let response_result = self
             .complete_model(
                 request,
                 model_rounds.saturating_add(1),
                 compatibility_hash,
+                &mut streaming_tools,
                 events,
                 cancellation,
             )
-            .await
-        {
+            .await;
+        let tool_items_committed = streaming_tools.committed_any();
+        let streaming_execution = streaming_tools.finish().await?;
+        if let Ok(response) = response_result.as_ref() {
+            streaming_execution.validate_terminal_calls(&response.tool_calls)?;
+        }
+        let mut completed_streaming_call_ids = self.commit_streaming_tool_execution(
+            streaming_execution,
+            budget,
+            tool_candidates,
+            provider_tool_results,
+            events,
+        )?;
+        let response = match response_result {
             Ok(response) => response,
             Err(_) if cancellation.is_some_and(CancellationToken::is_cancelled) => {
                 return Ok(ProviderRoundOutcome::Finished(
@@ -175,7 +205,7 @@ impl AgentCore {
                     ),
                 ));
             }
-            Err(error) if provider_context_window_exceeded(&error) => {
+            Err(error) if !tool_items_committed && provider_context_window_exceeded(&error) => {
                 let Some(retry_request) = self
                     .request_after_context_overflow(
                         thread_id,
@@ -203,15 +233,43 @@ impl AgentCore {
                 else {
                     return Err(error);
                 };
+                let mut retry_streaming_tools =
+                    super::streaming_tool_execution::StreamingToolExecution::new(
+                        self,
+                        thread_id,
+                        user_message_id,
+                        workspace_root.to_path_buf(),
+                        permission_mode,
+                        runtime_state,
+                        store.cloned(),
+                        cancellation.cloned(),
+                        conversation,
+                        model_user_message,
+                        model_user_content,
+                        model_context,
+                        events,
+                    )?;
                 let retry = self
                     .complete_model(
                         retry_request,
                         model_rounds.saturating_add(1),
                         compatibility_hash,
+                        &mut retry_streaming_tools,
                         events,
                         cancellation,
                     )
                     .await;
+                let retry_streaming_execution = retry_streaming_tools.finish().await?;
+                if let Ok(response) = retry.as_ref() {
+                    retry_streaming_execution.validate_terminal_calls(&response.tool_calls)?;
+                }
+                completed_streaming_call_ids.extend(self.commit_streaming_tool_execution(
+                    retry_streaming_execution,
+                    budget,
+                    tool_candidates,
+                    provider_tool_results,
+                    events,
+                )?);
                 if cancellation.is_some_and(CancellationToken::is_cancelled) {
                     return Ok(ProviderRoundOutcome::Finished(
                         finalize_inbox_cancelled_turn(
@@ -250,7 +308,7 @@ impl AgentCore {
                 ),
             ));
         }
-        if !post_parse_control.steers.is_empty() {
+        if !post_parse_control.steers.is_empty() && response.tool_calls.is_empty() {
             self.append_steer_observations(
                 &post_parse_control.steers,
                 provider_tool_calls,
@@ -258,13 +316,22 @@ impl AgentCore {
                 provider_response_items,
                 events,
             );
-            // The parsed response is deliberately not committed. Any tool
-            // calls it proposed remain unstarted and therefore cannot
-            // become orphan calls or duplicate side effects.
             return Ok(ProviderRoundOutcome::Continue {
                 model_rounds,
                 rollout_reviews,
             });
+        }
+
+        let response_committed_before_decision = !post_parse_control.steers.is_empty();
+        if response_committed_before_decision {
+            provider_response_items.extend(response.provider_items.iter().cloned());
+            self.append_steer_observations(
+                &post_parse_control.steers,
+                provider_tool_calls,
+                provider_tool_results,
+                provider_response_items,
+                events,
+            );
         }
 
         match response.decision() {
@@ -319,12 +386,17 @@ impl AgentCore {
                     });
                     anyhow::bail!(message);
                 }
-                *pending_tool_calls = tool_calls;
-                runtime_state.record_tool_calls(pending_tool_calls);
+                runtime_state.record_tool_calls(&tool_calls);
+                *pending_tool_calls = tool_calls
+                    .into_iter()
+                    .filter(|call| !completed_streaming_call_ids.contains(&call.id))
+                    .collect();
             }
         }
-        provider_response_items.extend(response.provider_items);
-        provider_tool_calls.extend(pending_tool_calls.clone());
+        if !response_committed_before_decision {
+            provider_response_items.extend(response.provider_items.iter().cloned());
+        }
+        provider_tool_calls.extend(response.tool_calls.iter().cloned());
         if let Some(budget) = budget.as_mut() {
             budget.record_tokens(0);
         }

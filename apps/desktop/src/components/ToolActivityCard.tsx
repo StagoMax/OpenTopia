@@ -22,6 +22,7 @@ import {
   Wrench,
 } from "lucide-react";
 import type { ToolCall, ToolResult } from "../types";
+import { conversationToolDetailRef } from "../toolResultDetail";
 import {
   buildToolActivity,
   buildToolActivitySummary,
@@ -31,7 +32,7 @@ import {
   type ToolActivityView,
 } from "../toolActivity";
 import { FileTypeIcon } from "./FileTypeIcon";
-import { ShimmerText } from "./ui";
+import { Button, ShimmerText } from "./ui";
 import "./ToolActivityCard.css";
 
 export type ToolSandboxState = {
@@ -138,6 +139,7 @@ type ToolActivityCardProps = {
   sandbox?: ToolSandboxState | null;
   streaming?: boolean;
   defaultExpanded?: boolean;
+  onLoadResultDetail?(eventId: string): Promise<ToolResult>;
 };
 
 export const ToolActivityCard = memo(function ToolActivityCard({
@@ -147,6 +149,7 @@ export const ToolActivityCard = memo(function ToolActivityCard({
   sandbox,
   streaming = false,
   defaultExpanded = false,
+  onLoadResultDetail,
 }: ToolActivityCardProps) {
   const view = useMemo(
     () => getCachedToolActivityView(call, result, "summary"),
@@ -188,7 +191,13 @@ export const ToolActivityCard = memo(function ToolActivityCard({
       streaming={streaming}
       defaultExpanded={defaultExpanded}
     >
-      {() => <ToolActivityDetails call={call} result={result} />}
+      {() => (
+        <ToolActivityDetails
+          call={call}
+          result={result}
+          onLoadResultDetail={onLoadResultDetail}
+        />
+      )}
     </ActivityCallCard>
   );
 }, toolActivityCardPropsEqual);
@@ -196,16 +205,98 @@ export const ToolActivityCard = memo(function ToolActivityCard({
 function ToolActivityDetails({
   call,
   result,
+  onLoadResultDetail,
 }: {
   call: ToolCall;
   result?: ToolResult;
+  onLoadResultDetail?(eventId: string): Promise<ToolResult>;
 }) {
+  const detailRef = conversationToolDetailRef(result);
+  const [retryNonce, setRetryNonce] = useState(0);
+  const [detailState, setDetailState] = useState<ToolResultDetailState>({
+    status: "idle",
+  });
+
+  useEffect(() => {
+    if (!result || !detailRef || !onLoadResultDetail) {
+      setDetailState({ status: "idle" });
+      return;
+    }
+    let active = true;
+    setDetailState({ source: result, status: "loading" });
+    let request = toolResultDetailRequests.get(result);
+    if (!request) {
+      request = onLoadResultDetail(detailRef.eventId);
+      toolResultDetailRequests.set(result, request);
+    }
+    void request.then(
+      (detail) => {
+        if (active) {
+          setDetailState({ source: result, status: "ready", result: detail });
+        }
+      },
+      (error: unknown) => {
+        if (toolResultDetailRequests.get(result) === request) {
+          toolResultDetailRequests.delete(result);
+        }
+        if (active) {
+          setDetailState({
+            source: result,
+            status: "error",
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      },
+    );
+    return () => {
+      active = false;
+    };
+  }, [detailRef?.eventId, onLoadResultDetail, result, retryNonce]);
+
+  const currentState =
+    "source" in detailState && detailState.source === result
+      ? detailState
+      : null;
+  const resolvedResult =
+    currentState?.status === "ready" ? currentState.result : result;
   const view = useMemo(
-    () => getCachedToolActivityView(call, result, "details"),
-    [call, result],
+    () => getCachedToolActivityView(call, resolvedResult, "details"),
+    [call, resolvedResult],
   );
+  if (detailRef && onLoadResultDetail && currentState?.status !== "ready") {
+    if (currentState?.status === "error") {
+      return (
+        <div className="tool-panel tool-panel-detail-status" role="alert">
+          <span title={currentState.error}>完整工具输出加载失败。</span>
+          <Button
+            size="compact"
+            variant="quiet"
+            onClick={() => setRetryNonce((value) => value + 1)}
+          >
+            重试
+          </Button>
+        </div>
+      );
+    }
+    return (
+      <div className="tool-panel is-pending" role="status">
+        正在加载完整工具输出…
+      </div>
+    );
+  }
   return <ToolActivityBodyView body={view.body} view={view} />;
 }
+
+type ToolResultDetailState =
+  | { status: "idle" }
+  | { source: ToolResult; status: "loading" }
+  | { source: ToolResult; status: "ready"; result: ToolResult }
+  | { source: ToolResult; status: "error"; error: string };
+
+const toolResultDetailRequests = new WeakMap<
+  ToolResult,
+  Promise<ToolResult>
+>();
 
 type ToolActivityViewMode = "summary" | "details";
 
@@ -255,6 +346,7 @@ function toolActivityCardPropsEqual(
     previous.timing === next.timing &&
     previous.streaming === next.streaming &&
     previous.defaultExpanded === next.defaultExpanded &&
+    previous.onLoadResultDetail === next.onLoadResultDetail &&
     toolSandboxEqual(previous.sandbox, next.sandbox)
   );
 }

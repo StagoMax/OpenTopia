@@ -518,6 +518,152 @@ fn responses_input_replays_typed_items_and_correlates_tool_outputs() {
     );
 }
 
+#[test]
+fn responses_transcript_keeps_parallel_tool_history_append_only() {
+    let call = |id: &str| ProviderToolCall {
+        id: id.to_string(),
+        name: "lookup".to_string(),
+        arguments: json!({ "id": id }),
+    };
+    let result = |id: &str| ProviderToolResult {
+        call_id: id.to_string(),
+        name: "lookup".to_string(),
+        output: format!("result-{id}"),
+        content: Vec::new(),
+        is_error: false,
+        metadata: json!({}),
+    };
+
+    let first_input = responses_input(&model_request());
+    let first_calls = vec![call("call_1"), call("call_2")];
+    let mut first_completed = first_input.clone();
+    first_completed.extend([
+        json!({ "type": "reasoning", "id": "rs_1", "encrypted_content": "opaque-1" }),
+        json!({ "type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{\"id\":\"call_1\"}" }),
+        json!({ "type": "function_call", "call_id": "call_2", "name": "lookup", "arguments": "{\"id\":\"call_2\"}" }),
+    ]);
+
+    let mut second = model_request();
+    second.provider_transcript = Some(ProviderWireTranscript {
+        format: OPENAI_RESPONSES_COMPLETED_TRANSCRIPT_FORMAT.to_string(),
+        items: first_completed,
+    });
+    second.instructions.items.push(ModelContextItem::text(
+        ContextItemKind::Environment,
+        ContextRole::Developer,
+        "round-two-state",
+        "round two context",
+        ContextCacheScope::Turn,
+        crate::model_context::ContextSensitivity::Workspace,
+    ));
+    second.input.tool_calls = first_calls.clone();
+    second.input.tool_results = vec![result("call_1"), result("call_2")];
+    let second_input = responses_input(&second);
+
+    assert_eq!(&second_input[..first_input.len()], first_input.as_slice());
+    let position = |items: &[Value], kind: &str, call_id: &str| {
+        items
+            .iter()
+            .position(|item| item["type"] == kind && item["call_id"] == call_id)
+            .expect("typed call item")
+    };
+    assert!(
+        position(&second_input, "function_call", "call_2")
+            < position(&second_input, "function_call_output", "call_1")
+    );
+    let round_two_context = second_input
+        .iter()
+        .position(|item| item.to_string().contains("round two context"))
+        .expect("current round context is appended");
+    assert!(
+        position(&second_input, "function_call", "call_2") < round_two_context
+            && round_two_context < position(&second_input, "function_call_output", "call_1")
+    );
+
+    let mut second_completed = second_input.clone();
+    second_completed.extend([
+        json!({ "type": "reasoning", "id": "rs_2", "encrypted_content": "opaque-2" }),
+        json!({ "type": "function_call", "call_id": "call_3", "name": "lookup", "arguments": "{\"id\":\"call_3\"}" }),
+    ]);
+    let mut third = model_request();
+    third.provider_transcript = Some(ProviderWireTranscript {
+        format: OPENAI_RESPONSES_COMPLETED_TRANSCRIPT_FORMAT.to_string(),
+        items: second_completed,
+    });
+    third.input.tool_calls = vec![
+        first_calls[0].clone(),
+        first_calls[1].clone(),
+        call("call_3"),
+    ];
+    third.input.tool_results = vec![result("call_1"), result("call_2"), result("call_3")];
+    let third_input = responses_input(&third);
+
+    assert_eq!(
+        &third_input[..second_input.len()],
+        second_input.as_slice(),
+        "a later Responses round must extend the exact prior request"
+    );
+    assert!(
+        position(&third_input, "function_call_output", "call_1")
+            < position(&third_input, "function_call", "call_3"),
+        "new provider calls must not move ahead of earlier tool outputs"
+    );
+}
+
+#[test]
+fn failed_responses_request_transcript_is_the_next_turns_strict_prefix() {
+    let mut failed = layered_model_request();
+    failed.input.current_user.message = "request that failed".to_string();
+    let failed_request = responses_input(&failed);
+
+    let mut next = layered_model_request();
+    next.input.current_user.message = "continue after failure".to_string();
+    next.input.conversation = vec![ModelConversationMessage {
+        role: ModelConversationRole::User,
+        content: "reconstructed failed turn".to_string(),
+        content_parts: Vec::new(),
+        tool_calls: Vec::new(),
+        tool_results: Vec::new(),
+    }];
+    next.provider_transcript = Some(ProviderWireTranscript {
+        format: OPENAI_RESPONSES_REQUEST_TRANSCRIPT_FORMAT.to_string(),
+        items: failed_request.clone(),
+    });
+
+    let next_request = responses_input(&next);
+    assert_eq!(
+        next_request[..failed_request.len()],
+        failed_request,
+        "a failed Responses request must remain the exact next-request prefix"
+    );
+    assert_eq!(next_request[failed_request.len()]["role"], "user");
+    assert_eq!(
+        next_request[failed_request.len()]["content"],
+        "continue after failure"
+    );
+    assert!(!next_request
+        .iter()
+        .any(|item| item["content"] == "reconstructed failed turn"));
+}
+
+#[test]
+fn completed_responses_transcript_appends_the_next_turn_user() {
+    let prior = vec![
+        json!({ "role": "user", "content": "prior" }),
+        json!({ "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}] }),
+    ];
+    let mut next = model_request();
+    next.provider_transcript = Some(ProviderWireTranscript {
+        format: OPENAI_RESPONSES_COMPLETED_TRANSCRIPT_FORMAT.to_string(),
+        items: prior.clone(),
+    });
+
+    let input = responses_input(&next);
+    assert_eq!(&input[..prior.len()], prior.as_slice());
+    assert_eq!(input[prior.len()]["role"], "user");
+    assert_eq!(input[prior.len()]["content"], "current");
+}
+
 #[tokio::test]
 async fn responses_provider_prepares_redacted_body_and_collects_typed_stream() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -596,7 +742,14 @@ async fn responses_provider_prepares_redacted_body_and_collects_typed_stream() {
         response.tool_calls[0].arguments,
         json!({ "path": "Cargo.toml" })
     );
-    assert_eq!(response.provider_items.len(), 1);
+    assert_eq!(response.provider_items.len(), 2);
+    let transcript = provider_wire_transcript(response.provider_items.last().unwrap())
+        .expect("Responses transcript candidate");
+    assert_eq!(
+        transcript.format,
+        OPENAI_RESPONSES_COMPLETED_TRANSCRIPT_FORMAT
+    );
+    assert_eq!(transcript.items.last().unwrap()["call_id"], "call_1");
     let usage = response.usage.unwrap();
     assert_eq!(usage.total_tokens, 25);
     assert_eq!(usage.cached_input_tokens, Some(12));

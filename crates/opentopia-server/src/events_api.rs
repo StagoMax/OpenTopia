@@ -10,7 +10,7 @@ use opentopia_core::collaboration::{
 };
 use opentopia_core::{
     AgentActivityNotification, AgentEvent, AgentEventPayload, DesktopStreamEnvelope,
-    DesktopStreamKind, SessionStore, TurnRecord,
+    DesktopStreamKind, SessionStore, ToolResult, TurnRecord,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -24,6 +24,10 @@ pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/api/threads/:thread_id/events", get(list_events))
         .route("/api/threads/:thread_id/events/stream", get(stream_events))
+        .route(
+            "/api/threads/:thread_id/events/:event_id/tool-result",
+            get(get_tool_result_detail),
+        )
         .route("/api/activity/events/stream", get(stream_activity_events))
         .route("/api/activity/statuses", get(list_activity_statuses))
         .route("/api/threads/:thread_id/agents", get(list_agent_threads))
@@ -75,6 +79,7 @@ async fn list_events(
     Query(query): Query<EventQuery>,
 ) -> Result<Json<Vec<AgentEvent>>, ApiError> {
     ensure_thread(&state, thread_id)?;
+    let conversation_view = matches!(query.view, Some(EventView::Conversation));
     let store = state.store.clone();
     let events = tokio::task::spawn_blocking(move || match query.view {
         Some(EventView::Conversation) if query.limit.is_some() || query.before.is_some() => store
@@ -89,7 +94,31 @@ async fn list_events(
     })
     .await
     .map_err(|error| ApiError::internal(format!("event history task failed: {error}")))??;
+    let events = if conversation_view {
+        events
+            .into_iter()
+            .filter_map(project_conversation_event)
+            .collect()
+    } else {
+        events
+    };
     Ok(Json(events))
+}
+
+async fn get_tool_result_detail(
+    State(state): State<AppState>,
+    Path((thread_id, event_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<ToolResult>, ApiError> {
+    ensure_thread(&state, thread_id)?;
+    let store = state.store.clone();
+    let event = tokio::task::spawn_blocking(move || store.get_event(thread_id, event_id))
+        .await
+        .map_err(|error| ApiError::internal(format!("tool result task failed: {error}")))??
+        .ok_or_else(|| ApiError::not_found("tool result event was not found"))?;
+    match event.payload {
+        AgentEventPayload::ToolCallFinished { result } => Ok(Json(result)),
+        _ => Err(ApiError::not_found("event does not contain a tool result")),
+    }
 }
 
 async fn stream_events(
@@ -256,12 +285,19 @@ async fn stream_agent_events(
 }
 
 pub(super) fn project_conversation_event(mut event: AgentEvent) -> Option<AgentEvent> {
-    event.payload = project_conversation_payload(event.payload)?;
+    event.payload = project_conversation_payload_inner(event.payload, Some(event.id))?;
     Some(event)
 }
 
 pub(super) fn project_conversation_payload(
+    payload: AgentEventPayload,
+) -> Option<AgentEventPayload> {
+    project_conversation_payload_inner(payload, None)
+}
+
+fn project_conversation_payload_inner(
     mut payload: AgentEventPayload,
+    detail_event_id: Option<Uuid>,
 ) -> Option<AgentEventPayload> {
     match &mut payload {
         AgentEventPayload::ReasoningDelta { .. } => return None,
@@ -270,7 +306,13 @@ pub(super) fn project_conversation_payload(
         AgentEventPayload::ProviderRequestSent { body, .. }
         | AgentEventPayload::ProviderRequestRetried { body, .. }
         | AgentEventPayload::ProviderResponseReceived { body, .. } => *body = Value::Null,
-        AgentEventPayload::ToolCallFinished { result } => result.content.clear(),
+        AgentEventPayload::ToolCallFinished { result } => {
+            if let Some(event_id) = detail_event_id {
+                *result = result.conversation_summary(event_id);
+            } else {
+                result.content.clear();
+            }
+        }
         _ => {}
     }
     Some(payload)

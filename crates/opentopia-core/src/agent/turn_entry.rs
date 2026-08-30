@@ -68,7 +68,7 @@ impl AgentCore {
             )
         });
         let lineage_instructions = self.lineage_instructions();
-        let tool_candidates = self.provider_tool_candidates();
+        let mut tool_candidates = self.provider_tool_candidates();
         let model_context =
             self.kernel
                 .context_assembler
@@ -174,16 +174,44 @@ impl AgentCore {
             )
             .await?;
         let rejected_opening_request = opening_request.logical().clone();
-        let response = match self
+        let mut streaming_tools = super::streaming_tool_execution::StreamingToolExecution::new(
+            self,
+            input.thread_id,
+            input.user_message_id,
+            input.workspace_root.clone(),
+            input.permission_mode,
+            &runtime_state,
+            input.store.clone(),
+            input.cancellation.clone(),
+            &input.conversation,
+            &model_user_message,
+            &input.user_content,
+            &model_context,
+            &events,
+        )?;
+        let response_result = self
             .complete_model(
                 opening_request,
                 1,
                 &provider_compatibility_hash,
+                &mut streaming_tools,
                 &mut events,
                 input.cancellation.as_ref(),
             )
-            .await
-        {
+            .await;
+        let tool_items_committed = streaming_tools.committed_any();
+        let streaming_execution = streaming_tools.finish().await?;
+        if let Ok(response) = response_result.as_ref() {
+            streaming_execution.validate_terminal_calls(&response.tool_calls)?;
+        }
+        let mut completed_streaming_call_ids = self.commit_streaming_tool_execution(
+            streaming_execution,
+            &mut budget,
+            &mut tool_candidates,
+            &mut opening_provider_tool_results,
+            &mut events,
+        )?;
+        let response = match response_result {
             Ok(response) => response,
             Err(_)
                 if input
@@ -193,7 +221,7 @@ impl AgentCore {
             {
                 return Ok(finalize_inbox_cancelled_turn(input.thread_id, events));
             }
-            Err(error) if provider_context_window_exceeded(&error) => {
+            Err(error) if !tool_items_committed && provider_context_window_exceeded(&error) => {
                 let Some(retry_request) = self
                     .request_after_context_overflow(
                         input.thread_id,
@@ -221,15 +249,43 @@ impl AgentCore {
                 else {
                     return Err(error);
                 };
+                let mut retry_streaming_tools =
+                    super::streaming_tool_execution::StreamingToolExecution::new(
+                        self,
+                        input.thread_id,
+                        input.user_message_id,
+                        input.workspace_root.clone(),
+                        input.permission_mode,
+                        &runtime_state,
+                        input.store.clone(),
+                        input.cancellation.clone(),
+                        &input.conversation,
+                        &model_user_message,
+                        &input.user_content,
+                        &model_context,
+                        &events,
+                    )?;
                 let retry = self
                     .complete_model(
                         retry_request,
                         1,
                         &provider_compatibility_hash,
+                        &mut retry_streaming_tools,
                         &mut events,
                         input.cancellation.as_ref(),
                     )
                     .await;
+                let retry_streaming_execution = retry_streaming_tools.finish().await?;
+                if let Ok(response) = retry.as_ref() {
+                    retry_streaming_execution.validate_terminal_calls(&response.tool_calls)?;
+                }
+                completed_streaming_call_ids.extend(self.commit_streaming_tool_execution(
+                    retry_streaming_execution,
+                    &mut budget,
+                    &mut tool_candidates,
+                    &mut opening_provider_tool_results,
+                    &mut events,
+                )?);
                 if input
                     .cancellation
                     .as_ref()
@@ -256,7 +312,7 @@ impl AgentCore {
         if post_parse_control.cancelled {
             return Ok(finalize_inbox_cancelled_turn(input.thread_id, events));
         }
-        if !post_parse_control.steers.is_empty() {
+        if !post_parse_control.steers.is_empty() && response.tool_calls.is_empty() {
             self.append_steer_observations(
                 &post_parse_control.steers,
                 &mut opening_provider_tool_calls,
@@ -297,6 +353,21 @@ impl AgentCore {
         }
         let mut provider_response_items = opening_provider_response_items.clone();
         provider_response_items.extend(response.provider_items.iter().cloned());
+        if !post_parse_control.steers.is_empty() {
+            self.append_steer_observations(
+                &post_parse_control.steers,
+                &mut opening_provider_tool_calls,
+                &mut opening_provider_tool_results,
+                &mut provider_response_items,
+                &mut events,
+            );
+        }
+        let pending_tool_calls = response
+            .tool_calls
+            .iter()
+            .filter(|call| !completed_streaming_call_ids.contains(&call.id))
+            .cloned()
+            .collect::<Vec<_>>();
         match response.decision() {
             ModelDecision::Incomplete(reason) => {
                 return Err(incomplete_model_response(reason, &response));
@@ -401,7 +472,7 @@ impl AgentCore {
             tool_candidates,
             opening_provider_tool_calls,
             opening_provider_tool_results,
-            response.tool_calls,
+            pending_tool_calls,
             String::new(),
             provider_response_items,
             branch_developer_instructions,

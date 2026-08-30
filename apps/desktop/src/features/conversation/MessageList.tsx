@@ -53,6 +53,7 @@ import type {
   Message,
   TurnFileChange,
   TurnFileDiffPreview,
+  ToolResult,
 } from "../../types";
 import { ConversationLoadingIndicator } from "./ConversationLoadingIndicator";
 import { MessagePartView } from "./MessagePartView";
@@ -86,6 +87,7 @@ export type MessageListProps = {
     path: string,
     offset?: number,
   ): Promise<TurnFileDiffPreview>;
+  onLoadToolResultDetail?(eventId: string): Promise<ToolResult>;
   onLoadOlderMessages?(): Promise<void>;
   onRetrySync?(): void;
 };
@@ -113,6 +115,7 @@ export function MessageList({
   onReviewChanges,
   onOpenFileReview,
   onLoadTurnFilePreview,
+  onLoadToolResultDetail,
   onLoadOlderMessages,
   onRetrySync,
 }: MessageListProps) {
@@ -421,6 +424,7 @@ export function MessageList({
                         isActive={activeTurnId === turnId}
                         formatError={friendlyProviderError}
                         onOpenMarkdownLink={onOpenMarkdownLink}
+                        onLoadToolResultDetail={onLoadToolResultDetail}
                       />
                       {!turnsWithAssistantCards.has(turnId) &&
                         renderTurnChangeCard(turnId)}
@@ -460,6 +464,7 @@ export function MessageList({
                 standalone
                 formatError={friendlyProviderError}
                 onOpenMarkdownLink={onOpenMarkdownLink}
+                onLoadToolResultDetail={onLoadToolResultDetail}
               />
             );
           })}

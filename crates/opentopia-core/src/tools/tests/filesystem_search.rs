@@ -89,6 +89,38 @@ async fn search_tool_finds_exact_symbol_definitions_and_references_across_files(
 }
 
 #[tokio::test]
+async fn search_tool_treats_an_empty_path_as_the_workspace_root() {
+    let workspace_root =
+        std::env::temp_dir().join(format!("opentopia-search-empty-path-{}", Uuid::new_v4()));
+    fs::create_dir_all(&workspace_root).unwrap();
+    fs::write(workspace_root.join("root.txt"), "find-me-here\n").unwrap();
+    let policy = Arc::new(BasicPolicyEngine::new(
+        workspace_root.clone(),
+        PermissionMode::FullAccess,
+    ));
+    let context = ToolInvocationContext::local(workspace_root.clone(), policy);
+
+    let searched = WorkspaceSearchTool
+        .execute(
+            ToolCall::new(
+                "workspace_search",
+                json!({
+                    "query": "find-me-here",
+                    "path": "",
+                    "fixedStrings": true
+                }),
+            ),
+            context,
+        )
+        .await
+        .unwrap();
+
+    assert!(searched.output.contains("root.txt"));
+    assert_eq!(searched.metadata["matches"], 1);
+    fs::remove_dir_all(workspace_root).unwrap();
+}
+
+#[tokio::test]
 async fn search_tool_returns_numbered_utf8_context_and_structured_location() {
     let workspace_root =
         std::env::temp_dir().join(format!("opentopia-search-context-{}", Uuid::new_v4()));

@@ -41,6 +41,7 @@ pub(in crate::provider) use codec::{
     compile_openai_tools, legacy_tool_observation, nonredundant_tool_result_content,
     openai_messages_with_reasoning, openai_portable_messages_with_reasoning,
     provider_tool_result_content, responses_input, OPENAI_CHAT_ASSISTANT_STATE_TYPE,
+    OPENAI_RESPONSES_COMPLETED_TRANSCRIPT_FORMAT, OPENAI_RESPONSES_REQUEST_TRANSCRIPT_FORMAT,
 };
 #[cfg(test)]
 pub(in crate::provider) use codec::{
@@ -1446,6 +1447,10 @@ pub(super) async fn decode_openai_chat_response(
                     name: Some(call.name.clone()),
                     arguments_delta: call.arguments.to_string(),
                 })?;
+                on_delta(ModelStreamDelta::ToolCallDone {
+                    index,
+                    call: call.clone(),
+                })?;
             }
             if let Some(usage) = response.usage.clone() {
                 on_delta(ModelStreamDelta::Usage { usage })?;
@@ -1481,7 +1486,10 @@ pub(super) async fn decode_openai_chat_response(
             accumulator.apply(&event, on_delta)?;
         }
     }
-    validate_provider_response_protocol(accumulator.finish_with_tools(tool_candidates)?)
+    let response =
+        validate_provider_response_protocol(accumulator.finish_with_tools(tool_candidates)?)?;
+    emit_completed_tool_calls(&response, on_delta)?;
+    Ok(response)
 }
 
 pub(super) fn validate_provider_response_protocol(
@@ -1511,9 +1519,26 @@ pub(super) fn emit_response_deltas(
             name: Some(call.name.clone()),
             arguments_delta: call.arguments.to_string(),
         })?;
+        on_delta(ModelStreamDelta::ToolCallDone {
+            index,
+            call: call.clone(),
+        })?;
     }
     if let Some(usage) = response.usage.clone() {
         on_delta(ModelStreamDelta::Usage { usage })?;
+    }
+    Ok(())
+}
+
+fn emit_completed_tool_calls(
+    response: &ModelResponse,
+    on_delta: &mut ModelStreamCallback<'_>,
+) -> anyhow::Result<()> {
+    for (index, call) in response.tool_calls.iter().enumerate() {
+        on_delta(ModelStreamDelta::ToolCallDone {
+            index,
+            call: call.clone(),
+        })?;
     }
     Ok(())
 }
@@ -1841,6 +1866,14 @@ impl OpenAiResponsesProvider {
             }
         }
 
+        let wire_transcript =
+            request
+                .previous_response_id
+                .is_none()
+                .then(|| ProviderWireTranscript {
+                    format: OPENAI_RESPONSES_REQUEST_TRANSCRIPT_FORMAT.to_string(),
+                    items: payload["input"].as_array().cloned().unwrap_or_default(),
+                });
         Ok(PreparedProviderRequest {
             request_id,
             adapter: "openai_responses".to_string(),
@@ -1850,7 +1883,7 @@ impl OpenAiResponsesProvider {
             cache_trace: crate::build_provider_cache_trace(&payload, None, false),
             body: payload,
             logical_request: request,
-            wire_transcript: None,
+            wire_transcript,
             tool_contracts: compiled_tools.contracts,
             response_commit: if tool_capable {
                 ProviderResponseCommitMode::Atomic
@@ -1914,7 +1947,13 @@ pub(super) async fn decode_openai_responses_response(
             accumulator.apply(&event, on_delta)?;
         }
     }
-    validate_provider_response_protocol(accumulator.finish_with_tools(tool_candidates)?)
+    let response =
+        validate_provider_response_protocol(accumulator.finish_with_tools(tool_candidates)?)?;
+    // Responses normally commits calls from `response.output_item.done`. Emit
+    // the terminal response calls as a compatibility fallback; the agent
+    // deduplicates by provider call id.
+    emit_completed_tool_calls(&response, on_delta)?;
+    Ok(response)
 }
 
 // Protocol codec implementation is defined in the child modules above.

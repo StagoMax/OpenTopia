@@ -71,6 +71,15 @@
   animation: none;
 }
 
+.turn-activity-virtual-chunk {
+  min-width: 0;
+  overflow-anchor: auto;
+}
+
+.turn-activity-virtual-chunk:not([data-mounted]) {
+  pointer-events: none;
+}
+
 .turn-change-card {
   width: 100%;
   max-width: 700px;

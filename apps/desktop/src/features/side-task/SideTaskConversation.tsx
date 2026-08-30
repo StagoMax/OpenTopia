@@ -394,6 +394,7 @@ export function SideTaskConversation({
               ? client.getTurnFileDiffPreview(thread.id, turnId, path, offset)
               : Promise.reject(new Error("服务尚未连接"))
           }
+          onLoadToolResultDetail={sessionController?.loadToolResultDetail}
         />
       )}
       {actionError || sessionError ? (

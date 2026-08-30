@@ -43,8 +43,7 @@ pub(super) enum FilesystemFindKind {
 #[serde(
     tag = "operation",
     rename_all = "snake_case",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
+    rename_all_fields = "camelCase"
 )]
 pub(super) enum FilesystemInput {
     Read {
@@ -135,7 +134,7 @@ impl FilesystemInput {
         match self {
             Self::Read { path, .. } | Self::Stat { path } => vec![PathBuf::from(path)],
             Self::List { path, .. } | Self::Find { path, .. } => {
-                vec![PathBuf::from(path.as_deref().unwrap_or("."))]
+                vec![PathBuf::from(directory_path(path.as_deref()))]
             }
             Self::Copy { source, .. } | Self::Move { source, .. } => {
                 vec![PathBuf::from(source)]
@@ -173,7 +172,7 @@ impl FilesystemInput {
             | Self::Stat { path }
             | Self::Delete { path } => vec![tool_resource_key("file", path)],
             Self::List { path, .. } | Self::Find { path, .. } => {
-                vec![tool_resource_key("tree", path.as_deref().unwrap_or("."))]
+                vec![tool_resource_key("tree", directory_path(path.as_deref()))]
             }
             Self::Copy {
                 source,
@@ -260,7 +259,7 @@ impl TypedTool for FilesystemTool {
                 expected_hash,
             } => write_file(call_id, &path, content, expected_hash.as_deref(), &ctx).await,
             FilesystemInput::List { path, limit } => {
-                list_directory(call_id, path.as_deref().unwrap_or("."), limit, &ctx).await
+                list_directory(call_id, directory_path(path.as_deref()), limit, &ctx).await
             }
             FilesystemInput::Find {
                 path,
@@ -272,7 +271,7 @@ impl TypedTool for FilesystemTool {
             } => {
                 find_entries(
                     call_id,
-                    path.as_deref().unwrap_or("."),
+                    directory_path(path.as_deref()),
                     &name_contains,
                     case_sensitive,
                     kind,
@@ -751,6 +750,12 @@ fn normalized_path(ctx: &ToolInvocationContext, raw_path: &str) -> anyhow::Resul
     normalize_workspace_path(&ctx.workspace_root, raw_path)
 }
 
+fn directory_path(path: Option<&str>) -> &str {
+    path.map(str::trim)
+        .filter(|path| !path.is_empty())
+        .unwrap_or(".")
+}
+
 impl FilesystemFindKind {
     fn matches(self, file_type: &std::fs::FileType) -> bool {
         match self {
@@ -1140,6 +1145,33 @@ mod tests {
         assert_eq!(value["entries"].as_array().unwrap().len(), 1);
         assert_eq!(value["truncated"], true);
         assert_eq!(value["truncationReason"], "match_limit");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn directory_operations_treat_empty_path_as_workspace_root() {
+        let (root, context) = fixture();
+        fs::write(root.join("root.txt"), "root").unwrap();
+        let input = json!({
+            "operation": "list",
+            "path": "",
+            "kind": "directory",
+            "maxDepth": 2,
+            "limit": 20
+        });
+        assert_eq!(Tool::input_error(&FilesystemTool, &input), None);
+
+        let listed = FilesystemTool
+            .execute(ToolCall::new("filesystem", input), context)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&listed.output).unwrap();
+        assert!(value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "root.txt"));
+        assert_eq!(listed.metadata["path"], ".");
         fs::remove_dir_all(root).unwrap();
     }
 

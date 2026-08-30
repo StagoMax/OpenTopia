@@ -330,7 +330,7 @@ fn conversation_retry_event_preserves_reconnect_progress() {
         body: serde_json::json!({"secret": "removed"}),
     };
     let full = serde_json::to_string(&payload).expect("serialize full payload");
-    let compact = conversation_payload_json(&payload, &full)
+    let compact = conversation_payload_json(Uuid::new_v4(), &payload, &full)
         .expect("project conversation payload")
         .expect("retry event remains visible");
     let projected: AgentEventPayload =
@@ -433,7 +433,10 @@ fn conversation_event_view_removes_diagnostic_bodies_and_hidden_reasoning() {
     assert!(matches!(
         &conversation[2].payload,
         AgentEventPayload::ToolCallFinished { result }
-            if result.content.is_empty() && result.output.len() == 11_000
+            if result.content.is_empty()
+                && result.output.len() < 11_000
+                && result.metadata[crate::CONVERSATION_TOOL_DETAIL_METADATA_KEY]["eventId"]
+                    == serde_json::json!(raw[3].id)
     ));
     assert!(conversation
         .iter()
@@ -446,8 +449,21 @@ fn conversation_event_view_removes_diagnostic_bodies_and_hidden_reasoning() {
     assert!(matches!(
         &turn_tool_results[0].payload,
         AgentEventPayload::ToolCallFinished { result }
-            if result.content.is_empty() && result.output.len() == 11_000
+            if result.content.is_empty() && result.output.len() < 11_000
     ));
+
+    let full_tool_event = store
+        .get_event(thread.id, raw[3].id)
+        .expect("load canonical tool event")
+        .expect("canonical tool event exists");
+    assert!(matches!(
+        full_tool_event.payload,
+        AgentEventPayload::ToolCallFinished { result } if result.output.len() == 11_000
+    ));
+    assert!(store
+        .get_event(Uuid::new_v4(), raw[3].id)
+        .expect("scope canonical event lookup to its thread")
+        .is_none());
 
     let context = store
         .list_context_events(thread.id)

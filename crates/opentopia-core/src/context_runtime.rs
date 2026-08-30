@@ -686,6 +686,43 @@ mod tests {
     }
 
     #[test]
+    fn newest_provider_transcript_candidate_is_promoted_during_active_turn() {
+        let context = CompiledModelContext::default();
+        let old = crate::provider::ProviderWireTranscript {
+            format: "test_wire_v1".to_string(),
+            items: vec![json!({ "role": "user", "content": "old" })],
+        };
+        let current = crate::provider::ProviderWireTranscript {
+            format: "test_wire_v1".to_string(),
+            items: vec![
+                json!({ "role": "user", "content": "old" }),
+                json!({ "role": "assistant", "content": "current" }),
+            ],
+        };
+        let native_state = json!({
+            "type": "reasoning",
+            "id": "reasoning_1",
+            "encrypted_content": "opaque",
+        });
+        let mut assembly = input(&context, "next");
+        assembly.previous_response_items = vec![
+            crate::provider::provider_transcript_state_item(&old),
+            native_state.clone(),
+            crate::provider::provider_transcript_candidate_item(&current),
+        ];
+
+        let request = DefaultContextAssembler
+            .compile(assembly)
+            .expect("request compiles");
+
+        assert_eq!(request.logical().provider_transcript, Some(current));
+        assert_eq!(
+            request.logical().previous_response_items,
+            vec![native_state]
+        );
+    }
+
+    #[test]
     fn assembler_is_an_object_safe_runtime_port() {
         let assembler: &dyn ContextAssembler = &DefaultContextAssembler;
         let request = assembler

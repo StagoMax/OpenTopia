@@ -15448,6 +15448,9 @@
         }
       ]
     },
+    "getToolResultDetail": {
+      "$ref": "#/definitions/ToolResult"
+    },
     "getTurnChanges": {
       "$ref": "#/definitions/TurnChangeSet"
     },
@@ -15942,6 +15945,7 @@
     "getSpreadsheetPreview",
     "getSpreadsheetPreviewRange",
     "getThreadCapabilities",
+    "getToolResultDetail",
     "getTurnChanges",
     "getTurnFileDiffPreview",
     "getWindowsSandboxSetup",
