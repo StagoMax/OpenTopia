@@ -25,6 +25,8 @@ import {
   authSchemeLabel,
   authVerificationLabel,
   connectionAccountLabel,
+  connectionProblemAreaLabel,
+  connectionProblems,
   connectionStatusLabel,
   connectionStatusVariant,
   integrationKindLabel,
@@ -74,6 +76,7 @@ export function ConnectionDetails({
     snapshot.lastHealth?.connectionId === connection.id
       ? snapshot.lastHealth.health
       : null;
+  const problems = connectionProblems(connection);
 
   return (
     <article className={`connection-details connection-details--${variant}`}>
@@ -123,6 +126,48 @@ export function ConnectionDetails({
             </Button>
           </div>
         </header>
+      ) : null}
+
+      {variant === "core" && problems.length > 0 ? (
+        <Panel
+          actions={
+            <div className="connection-attention__actions">
+              <Button
+                disabled={busy}
+                onClick={() => store.beginEdit()}
+                size="compact"
+                variant="quiet"
+              >
+                <Pencil aria-hidden="true" size={14} />
+                编辑配置
+              </Button>
+              <Button
+                disabled={busy || !connection.enabled}
+                onClick={() => void store.test(connection.id)}
+                size="compact"
+                variant="secondary"
+              >
+                <RotateCw aria-hidden="true" size={14} />
+                {testing ? "测试中…" : "测试连接"}
+              </Button>
+            </div>
+          }
+          className="connection-attention"
+          title={`${connection.name} · 需要处理`}
+        >
+          <div className="connection-attention__issues">
+            {problems.map((problem) => (
+              <div className="connection-attention__issue" key={problem.code}>
+                <AlertTriangle aria-hidden="true" size={16} />
+                <span>
+                  <small>{connectionProblemAreaLabel(problem.area)}</small>
+                  <strong>{problem.title}</strong>
+                  <span>{problem.detail}</span>
+                </span>
+              </div>
+            ))}
+          </div>
+        </Panel>
       ) : null}
 
       {variant !== "core" && connection.status === "reauth_required" ? (
@@ -347,9 +392,7 @@ function CapabilityRevisionView({
       <div className="connection-capabilities__notice">
         <Info aria-hidden="true" size={14} />
         <span>
-          发现覆盖：tools {revision.discoveryCoverage.tools}；resources{" "}
-          {revision.discoveryCoverage.resources}；prompts{" "}
-          {revision.discoveryCoverage.prompts}。
+          {`本次快照范围：Tools ${discoveryCoverageLabel(revision.discoveryCoverage.tools)}；Resources ${discoveryCoverageLabel(revision.discoveryCoverage.resources)}；Prompts ${discoveryCoverageLabel(revision.discoveryCoverage.prompts)}。`}
         </span>
       </div>
       <div className="connection-capabilities__summary">
@@ -389,6 +432,10 @@ function CapabilityRevisionView({
       </div>
     </div>
   );
+}
+
+function discoveryCoverageLabel(support: "supported" | "unsupported"): string {
+  return support === "supported" ? "已读取" : "暂未读取";
 }
 
 function accountValue(connection: Connection, kind: "tenant" | "workspace") {

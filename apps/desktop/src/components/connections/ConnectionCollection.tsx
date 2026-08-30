@@ -117,7 +117,7 @@ export function ConnectionCollection({
                 label: connectionStatusLabel(connection.status),
                 tone: connectionStatusTone(connection.status),
               }}
-              title={connection.name}
+              title={`${connection.name} · ${definition ? integrationKindLabel(definition.kind) : "Unknown"} · ${connection.environment}`}
             />
           ) : (
             <button

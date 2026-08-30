@@ -239,6 +239,66 @@
   min-block-size: 100%;
 }
 
+.connection-attention {
+  border-color: var(--danger);
+}
+
+.connection-attention__actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.connection-attention__issues {
+  display: grid;
+}
+
+.connection-attention__issue {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+  padding-block: var(--space-4);
+  color: var(--danger);
+}
+
+.connection-attention__issue:first-child {
+  border-top: 0;
+  padding-top: var(--space-0);
+}
+
+.connection-attention__issue:last-child {
+  padding-bottom: var(--space-0);
+}
+
+.connection-attention__issue > span {
+  display: grid;
+  min-inline-size: 0;
+  gap: var(--space-1);
+}
+
+.connection-attention__issue small {
+  color: var(--danger);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+}
+
+.connection-attention__issue strong {
+  color: var(--text);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+}
+
+.connection-attention__issue span span {
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  line-height: var(--line-height-body);
+  overflow-wrap: anywhere;
+}
+
 .connection-details__header,
 .connections-editor__header {
   display: grid;
@@ -407,9 +467,14 @@
 }
 
 .connection-details__runtime-note,
-.connection-capabilities__notice,
 .connections-form-note {
   color: var(--warning);
+  font-size: var(--font-size-xs);
+  line-height: var(--line-height-body);
+}
+
+.connection-capabilities__notice {
+  color: var(--text-secondary);
   font-size: var(--font-size-xs);
   line-height: var(--line-height-body);
 }

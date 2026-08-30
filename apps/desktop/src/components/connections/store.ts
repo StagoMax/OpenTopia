@@ -8,7 +8,7 @@ import type {
   IntegrationDefinition,
   McpServerView,
 } from "../../types";
-import { connectionUpdateFromInput, sortConnections } from "./model";
+import { connectionUpdateFromInput, sortConnections } from "./model.ts";
 
 export type ConnectionEditorMode = "create" | "edit" | null;
 
@@ -50,8 +50,12 @@ export class ConnectionsStore {
   private readonly listeners = new Set<() => void>();
   private loadPromise: Promise<void> | null = null;
   private readonly capabilityLoads = new Map<string, Promise<void>>();
+  private pendingSelectionId: string | null = null;
+  private readonly client: ApiClient;
 
-  constructor(private readonly client: ApiClient) {}
+  constructor(client: ApiClient) {
+    this.client = client;
+  }
 
   readonly getSnapshot = (): ConnectionsSnapshot => this.snapshot;
 
@@ -74,11 +78,20 @@ export class ConnectionsStore {
     ])
       .then(([definitions, connections, mcpServers]) => {
         const sorted = sortConnections(connections);
-        const selectedConnectionId = sorted.some(
-          (connection) => connection.id === this.snapshot.selectedConnectionId,
-        )
-          ? this.snapshot.selectedConnectionId
-          : (sorted[0]?.id ?? null);
+        const requestedConnectionId = this.pendingSelectionId;
+        this.pendingSelectionId = null;
+        const selectedConnectionId = requestedConnectionId
+          ? (sorted.find(
+              (connection) => connection.id === requestedConnectionId,
+            )?.id ??
+            sorted[0]?.id ??
+            null)
+          : sorted.some(
+                (connection) =>
+                  connection.id === this.snapshot.selectedConnectionId,
+              )
+            ? this.snapshot.selectedConnectionId
+            : (sorted[0]?.id ?? null);
         this.update({
           status: "ready",
           definitions,
@@ -111,6 +124,21 @@ export class ConnectionsStore {
       lastHealth: null,
     });
     void this.loadCapabilities(connectionId);
+  }
+
+  reveal(connectionId: string): void {
+    if (
+      this.snapshot.connections.some(
+        (connection) => connection.id === connectionId,
+      )
+    ) {
+      this.pendingSelectionId = null;
+      this.select(connectionId);
+      return;
+    }
+
+    this.pendingSelectionId = connectionId;
+    void this.load(this.snapshot.status === "ready");
   }
 
   beginCreate(): void {

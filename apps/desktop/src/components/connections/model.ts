@@ -33,6 +33,19 @@ export type ConnectionFormErrors = Partial<
   Record<"definition" | "name" | "environment" | "server", string>
 >;
 
+export type ConnectionProblem = {
+  code:
+    | "disabled"
+    | "configured"
+    | "degraded"
+    | "reauth_required"
+    | "unverified"
+    | "legacy_unverified";
+  area: "configuration" | "runtime" | "authentication";
+  title: string;
+  detail: string;
+};
+
 const STATUS_PRIORITY: Record<ConnectionStatus, number> = {
   reauth_required: 0,
   degraded: 1,
@@ -106,6 +119,70 @@ export function connectionAccountLabel(connection: Connection): string {
     account.tenantName ||
     "未声明账号"
   );
+}
+
+export function connectionProblems(
+  connection: Connection,
+): ConnectionProblem[] {
+  const problems: ConnectionProblem[] = [];
+
+  if (!connection.enabled || connection.status === "disabled") {
+    problems.push({
+      code: "disabled",
+      area: "configuration",
+      title: "Connection 已停用",
+      detail: "启用此 Connection 后，外部调用才能通过执行边界。",
+    });
+  } else if (connection.status === "configured") {
+    problems.push({
+      code: "configured",
+      area: "runtime",
+      title: "尚未完成连接测试",
+      detail: "当前仅完成配置；请测试 runtime 与账号后再刷新能力。",
+    });
+  } else if (connection.status === "degraded") {
+    problems.push({
+      code: "degraded",
+      area: "runtime",
+      title: "运行状态异常",
+      detail: connection.lastError
+        ? `最近错误：${connection.lastError}`
+        : "检查 runtime 与凭据配置，然后重新测试此 Connection。",
+    });
+  } else if (connection.status === "reauth_required") {
+    problems.push({
+      code: "reauth_required",
+      area: "authentication",
+      title: "账号授权已失效",
+      detail: "更新凭据或重新授权后，再测试此 Connection。",
+    });
+  }
+
+  if (connection.authContext.verification === "unverified") {
+    problems.push({
+      code: "unverified",
+      area: "authentication",
+      title: "认证尚未验证",
+      detail: "当前凭据未通过账号验证，外部调用会被拒绝。",
+    });
+  } else if (connection.authContext.verification === "legacy_unverified") {
+    problems.push({
+      code: "legacy_unverified",
+      area: "authentication",
+      title: "Legacy 认证来源未验证",
+      detail: "旧版环境变量凭据未验证来源，需要迁移或重新验证。",
+    });
+  }
+
+  return problems;
+}
+
+export function connectionProblemAreaLabel(
+  area: ConnectionProblem["area"],
+): string {
+  if (area === "configuration") return "配置";
+  if (area === "runtime") return "运行";
+  return "认证";
 }
 
 export function definitionForConnection(

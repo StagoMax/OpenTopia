@@ -6,6 +6,7 @@ import type * as ConnectionsModel from "./components/connections/model";
 const {
   connectionFormFromConnection,
   connectionInputFromForm,
+  connectionProblems,
   connectionStatusLabel,
   connectionUpdateFromInput,
   emptyConnectionForm,
@@ -53,6 +54,18 @@ test("sortConnections prioritizes operator attention before ready connections", 
     ["reauth", "degraded", "ready", "disabled"],
   );
   assert.equal(connectionStatusLabel(sorted[0].status), "需重新授权");
+});
+
+test("connection problems explain configuration and authentication failures", () => {
+  const disabled = connection("disabled", "Disabled", "disabled");
+  disabled.enabled = false;
+  disabled.authContext.verification = "unverified";
+
+  assert.deepEqual(
+    connectionProblems(disabled).map((problem) => problem.code),
+    ["disabled", "unverified"],
+  );
+  assert.match(connectionProblems(disabled)[0]?.detail ?? "", /启用/);
 });
 
 test("validateConnectionForm rejects a runtime already owned by another connection", () => {
