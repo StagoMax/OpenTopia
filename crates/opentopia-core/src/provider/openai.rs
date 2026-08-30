@@ -87,6 +87,7 @@ pub struct OpenAiCompatibleProvider {
     pub(in crate::provider) reasoning_effort: Option<String>,
     pub(in crate::provider) parallel_tool_calls: bool,
     pub(in crate::provider) prompt_cache_key: Option<String>,
+    pub(in crate::provider) supports_prompt_cache: bool,
     pub(in crate::provider) supports_vision: bool,
     pub(in crate::provider) chat_codec: OpenAiChatCodec,
     pub(in crate::provider) reasoning_protocol: ProviderReasoningProtocol,
@@ -221,6 +222,10 @@ impl OpenAiCompatibleProvider {
             reasoning_effort: None,
             parallel_tool_calls: true,
             prompt_cache_key: None,
+            // Direct constructors do not carry a negotiated connection
+            // contract. Only the first-party endpoint is trusted by default;
+            // configured providers replace this from ProviderCapabilities.
+            supports_prompt_cache: is_official_openai_endpoint(&base_url),
             supports_vision: true,
             chat_codec: OpenAiChatCodec {
                 instruction_encoding,
@@ -287,9 +292,9 @@ impl OpenAiCompatibleProvider {
         self.parallel_tool_calls = settings.parallel_tool_calls;
         self.prompt_cache_key = settings.prompt_cache_key.clone();
         self.supports_vision = settings.supports_vision_for_model();
-        self.tool_protocol = settings
-            .capabilities_for_adapter(ProviderAdapterKind::OpenAiChat)
-            .tool_protocol;
+        let capabilities = settings.capabilities_for_adapter(ProviderAdapterKind::OpenAiChat);
+        self.supports_prompt_cache = capabilities.supports_prompt_cache;
+        self.tool_protocol = capabilities.tool_protocol;
         if let Some(profile) = settings
             .adapter_profile_for_model_and_adapter(&settings.model, ProviderAdapterKind::OpenAiChat)
         {
@@ -1360,7 +1365,7 @@ impl OpenAiCompatibleProvider {
                 payload["parallel_tool_calls"] = json!(self.parallel_tool_calls);
             }
         }
-        if is_official_openai_endpoint(&self.base_url) {
+        if self.supports_prompt_cache {
             if let Some(prompt_cache_key) = request
                 .instructions
                 .prompt_cache_key
@@ -1557,6 +1562,7 @@ pub struct OpenAiResponsesProvider {
     pub(in crate::provider) store_responses: bool,
     pub(in crate::provider) parallel_tool_calls: bool,
     pub(in crate::provider) prompt_cache_key: Option<String>,
+    pub(in crate::provider) supports_prompt_cache: bool,
     pub(in crate::provider) prompt_cache_policy: Option<PromptCachePolicy>,
     pub(in crate::provider) compaction_threshold_tokens: Option<u32>,
     pub(in crate::provider) native_web_search: bool,
@@ -1657,6 +1663,7 @@ impl OpenAiResponsesProvider {
         let model = model.into();
         let native_tool_search = official_openai_tool_search_support(&base_url, &model);
         let native_web_search = is_official_openai_endpoint(&base_url);
+        let supports_prompt_cache = is_official_openai_endpoint(&base_url);
         let reasoning_protocol =
             default_reasoning_protocol(ProviderAdapterKind::OpenAiResponses, &model);
         Self {
@@ -1672,6 +1679,9 @@ impl OpenAiResponsesProvider {
             store_responses: false,
             parallel_tool_calls: true,
             prompt_cache_key: None,
+            // See the Chat adapter: configured connections replace this
+            // conservative constructor default with their capability contract.
+            supports_prompt_cache,
             prompt_cache_policy: None,
             compaction_threshold_tokens: None,
             native_web_search,
@@ -1699,12 +1709,12 @@ impl OpenAiResponsesProvider {
         provider.store_responses = settings.store_responses;
         provider.parallel_tool_calls = settings.parallel_tool_calls;
         provider.prompt_cache_key = settings.prompt_cache_key.clone();
+        let capabilities = settings.capabilities_for_adapter(ProviderAdapterKind::OpenAiResponses);
+        provider.supports_prompt_cache = capabilities.supports_prompt_cache;
         provider.prompt_cache_policy = settings.prompt_cache_policy;
         provider.compaction_threshold_tokens = settings.responses_compaction_threshold_tokens;
         provider.supports_vision = settings.supports_vision_for_model();
-        provider.tool_protocol = settings
-            .capabilities_for_adapter(ProviderAdapterKind::OpenAiResponses)
-            .tool_protocol;
+        provider.tool_protocol = capabilities.tool_protocol;
         provider.native_web_search = is_official_openai_endpoint(&provider.base_url)
             || provider.tool_protocol.hosted_web_search == ProviderFeatureSupport::Supported;
         if let Some(profile) = settings.adapter_profile_for_model_and_adapter(
@@ -1812,7 +1822,7 @@ impl OpenAiResponsesProvider {
             payload["tools"] = json!(tools);
             payload["tool_choice"] = json!("auto");
         }
-        if is_official_openai_endpoint(&self.base_url) {
+        if self.supports_prompt_cache {
             if let Some(prompt_cache_key) = request
                 .instructions
                 .prompt_cache_key

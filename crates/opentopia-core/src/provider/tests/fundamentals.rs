@@ -797,6 +797,44 @@ fn official_openai_adapters_keep_the_prompt_cache_key_extension() {
 }
 
 #[test]
+fn configured_openai_compatible_adapters_use_prompt_cache_capability() {
+    let mut settings = ProviderSettings {
+        base_url: "https://relay.example/v1".to_string(),
+        model: "relay-model".to_string(),
+        auth: Some(ProviderAuthKind::None),
+        ..ProviderSettings::default()
+    };
+    settings.preferred_adapter = Some(ProviderAdapterKind::OpenAiChat);
+
+    let mut request = model_request();
+    request.instructions.prompt_cache_key = Some("workspace-cache".to_string());
+
+    let chat = OpenAiCompatibleProvider::new(
+        settings.base_url.clone(),
+        "test-key",
+        settings.model.clone(),
+    )
+    .with_generation_settings(&settings)
+    .prepare(Uuid::nil(), request.clone())
+    .unwrap();
+    let responses = OpenAiResponsesProvider::from_settings(&settings)
+        .unwrap()
+        .prepare(Uuid::nil(), request)
+        .unwrap();
+
+    assert_eq!(chat.body["prompt_cache_key"], "workspace-cache");
+    assert_eq!(responses.body["prompt_cache_key"], "workspace-cache");
+    assert!(chat
+        .cache_trace
+        .as_ref()
+        .is_some_and(|trace| trace.prompt_cache_key_hash.is_some()));
+    assert!(responses
+        .cache_trace
+        .as_ref()
+        .is_some_and(|trace| trace.prompt_cache_key_hash.is_some()));
+}
+
+#[test]
 fn responses_guardian_requests_do_not_receive_native_web_search() {
     let provider =
         OpenAiResponsesProvider::new("https://api.openai.com/v1", "test-key", "gpt-test")
