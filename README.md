@@ -3,22 +3,30 @@
 <div align="center">
   <p><strong>A local-first desktop workbench for AI-assisted coding and long-running work.</strong></p>
   <p>
-    Keep the repository, terminal, review surface, approvals, and execution policy
-    in one inspectable workspace.
+    Let agents inspect a repository, run tools, review changes, and continue complex work<br>
+    without hiding execution or workspace state behind a chat box.
   </p>
   <p>
-    <a href="#quick-start"><strong>Run from source</strong></a>
-    &nbsp;&middot;&nbsp;
-    <a href="docs/architecture-detailed.md">Architecture</a>
-    &nbsp;&middot;&nbsp;
-    <a href="docs/implementation-backlog.md">Roadmap</a>
-    &nbsp;&middot;&nbsp;
-    <a href="https://github.com/StagoMax/OpenTopia/issues">Issues</a>
+    <a href="README.md">English</a>
+    &nbsp;|&nbsp;
+    <a href="README.zh-CN.md">简体中文</a>
   </p>
   <p>
-    <img alt="Project status: pre-release" src="https://img.shields.io/badge/status-pre--release-b7791f?style=flat-square">
+    <a href="https://github.com/StagoMax/OpenTopia/actions/workflows/ci.yml"><img alt="CI status" src="https://github.com/StagoMax/OpenTopia/actions/workflows/ci.yml/badge.svg?branch=main"></a>
+    <img alt="Project status: developer preview" src="https://img.shields.io/badge/status-developer%20preview-b7791f?style=flat-square">
     <img alt="Platform: Windows first" src="https://img.shields.io/badge/platform-Windows%20first-2563eb?style=flat-square">
     <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-087b52?style=flat-square"></a>
+  </p>
+  <p>
+    <a href="#quick-start"><strong>Quick start</strong></a>
+    &nbsp;&middot;&nbsp;
+    <a href="#highlights">Highlights</a>
+    &nbsp;&middot;&nbsp;
+    <a href="#architecture">Architecture</a>
+    &nbsp;&middot;&nbsp;
+    <a href="docs/README.md">Documentation</a>
+    &nbsp;&middot;&nbsp;
+    <a href="CONTRIBUTING.md">Contributing</a>
   </p>
 </div>
 
@@ -27,47 +35,47 @@
   <img src="docs/assets/opentopia-workbench-light.png" alt="OpenTopia desktop workbench showing the workspace sidebar, task surface, environment panel, and composer" width="1536">
 </picture>
 
-<p align="center"><sub>Actual OpenTopia workbench in light and dark appearance.</sub></p>
+<p align="center"><sub>The OpenTopia desktop workbench in light and dark appearance.</sub></p>
 
-## Why OpenTopia
-
-OpenTopia is built for work that goes beyond a single chat response:
-
-- **One workbench, not a pile of tabs.** Agent conversation, repository files,
-  Git changes, previews, terminal sessions, and review controls share the same
-  desktop context.
-- **Execution stays explicit.** Dangerous actions can require approval, tool
-  access can be narrowed, and commands run through an operating-system sandbox
-  instead of relying on prompt instructions alone.
-- **Long-running work remains recoverable.** Threads, events, terminal history,
-  artifacts, and context summaries are persisted locally in SQLite.
+OpenTopia is for developers and technical teams who want an AI work agent that
+can operate inside a real workspace while remaining observable and controllable.
+The repository, terminal, review surface, approvals, execution policy, and task
+history live in one desktop application.
 
 > [!IMPORTANT]
-> **Local-first is not the same as offline.** Workspace state and execution live
-> on your machine. When you configure a remote model provider, the prompts and
-> context required for that request are sent to the provider you selected.
+> OpenTopia is an active **developer preview**, not a stable end-user release.
+> It is currently Windows-first, has no official signed binaries, and may change
+> configuration or storage formats between revisions.
 
-## What is working today
+## Highlights
 
-| Area | Current capability |
+| | Capability |
 | --- | --- |
-| Desktop workbench | Electron + React workspace with task history, repository navigation, previews, Git diff review, and an integrated PTY terminal |
-| Agent runtime | Rust agent core with bounded tool loops, persisted event replay, context compaction, plan mode, and multi-agent orchestration |
-| Controlled execution | Read-only, workspace-write, and unrestricted sandbox modes; approval policies; process-tree cleanup; and tool allowlists |
-| Provider choice | OpenAI Responses, OpenAI-compatible Chat Completions, Anthropic Messages, and a deterministic mock provider for local development |
-| Extensibility | Built-in tools plus MCP servers, skills, plugins, agent profiles, and capability projection per thread |
-| Artifacts and interaction | Text, code, image, PDF, and spreadsheet previews; browser automation; and Windows computer-use support |
+| **Unified workbench** | Agent conversation, repository files, Git changes, previews, terminal sessions, and review controls share the same desktop context. |
+| **Inspectable execution** | Tool calls, approvals, sandbox policy, and command output remain visible instead of being hidden behind a chat response. |
+| **Durable long-running work** | Threads, events, terminal history, artifacts, plans, and context summaries are persisted locally in SQLite. |
+| **Provider choice** | OpenAI Responses, OpenAI-compatible Chat Completions, Anthropic Messages, and a deterministic mock provider for local development. |
+| **Extensible runtime** | Built-in tools, MCP servers, skills, plugins, agent profiles, and capability projection per task. |
+| **Rich interaction** | Text, code, image, PDF, and spreadsheet previews, plus browser automation and Windows computer-use support. |
+
+### Local-first, not cloud-blind
+
+Workspace state and execution stay on your machine. If you configure a remote
+model provider, OpenTopia sends that provider the prompts and context required
+for the request. Provider secrets are kept out of the desktop renderer and are
+injected only into the local server process when needed.
 
 ## Quick start
 
-OpenTopia is currently a **developer preview**. The most reliable way to try it
-is to run the desktop app from source on Windows.
+The most reliable way to try OpenTopia today is to run the desktop app from
+source on Windows.
 
 ### Prerequisites
 
-- Rust stable toolchain
-- Node.js 22 or newer
-- pnpm 10 or newer
+- [Rust](https://www.rust-lang.org/tools/install) stable toolchain
+- [Node.js](https://nodejs.org/) 22 or newer
+- [pnpm](https://pnpm.io/installation) 10 or newer
+- Git
 
 ### Run the desktop app
 
@@ -78,9 +86,13 @@ pnpm install
 pnpm dev:desktop
 ```
 
-The Electron development shell starts the local Rust server automatically. On
-first launch, select a workspace and use the built-in mock provider, or open
-the model and API settings to add and test your own provider endpoint.
+The Electron development shell starts the local Rust server automatically.
+On first launch:
+
+1. Select a workspace directory.
+2. Start with the built-in mock provider, or open model settings to configure a
+   provider endpoint and API key.
+3. Create a task and review requested approvals before allowing tool execution.
 
 If PowerShell blocks the `pnpm` script shim, use `pnpm.cmd` instead:
 
@@ -89,42 +101,11 @@ pnpm.cmd install
 pnpm.cmd dev:desktop
 ```
 
-### Connect a Library retrieval provider
+For provider variables and optional Library integrations, see the
+[configuration example](.env.example) and
+[Library retrieval provider guide](docs/library-retrieval-providers.md).
 
-The Flow-mode **Library** surface can switch between SAG and Graph RAG through
-one provider contract in the local OpenTopia server. The desktop app starts or
-reuses only the provider selected in Library:
-
-```powershell
-# Optional explicit source project for development
-$env:OPENTOPIA_SAG_PROJECT_ROOT="J:\path\to\sag-project"
-
-# Or connect to an externally managed service
-$env:OPENTOPIA_SAG_URL="http://127.0.0.1:8765"
-
-# Graph RAG supports the same two options
-$env:OPENTOPIA_GRAPH_RAG_PROJECT_ROOT="J:\path\to\graph-rag-project"
-$env:OPENTOPIA_GRAPH_RAG_URL="http://127.0.0.1:8000"
-pnpm dev:desktop
-```
-
-During development, adjacent projects are discovered from the
-`enterprise-sag-panel` or `enterprise-graph-rag-panel` entry in
-`pyproject.toml`, so directory names are not part of the integration contract.
-A packaged build can instead provide `OPENTOPIA_SAG_EXECUTABLE` /
-`OPENTOPIA_GRAPH_RAG_EXECUTABLE`, or ship the corresponding executable under
-`resources/sag/` / `resources/graph-rag/`. Remote endpoints are never launched
-by OpenTopia.
-
-For a non-development Graph RAG service, set `OPENTOPIA_GRAPH_RAG_TOKEN` to a
-service identity token. The local development handshake otherwise requests a
-short-lived token using `OPENTOPIA_GRAPH_RAG_ROLES` and
-`OPENTOPIA_GRAPH_RAG_TENANT`.
-
-This integration is review-only: it manages sources and builds draft Context
-Packs, but does not inject them into prompts or change the Agent Loop.
-
-## Architecture at a glance
+## Architecture
 
 ```mermaid
 flowchart LR
@@ -138,15 +119,19 @@ flowchart LR
     Sandbox --> Workspace["Workspace, terminal, browser, computer"]
 ```
 
-The desktop renderer never receives stored provider secrets. Electron stores an
-optional key through `safeStorage` and injects it only into the local server
-process when needed. See the [detailed architecture](docs/architecture-detailed.md),
-[sandbox design](docs/mcp-sandbox-implementation-plan.md), and
-[evaluation system](docs/evaluation-system.md) for the engineering details.
+The renderer is deliberately separated from provider credentials and local
+execution. The Rust core owns the agent loop, durable events, policy decisions,
+tool dispatch, and context management; the desktop app is the interaction and
+review surface.
+
+Start with the [documentation index](docs/README.md), then use the
+[detailed architecture](docs/architecture-detailed.md),
+[runtime boundaries](docs/agent-runtime-boundaries.md), and
+[evaluation system](docs/evaluation-system.md) for deeper engineering context.
 
 ## Project status
 
-OpenTopia is under active development and is not yet a stable end-user release.
+OpenTopia is under active development.
 
 - The current preview is Windows-first.
 - A Windows installer can be built locally, but official signed binaries have
@@ -154,11 +139,12 @@ OpenTopia is under active development and is not yet a stable end-user release.
 - Configuration, database, plugin, and internal API formats may still change.
 - Use a disposable workspace or version control while evaluating high-risk
   automation.
+- Issues and pull requests are welcome; large changes should start with an
+  issue so the design can be discussed first.
 
-The implementation backlog and release gaps are tracked in
-[`docs/implementation-backlog.md`](docs/implementation-backlog.md). Source
-adaptations and upstream influences are documented explicitly in
-[`docs/source-adaptation-map.md`](docs/source-adaptation-map.md).
+The [implementation backlog](docs/implementation-backlog.md) tracks release
+gaps. Upstream influences and source adaptations are documented in the
+[source adaptation map](docs/source-adaptation-map.md).
 
 ## Development
 
@@ -173,58 +159,46 @@ crates/opentopia-windows-sandbox/
                               Windows sandbox helper
 evaluation/                   Evaluation runner, suites, and result schemas
 scripts/                      Development, packaging, and verification commands
-docs/                         Architecture notes and implementation decisions
+docs/                         Architecture, design, and operating documentation
 ```
 
 ### Useful commands
 
 ```powershell
-# Prepare pinned rg and Git tools once (dev startup and release builds also do this)
-pnpm runtime:agent-tools
-
 # Start the desktop development environment
 pnpm dev:desktop
 
 # Start only the local Rust server
-cargo run -p opentopia-server
+pnpm dev:server
 
-# Run the repository checks
+# Run the full repository verification suite
 pnpm check
 
 # Build a Windows installer
 .\scripts\build-desktop.ps1
 ```
 
-For an explicit model configuration, set the provider variables before starting
-the app:
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, focused
+validation commands, UI conventions, and pull request checklist.
 
-```powershell
-$env:OPENTOPIA_API_KEY="sk-..."
-$env:OPENTOPIA_OPENAI_BASE_URL="https://api.openai.com/v1"
-$env:OPENTOPIA_MODEL="your-model"
-pnpm dev:desktop
-```
+## Documentation
 
-Do not commit API keys, signing identities, or provider credentials. Additional
-development and release commands are documented next to the relevant subsystem
-under [`docs/`](docs/).
-
-## Engineering documentation
-
+- [Documentation index](docs/README.md)
 - [Detailed architecture](docs/architecture-detailed.md)
 - [Current agent-loop architecture](docs/agent-loop-architecture-current.md)
 - [Context compaction design](docs/context-compaction-design.md)
 - [Browser and computer-use design](docs/browser-computer-use-technical-design.md)
 - [Evaluation system](docs/evaluation-system.md)
-- [Harness and plugin boundary](docs/harness-plugin-boundary-design-zh-cn.md)
-- [Source adaptation map](docs/source-adaptation-map.md)
+- [Security policy](SECURITY.md)
 
 ## Contributing
 
-Issues and pull requests are welcome. Because the project is still pre-release,
-please open an issue before starting a large architectural change. Keep changes
-scoped, include proportional tests, and preserve the sandbox and approval
-boundaries described in the architecture documentation.
+Contributions are welcome. Read the [contributing guide](CONTRIBUTING.md) and
+[Code of Conduct](CODE_OF_CONDUCT.md) before opening a pull request. Please use
+the issue templates for reproducible bug reports and focused feature proposals.
+
+For a security vulnerability, do **not** open a public issue. Follow the
+[security policy](SECURITY.md) instead.
 
 ## License
 
