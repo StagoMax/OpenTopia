@@ -1,3 +1,6 @@
+use super::progress_deadline::{
+    await_with_progress_deadlines, record_progress, ProgressDeadlineExceeded,
+};
 use super::{
     checkpoint_retention_percentages, checkpoint_token_budget, context_checkpoint_schema,
     context_summary_system_prompt, merge_context_checkpoint, parse_checkpoint_response,
@@ -28,8 +31,11 @@ use std::sync::{
     Arc,
 };
 use std::time::{Duration, Instant};
-use tokio::time::timeout;
+use tokio::sync::watch;
 use uuid::Uuid;
+
+const CONTEXT_SUMMARIZATION_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+const CONTEXT_SUMMARIZATION_ABSOLUTE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 pub(crate) fn context_window_tokens(state: &AppState) -> usize {
     current_settings(state)
@@ -548,6 +554,19 @@ fn send_context_compaction_payload(
     sender.send(payload).map_err(|error| error.0)
 }
 
+fn context_summarization_timeout_error(timeout: ProgressDeadlineExceeded) -> ApiError {
+    match timeout {
+        ProgressDeadlineExceeded::Idle { timeout } => ApiError::gateway_timeout(format!(
+            "context summarization timed out after {} seconds without stream progress",
+            timeout.as_secs()
+        )),
+        ProgressDeadlineExceeded::Absolute { timeout } => ApiError::gateway_timeout(format!(
+            "context summarization exceeded its {}-second absolute timeout",
+            timeout.as_secs()
+        )),
+    }
+}
+
 pub(crate) async fn generate_context_summary(
     state: &AppState,
     thread_id: Uuid,
@@ -646,7 +665,9 @@ pub(crate) async fn generate_context_summary(
     let mut transport_events = Vec::new();
     let mut streamed_usage = None;
     let first_token_observed = Arc::new(AtomicBool::new(false));
+    let (progress_sender, progress_receiver) = watch::channel(0_u64);
     let metric_first_token_observed = Arc::clone(&first_token_observed);
+    let metric_progress_sender = progress_sender.clone();
     let mut on_metric = |metric| {
         match metric {
             ModelGatewayMetricEvent::FirstOutputTokenReceived {
@@ -654,6 +675,7 @@ pub(crate) async fn generate_context_summary(
             } => {
                 debug_assert_eq!(metric_request_id, request_id);
                 if !metric_first_token_observed.swap(true, AtomicOrdering::SeqCst) {
+                    record_progress(&metric_progress_sender);
                     emit_context_compaction_payload(
                         state,
                         thread_id,
@@ -666,14 +688,18 @@ pub(crate) async fn generate_context_summary(
         }
         Ok(())
     };
+    let delta_progress_sender = progress_sender.clone();
     let mut on_delta = |delta: ModelStreamDelta| {
+        record_progress(&delta_progress_sender);
         if let ModelStreamDelta::Usage { usage } = delta {
             streamed_usage = Some(usage);
         }
         Ok(())
     };
     let transport_first_token_observed = Arc::clone(&first_token_observed);
+    let transport_progress_sender = progress_sender.clone();
     let mut on_transport = |event| {
+        record_progress(&transport_progress_sender);
         let payload = match event {
             ProviderTransportEvent::ResponseHeaders { attempt, status } => {
                 Some(AgentEventPayload::ProviderResponseHeadersReceived {
@@ -722,13 +748,15 @@ pub(crate) async fn generate_context_summary(
         }
         Ok(())
     };
-    // Long-history structured checkpoints can legitimately require more than
-    // a normal round's latency, especially on reasoning-capable models. Keep
-    // the call bounded, but do not abort a healthy 60k+ token compression at
-    // the former 90-second boundary.
-    let response_result = timeout(
-        Duration::from_secs(180),
+    // Long-history structured checkpoints can legitimately run for minutes.
+    // Bound silence independently from total runtime so a healthy streaming
+    // response keeps its lease while an endlessly active response still has a
+    // finite safety ceiling.
+    let response_result = await_with_progress_deadlines(
         gateway.stream_prepared(prepared, &mut on_delta, &mut on_transport, &mut on_metric),
+        progress_receiver,
+        CONTEXT_SUMMARIZATION_IDLE_TIMEOUT,
+        CONTEXT_SUMMARIZATION_ABSOLUTE_TIMEOUT,
     )
     .await;
     drop(on_delta);
@@ -786,7 +814,7 @@ pub(crate) async fn generate_context_summary(
         }
     }
     let response = response_result
-        .map_err(|_| ApiError::gateway_timeout("context summarization timed out"))?
+        .map_err(context_summarization_timeout_error)?
         .map_err(|err| ApiError::bad_gateway(format!("context summarization failed: {err}")))?;
     let usage = response.usage.as_ref().or(streamed_usage.as_ref()).cloned();
     if let Some(usage) = usage.as_ref() {

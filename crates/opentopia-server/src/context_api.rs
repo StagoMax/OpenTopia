@@ -4,6 +4,7 @@ mod checkpoint;
 mod compaction;
 mod conversation;
 mod http;
+mod progress_deadline;
 mod round_compaction;
 mod turn_context;
 
