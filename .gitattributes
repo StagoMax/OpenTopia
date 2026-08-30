@@ -1,0 +1,7 @@
+# Generated API contracts are compared byte-for-byte by the verification suite.
+# Keep their line endings deterministic on every checkout, including Windows CI.
+/apps/desktop/src/api/generated/** text eol=lf
+
+# Preserve native Windows launcher line endings.
+*.bat text eol=crlf
+*.cmd text eol=crlf
