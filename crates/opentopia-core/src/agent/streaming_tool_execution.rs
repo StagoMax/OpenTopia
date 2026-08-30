@@ -1,12 +1,12 @@
 use super::{
     approval_required, browser_handoff_required, current_work_form_for_tool, AgentCore,
     CancellationToken, CompiledModelContext, ContextBudget, ExecutionAuthority, ModelContentPart,
-    ModelConversationMessage, ModelConversationRole, PathBuf, PermissionMode,
-    ProviderToolCall, ProviderToolCandidate, ProviderToolResult, SessionStore, ToolCall, ToolClass,
-    ToolStateStore, TurnEvents, TurnRuntimeState, UserInputRequest, Uuid,
+    ModelConversationMessage, ModelConversationRole, PathBuf, PermissionMode, ProviderToolCall,
+    ProviderToolCandidate, ProviderToolResult, SessionStore, ToolCall, ToolClass, ToolStateStore,
+    TurnEvents, TurnRuntimeState, UserInputRequest, Uuid,
 };
-use crate::tools::ToolInvocationContext;
 use crate::policy::PolicyDecision;
+use crate::tools::ToolInvocationContext;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -37,7 +37,10 @@ pub(super) struct StreamingToolExecutionResult {
 }
 
 impl StreamingToolExecutionResult {
-    pub fn validate_terminal_calls(&self, terminal_calls: &[ProviderToolCall]) -> anyhow::Result<()> {
+    pub fn validate_terminal_calls(
+        &self,
+        terminal_calls: &[ProviderToolCall],
+    ) -> anyhow::Result<()> {
         for committed in &self.committed_calls {
             let Some(terminal) = terminal_calls.iter().find(|call| call.id == committed.id) else {
                 anyhow::bail!(
@@ -86,13 +89,15 @@ impl StreamingToolExecution {
         base_context.cancel = cancellation;
         agent.apply_agent_context(&mut base_context, user_message_id);
         base_context.fork_conversation = conversation.to_vec();
-        base_context.fork_conversation.push(ModelConversationMessage {
-            role: ModelConversationRole::User,
-            content: model_user_message.to_string(),
-            content_parts: model_user_content.to_vec(),
-            tool_calls: Vec::new(),
-            tool_results: Vec::new(),
-        });
+        base_context
+            .fork_conversation
+            .push(ModelConversationMessage {
+                role: ModelConversationRole::User,
+                content: model_user_message.to_string(),
+                content_parts: model_user_content.to_vec(),
+                tool_calls: Vec::new(),
+                tool_results: Vec::new(),
+            });
         base_context.fork_model_context = Some(model_context.clone());
         base_context.current_work_form = current_work_form_for_tool(&base_context, events)?;
 
@@ -167,10 +172,7 @@ impl StreamingToolExecution {
                     .execute_provider_tool_call(&call, user_message_id, context, &mut events)
                     .await
             };
-            StreamingToolTaskResult {
-                result,
-                events,
-            }
+            StreamingToolTaskResult { result, events }
         }));
         Ok(())
     }
@@ -189,8 +191,7 @@ impl StreamingToolExecution {
                 Ok(result) => completed.push((result, task.events)),
                 Err(error)
                     if approval_required(&error).is_some()
-                        || browser_handoff_required(&error).is_some() =>
-                {}
+                        || browser_handoff_required(&error).is_some() => {}
                 Err(error) => return Err(error),
             }
         }

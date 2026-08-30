@@ -261,10 +261,7 @@ impl AgentCore {
                     latest_usage = Some(usage);
                 }
                 ModelStreamDelta::ToolCall { .. } => {}
-                ModelStreamDelta::ToolCallDone {
-                    index: _,
-                    mut call,
-                } => {
+                ModelStreamDelta::ToolCallDone { index: _, mut call } => {
                     if let Some(schema) = tool_input_schemas.get(&call.name) {
                         let normalized = normalize_tool_argument_keys(schema, &mut call.arguments);
                         if !normalized.is_empty() {

@@ -1,4 +1,163 @@
 #[tokio::test]
+async fn completed_tool_item_starts_before_provider_response_finishes() {
+    let workspace = test_workspace("streaming-tool-dispatch");
+    let started = Arc::new(tokio::sync::Notify::new());
+    let provider = Arc::new(EarlyDispatchProvider {
+        round: AtomicUsize::new(0),
+        tool_started: Arc::clone(&started),
+    });
+    let mut registry = ToolRegistry::with_core_tools();
+    registry.insert(
+        "early_dispatch_test".to_string(),
+        Arc::new(EarlyDispatchTestTool {
+            started: Arc::clone(&started),
+        }),
+    );
+    let agent = AgentCore::new(provider, registry);
+
+    let result = agent
+        .run_turn_detailed_streaming(
+            AgentTurnInput {
+                thread_id: Uuid::new_v4(),
+                user_message_id: Uuid::new_v4(),
+                workspace_root: workspace.clone(),
+                content: "run the early tool".to_string(),
+                user_content: Vec::new(),
+                context_summary: None,
+                conversation: Vec::new(),
+                permission_mode: PermissionMode::FullAccess,
+                context_budget: None,
+                provider_cursor: None,
+                store: None,
+                cancellation: None,
+            },
+            None,
+        )
+        .await
+        .expect("streaming tool turn succeeds");
+
+    assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
+    let _ = fs::remove_dir_all(workspace);
+}
+
+struct EarlyDispatchProvider {
+    round: AtomicUsize,
+    tool_started: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl ModelProvider for EarlyDispatchProvider {
+    async fn complete(&self, _request: ModelRequest) -> anyhow::Result<ModelResponse> {
+        anyhow::bail!("the early-dispatch provider must be streamed")
+    }
+
+    async fn stream_prepared(
+        &self,
+        prepared: crate::provider::PreparedProviderRequest,
+        on_delta: &mut crate::provider::ModelStreamCallback<'_>,
+        _on_transport: &mut crate::provider::ProviderTransportCallback<'_>,
+    ) -> anyhow::Result<ModelResponse> {
+        if self.round.fetch_add(1, Ordering::SeqCst) == 0 {
+            let call = ProviderToolCall {
+                id: "early-call".to_string(),
+                name: "early_dispatch_test".to_string(),
+                arguments: json!({}),
+            };
+            on_delta(ModelStreamDelta::ToolCallDone {
+                index: 0,
+                call: call.clone(),
+            })?;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                self.tool_started.notified(),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "tool did not start while the provider response was still streaming"
+                )
+            })?;
+            return Ok(ModelResponse {
+                text: String::new(),
+                tool_calls: vec![call],
+                usage: None,
+                response_id: None,
+                provider_items: Vec::new(),
+                finish_reason: ModelFinishReason::ToolCalls,
+            });
+        }
+        anyhow::ensure!(
+            prepared
+                .logical_request
+                .input
+                .tool_results
+                .iter()
+                .any(|result| result.call_id == "early-call"),
+            "the next model request did not receive the early tool result"
+        );
+        Ok(ModelResponse::text("done"))
+    }
+
+    async fn check_health(&self) -> anyhow::Result<ProviderHealthCheck> {
+        Ok(ProviderHealthCheck {
+            reachable: true,
+            latency_ms: None,
+            model_available: true,
+            error: None,
+            openai_compatibility: None,
+        })
+    }
+}
+
+struct EarlyDispatchTestTool {
+    started: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Tool for EarlyDispatchTestTool {
+    fn name(&self) -> &str {
+        "early_dispatch_test"
+    }
+
+    fn description(&self) -> &str {
+        "Test that a completed provider tool item starts before response completion."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        })
+    }
+
+    fn execution_policy(&self, _call: &ToolCall) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::read_only(vec!["test:early-dispatch".to_string()])
+    }
+
+    fn authorization_preflight(
+        &self,
+        _call: &ToolCall,
+        _ctx: &ToolInvocationContext,
+    ) -> Option<PolicyDecision> {
+        Some(PolicyDecision::Allow)
+    }
+
+    async fn execute(
+        &self,
+        call: ToolCall,
+        _ctx: ToolInvocationContext,
+    ) -> anyhow::Result<ToolResult> {
+        self.started.notify_one();
+        Ok(ToolResult::text(
+            call.id,
+            "started early",
+            json!({ "success": true }),
+        ))
+    }
+}
+
+#[tokio::test]
 async fn approved_batch_executes_disjoint_resources_concurrently_in_order() {
     let workspace = test_workspace("approved-parallel-batch");
     let active = Arc::new(AtomicUsize::new(0));
