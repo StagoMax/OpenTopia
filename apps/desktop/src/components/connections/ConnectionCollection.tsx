@@ -1,7 +1,15 @@
 import { Cable, CircleAlert, Plus, Search } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { ApiClient } from "../../api/client";
-import { Badge, Button, TextField } from "../ui";
+import type { ConnectionStatus } from "../../types";
+import {
+  Badge,
+  Button,
+  IconButton,
+  SidebarRow,
+  TextField,
+  type SidebarRowStatusTone,
+} from "../ui";
 import {
   connectionAccountLabel,
   connectionStatusLabel,
@@ -54,13 +62,24 @@ export function ConnectionCollection({
           <strong>Connections</strong>
           <small>{snapshot.connections.length} 个账号连接</small>
         </span>
-        <Button
-          onClick={() => store.beginCreate()}
-          size="compact"
-          variant="quiet"
-        >
-          <Plus aria-hidden="true" size={14} /> 新建
-        </Button>
+        {compact ? (
+          <IconButton
+            aria-label="新建 Connection"
+            onClick={() => store.beginCreate()}
+            size="compact"
+            title="新建 Connection"
+          >
+            <Plus aria-hidden="true" size={14} />
+          </IconButton>
+        ) : (
+          <Button
+            onClick={() => store.beginCreate()}
+            size="compact"
+            variant="quiet"
+          >
+            <Plus aria-hidden="true" size={14} /> 新建
+          </Button>
+        )}
       </header>
       {!compact && snapshot.connections.length > 4 ? (
         <TextField
@@ -87,7 +106,20 @@ export function ConnectionCollection({
             connection,
           );
           const selected = connection.id === snapshot.selectedConnectionId;
-          return (
+          return compact ? (
+            <SidebarRow
+              active={selected}
+              className="connection-collection__sidebar-row"
+              description={`${definition ? integrationKindLabel(definition.kind) : "Unknown"} · ${connection.environment}`}
+              key={connection.id}
+              onSelect={() => store.select(connection.id)}
+              status={{
+                label: connectionStatusLabel(connection.status),
+                tone: connectionStatusTone(connection.status),
+              }}
+              title={connection.name}
+            />
+          ) : (
             <button
               aria-current={selected ? "page" : undefined}
               className={`connection-collection__item${selected ? " is-selected" : ""}`}
@@ -129,6 +161,14 @@ export function ConnectionCollection({
       ) : null}
     </section>
   );
+}
+
+function connectionStatusTone(status: ConnectionStatus): SidebarRowStatusTone {
+  if (status === "ready") return "success";
+  if (status === "reauth_required") return "danger";
+  if (status === "degraded") return "warning";
+  if (status === "configured") return "info";
+  return "neutral";
 }
 
 export function ConnectionSidebarCollection({ client }: { client: ApiClient }) {

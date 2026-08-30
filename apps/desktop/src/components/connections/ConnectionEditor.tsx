@@ -14,11 +14,18 @@ import {
 import type { ConnectionsSnapshot, ConnectionsStore } from "./store";
 
 export type ConnectionEditorProps = {
+  formId?: string;
+  submitAction?: "inline" | "external";
   snapshot: ConnectionsSnapshot;
   store: ConnectionsStore;
 };
 
-export function ConnectionEditor({ snapshot, store }: ConnectionEditorProps) {
+export function ConnectionEditor({
+  formId,
+  snapshot,
+  store,
+  submitAction = "inline",
+}: ConnectionEditorProps) {
   const editing = snapshot.connections.find(
     (connection) => connection.id === snapshot.selectedConnectionId,
   );
@@ -61,6 +68,7 @@ export function ConnectionEditor({ snapshot, store }: ConnectionEditorProps) {
   return (
     <form
       className="connections-editor"
+      id={formId}
       onSubmit={(event) => void submit(event)}
     >
       <header className="connections-editor__header">
@@ -278,10 +286,12 @@ export function ConnectionEditor({ snapshot, store }: ConnectionEditorProps) {
             <small>停用后 Agent 和 Workflow 不得调用该账号。</small>
           </span>
         </label>
-        <Button disabled={Boolean(saving)} type="submit" variant="primary">
-          <Save aria-hidden="true" size={14} />
-          {saving ? "保存中…" : "保存 Connection"}
-        </Button>
+        {submitAction === "inline" ? (
+          <Button disabled={Boolean(saving)} type="submit" variant="primary">
+            <Save aria-hidden="true" size={14} />
+            {saving ? "保存中…" : "保存 Connection"}
+          </Button>
+        ) : null}
       </footer>
     </form>
   );

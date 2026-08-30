@@ -37,6 +37,7 @@ export type ConnectionDetailsProps = {
   definition?: IntegrationDefinition;
   snapshot: ConnectionsSnapshot;
   store: ConnectionsStore;
+  variant?: "full" | "core" | "inspector";
 };
 
 export function ConnectionDetails({
@@ -44,6 +45,7 @@ export function ConnectionDetails({
   definition,
   snapshot,
   store,
+  variant = "full",
 }: ConnectionDetailsProps) {
   const revisions = snapshot.capabilityRevisions[connection.id];
   const defaultRevision = useMemo(
@@ -74,54 +76,56 @@ export function ConnectionDetails({
       : null;
 
   return (
-    <article className="connection-details">
-      <header className="connection-details__header">
-        <span className="connections-icon connections-icon--large">
-          <Cable aria-hidden="true" size={18} />
-        </span>
-        <span className="connection-details__title">
-          <span>
-            <h2>{connection.name}</h2>
-            <Badge variant={connectionStatusVariant(connection.status)}>
-              {connectionStatusLabel(connection.status)}
-            </Badge>
+    <article className={`connection-details connection-details--${variant}`}>
+      {variant === "full" ? (
+        <header className="connection-details__header">
+          <span className="connections-icon connections-icon--large">
+            <Cable aria-hidden="true" size={18} />
           </span>
-          <p>
-            {definition?.name ?? "Unknown provider"} · {connection.environment}{" "}
-            · {connectionAccountLabel(connection)}
-          </p>
-        </span>
-        <div className="connection-details__actions">
-          <Button
-            disabled={busy}
-            onClick={() => store.beginEdit()}
-            size="compact"
-            variant="quiet"
-          >
-            <Pencil aria-hidden="true" size={14} /> 编辑
-          </Button>
-          <Button
-            disabled={busy || !connection.enabled}
-            onClick={() => void store.test(connection.id)}
-            size="compact"
-            variant="secondary"
-          >
-            <RotateCw aria-hidden="true" size={14} />
-            {testing ? "测试中…" : "测试连接"}
-          </Button>
-          <Button
-            disabled={busy || connection.status !== "ready"}
-            onClick={() => void store.refreshCapabilities(connection.id)}
-            size="compact"
-            variant="primary"
-          >
-            <RefreshCw aria-hidden="true" size={14} />
-            {refreshing ? "发现中…" : "刷新能力"}
-          </Button>
-        </div>
-      </header>
+          <span className="connection-details__title">
+            <span>
+              <h2>{connection.name}</h2>
+              <Badge variant={connectionStatusVariant(connection.status)}>
+                {connectionStatusLabel(connection.status)}
+              </Badge>
+            </span>
+            <p>
+              {definition?.name ?? "Unknown provider"} ·{" "}
+              {connection.environment} · {connectionAccountLabel(connection)}
+            </p>
+          </span>
+          <div className="connection-details__actions">
+            <Button
+              disabled={busy}
+              onClick={() => store.beginEdit()}
+              size="compact"
+              variant="quiet"
+            >
+              <Pencil aria-hidden="true" size={14} /> 编辑
+            </Button>
+            <Button
+              disabled={busy || !connection.enabled}
+              onClick={() => void store.test(connection.id)}
+              size="compact"
+              variant="secondary"
+            >
+              <RotateCw aria-hidden="true" size={14} />
+              {testing ? "测试中…" : "测试连接"}
+            </Button>
+            <Button
+              disabled={busy || connection.status !== "ready"}
+              onClick={() => void store.refreshCapabilities(connection.id)}
+              size="compact"
+              variant="primary"
+            >
+              <RefreshCw aria-hidden="true" size={14} />
+              {refreshing ? "发现中…" : "刷新能力"}
+            </Button>
+          </div>
+        </header>
+      ) : null}
 
-      {connection.status === "reauth_required" ? (
+      {variant !== "core" && connection.status === "reauth_required" ? (
         <div className="connections-feedback connections-feedback--warning">
           <KeyRound aria-hidden="true" size={16} />
           <span>
@@ -137,7 +141,7 @@ export function ConnectionDetails({
         </div>
       ) : null}
 
-      {snapshot.error ? (
+      {variant !== "core" && snapshot.error ? (
         <div
           className="connections-feedback connections-feedback--error"
           role="alert"
@@ -152,7 +156,7 @@ export function ConnectionDetails({
             关闭
           </Button>
         </div>
-      ) : snapshot.notice ? (
+      ) : variant !== "core" && snapshot.notice ? (
         <div
           className="connections-feedback connections-feedback--success"
           role="status"
@@ -169,107 +173,111 @@ export function ConnectionDetails({
         </div>
       ) : null}
 
-      <div className="connection-details__grid">
-        <Panel title="Identity & access / 身份与授权">
-          <DetailList
-            items={[
-              [
-                "Provider",
-                definition?.name ?? connection.integrationDefinitionId,
-              ],
-              [
-                "Provider kind",
-                definition ? integrationKindLabel(definition.kind) : "—",
-              ],
-              [
-                "Auth scheme",
-                definition ? authSchemeLabel(definition.authScheme) : "—",
-              ],
-              ["Owner", ownerTypeLabel(connection.ownerType)],
-              ["Account", connectionAccountLabel(connection)],
-              [
-                "Auth verification",
-                authVerificationLabel(connection.authContext.verification),
-              ],
-              ["Tenant", accountValue(connection, "tenant")],
-              ["Workspace", accountValue(connection, "workspace")],
-              [
-                "Credential",
-                connection.authContext.credentialRef
-                  ? "Secret reference 已绑定"
-                  : "无",
-              ],
-            ]}
-          />
-          <ScopeList scopes={connection.authContext.grantedScopes} />
-        </Panel>
-
-        <Panel title="Runtime & health / 运行与健康">
-          <DetailList
-            items={[
-              ["Environment", connection.environment],
-              [
-                "Runtime binding",
-                server?.server.name ?? connection.runtimeBinding.serverId,
-              ],
-              ["Runtime status", server?.status.status ?? "unavailable"],
-              ["Connection revision", String(connection.revision)],
-              ["Last tested", formatDate(connection.lastTestedAt)],
-              ["Token expires", formatDate(connection.authContext.expiresAt)],
-            ]}
-          />
-          {connection.lastError ? (
-            <div className="connection-details__runtime-error">
-              <AlertTriangle aria-hidden="true" size={14} />
-              <span>{connection.lastError}</span>
-            </div>
-          ) : null}
-          {server?.server.envKeys.length ? (
-            <div className="connection-details__runtime-note">
-              <Info aria-hidden="true" size={14} />
-              <span>
-                该 runtime 仍从 legacy envKeys 读取凭据，来源尚未验证；runtime
-                ready 不代表账号认证健康。
-              </span>
-            </div>
-          ) : null}
-          {health ? (
-            <div className="connection-details__health">
-              <ShieldCheck aria-hidden="true" size={16} />
-              <span>
-                <strong>{health.message}</strong>
-                <small>
-                  runtime {health.runtimeStatus} · auth{" "}
-                  {authVerificationLabel(health.authStatus)} ·{" "}
-                  {health.toolsCount} tools · {formatDate(health.checkedAt)}
-                </small>
-              </span>
-            </div>
-          ) : null}
-        </Panel>
-      </div>
-
-      <Panel
-        actions={
-          revisions && revisions.length > 0 ? (
-            <Select
-              label="Capability revision"
-              onChange={setSelectedRevision}
-              options={revisions.map((item) => ({
-                value: String(item.revision),
-                label: `Revision ${item.revision}`,
-              }))}
-              value={
-                selectedRevision || String(defaultRevision?.revision ?? "")
-              }
+      {variant !== "core" ? (
+        <div className="connection-details__grid">
+          <Panel title="Identity & access / 身份与授权">
+            <DetailList
+              items={[
+                [
+                  "Provider",
+                  definition?.name ?? connection.integrationDefinitionId,
+                ],
+                [
+                  "Provider kind",
+                  definition ? integrationKindLabel(definition.kind) : "—",
+                ],
+                [
+                  "Auth scheme",
+                  definition ? authSchemeLabel(definition.authScheme) : "—",
+                ],
+                ["Owner", ownerTypeLabel(connection.ownerType)],
+                ["Account", connectionAccountLabel(connection)],
+                [
+                  "Auth verification",
+                  authVerificationLabel(connection.authContext.verification),
+                ],
+                ["Tenant", accountValue(connection, "tenant")],
+                ["Workspace", accountValue(connection, "workspace")],
+                [
+                  "Credential",
+                  connection.authContext.credentialRef
+                    ? "Secret reference 已绑定"
+                    : "无",
+                ],
+              ]}
             />
-          ) : undefined
-        }
-        className="connection-capabilities"
-        title="Capability revision / 能力快照"
-      >
-        <CapabilityRevisionView revision={revision} revisions={revisions} />
-      </Panel>
+            <ScopeList scopes={connection.authContext.grantedScopes} />
+          </Panel>
+
+          <Panel title="Runtime & health / 运行与健康">
+            <DetailList
+              items={[
+                ["Environment", connection.environment],
+                [
+                  "Runtime binding",
+                  server?.server.name ?? connection.runtimeBinding.serverId,
+                ],
+                ["Runtime status", server?.status.status ?? "unavailable"],
+                ["Connection revision", String(connection.revision)],
+                ["Last tested", formatDate(connection.lastTestedAt)],
+                ["Token expires", formatDate(connection.authContext.expiresAt)],
+              ]}
+            />
+            {connection.lastError ? (
+              <div className="connection-details__runtime-error">
+                <AlertTriangle aria-hidden="true" size={14} />
+                <span>{connection.lastError}</span>
+              </div>
+            ) : null}
+            {server?.server.envKeys.length ? (
+              <div className="connection-details__runtime-note">
+                <Info aria-hidden="true" size={14} />
+                <span>
+                  该 runtime 仍从 legacy envKeys 读取凭据，来源尚未验证；runtime
+                  ready 不代表账号认证健康。
+                </span>
+              </div>
+            ) : null}
+            {health ? (
+              <div className="connection-details__health">
+                <ShieldCheck aria-hidden="true" size={16} />
+                <span>
+                  <strong>{health.message}</strong>
+                  <small>
+                    runtime {health.runtimeStatus} · auth{" "}
+                    {authVerificationLabel(health.authStatus)} ·{" "}
+                    {health.toolsCount} tools · {formatDate(health.checkedAt)}
+                  </small>
+                </span>
+              </div>
+            ) : null}
+          </Panel>
+        </div>
+      ) : null}
+
+      {variant !== "inspector" ? (
+        <Panel
+          actions={
+            revisions && revisions.length > 0 ? (
+              <Select
+                label="Capability revision"
+                onChange={setSelectedRevision}
+                options={revisions.map((item) => ({
+                  value: String(item.revision),
+                  label: `Revision ${item.revision}`,
+                }))}
+                value={
+                  selectedRevision || String(defaultRevision?.revision ?? "")
+                }
+              />
+            ) : undefined
+          }
+          className="connection-capabilities"
+          title="Capability revision / 能力快照"
+        >
+          <CapabilityRevisionView revision={revision} revisions={revisions} />
+        </Panel>
+      ) : null}
     </article>
   );
 }
