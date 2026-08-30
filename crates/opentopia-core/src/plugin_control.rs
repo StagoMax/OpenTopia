@@ -413,14 +413,18 @@ impl SqliteSessionStore {
         plugin_id: &str,
         default_enabled: bool,
         workspace_root: Option<&Path>,
-        thread_id: Option<Uuid>,
+        _thread_id: Option<Uuid>,
     ) -> anyhow::Result<bool> {
+        // Ordinary plugin enablement follows the Codex model: the effective
+        // user/project configuration is inherited by every thread. Keep the
+        // thread argument in this compatibility-facing API because callers also
+        // use it to select the workspace context, but never consult a
+        // thread-scoped activation row here.
         let records = self.list_plugin_activations(plugin_id)?;
         let global = PluginControlScope::global();
         let workspace = workspace_root
             .map(PluginControlScope::workspace)
             .transpose()?;
-        let thread = thread_id.map(PluginControlScope::thread);
         let value_for = |target: &PluginControlScope| {
             records
                 .iter()
@@ -428,8 +432,7 @@ impl SqliteSessionStore {
                 .map(|record| record.enabled)
         };
         Ok(value_for(&global).unwrap_or(default_enabled)
-            && workspace.as_ref().and_then(value_for).unwrap_or(true)
-            && thread.as_ref().and_then(value_for).unwrap_or(true))
+            && workspace.as_ref().and_then(value_for).unwrap_or(true))
     }
 
     pub fn get_plugin_settings(
@@ -1128,6 +1131,24 @@ mod tests {
             .plugin_effectively_enabled("plugin", true, Some(workspace), Some(thread_id))
             .unwrap());
         assert_eq!(store.list_plugin_activations("plugin").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn legacy_thread_activation_does_not_override_global_or_workspace_configuration() {
+        let store = SqliteSessionStore::open(":memory:").unwrap();
+        let workspace = Path::new("C:/work/demo");
+        let thread_id = Uuid::new_v4();
+
+        store
+            .set_plugin_activation("plugin", &PluginControlScope::global(), true)
+            .unwrap();
+        store
+            .set_plugin_activation("plugin", &PluginControlScope::thread(thread_id), false)
+            .unwrap();
+
+        assert!(store
+            .plugin_effectively_enabled("plugin", false, Some(workspace), Some(thread_id))
+            .unwrap());
     }
 
     #[test]

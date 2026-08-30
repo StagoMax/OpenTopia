@@ -614,10 +614,15 @@ pub struct PluginActivation {
 }
 
 impl PluginActivation {
+    /// Resolves ordinary plugin enablement from the user/project configuration.
+    ///
+    /// `thread_enabled` is retained in the wire model for backwards-compatible
+    /// decoding of older snapshots, but ordinary plugin activation is no longer
+    /// a per-thread switch. Runtime state such as browser tabs, cookies, and
+    /// domain grants remains thread-scoped elsewhere.
     pub fn is_enabled(&self, default_enabled: bool) -> bool {
         self.global_enabled.unwrap_or(default_enabled)
             && self.workspace_enabled.unwrap_or(true)
-            && self.thread_enabled.unwrap_or(true)
     }
 }
 

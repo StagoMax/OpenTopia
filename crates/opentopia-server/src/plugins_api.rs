@@ -1,4 +1,4 @@
-use super::{ensure_thread, load_bound_agent_context, sync_plugin_mcp_configs, ApiError, AppState};
+use super::{ensure_thread, load_bound_agent_context, ApiError, AppState};
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, put};
 use axum::{Json, Router};
@@ -74,26 +74,16 @@ async fn put_plugin_activation(
     Json(request): Json<PluginActivationRequest>,
 ) -> Result<Json<PluginActivationResponse>, ApiError> {
     let scope = validate_scope(&state, &request.scope)?;
+    if scope.scope_type == PluginControlScopeType::Thread {
+        return Err(ApiError::bad_request(
+            "ordinary plugin activation is inherited from global or project configuration; thread scope is not supported",
+        ));
+    }
     let query = context_for_scope(&state, &scope)?;
     let (plugin, _) = prepare_plugin(&state, &plugin_id, &query)?;
-    let servers = sync_plugin_mcp_configs(&state, &plugin).await?;
     let activation = state
         .store
         .set_plugin_activation(&plugin.id, &scope, request.enabled)?;
-    if scope.scope_type == PluginControlScopeType::Thread {
-        let thread_id = Uuid::parse_str(scope.scope_id.as_deref().unwrap_or_default())
-            .map_err(|_| ApiError::bad_request("thread scopeId must be a UUID"))?;
-        if !plugin.native_capabilities.is_empty() {
-            state
-                .store
-                .set_thread_plugin_activation(thread_id, &plugin.name, request.enabled)?;
-        }
-        for server in servers {
-            state
-                .store
-                .set_thread_mcp_server(thread_id, server.server_id, request.enabled)?;
-        }
-    }
     let effective_enabled = state.store.plugin_effectively_enabled(
         &plugin.id,
         plugin.default_enabled,
@@ -434,10 +424,9 @@ fn capability_activation(
     records: &[PluginActivationRecord],
     granted_permissions: &[String],
     workspace_root: &FsPath,
-    thread_id: Uuid,
+    _thread_id: Uuid,
 ) -> PluginActivation {
     let workspace_id = opentopia_core::normalize_workspace_key(workspace_root);
-    let thread_id = thread_id.to_string();
     let enabled_at = |scope_type, scope_id: Option<&str>| {
         records
             .iter()
@@ -462,7 +451,9 @@ fn capability_activation(
             PluginControlScopeType::Workspace,
             Some(workspace_id.as_str()),
         ),
-        thread_enabled: enabled_at(PluginControlScopeType::Thread, Some(thread_id.as_str())),
+        // Kept empty for backwards-compatible snapshot decoding. Ordinary
+        // plugin activation is inherited by all threads in the workspace.
+        thread_enabled: None,
         granted_permissions: permission_objects,
     }
 }
