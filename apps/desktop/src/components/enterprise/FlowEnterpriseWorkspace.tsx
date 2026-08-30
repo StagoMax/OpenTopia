@@ -57,6 +57,7 @@ export function FlowEnterpriseWorkspace({
         onPageHeaderChange={onPageHeaderChange}
       />
     );
-  if (view === "trust") return <TrustPage client={client} />;
+  if (view === "trust")
+    return <TrustPage client={client} onNavigate={onNavigate} />;
   return <LibraryPanel client={client} />;
 }

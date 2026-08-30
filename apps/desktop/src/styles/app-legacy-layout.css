@@ -486,26 +486,29 @@ button:disabled {
   overflow-x: hidden;
   overflow-y: auto;
   padding: 0 6px 14px;
+}
+
+.sidebar-scroll-region {
   scrollbar-color: color-mix(in srgb, var(--text-muted) 36%, transparent)
     transparent;
   scrollbar-width: thin;
 }
 
-.project-tree::-webkit-scrollbar {
+.sidebar-scroll-region::-webkit-scrollbar {
   width: var(--space-3);
 }
 
-.project-tree::-webkit-scrollbar-track,
-.project-tree::-webkit-scrollbar-corner {
+.sidebar-scroll-region::-webkit-scrollbar-track,
+.sidebar-scroll-region::-webkit-scrollbar-corner {
   background: transparent;
 }
 
-.project-tree::-webkit-scrollbar-thumb {
+.sidebar-scroll-region::-webkit-scrollbar-thumb {
   border-radius: var(--radius-sm);
   background: color-mix(in srgb, var(--text-muted) 36%, transparent);
 }
 
-.project-tree::-webkit-scrollbar-thumb:hover {
+.sidebar-scroll-region::-webkit-scrollbar-thumb:hover {
   background: color-mix(in srgb, var(--text-secondary) 48%, transparent);
 }
 

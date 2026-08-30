@@ -1,23 +1,28 @@
 import {
   Activity,
-  Clock3,
   PauseCircle,
   PlayCircle,
   RefreshCw,
-  ShieldAlert,
   XCircle,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { ApiClient } from "../../api/client";
 import type { FlowRun } from "../../types";
-import { Badge, Button, IconButton } from "../ui";
+import { Button, IconButton } from "../ui";
 import {
   FlowInspectorPortal,
   useFlowWorkspaceSelection,
   useFlowWorkspaceTitle,
 } from "./flowAgentSelection";
 import { FlowInspectorPanel, FlowInspectorSection } from "./FlowInspectorPanel";
+import { RunDetails } from "./RunDetails";
+import {
+  formatDateTime,
+  formatDuration,
+  runStatusPresentation,
+} from "./runPresentation";
 import { useEnterpriseStore } from "./store";
+import "./runs-page.css";
 
 export function RunsPage({ client }: { client: ApiClient }) {
   const { snapshot, store } = useEnterpriseStore(client);
@@ -26,6 +31,10 @@ export function RunsPage({ client }: { client: ApiClient }) {
     snapshot.runs.find((run) => run.id === selection?.selectedRunId) ??
     snapshot.runs[0] ??
     null;
+  const selectedFlow = selected
+    ? snapshot.flows.find((flow) => flow.flowId === selected.flowId)
+    : null;
+  const flowName = selectedFlow?.name ?? selected?.flowId ?? "Workflow Run";
   const [busy, setBusy] = useState<"pause" | "resume" | "cancel" | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -36,7 +45,7 @@ export function RunsPage({ client }: { client: ApiClient }) {
   }, [selected, selection]);
 
   useFlowWorkspaceTitle(
-    selected ? `${selected.flowId}@${selected.flowVersion}` : "Runs / 运行追踪",
+    selected ? `${flowName} · 运行记录` : "Runs / 运行追踪",
   );
 
   async function runAction(
@@ -70,9 +79,14 @@ export function RunsPage({ client }: { client: ApiClient }) {
   const canResume = ["paused", "waiting_approval", "waiting_human"].includes(
     selected.status,
   );
-  const canCancel = !["succeeded", "failed", "cancelled"].includes(
-    selected.status,
-  );
+  const canCancel = ![
+    "succeeded",
+    "failed",
+    "cancel_requested",
+    "cancelled",
+  ].includes(selected.status);
+  const status = runStatusPresentation(selected.status);
+  const endedAt = selected.completedAt ?? selected.updatedAt;
 
   return (
     <>
@@ -119,36 +133,69 @@ export function RunsPage({ client }: { client: ApiClient }) {
               ) : null}
             </>
           }
-          status={selected.status.replaceAll("_", " ")}
-          statusVariant={runVariant(selected.status)}
-          subtitle={selected.id}
-          title="Run 状态"
+          status={status.label}
+          statusVariant={status.variant}
+          subtitle={`${flowName} · v${selected.flowVersion}`}
+          title="运行概览"
         >
-          <FlowInspectorSection title="运行信息">
+          {snapshot.error || error ? (
+            <p className="enterprise-page__message is-error" role="alert">
+              {snapshot.error ?? error}
+            </p>
+          ) : null}
+          <FlowInspectorSection title="时间">
             <dl className="enterprise-facts flow-inspector-facts">
               <div>
-                <dt>Thread</dt>
-                <dd>{selected.threadId}</dd>
+                <dt>开始</dt>
+                <dd>{formatDateTime(selected.startedAt)}</dd>
               </div>
               <div>
-                <dt>Supersteps</dt>
-                <dd>{selected.superstep}</dd>
+                <dt>{selected.completedAt ? "完成" : "更新"}</dt>
+                <dd>{formatDateTime(endedAt)}</dd>
               </div>
               <div>
-                <dt>Node executions</dt>
+                <dt>耗时</dt>
+                <dd>{formatDuration(selected.startedAt, endedAt)}</dd>
+              </div>
+            </dl>
+          </FlowInspectorSection>
+          <FlowInspectorSection title="用量与预算">
+            <dl className="enterprise-facts flow-inspector-facts">
+              <div>
+                <dt>节点执行</dt>
                 <dd>
                   {selected.nodeExecutions}/{selected.budget.maxNodeExecutions}
                 </dd>
               </div>
               <div>
-                <dt>Tool calls</dt>
+                <dt>工具调用</dt>
                 <dd>
                   {selected.toolCalls}/{selected.budget.maxToolCalls}
                 </dd>
               </div>
               <div>
-                <dt>Updated</dt>
-                <dd>{formatTime(selected.updatedAt)}</dd>
+                <dt>检查点</dt>
+                <dd>{selected.checkpointHistory.length}</dd>
+              </div>
+              <div>
+                <dt>最长运行</dt>
+                <dd>{selected.budget.maxDurationSeconds} 秒</dd>
+              </div>
+            </dl>
+          </FlowInspectorSection>
+          <FlowInspectorSection title="技术标识">
+            <dl className="enterprise-facts flow-inspector-facts">
+              <div>
+                <dt>Run ID</dt>
+                <dd>
+                  <code>{selected.id}</code>
+                </dd>
+              </div>
+              <div>
+                <dt>Thread</dt>
+                <dd>
+                  <code>{selected.threadId}</code>
+                </dd>
               </div>
             </dl>
           </FlowInspectorSection>
@@ -169,101 +216,11 @@ export function RunsPage({ client }: { client: ApiClient }) {
               </Button>
             </FlowInspectorSection>
           ) : null}
-          {error ? (
-            <p className="enterprise-page__message is-error" role="alert">
-              {error}
-            </p>
-          ) : null}
         </FlowInspectorPanel>
       </FlowInspectorPortal>
-      <div className="enterprise-page enterprise-runs enterprise-run-core">
-        <RunTrace run={selected} />
+      <div className="enterprise-page enterprise-runs enterprise-core-detail">
+        <RunDetails flowName={flowName} run={selected} />
       </div>
     </>
   );
-}
-
-function RunTrace({ run }: { run: FlowRun }) {
-  return (
-    <article
-      className="enterprise-run-detail"
-      aria-label={`Run ${run.id} 详情`}
-    >
-      <header>
-        <span>
-          <Activity aria-hidden="true" size={18} />
-          <strong>
-            {run.flowId}@{run.flowVersion}
-          </strong>
-        </span>
-        <Badge variant={runVariant(run.status)}>
-          {run.status.replaceAll("_", " ")}
-        </Badge>
-      </header>
-      {run.error ? (
-        <p className="enterprise-page__message is-error" role="alert">
-          <ShieldAlert aria-hidden="true" size={15} />
-          {run.error}
-        </p>
-      ) : null}
-      <h3>Checkpoint timeline / 检查点</h3>
-      <ol className="enterprise-trace">
-        {run.checkpointHistory.toReversed().map((checkpoint) => (
-          <li key={checkpoint.id}>
-            <Clock3 aria-hidden="true" size={15} />
-            <span>
-              <strong>Superstep {checkpoint.superstep}</strong>
-              <small>
-                {checkpoint.nodeIds.join(", ") || "no nodes"} ·{" "}
-                {checkpoint.pendingWriteCount} writes
-              </small>
-            </span>
-            <Badge
-              variant={
-                checkpoint.status === "committed"
-                  ? "success"
-                  : checkpoint.status === "failed"
-                    ? "danger"
-                    : "neutral"
-              }
-            >
-              {checkpoint.status}
-            </Badge>
-          </li>
-        ))}
-      </ol>
-      <h3>Node trace / 节点轨迹</h3>
-      <ol className="enterprise-trace">
-        {run.nodeRuns.toReversed().map((node) => (
-          <li key={node.id}>
-            <Activity aria-hidden="true" size={15} />
-            <span>
-              <strong>
-                {node.nodeId} · attempt {node.attempt}
-              </strong>
-              <small>
-                {node.toolCalls} tool calls ·{" "}
-                {node.completedAt ? formatTime(node.completedAt) : "running"}
-              </small>
-            </span>
-            <Badge variant={runVariant(node.status)}>{node.status}</Badge>
-          </li>
-        ))}
-      </ol>
-    </article>
-  );
-}
-
-function runVariant(
-  status: string,
-): "success" | "danger" | "warning" | "info" | "neutral" {
-  if (status === "succeeded" || status === "committed") return "success";
-  if (status === "failed" || status === "cancelled") return "danger";
-  if (status.includes("waiting") || status === "paused") return "warning";
-  if (["queued", "running", "resuming"].includes(status)) return "info";
-  return "neutral";
-}
-
-function formatTime(value: string): string {
-  return new Date(value).toLocaleString();
 }

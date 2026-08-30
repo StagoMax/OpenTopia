@@ -1,5 +1,7 @@
 import {
+  ArrowRight,
   CheckCircle2,
+  CircleAlert,
   RefreshCw,
   ShieldAlert,
   ShieldCheck,
@@ -7,7 +9,10 @@ import {
 } from "lucide-react";
 import { useEffect } from "react";
 import type { ApiClient } from "../../api/client";
+import type { FlowPrimaryView } from "../../workspaceNavigation";
 import { IconButton } from "../ui";
+import { connectionProblemAreaLabel } from "../connections/model";
+import { getConnectionsStore } from "../connections/store";
 import {
   FlowInspectorPanel,
   FlowInspectorSection,
@@ -21,7 +26,13 @@ import {
 import { trustSignals } from "./model";
 import { useEnterpriseStore } from "./store";
 
-export function TrustPage({ client }: { client: ApiClient }) {
+export function TrustPage({
+  client,
+  onNavigate,
+}: {
+  client: ApiClient;
+  onNavigate(view: Exclude<FlowPrimaryView, "conversation">): void;
+}) {
   const { snapshot, store } = useEnterpriseStore(client);
   const workspace = useFlowWorkspaceSelection();
   const signals = trustSignals(snapshot);
@@ -44,6 +55,11 @@ export function TrustPage({ client }: { client: ApiClient }) {
         ? ShieldAlert
         : TriangleAlert;
 
+  function openConnection(connectionId: string) {
+    getConnectionsStore(client).reveal(connectionId);
+    onNavigate("connections");
+  }
+
   return (
     <div className="enterprise-page enterprise-trust enterprise-core-detail">
       {signal ? (
@@ -58,6 +74,53 @@ export function TrustPage({ client }: { client: ApiClient }) {
             <h2>{signal.title}</h2>
             <p>{signal.detail}</p>
           </div>
+        </section>
+      ) : null}
+
+      {signal?.findings.length ? (
+        <section className="enterprise-core-detail__payload enterprise-trust-findings">
+          <header>
+            <span>
+              <strong>Affected Connections / 受影响的连接</strong>
+              <small>点击条目可直达对应 Connection 的问题详情。</small>
+            </span>
+          </header>
+          <ol>
+            {signal.findings.map((finding) => (
+              <li key={finding.id}>
+                <button
+                  aria-label={`定位并处理 Connection：${finding.label}`}
+                  onClick={() => openConnection(finding.target.connectionId)}
+                  type="button"
+                >
+                  <CircleAlert aria-hidden="true" size={18} />
+                  <span className="enterprise-trust-finding__content">
+                    <span className="enterprise-trust-finding__identity">
+                      <strong>{finding.label}</strong>
+                      <small>{finding.context}</small>
+                    </span>
+                    <span className="enterprise-trust-finding__problems">
+                      {finding.problems.map((problem) => (
+                        <span key={problem.code}>
+                          <small>
+                            {connectionProblemAreaLabel(problem.area)}
+                          </small>
+                          <span>
+                            <strong>{problem.title}</strong>
+                            <small>{problem.detail}</small>
+                          </span>
+                        </span>
+                      ))}
+                    </span>
+                  </span>
+                  <span className="enterprise-trust-finding__action">
+                    定位问题
+                    <ArrowRight aria-hidden="true" size={14} />
+                  </span>
+                </button>
+              </li>
+            ))}
+          </ol>
         </section>
       ) : null}
 

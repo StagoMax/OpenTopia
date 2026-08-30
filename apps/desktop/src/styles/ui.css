@@ -331,7 +331,7 @@
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-md);
   background: var(--surface);
-  padding-right: var(--space-6);
+  padding-right: calc(var(--icon-size-xs) + var(--space-5));
 }
 
 .ot-select__leading {

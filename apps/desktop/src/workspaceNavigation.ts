@@ -23,6 +23,19 @@ export type SidebarDestination =
   | "flow-knowledge"
   | "plugins";
 
+type WorkspaceNavigationInput = {
+  experienceMode: ExperienceMode;
+  flowPrimaryView: FlowPrimaryView;
+  toolStageOpen: boolean;
+  activeToolKind: string | null;
+};
+
+export type WorkspaceNavigationState = {
+  sidebarDestination: SidebarDestination;
+  activeFlowPrimaryView: Exclude<FlowPrimaryView, "conversation"> | null;
+  flowInspectorOpen: boolean;
+};
+
 export function resolveActiveFlowPrimaryView({
   flowPrimaryView,
   sidebarDestination,
@@ -45,12 +58,7 @@ export function resolveSidebarDestination({
   flowPrimaryView,
   toolStageOpen,
   activeToolKind,
-}: {
-  experienceMode: ExperienceMode;
-  flowPrimaryView: FlowPrimaryView;
-  toolStageOpen: boolean;
-  activeToolKind: string | null;
-}): SidebarDestination {
+}: WorkspaceNavigationInput): SidebarDestination {
   if (toolStageOpen && activeToolKind === "extensions") {
     return "plugins";
   }
@@ -60,4 +68,23 @@ export function resolveSidebarDestination({
   }
 
   return "conversation";
+}
+
+export function resolveWorkspaceNavigation(
+  input: WorkspaceNavigationInput,
+): WorkspaceNavigationState {
+  const sidebarDestination = resolveSidebarDestination(input);
+  const activeFlowPrimaryView = resolveActiveFlowPrimaryView({
+    flowPrimaryView: input.flowPrimaryView,
+    sidebarDestination,
+  });
+
+  return {
+    sidebarDestination,
+    activeFlowPrimaryView,
+    flowInspectorOpen:
+      activeFlowPrimaryView !== null &&
+      activeFlowPrimaryView !== "knowledge" &&
+      activeFlowPrimaryView !== "overview",
+  };
 }

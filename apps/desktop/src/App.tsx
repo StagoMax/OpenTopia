@@ -47,8 +47,7 @@ import {
 } from "./components/SettingsPanel";
 import { TaskSearchDialog } from "./components/TaskSearchDialog";
 import {
-  resolveActiveFlowPrimaryView,
-  resolveSidebarDestination,
+  resolveWorkspaceNavigation,
   type FlowPrimaryView,
 } from "./workspaceNavigation";
 import {
@@ -867,8 +866,13 @@ export function App() {
   );
   const flowPrimarySurface =
     experienceMode === "flow" && flowPrimaryView !== "conversation";
-  const flowInspectorOpen =
-    flowPrimarySurface && flowPrimaryView !== "knowledge";
+  const { sidebarDestination, activeFlowPrimaryView, flowInspectorOpen } =
+    resolveWorkspaceNavigation({
+      experienceMode,
+      flowPrimaryView,
+      toolStageOpen,
+      activeToolKind: activeToolTab?.kind ?? null,
+    });
   const workspaceRightPanelKind: WorkspaceRightPanelKind = flowInspectorOpen
     ? "inspector"
     : toolStageOpen
@@ -876,12 +880,6 @@ export function App() {
       : "context";
   const rightResizePreferenceKey: keyof WorkspaceLayoutPreferences =
     flowInspectorOpen ? "inspectorRight" : "toolRight";
-  const sidebarDestination = resolveSidebarDestination({
-    experienceMode,
-    flowPrimaryView,
-    toolStageOpen,
-    activeToolKind: activeToolTab?.kind ?? null,
-  });
   const activeToolRequiresFullWorkspace = activeToolTab?.kind === "extensions";
   const toolStageCoversConversation =
     toolStageOpen && (conversationCollapsed || activeToolRequiresFullWorkspace);
@@ -3895,18 +3893,15 @@ export function App() {
               newTaskOpen={
                 sidebarDestination === "conversation" && activeThreadId === null
               }
-              activeFlowPrimaryView={resolveActiveFlowPrimaryView({
-                flowPrimaryView,
-                sidebarDestination,
-              })}
+              activeFlowPrimaryView={activeFlowPrimaryView}
               pluginsOpen={sidebarDestination === "plugins"}
               contextualCollection={
                 sidebarDestination === "flow-connections" && client ? (
                   <ConnectionSidebarCollection client={client} />
-                ) : flowPrimarySurface && client ? (
+                ) : activeFlowPrimaryView && client ? (
                   <EnterpriseSidebarCollection
                     client={client}
-                    view={flowPrimaryView}
+                    view={activeFlowPrimaryView}
                   />
                 ) : undefined
               }

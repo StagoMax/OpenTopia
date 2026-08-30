@@ -4,6 +4,13 @@ import type { ApiClient } from "../../api/client";
 import type { FlowPrimaryView } from "../../workspaceNavigation";
 import { IconButton, SidebarRow } from "../ui";
 import { enterpriseSidebarStatus } from "./enterpriseSidebarStatus";
+import {
+  compactSidebarTime,
+  enterpriseSidebarTitle,
+  flowCaseCoreLabel,
+  humanizeIdentifier,
+  workflowTriggerLabel,
+} from "./enterpriseSidebarPresentation";
 import { shortId, trustSignals } from "./model";
 import {
   templateKeyForAgent,
@@ -34,11 +41,17 @@ export function EnterpriseSidebarCollection({
     if (agentDataRevision > 0) void store.load(true);
   }, [agentDataRevision, store]);
 
+  if (view === "overview") return null;
+
   const rows =
     view === "agents"
       ? snapshot.templates.slice(0, 40).map(({ template }) => ({
           id: templateKeyForAgent(template.templateId, template.version),
-          title: template.name,
+          title: enterpriseSidebarTitle({
+            id: template.templateId,
+            label: template.name,
+            qualifier: `${template.owner} · v${template.version}`,
+          }),
           detail: `${template.templateId}@${template.version}`,
           status: template.status,
         }))
@@ -46,33 +59,54 @@ export function EnterpriseSidebarCollection({
         ? [
             ...snapshot.tasks.map((task) => ({
               id: `task:${task.id}`,
-              title: task.title,
-              detail: task.taskType.replaceAll("_", " "),
+              title: enterpriseSidebarTitle({
+                id: task.id,
+                label: task.title,
+                qualifier: humanizeIdentifier(task.taskType),
+              }),
+              detail: shortId(task.id),
               status: task.status,
             })),
             ...pendingCases.map((flowCase) => ({
               id: `case:${flowCase.id}`,
-              title:
-                snapshot.flows.find((flow) => flow.flowId === flowCase.flowId)
-                  ?.name ?? flowCase.flowId,
-              detail: "pending event",
+              title: enterpriseSidebarTitle({
+                id: flowCase.flowId,
+                label:
+                  snapshot.flows.find((flow) => flow.flowId === flowCase.flowId)
+                    ?.name ?? flowCase.flowId,
+                qualifier: flowCaseCoreLabel(flowCase),
+              }),
+              detail: shortId(flowCase.id),
               status: "pending",
             })),
           ].slice(0, 40)
         : view === "workflow-templates"
           ? snapshot.flows.slice(0, 40).map((flow) => ({
               id: flow.flowId,
-              title: flow.name,
+              title: enterpriseSidebarTitle({
+                id: flow.flowId,
+                label: flow.name,
+                qualifier: `${workflowTriggerLabel(flow.activeRevision.trigger)} · v${flow.activeRevision.compiledWorkflow.flowVersion}`,
+              }),
               detail: `${flow.flowId}@${flow.activeRevision.compiledWorkflow.flowVersion}`,
               status: flow.status,
             }))
           : view === "runs"
-            ? snapshot.runs.slice(0, 40).map((run) => ({
-                id: run.id,
-                title: run.flowId,
-                detail: shortId(run.id),
-                status: run.status,
-              }))
+            ? snapshot.runs.slice(0, 40).map((run) => {
+                const flow = snapshot.flows.find(
+                  (item) => item.flowId === run.flowId,
+                );
+                return {
+                  id: run.id,
+                  title: enterpriseSidebarTitle({
+                    id: run.flowId,
+                    label: flow?.name ?? run.flowId,
+                    qualifier: compactSidebarTime(run.updatedAt),
+                  }),
+                  detail: `${shortId(run.id)} · v${run.flowVersion}`,
+                  status: run.status,
+                };
+              })
             : view === "trust"
               ? trustSignals(snapshot).map((signal) => ({
                   id: signal.id,
@@ -89,14 +123,7 @@ export function EnterpriseSidebarCollection({
                       status: "ready",
                     },
                   ]
-                : [
-                    {
-                      id: "overview",
-                      title: "Operations overview",
-                      detail: "Agents · Workflows · Runs",
-                      status: "live",
-                    },
-                  ];
+                : [];
   return (
     <section
       className="enterprise-sidebar-collection"
@@ -144,7 +171,7 @@ export function EnterpriseSidebarCollection({
                   : isTrustRow
                     ? row.id ===
                       (selection?.selectedTrustSignalId ?? rows[0]?.id)
-                    : view === "overview";
+                    : false;
           return (
             <li key={row.id}>
               <SidebarRow

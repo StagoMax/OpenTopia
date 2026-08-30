@@ -1,5 +1,6 @@
 .enterprise-workflow-editor-page {
   align-content: stretch;
+  grid-template-rows: minmax(0, 1fr);
   block-size: 100%;
   overflow: hidden;
   gap: var(--space-0);
@@ -65,6 +66,8 @@
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   min-block-size: 0;
+  block-size: 100%;
+  overflow: hidden;
 }
 
 .workflow-editor--canvas-only {

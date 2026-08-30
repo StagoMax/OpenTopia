@@ -26,9 +26,13 @@ export type PopoverProps = {
   }) => ReactNode;
   children: (props: { close: () => void }) => ReactNode;
   align?: PopoverAlign;
+  autoFocus?: boolean;
   placement?: PopoverPlacement;
   /** Accessible name for the floating surface. */
   label: string;
+  /** Optional controlled open state for keyboard-driven feature commands. */
+  open?: boolean;
+  onOpenChange?(open: boolean): void;
 };
 
 type PopoverPosition = { left: number; top: number };
@@ -42,20 +46,32 @@ export function Popover({
   trigger,
   children,
   align = "start",
+  autoFocus = false,
   placement = "top",
   label,
+  open: controlledOpen,
+  onOpenChange,
 }: PopoverProps) {
-  const [open, setOpen] = useState(false);
+  const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
+  const open = controlledOpen ?? uncontrolledOpen;
   const [position, setPosition] = useState<PopoverPosition | null>(null);
   const surfaceId = useId();
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const surfaceRef = useRef<HTMLDivElement | null>(null);
 
+  const setOpen = useCallback(
+    (nextOpen: boolean) => {
+      if (controlledOpen === undefined) setUncontrolledOpen(nextOpen);
+      onOpenChange?.(nextOpen);
+    },
+    [controlledOpen, onOpenChange],
+  );
+
   const close = useCallback(() => {
     setOpen(false);
     setPosition(null);
     triggerRef.current?.focus();
-  }, []);
+  }, [setOpen]);
 
   const updatePosition = useCallback(() => {
     const triggerElement = triggerRef.current;
@@ -103,6 +119,18 @@ export function Popover({
   }, [open, updatePosition]);
 
   useEffect(() => {
+    if (!open || !autoFocus) return undefined;
+    const frame = window.requestAnimationFrame(() => {
+      surfaceRef.current
+        ?.querySelector<HTMLElement>(
+          "button:not(:disabled), [href], input:not(:disabled), [tabindex]:not([tabindex='-1'])",
+        )
+        ?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [autoFocus, open, updatePosition]);
+
+  useEffect(() => {
     if (!open) return undefined;
 
     function onPointerDown(event: PointerEvent) {
@@ -140,7 +168,7 @@ export function Popover({
         "aria-controls": surfaceId,
         "aria-expanded": open,
         "aria-haspopup": "dialog",
-        onClick: () => setOpen((value) => !value),
+        onClick: () => setOpen(!open),
         ref: (node) => {
           triggerRef.current = node;
         },

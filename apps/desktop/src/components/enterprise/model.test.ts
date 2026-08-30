@@ -51,12 +51,34 @@ test("trust signals fail closed for degraded connections", () => {
   const value = snapshot();
   value.connections = [
     {
+      id: "crm-production",
+      name: "CRM Production",
+      environment: "production",
       enabled: true,
       status: "degraded",
-      authContext: { verification: "verified" },
+      lastError: "runtime handshake timed out",
+      authContext: {
+        account: { displayName: "Operations" },
+        verification: "verified",
+      },
     },
   ] as unknown as EnterpriseSnapshot["connections"];
-  assert.equal(trustSignals(value)[0]?.level, "warning");
+  const signal = trustSignals(value)[0];
+  assert.equal(signal?.level, "warning");
+  assert.equal(signal?.findings[0]?.label, "CRM Production");
+  assert.match(signal?.findings[0]?.context ?? "", /Operations.*production/);
+  assert.deepEqual(
+    signal?.findings[0]?.problems.map((problem) => problem.code),
+    ["degraded"],
+  );
+  assert.match(
+    signal?.findings[0]?.problems[0]?.detail ?? "",
+    /runtime handshake timed out/,
+  );
+  assert.deepEqual(signal?.findings[0]?.target, {
+    kind: "connection",
+    connectionId: "crm-production",
+  });
 });
 
 test("guided workflow pins reusable Agents and derives graph edges from Final subscriptions", () => {

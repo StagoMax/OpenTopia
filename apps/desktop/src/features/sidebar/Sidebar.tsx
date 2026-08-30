@@ -421,7 +421,7 @@ export function Sidebar({
         </nav>
 
         {contextualCollection ? (
-          <div className="sidebar-contextual-collection">
+          <div className="sidebar-contextual-collection sidebar-scroll-region">
             {contextualCollection}
           </div>
         ) : (
@@ -472,7 +472,7 @@ export function Sidebar({
                 )}
               </div>
             </div>
-            <div className="project-tree">
+            <div className="project-tree sidebar-scroll-region">
               {projects.map((project, projectIndex) => {
                 const projectThreads = modeThreads.filter(
                   (thread) =>

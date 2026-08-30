@@ -18,11 +18,12 @@ import {
   useFlowWorkspaceTitle,
 } from "./flowAgentSelection";
 import { FlowTriggerConfigPage } from "./FlowTriggerConfigPage";
-import { templateKey } from "./flowActivation";
+import { activationLabel, templateKey } from "./flowActivation";
 import { WorkflowGraphEditor } from "./WorkflowGraphEditor";
 import {
   createDefaultWorkflowNodes,
   removeWorkflowNode,
+  workflowNodeLabel,
   workflowNodesFromGraph,
   workflowNodesFromSpec,
   type WorkflowNodeSelection,
@@ -62,6 +63,9 @@ export function WorkflowTemplatesPage({
   const [notice, setNotice] = useState<string | null>(null);
   const [creating, setCreating] = useState(Boolean(selection?.creatingFlow));
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [editorLayoutId, setEditorLayoutId] = useState(
+    () => `draft:${crypto.randomUUID()}`,
+  );
   const [detailPage, setDetailPage] = useState<{
     kind: "trigger";
     nodeId: string;
@@ -91,6 +95,7 @@ export function WorkflowTemplatesPage({
       setError(null);
       setNotice(null);
       setSelectedNodeId(null);
+      setEditorLayoutId(`draft:${crypto.randomUUID()}`);
       setDetailPage(null);
       setCreating(true);
     }
@@ -364,6 +369,7 @@ export function WorkflowTemplatesPage({
       setNodes(workflowNodesFromSpec(copied.draft.spec));
       setDraft(copied);
       setSelectedNodeId(null);
+      setEditorLayoutId(`draft:${crypto.randomUUID()}`);
       selection?.beginFlowDraft();
       setCreating(true);
       setNotice(
@@ -429,40 +435,36 @@ export function WorkflowTemplatesPage({
                 </Button>
               </>
             }
-            status={selectedFlow.status}
+            status={selectedActiveNode?.kind ?? selectedFlow.status}
             statusVariant={
-              selectedFlow.status === "active" ? "success" : "neutral"
+              selectedActiveNode?.kind === "approval"
+                ? "warning"
+                : selectedActiveNode?.kind === "output" ||
+                    (!selectedActiveNode && selectedFlow.status === "active")
+                  ? "success"
+                  : selectedActiveNode
+                    ? "info"
+                    : "neutral"
             }
-            subtitle={`${selectedFlow.flowId}@${selectedFlow.activeRevision.compiledWorkflow.flowVersion}`}
-            title="Flow 配置"
+            subtitle={
+              selectedActiveNode
+                ? workflowNodeLabel(selectedActiveNode, publishedTemplates)
+                : `${selectedFlow.flowId}@${selectedFlow.activeRevision.compiledWorkflow.flowVersion}`
+            }
+            title={selectedActiveNode ? "Node 配置" : "Flow 配置"}
           >
-            <FlowInspectorSection title="Revision">
-              <dl className="enterprise-facts flow-inspector-facts">
-                <div>
-                  <dt>所有者</dt>
-                  <dd>{selectedFlow.createdBy}</dd>
-                </div>
-                <div>
-                  <dt>触发方式</dt>
-                  <dd>{triggerLabel(selectedFlow.activeRevision.trigger)}</dd>
-                </div>
-                <div>
-                  <dt>入口策略</dt>
-                  <dd>
-                    {selectedFlow.activeRevision.ingressPolicy === "immediate"
-                      ? "自动执行"
-                      : "人工确认"}
-                  </dd>
-                </div>
-                <div>
-                  <dt>输出</dt>
-                  <dd>{outputLabel(selectedFlow.activeRevision.output)}</dd>
-                </div>
-              </dl>
-            </FlowInspectorSection>
             {selectedActiveNode ? (
               <FlowInspectorSection title="Node">
                 <dl className="enterprise-facts flow-inspector-facts">
+                  <div>
+                    <dt>名称</dt>
+                    <dd>
+                      {workflowNodeLabel(
+                        selectedActiveNode,
+                        publishedTemplates,
+                      )}
+                    </dd>
+                  </div>
                   <div>
                     <dt>Node ID</dt>
                     <dd>{selectedActiveNode.id}</dd>
@@ -471,9 +473,44 @@ export function WorkflowTemplatesPage({
                     <dt>Kind</dt>
                     <dd>{selectedActiveNode.kind}</dd>
                   </div>
+                  <div>
+                    <dt>Input</dt>
+                    <dd>
+                      {activationLabel(
+                        selectedActiveNode.activation,
+                        activeSelections,
+                        publishedTemplates,
+                      )}
+                    </dd>
+                  </div>
                 </dl>
               </FlowInspectorSection>
-            ) : null}
+            ) : (
+              <FlowInspectorSection title="Revision">
+                <dl className="enterprise-facts flow-inspector-facts">
+                  <div>
+                    <dt>所有者</dt>
+                    <dd>{selectedFlow.createdBy}</dd>
+                  </div>
+                  <div>
+                    <dt>触发方式</dt>
+                    <dd>{triggerLabel(selectedFlow.activeRevision.trigger)}</dd>
+                  </div>
+                  <div>
+                    <dt>入口策略</dt>
+                    <dd>
+                      {selectedFlow.activeRevision.ingressPolicy === "immediate"
+                        ? "自动执行"
+                        : "人工确认"}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>输出</dt>
+                    <dd>{outputLabel(selectedFlow.activeRevision.output)}</dd>
+                  </div>
+                </dl>
+              </FlowInspectorSection>
+            )}
             {error ? (
               <p className="enterprise-page__message is-error" role="alert">
                 {error}
@@ -485,6 +522,7 @@ export function WorkflowTemplatesPage({
           <section className="workflow-editor workflow-editor--canvas-only">
             <div className="workflow-editor__body">
               <WorkflowGraphEditor
+                layoutId={`active:${selectedFlow.flowId}@${selectedFlow.activeRevision.compiledWorkflow.flowVersion}`}
                 onSelectNode={setSelectedNodeId}
                 readOnly
                 selections={activeSelections}
@@ -584,6 +622,7 @@ export function WorkflowTemplatesPage({
           <div className="workflow-editor__body">
             <WorkflowGraphEditor
               disabled={Boolean(busy)}
+              layoutId={editorLayoutId}
               onChange={changeNodes}
               onEditTrigger={(nodeId) =>
                 setDetailPage({ kind: "trigger", nodeId })

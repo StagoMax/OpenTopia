@@ -1,20 +1,53 @@
 import {
-  Bot,
-  Braces,
-  CircleDot,
-  Inbox,
-  Plus,
-  RadioTower,
-  ShieldCheck,
-  Trash2,
-} from "lucide-react";
+  Background,
+  BackgroundVariant,
+  ReactFlow,
+  SelectionMode,
+  applyNodeChanges,
+  type Connection,
+  type Edge,
+  type FinalConnectionState,
+  type NodeChange,
+  type NodeTypes,
+  type ReactFlowInstance,
+  type XYPosition,
+} from "@xyflow/react";
+import "@xyflow/react/dist/base.css";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
 import type { AgentTemplateVersionView } from "../../types";
-import { Button, IconButton, Popover } from "../ui";
 import {
   activationLabel,
-  activationSourceNodeIds,
+  createFinalActivation,
   templateKey,
 } from "./flowActivation";
+import {
+  canConnectWorkflowNodes,
+  connectWorkflowNodes,
+  disconnectWorkflowNodes,
+  workflowConnections,
+} from "./workflowGraphOperations";
+import {
+  readWorkflowCanvasLayout,
+  reconcileWorkflowPositions,
+  writeWorkflowCanvasLayout,
+  type WorkflowCanvasLayout,
+} from "./workflowCanvasLayout";
+import { workflowCanvasCommand } from "./workflowCanvasShortcuts";
+import {
+  WorkflowCanvasQuickCreate,
+  WorkflowCanvasToolbar,
+  type CanvasTool,
+  type QuickCreateState,
+} from "./WorkflowCanvasControls";
+import {
+  WorkflowCanvasNode,
+  type WorkflowCanvasNodeType,
+} from "./WorkflowCanvasNode";
 import {
   addWorkflowNode,
   removeWorkflowNode,
@@ -24,13 +57,18 @@ import {
 } from "./workflowNodeSelection";
 import "./workflow-graph.css";
 
-const NODE_WIDTH = 260;
-const NODE_HEIGHT = 156;
-const COLUMN_GAP = 80;
-const CANVAS_PADDING = 48;
+const nodeTypes: NodeTypes = { workflowNode: WorkflowCanvasNode };
+const HISTORY_LIMIT = 50;
+const DEFAULT_VIEWPORT = { x: 0, y: 0, zoom: 0.9 };
+
+type CanvasSnapshot = {
+  layout: WorkflowCanvasLayout;
+  selections: WorkflowNodeSelection[];
+};
 
 export function WorkflowGraphEditor({
-  disabled,
+  disabled = false,
+  layoutId,
   onChange,
   onEditTrigger,
   onSelectNode,
@@ -40,233 +78,529 @@ export function WorkflowGraphEditor({
   templates,
 }: {
   disabled?: boolean;
+  layoutId: string;
   onChange?(selections: WorkflowNodeSelection[]): void;
   onEditTrigger?(nodeId: string): void;
-  onSelectNode(nodeId: string): void;
+  onSelectNode(nodeId: string | null): void;
   readOnly?: boolean;
   selections: WorkflowNodeSelection[];
   selectedNodeId: string | null;
   templates: AgentTemplateVersionView[];
 }) {
-  const positions = layoutNodes(selections);
-  const width =
-    CANVAS_PADDING * 2 +
-    selections.length * NODE_WIDTH +
-    Math.max(0, selections.length - 1) * COLUMN_GAP;
-  const height = CANVAS_PADDING * 2 + NODE_HEIGHT;
-  const edges = selections.flatMap((target) =>
-    activationSourceNodeIds(target.activation).map((sourceId) => ({
-      sourceId,
-      targetId: target.id,
-    })),
+  const canvasRef = useRef<HTMLElement | null>(null);
+  const instanceRef = useRef<ReactFlowInstance<WorkflowCanvasNodeType> | null>(
+    null,
   );
+  const dragStartPositions = useRef<Record<string, XYPosition> | null>(null);
+  const history = useRef<{
+    future: CanvasSnapshot[];
+    past: CanvasSnapshot[];
+  }>({ future: [], past: [] });
+  const [, setHistoryVersion] = useState(0);
+  const [layout, setLayout] = useState(() =>
+    readWorkflowCanvasLayout(layoutId, selections),
+  );
+  const [nodePickerOpen, setNodePickerOpen] = useState(false);
+  const [quickCreate, setQuickCreate] = useState<QuickCreateState | null>(null);
+  const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
+  const [tool, setTool] = useState<CanvasTool>(readOnly ? "pan" : "select");
 
-  function addNode(kind: AddableWorkflowNodeKind) {
-    onChange?.(addWorkflowNode(selections, kind, templates[0]));
+  useEffect(() => {
+    const next = readWorkflowCanvasLayout(layoutId, selections);
+    setLayout(next);
+    setNodePickerOpen(false);
+    setQuickCreate(null);
+    setSelectedEdgeId(null);
+    history.current = { future: [], past: [] };
+    setHistoryVersion((value) => value + 1);
+    const frame = window.requestAnimationFrame(() => {
+      const instance = instanceRef.current;
+      if (!instance) return;
+      if (next.viewport) void instance.setViewport(next.viewport);
+      else void instance.setViewport(DEFAULT_VIEWPORT);
+    });
+    return () => window.cancelAnimationFrame(frame);
+    // The layout identity is the reset boundary. Node changes are reconciled
+    // separately so adding a node does not reset the viewport.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [layoutId]);
+
+  useEffect(() => {
+    setLayout((current) => ({
+      ...current,
+      positions: reconcileWorkflowPositions(selections, current.positions),
+    }));
+  }, [selections]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(
+      () => writeWorkflowCanvasLayout(layoutId, layout),
+      180,
+    );
+    return () => window.clearTimeout(timer);
+  }, [layout, layoutId]);
+
+  const flowNodes: WorkflowCanvasNodeType[] = selections.map((selection) => {
+    const template =
+      selection.kind === "agent"
+        ? templates.find((item) => templateKey(item) === selection.templateKey)
+        : null;
+    return {
+      id: selection.id,
+      type: "workflowNode",
+      position: layout.positions[selection.id] ?? { x: 0, y: 0 },
+      selected: selectedNodeId === selection.id,
+      draggable: !readOnly && !disabled && tool === "select",
+      connectable: !readOnly && !disabled,
+      deletable: !readOnly && selection.kind !== "output",
+      focusable: true,
+      ariaLabel: `${workflowNodeLabel(selection, templates)}，${selection.kind} node`,
+      data: {
+        activationText: activationLabel(
+          selection.activation,
+          selections,
+          templates,
+        ),
+        disabled,
+        label: workflowNodeLabel(selection, templates),
+        onEditTrigger: (nodeId) => onEditTrigger?.(nodeId),
+        onRemove: removeNode,
+        onSelect: (nodeId) => {
+          setSelectedEdgeId(null);
+          onSelectNode(nodeId);
+        },
+        readOnly,
+        selection,
+        subtitle:
+          selection.kind === "agent" && template
+            ? `${template.template.templateId}@${template.template.version}`
+            : `${selection.kind} node`,
+      },
+    };
+  });
+
+  const edges: Edge[] = workflowConnections(selections).map((edge) => ({
+    id: edgeId(edge.sourceId, edge.targetId),
+    source: edge.sourceId,
+    sourceHandle: "final",
+    target: edge.targetId,
+    targetHandle: "input",
+    type: "smoothstep",
+    className: "workflow-canvas__edge",
+    selected: selectedEdgeId === edgeId(edge.sourceId, edge.targetId),
+    selectable: true,
+    deletable: !readOnly && !disabled,
+    reconnectable: !readOnly && !disabled,
+  }));
+
+  function snapshot(
+    snapshotLayout: WorkflowCanvasLayout = layout,
+  ): CanvasSnapshot {
+    return {
+      layout: {
+        ...snapshotLayout,
+        positions: { ...snapshotLayout.positions },
+      },
+      selections: selections.map((node) => ({ ...node })),
+    };
+  }
+
+  function pushPast(value: CanvasSnapshot) {
+    history.current.past = [...history.current.past, value].slice(
+      -HISTORY_LIMIT,
+    );
+    history.current.future = [];
+    setHistoryVersion((current) => current + 1);
+  }
+
+  function commitSemanticChange(
+    nextSelections: WorkflowNodeSelection[],
+    nextPositions = reconcileWorkflowPositions(
+      nextSelections,
+      layout.positions,
+    ),
+  ) {
+    if (!onChange || readOnly || disabled) return;
+    pushPast(snapshot());
+    setLayout((current) => ({ ...current, positions: nextPositions }));
+    onChange(nextSelections);
+    setSelectedEdgeId(null);
+  }
+
+  function addNode(
+    kind: AddableWorkflowNodeKind,
+    preferredPosition?: XYPosition,
+    sourceId?: string,
+  ) {
+    const next = addWorkflowNode(selections, kind, templates[0]);
+    const added = next.find(
+      (candidate) => !selections.some((node) => node.id === candidate.id),
+    );
+    if (!added) return;
+    const position = preferredPosition ?? viewportCenter();
+    const withSource = sourceId
+      ? next.map((node) =>
+          node.id === added.id
+            ? { ...node, activation: createFinalActivation(sourceId) }
+            : node,
+        )
+      : next;
+    commitSemanticChange(withSource, {
+      ...reconcileWorkflowPositions(withSource, layout.positions),
+      [added.id]: position,
+    });
+    onSelectNode(added.id);
+    setQuickCreate(null);
+  }
+
+  function removeNode(nodeId: string) {
+    const next = removeWorkflowNode(selections, nodeId);
+    if (next.length === selections.length) return;
+    commitSemanticChange(next);
+    onSelectNode(null);
+  }
+
+  function connect(connection: Connection) {
+    if (!connection.source || !connection.target) return;
+    const next = connectWorkflowNodes(
+      selections,
+      connection.source,
+      connection.target,
+    );
+    if (sameConnections(selections, next)) return;
+    commitSemanticChange(next);
+    onSelectNode(connection.target);
+  }
+
+  function reconnect(oldEdge: Edge, connection: Connection) {
+    if (!connection.source || !connection.target) return;
+    const disconnected = disconnectWorkflowNodes(
+      selections,
+      oldEdge.source,
+      oldEdge.target,
+    );
+    if (
+      !canConnectWorkflowNodes(
+        disconnected,
+        connection.source,
+        connection.target,
+      )
+    ) {
+      return;
+    }
+    commitSemanticChange(
+      connectWorkflowNodes(disconnected, connection.source, connection.target),
+    );
+    onSelectNode(connection.target);
+  }
+
+  function disconnectSelectedEdge() {
+    if (!selectedEdgeId) return false;
+    const edge = edges.find((candidate) => candidate.id === selectedEdgeId);
+    if (!edge) return false;
+    commitSemanticChange(
+      disconnectWorkflowNodes(selections, edge.source, edge.target),
+    );
+    setSelectedEdgeId(null);
+    return true;
+  }
+
+  function undo() {
+    const previous = history.current.past.pop();
+    if (!previous) return;
+    history.current.future = [snapshot(), ...history.current.future].slice(
+      0,
+      HISTORY_LIMIT,
+    );
+    applySnapshot(previous);
+  }
+
+  function redo() {
+    const next = history.current.future.shift();
+    if (!next) return;
+    history.current.past = [...history.current.past, snapshot()].slice(
+      -HISTORY_LIMIT,
+    );
+    applySnapshot(next);
+  }
+
+  function applySnapshot(next: CanvasSnapshot) {
+    setLayout(next.layout);
+    if (!sameSelections(selections, next.selections))
+      onChange?.(next.selections);
+    setQuickCreate(null);
+    setSelectedEdgeId(null);
+    onSelectNode(null);
+    setHistoryVersion((current) => current + 1);
+  }
+
+  function viewportCenter(): XYPosition {
+    const bounds = canvasRef.current?.getBoundingClientRect();
+    const instance = instanceRef.current;
+    if (!bounds || !instance) return { x: 80, y: 80 };
+    return instance.screenToFlowPosition({
+      x: bounds.left + bounds.width / 2,
+      y: bounds.top + bounds.height / 2,
+    });
+  }
+
+  function handleNodesChange(changes: NodeChange<WorkflowCanvasNodeType>[]) {
+    const positionChanges = changes.filter(
+      (change) => change.type === "position",
+    );
+    if (positionChanges.length === 0) return;
+    const moved = applyNodeChanges(positionChanges, flowNodes);
+    setLayout((current) => ({
+      ...current,
+      positions: {
+        ...current.positions,
+        ...Object.fromEntries(moved.map((node) => [node.id, node.position])),
+      },
+    }));
+  }
+
+  function handleConnectEnd(
+    event: MouseEvent | TouchEvent,
+    connectionState: FinalConnectionState,
+  ) {
+    if (
+      readOnly ||
+      disabled ||
+      connectionState.isValid ||
+      connectionState.toNode ||
+      !connectionState.fromNode ||
+      connectionState.fromHandle?.type !== "source" ||
+      connectionState.fromNode.id === "output"
+    ) {
+      return;
+    }
+    const point = pointerPosition(event);
+    const bounds = canvasRef.current?.getBoundingClientRect();
+    const instance = instanceRef.current;
+    if (!point || !bounds || !instance) return;
+    const styles = getComputedStyle(document.documentElement);
+    const margin = cssNumber(styles, "--space-4", 8);
+    const menuWidth = cssNumber(styles, "--popover-width-compact", 260);
+    const menuHeight = cssNumber(styles, "--control-height-lg", 36) * 5;
+    const left = Math.min(
+      Math.max(margin, point.x - bounds.left),
+      Math.max(margin, bounds.width - menuWidth - margin),
+    );
+    const top = Math.min(
+      Math.max(margin, point.y - bounds.top),
+      Math.max(margin, bounds.height - menuHeight - margin),
+    );
+    setQuickCreate({
+      canvasPosition: instance.screenToFlowPosition({ x: point.x, y: point.y }),
+      left,
+      sourceId: connectionState.fromNode.id,
+      top,
+    });
+  }
+
+  function handleKeyDown(event: ReactKeyboardEvent<HTMLElement>) {
+    const target = event.target as HTMLElement;
+    const isEditing =
+      target.matches("input, textarea, select") || target.isContentEditable;
+    if (isEditing) return;
+
+    const command = workflowCanvasCommand(event, { disabled, readOnly });
+    if (!command) return;
+
+    event.preventDefault();
+    if (command === "undo") return undo();
+    if (command === "redo") return redo();
+    if (command === "selectTool") return setTool("select");
+    if (command === "panTool") return setTool("pan");
+    if (command === "openNodePicker") {
+      setQuickCreate(null);
+      return setNodePickerOpen(true);
+    }
+    if (command === "fitView") return fitCanvas();
+    if (command === "zoomIn") return void instanceRef.current?.zoomIn();
+    if (command === "zoomOut") return void instanceRef.current?.zoomOut();
+    if (command === "deselect") {
+      setNodePickerOpen(false);
+      setQuickCreate(null);
+      setSelectedEdgeId(null);
+      onSelectNode(null);
+      return;
+    }
+    if (command === "deleteSelection") {
+      if (disconnectSelectedEdge()) {
+        return;
+      }
+      if (selectedNodeId) {
+        const node = selections.find((item) => item.id === selectedNodeId);
+        if (node && node.kind !== "output") {
+          removeNode(node.id);
+        }
+      }
+    }
+  }
+
+  function fitCanvas() {
+    void instanceRef.current?.fitView({
+      duration: 180,
+      padding: 0.18,
+    });
   }
 
   return (
-    <section className="workflow-graph" aria-label="Flow graph / Flow 图">
-      <header className="workflow-graph__header">
-        <span>
-          <strong>Flow graph / Flow 图</strong>
-          <small>
-            Agent、Approval 与 Output 都是 Flow Node；连线表示上游 Final 订阅。
-          </small>
-        </span>
-        {!readOnly ? (
-          <Popover
-            align="end"
-            label="选择要添加的节点类型"
-            placement="bottom"
-            trigger={(props) => (
-              <Button
-                {...props}
-                disabled={disabled}
-                size="compact"
-                variant="secondary"
-              >
-                <Plus aria-hidden="true" size={14} /> 添加节点
-              </Button>
-            )}
-          >
-            {({ close }) => (
-              <div className="workflow-node-picker">
-                <button
-                  disabled={templates.length === 0}
-                  onClick={() => {
-                    addNode("agent");
-                    close();
-                  }}
-                  type="button"
-                >
-                  <Bot aria-hidden="true" size={16} />
-                  <span>
-                    <strong>Agent</strong>
-                    <small>运行一个已发布的 Agent 模板</small>
-                  </span>
-                </button>
-                <button
-                  onClick={() => {
-                    addNode("approval");
-                    close();
-                  }}
-                  type="button"
-                >
-                  <ShieldCheck aria-hidden="true" size={16} />
-                  <span>
-                    <strong>Approval</strong>
-                    <small>暂停流程并等待人工审批</small>
-                  </span>
-                </button>
-              </div>
-            )}
-          </Popover>
-        ) : null}
-      </header>
-      <div className="workflow-graph__viewport">
-        <div
-          className="workflow-graph__canvas"
-          style={{ minHeight: height, minWidth: width }}
-        >
-          <svg
-            aria-hidden="true"
-            className="workflow-graph__edges"
-            height={height}
-            viewBox={`0 0 ${width} ${height}`}
-            width={width}
-          >
-            {edges.map((edge) => {
-              const source = positions.get(edge.sourceId);
-              const target = positions.get(edge.targetId);
-              if (!source || !target) return null;
-              const startX = source.x + NODE_WIDTH;
-              const startY = source.y + NODE_HEIGHT / 2;
-              const endX = target.x;
-              const endY = target.y + NODE_HEIGHT / 2;
-              const bend = Math.max(36, Math.abs(endX - startX) / 2);
-              return (
-                <path
-                  d={`M ${startX} ${startY} C ${startX + bend} ${startY}, ${endX - bend} ${endY}, ${endX} ${endY}`}
-                  key={`${edge.sourceId}:${edge.targetId}`}
-                />
-              );
-            })}
-          </svg>
-          {selections.map((selection) => {
-            const position = positions.get(selection.id)!;
-            const label = workflowNodeLabel(selection, templates);
-            const template =
-              selection.kind === "agent"
-                ? templates.find(
-                    (item) => templateKey(item) === selection.templateKey,
-                  )
-                : null;
-            const NodeIcon =
-              selection.kind === "agent"
-                ? Bot
-                : selection.kind === "approval"
-                  ? ShieldCheck
-                  : Inbox;
-            return (
-              <article
-                className={`workflow-node workflow-node--${selection.kind}${
-                  selectedNodeId === selection.id ? " is-selected" : ""
-                }`}
-                key={selection.id}
-                style={{ left: position.x, top: position.y }}
-              >
-                {selection.kind === "output" || readOnly ? (
-                  <div className="workflow-node__trigger">
-                    <RadioTower aria-hidden="true" size={14} />
-                    <span>
-                      <small>Input / 输入</small>
-                      <strong>
-                        {activationLabel(
-                          selection.activation,
-                          selections,
-                          templates,
-                        )}
-                      </strong>
-                    </span>
-                  </div>
-                ) : (
-                  <button
-                    className="workflow-node__trigger"
-                    disabled={disabled}
-                    onClick={() => onEditTrigger?.(selection.id)}
-                    type="button"
-                  >
-                    <RadioTower aria-hidden="true" size={14} />
-                    <span>
-                      <small>Trigger / 触发器</small>
-                      <strong>
-                        {activationLabel(
-                          selection.activation,
-                          selections,
-                          templates,
-                        )}
-                      </strong>
-                    </span>
-                  </button>
-                )}
-                <button
-                  aria-pressed={selectedNodeId === selection.id}
-                  className="workflow-node__body"
-                  onClick={() => onSelectNode(selection.id)}
-                  type="button"
-                >
-                  <NodeIcon aria-hidden="true" size={17} />
-                  <span>
-                    <strong>{label}</strong>
-                    <small>
-                      {selection.kind === "agent" && template
-                        ? `${template.template.templateId}@${template.template.version}`
-                        : `${selection.kind} node`}
-                    </small>
-                  </span>
-                  {selection.kind === "agent" ? (
-                    <Braces aria-hidden="true" size={14} />
-                  ) : null}
-                </button>
-                <footer className="workflow-node__final">
-                  <CircleDot aria-hidden="true" size={12} />
-                  <span>
-                    {selection.kind === "output"
-                      ? "Terminal / 流程输出"
-                      : "Final / 完成通知"}
-                  </span>
-                  {!readOnly && selection.kind !== "output" ? (
-                    <IconButton
-                      aria-label={`移除 ${label}`}
-                      disabled={disabled}
-                      onClick={() =>
-                        onChange?.(removeWorkflowNode(selections, selection.id))
-                      }
-                      size="compact"
-                      variant="danger"
-                    >
-                      <Trash2 aria-hidden="true" size={13} />
-                    </IconButton>
-                  ) : null}
-                </footer>
-              </article>
-            );
-          })}
-        </div>
-      </div>
+    <section
+      aria-label="Flow 交互画布"
+      className={`workflow-graph workflow-graph--${tool}`}
+      onKeyDownCapture={handleKeyDown}
+      ref={canvasRef}
+      tabIndex={0}
+    >
+      <ReactFlow<WorkflowCanvasNodeType>
+        autoPanOnConnect
+        autoPanOnNodeDrag
+        connectOnClick
+        deleteKeyCode={null}
+        edges={edges}
+        elementsSelectable
+        defaultViewport={layout.viewport ?? DEFAULT_VIEWPORT}
+        isValidConnection={(connection) =>
+          canConnectWorkflowNodes(
+            selections,
+            connection.source,
+            connection.target,
+          )
+        }
+        maxZoom={1.8}
+        minZoom={0.3}
+        nodeTypes={nodeTypes}
+        nodes={flowNodes}
+        nodesConnectable={!readOnly && !disabled}
+        nodesDraggable={!readOnly && !disabled && tool === "select"}
+        onConnect={connect}
+        onConnectEnd={handleConnectEnd}
+        onEdgeClick={(event, edge) => {
+          event.stopPropagation();
+          setQuickCreate(null);
+          setSelectedEdgeId(edge.id);
+          onSelectNode(null);
+        }}
+        onInit={(instance) => {
+          instanceRef.current = instance;
+        }}
+        onMoveEnd={(_event, viewport) =>
+          setLayout((current) => ({ ...current, viewport }))
+        }
+        onNodeClick={(_event, node) => {
+          setQuickCreate(null);
+          setSelectedEdgeId(null);
+          onSelectNode(node.id);
+        }}
+        onNodeDragStart={(_event, node) => {
+          dragStartPositions.current = { ...layout.positions };
+          setSelectedEdgeId(null);
+          onSelectNode(node.id);
+        }}
+        onNodeDragStop={(_event, node) => {
+          const before = dragStartPositions.current;
+          dragStartPositions.current = null;
+          setLayout((current) => ({
+            ...current,
+            positions: { ...current.positions, [node.id]: node.position },
+          }));
+          if (
+            before &&
+            (before[node.id]?.x !== node.position.x ||
+              before[node.id]?.y !== node.position.y)
+          ) {
+            pushPast(snapshot({ ...layout, positions: before }));
+          }
+        }}
+        onNodesChange={handleNodesChange}
+        onPaneClick={() => {
+          canvasRef.current?.focus({ preventScroll: true });
+          setNodePickerOpen(false);
+          setQuickCreate(null);
+          setSelectedEdgeId(null);
+          onSelectNode(null);
+        }}
+        onReconnect={reconnect}
+        panActivationKeyCode="Space"
+        panOnDrag={tool === "pan" ? true : [1]}
+        panOnScroll
+        selectionMode={SelectionMode.Partial}
+        selectionOnDrag={false}
+        zoomActivationKeyCode={["Meta", "Control"]}
+        zoomOnDoubleClick={false}
+        zoomOnScroll={false}
+      >
+        <Background
+          color="var(--border)"
+          gap={24}
+          size={1}
+          variant={BackgroundVariant.Dots}
+        />
+        <WorkflowCanvasToolbar
+          canRedo={history.current.future.length > 0}
+          canUndo={history.current.past.length > 0}
+          disabled={disabled}
+          disableAgent={templates.length === 0}
+          nodePickerOpen={nodePickerOpen}
+          onAdd={addNode}
+          onFitView={fitCanvas}
+          onNodePickerOpenChange={setNodePickerOpen}
+          onRedo={redo}
+          onToolChange={setTool}
+          onUndo={undo}
+          onZoomIn={() => void instanceRef.current?.zoomIn()}
+          onZoomOut={() => void instanceRef.current?.zoomOut()}
+          readOnly={readOnly}
+          tool={tool}
+        />
+      </ReactFlow>
+
+      {quickCreate ? (
+        <WorkflowCanvasQuickCreate
+          disableAgent={templates.length === 0}
+          onAdd={addNode}
+          state={quickCreate}
+        />
+      ) : null}
     </section>
   );
 }
 
-function layoutNodes(selections: readonly WorkflowNodeSelection[]) {
-  return new Map(
-    selections.map((selection, index) => [
-      selection.id,
-      {
-        x: CANVAS_PADDING + index * (NODE_WIDTH + COLUMN_GAP),
-        y: CANVAS_PADDING,
-      },
-    ]),
+function edgeId(sourceId: string, targetId: string) {
+  return `${sourceId}:${targetId}`;
+}
+
+function sameConnections(
+  current: readonly WorkflowNodeSelection[],
+  next: readonly WorkflowNodeSelection[],
+) {
+  return (
+    JSON.stringify(workflowConnections(current)) ===
+    JSON.stringify(workflowConnections(next))
   );
+}
+
+function sameSelections(
+  current: readonly WorkflowNodeSelection[],
+  next: readonly WorkflowNodeSelection[],
+) {
+  return JSON.stringify(current) === JSON.stringify(next);
+}
+
+function pointerPosition(event: MouseEvent | TouchEvent) {
+  if (event instanceof MouseEvent)
+    return { x: event.clientX, y: event.clientY };
+  const touch = event.changedTouches[0];
+  return touch ? { x: touch.clientX, y: touch.clientY } : null;
+}
+
+function cssNumber(
+  styles: CSSStyleDeclaration,
+  name: string,
+  fallback: number,
+) {
+  const value = Number.parseFloat(styles.getPropertyValue(name));
+  return Number.isFinite(value) ? value : fallback;
 }

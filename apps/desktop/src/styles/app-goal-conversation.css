@@ -806,18 +806,21 @@
 /* The context summary floats over the conversation instead of reserving a
  * permanent grid column. Tool stages continue to use the right workspace
  * column above. */
-.workspace:not(.with-tool-stage) {
+.workspace:not(.with-tool-stage):not(.with-flow-inspector) {
   --context-rail-inline-size: calc(var(--space-16) * 9 + var(--space-4));
   grid-template-columns: var(--workspace-left-width) 0 minmax(0, 1fr);
 }
 
-.workspace:not(.with-tool-stage):has(.context-rail-shell.is-inline) {
+.workspace:not(.with-tool-stage):not(.with-flow-inspector):has(
+    .context-rail-shell.is-inline
+  ) {
   --context-rail-reserved: calc(
     var(--context-rail-inline-size) + var(--space-6) + var(--space-8)
   );
 }
 
-.workspace:not(.with-tool-stage) > .workspace-resizer-right {
+.workspace:not(.with-tool-stage):not(.with-flow-inspector)
+  > .workspace-resizer-right {
   display: none;
 }
 
@@ -847,13 +850,17 @@
   pointer-events: auto;
 }
 
-.workspace:not(.with-tool-stage):has(.context-rail-shell.is-inline)
+.workspace:not(.with-tool-stage):not(.with-flow-inspector):has(
+    .context-rail-shell.is-inline
+  )
   .message-list {
   padding-inline-start: var(--space-12);
   padding-inline-end: var(--context-rail-reserved);
 }
 
-.workspace:not(.with-tool-stage):has(.context-rail-shell.is-inline)
+.workspace:not(.with-tool-stage):not(.with-flow-inspector):has(
+    .context-rail-shell.is-inline
+  )
   .composer-shell {
   padding-inline-start: var(--space-12);
   padding-inline-end: var(--context-rail-reserved);
@@ -861,7 +868,9 @@
 
 /* Keep the new-task welcome content centered in the usable conversation area,
  * excluding the inline context rail that overlays the right edge. */
-.workspace:not(.with-tool-stage):has(.context-rail-shell.is-inline)
+.workspace:not(.with-tool-stage):not(.with-flow-inspector):has(
+    .context-rail-shell.is-inline
+  )
   .new-task-state {
   padding-inline-start: var(--space-12);
   padding-inline-end: var(--context-rail-reserved);
@@ -880,7 +889,9 @@
   position: relative;
 }
 
-.workspace:not(.with-tool-stage):has(.context-rail-shell.is-inline)
+.workspace:not(.with-tool-stage):not(.with-flow-inspector):has(
+    .context-rail-shell.is-inline
+  )
   .center-pane {
   --conversation-content-padding-end: var(--context-rail-reserved);
 }

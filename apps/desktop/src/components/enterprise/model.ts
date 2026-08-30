@@ -5,12 +5,29 @@ import {
 } from "./flowActivation.ts";
 import type { WorkflowNodeSelection } from "./workflowNodeSelection.ts";
 import type { EnterpriseSnapshot } from "./store";
+import {
+  connectionAccountLabel,
+  connectionProblems,
+  type ConnectionProblem,
+} from "../connections/model.ts";
+
+export type TrustSignalFinding = {
+  id: string;
+  label: string;
+  context: string;
+  problems: readonly ConnectionProblem[];
+  target: {
+    kind: "connection";
+    connectionId: string;
+  };
+};
 
 export type TrustSignal = {
   id: string;
   level: "attention" | "warning" | "healthy";
   title: string;
   detail: string;
+  findings: readonly TrustSignalFinding[];
 };
 
 export function activeRunCount(snapshot: EnterpriseSnapshot): number {
@@ -31,20 +48,30 @@ export function latestPublishedTemplateCount(
 
 export function trustSignals(snapshot: EnterpriseSnapshot): TrustSignal[] {
   const signals: TrustSignal[] = [];
-  const unhealthyConnections = snapshot.connections.filter(
-    (connection) =>
-      !connection.enabled ||
-      connection.status !== "ready" ||
-      !["verified", "not_required"].includes(
-        connection.authContext.verification,
-      ),
-  );
-  if (unhealthyConnections.length) {
+  const connectionFindings = snapshot.connections.flatMap((connection) => {
+    const problems = connectionProblems(connection);
+    return problems.length > 0
+      ? [
+          {
+            id: `connection:${connection.id}`,
+            label: connection.name,
+            context: `${connectionAccountLabel(connection)} · ${connection.environment} · ${shortId(connection.id)}`,
+            problems,
+            target: {
+              kind: "connection" as const,
+              connectionId: connection.id,
+            },
+          },
+        ]
+      : [];
+  });
+  if (connectionFindings.length) {
     signals.push({
       id: "connections",
       level: "warning",
-      title: `${unhealthyConnections.length} 个 Connection 需要处理`,
+      title: `${connectionFindings.length} 个 Connection 需要处理`,
       detail: "停用、降级或认证失效的 Connection 会在调用边界 fail closed。",
+      findings: connectionFindings,
     });
   } else {
     signals.push({
@@ -52,6 +79,7 @@ export function trustSignals(snapshot: EnterpriseSnapshot): TrustSignal[] {
       level: "healthy",
       title: "Connection 运行许可正常",
       detail: "已启用 Connection 均处于 ready，认证状态可执行。",
+      findings: [],
     });
   }
 
@@ -62,6 +90,7 @@ export function trustSignals(snapshot: EnterpriseSnapshot): TrustSignal[] {
       level: "warning",
       title: `${failedRuns.length} 个 Run 失败`,
       detail: "检查 Node Trace 和 Activity Receipt 后再决定是否恢复。",
+      findings: [],
     });
   }
 
@@ -71,6 +100,7 @@ export function trustSignals(snapshot: EnterpriseSnapshot): TrustSignal[] {
       level: "attention",
       title: `${snapshot.tasks.length} 个 HumanTask 等待人工处理`,
       detail: "审批、输入、重连、核对和输出审查统一由 Inbox 处理。",
+      findings: [],
     });
   } else {
     signals.push({
@@ -78,6 +108,7 @@ export function trustSignals(snapshot: EnterpriseSnapshot): TrustSignal[] {
       level: "healthy",
       title: "Inbox 已清空",
       detail: "当前没有待处理的人工控制点。",
+      findings: [],
     });
   }
 
@@ -91,6 +122,7 @@ export function trustSignals(snapshot: EnterpriseSnapshot): TrustSignal[] {
       title: `${draftTemplates} 个 Agent 模板版本尚未发布`,
       detail:
         "只有已发布且固定 content hash 的 Agent 版本能进入 Flow Revision。",
+      findings: [],
     });
   }
   return signals;

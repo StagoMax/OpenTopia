@@ -3,10 +3,13 @@ import test from "node:test";
 
 import type * as WorkspaceNavigationModule from "./workspaceNavigation";
 
-const { resolveActiveFlowPrimaryView, resolveSidebarDestination } =
-  (await import(
-    "./workspaceNavigation" + ".ts"
-  )) as typeof WorkspaceNavigationModule;
+const {
+  resolveActiveFlowPrimaryView,
+  resolveSidebarDestination,
+  resolveWorkspaceNavigation,
+} = (await import(
+  "./workspaceNavigation" + ".ts"
+)) as typeof WorkspaceNavigationModule;
 
 test("maps fixed Flow navigation to one primary destination", () => {
   for (const [flowPrimaryView, destination] of [
@@ -55,21 +58,39 @@ test("maps fixed Flow navigation to one primary destination", () => {
   );
 });
 
-test("lets the full-workspace Plugins page own the current state", () => {
-  const sidebarDestination = resolveSidebarDestination({
+test("lets the full-workspace Plugins page own every visible navigation region", () => {
+  const navigation = resolveWorkspaceNavigation({
     experienceMode: "flow",
-    flowPrimaryView: "trust",
+    flowPrimaryView: "runs",
     toolStageOpen: true,
     activeToolKind: "extensions",
   });
 
-  assert.equal(sidebarDestination, "plugins");
+  assert.deepEqual(navigation, {
+    sidebarDestination: "plugins",
+    activeFlowPrimaryView: null,
+    flowInspectorOpen: false,
+  });
+});
+
+test("opens the Flow inspector only for active detail destinations", () => {
   assert.equal(
-    resolveActiveFlowPrimaryView({
-      flowPrimaryView: "trust",
-      sidebarDestination,
-    }),
-    null,
+    resolveWorkspaceNavigation({
+      experienceMode: "flow",
+      flowPrimaryView: "runs",
+      toolStageOpen: false,
+      activeToolKind: null,
+    }).flowInspectorOpen,
+    true,
+  );
+  assert.equal(
+    resolveWorkspaceNavigation({
+      experienceMode: "flow",
+      flowPrimaryView: "overview",
+      toolStageOpen: false,
+      activeToolKind: null,
+    }).flowInspectorOpen,
+    false,
   );
 });
 

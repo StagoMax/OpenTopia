@@ -88,6 +88,7 @@
   "dependencies": {
     "@glideapps/glide-data-grid": "6.0.3",
     "@monaco-editor/react": "^4.7.0",
+    "@xyflow/react": "12.11.5",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
     "docx-preview": "0.4.0",
