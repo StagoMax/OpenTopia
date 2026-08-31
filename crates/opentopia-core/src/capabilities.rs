@@ -621,8 +621,7 @@ impl PluginActivation {
     /// a per-thread switch. Runtime state such as browser tabs, cookies, and
     /// domain grants remains thread-scoped elsewhere.
     pub fn is_enabled(&self, default_enabled: bool) -> bool {
-        self.global_enabled.unwrap_or(default_enabled)
-            && self.workspace_enabled.unwrap_or(true)
+        self.global_enabled.unwrap_or(default_enabled) && self.workspace_enabled.unwrap_or(true)
     }
 }
 
