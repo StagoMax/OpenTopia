@@ -36,6 +36,17 @@ pub enum WorkflowOutputReviewPolicyV1 {
     AlwaysReviewOutput,
 }
 
+/// Selects the Library retrieval backend available to capability-approved
+/// Agent nodes in one immutable Flow revision. This binds only the provider;
+/// provider-owned projects, databases, and indexes remain runtime
+/// configuration so Agent templates stay reusable.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkflowLibraryProviderV1 {
+    Sag,
+    GraphRag,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowAgentSpecV1 {
@@ -298,6 +309,8 @@ pub struct FlowRevisionV1 {
     pub output: WorkflowOutputSpecV1,
     #[serde(default)]
     pub output_review_policy: WorkflowOutputReviewPolicyV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_provider: Option<WorkflowLibraryProviderV1>,
     pub content_hash: String,
     pub created_at: DateTime<Utc>,
     pub created_by: String,
@@ -353,6 +366,26 @@ impl FlowRevisionV1 {
         output_review_policy: WorkflowOutputReviewPolicyV1,
         created_by: impl Into<String>,
     ) -> Self {
+        Self::new_with_runtime_options(
+            compiled_workflow,
+            trigger,
+            ingress_policy,
+            output,
+            output_review_policy,
+            None,
+            created_by,
+        )
+    }
+
+    pub fn new_with_runtime_options(
+        compiled_workflow: CompiledWorkflowV1,
+        trigger: WorkflowTriggerSpecV1,
+        ingress_policy: crate::workflow_automation::WorkflowIngressPolicyV1,
+        output: WorkflowOutputSpecV1,
+        output_review_policy: WorkflowOutputReviewPolicyV1,
+        library_provider: Option<WorkflowLibraryProviderV1>,
+        created_by: impl Into<String>,
+    ) -> Self {
         let created_by = created_by.into();
         let id = Uuid::new_v4();
         let created_at = Utc::now();
@@ -363,6 +396,7 @@ impl FlowRevisionV1 {
             ingress_policy,
             &output,
             output_review_policy,
+            library_provider,
             &created_by,
         ))
         .unwrap_or_default();
@@ -374,6 +408,7 @@ impl FlowRevisionV1 {
             ingress_policy,
             output,
             output_review_policy,
+            library_provider,
             content_hash: content_fingerprint(&bytes),
             created_at,
             created_by,
@@ -480,6 +515,30 @@ impl ActiveFlowV1 {
         output_review_policy: WorkflowOutputReviewPolicyV1,
         created_by: impl Into<String>,
     ) -> Result<Self, WorkflowCompileError> {
+        Self::new_with_runtime_options(
+            name,
+            thread_id,
+            compiled_workflow,
+            trigger,
+            ingress_policy,
+            output,
+            output_review_policy,
+            None,
+            created_by,
+        )
+    }
+
+    pub fn new_with_runtime_options(
+        name: impl Into<String>,
+        thread_id: Uuid,
+        compiled_workflow: CompiledWorkflowV1,
+        trigger: WorkflowTriggerSpecV1,
+        ingress_policy: crate::workflow_automation::WorkflowIngressPolicyV1,
+        output: WorkflowOutputSpecV1,
+        output_review_policy: WorkflowOutputReviewPolicyV1,
+        library_provider: Option<WorkflowLibraryProviderV1>,
+        created_by: impl Into<String>,
+    ) -> Result<Self, WorkflowCompileError> {
         let name = name.into().trim().to_string();
         let created_by = created_by.into().trim().to_string();
         if name.is_empty() || created_by.is_empty() {
@@ -495,12 +554,13 @@ impl ActiveFlowV1 {
             name,
             thread_id,
             status: FlowStatusV1::Active,
-            active_revision: FlowRevisionV1::new_with_ingress_policy(
+            active_revision: FlowRevisionV1::new_with_runtime_options(
                 compiled_workflow,
                 trigger,
                 ingress_policy,
                 output,
                 output_review_policy,
+                library_provider,
                 created_by.clone(),
             ),
             created_at: now,
@@ -533,6 +593,7 @@ impl ActiveFlowV1 {
         ingress_policy: crate::workflow_automation::WorkflowIngressPolicyV1,
         output: WorkflowOutputSpecV1,
         output_review_policy: WorkflowOutputReviewPolicyV1,
+        library_provider: Option<WorkflowLibraryProviderV1>,
         applied_by: impl Into<String>,
     ) -> Result<(), WorkflowCompileError> {
         if compiled_workflow.flow_id != self.flow_id {
@@ -544,12 +605,13 @@ impl ActiveFlowV1 {
             return Err(WorkflowCompileError::InvalidFlowIdentity);
         }
         self.name = name;
-        self.active_revision = FlowRevisionV1::new_with_ingress_policy(
+        self.active_revision = FlowRevisionV1::new_with_runtime_options(
             compiled_workflow,
             trigger,
             ingress_policy,
             output,
             output_review_policy,
+            library_provider,
             applied_by,
         );
         self.status = FlowStatusV1::Active;

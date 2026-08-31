@@ -1,7 +1,12 @@
 import { Copy, PauseCircle, PlayCircle, Workflow } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ApiClient } from "../../api/client";
+import { ensureLibraryProviderService } from "../../platform";
 import type { ActiveFlow, FlowDraftView } from "../../types";
+import {
+  flowLibraryProviderLabel,
+  type FlowLibraryProviderSelection,
+} from "../../flowLibraryBinding";
 import { Button } from "../ui";
 import { FlowEditorInspector } from "./FlowEditorInspector";
 import { FlowEditorToolbar } from "./FlowEditorToolbar";
@@ -18,13 +23,13 @@ import {
   useFlowWorkspaceTitle,
 } from "./flowAgentSelection";
 import { FlowTriggerConfigPage } from "./FlowTriggerConfigPage";
-import { activationLabel, templateKey } from "./flowActivation";
+import { templateKey } from "./flowActivation";
 import { WorkflowGraphEditor } from "./WorkflowGraphEditor";
+import { workflowGraphNodeInputLabel } from "./workflowCanvasModel";
 import {
   createDefaultWorkflowNodes,
   removeWorkflowNode,
   workflowNodeLabel,
-  workflowNodesFromGraph,
   workflowNodesFromSpec,
   type WorkflowNodeSelection,
 } from "./workflowNodeSelection";
@@ -56,6 +61,8 @@ export function WorkflowTemplatesPage({
   );
   const [owner, setOwner] = useState("local_operator");
   const [outcome, setOutcome] = useState("");
+  const [libraryProvider, setLibraryProvider] =
+    useState<FlowLibraryProviderSelection>("");
   const [nodes, setNodes] = useState<WorkflowNodeSelection[]>([]);
   const [draft, setDraft] = useState<FlowDraftView | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -90,6 +97,7 @@ export function WorkflowTemplatesPage({
       setName("Untitled Flow / 未命名 Flow");
       setOwner("local_operator");
       setOutcome("");
+      setLibraryProvider("");
       setNodes(createDefaultWorkflowNodes(publishedTemplates[0]));
       setDraft(null);
       setError(null);
@@ -171,12 +179,15 @@ export function WorkflowTemplatesPage({
       (run) =>
         run.testDraftRevision === draft.draft.revision &&
         run.definitionContentHash === draft.draft.contentHash &&
+        (run.flowRevision?.libraryProvider ?? "") === libraryProvider &&
         run.status === "succeeded",
     ),
   );
   const activeTestRun = draft?.testRuns.find(
     (run) =>
-      run.testDraftRevision === draft.draft.revision && !isTerminal(run.status),
+      run.testDraftRevision === draft.draft.revision &&
+      (run.flowRevision?.libraryProvider ?? "") === libraryProvider &&
+      !isTerminal(run.status),
   );
 
   useEffect(() => {
@@ -203,10 +214,6 @@ export function WorkflowTemplatesPage({
     }, 1_000);
     return () => window.clearInterval(timer);
   }, [activeTestRun, client]);
-
-  const activeSelections = selectedFlow
-    ? workflowNodesFromGraph(selectedFlow.activeRevision.compiledWorkflow.graph)
-    : [];
 
   async function execute(name: string, action: () => Promise<void>) {
     if (busy) return;
@@ -276,6 +283,13 @@ export function WorkflowTemplatesPage({
     if (hadDraft) setNotice("Flow 配置已修改，请重新创建草稿并验证。");
   }
 
+  function changeLibraryProvider(provider: FlowLibraryProviderSelection) {
+    setLibraryProvider(provider);
+    if (draft) {
+      setNotice("运行资料库已修改；草稿仍有效，但需要重新执行真实 Test Run。");
+    }
+  }
+
   function changeNode(next: WorkflowNodeSelection) {
     changeNodes(nodes.map((node) => (node.id === next.id ? next : node)));
   }
@@ -304,10 +318,12 @@ export function WorkflowTemplatesPage({
   function startTestRun() {
     if (!draft) return;
     void execute("test-run", async () => {
+      await ensureRuntimeLibraryProvider(libraryProvider);
       const run = await client.startFlowTestRun(
         draft.draft.id,
         {},
         owner.trim(),
+        libraryProvider || null,
       );
       setDraft((current) =>
         current
@@ -334,6 +350,7 @@ export function WorkflowTemplatesPage({
   function activateDraft() {
     if (!draft) return;
     void execute("activate", async () => {
+      await ensureRuntimeLibraryProvider(libraryProvider);
       const activatedFlowId = draft.draft.spec.flowId;
       const active = snapshot.flows.find(
         (flow) => flow.flowId === activatedFlowId,
@@ -341,6 +358,7 @@ export function WorkflowTemplatesPage({
       await client.activateFlowDraft(draft.draft.id, {
         activatedBy: owner.trim(),
         expectedFlowRevision: active?.revision,
+        libraryProvider: libraryProvider || null,
       });
       await store.load(true);
       selection?.setSelectedFlowId(activatedFlowId);
@@ -366,6 +384,7 @@ export function WorkflowTemplatesPage({
       setName(copyName);
       setOwner(copied.draft.spec.owner);
       setOutcome(copied.draft.spec.description);
+      setLibraryProvider(selectedFlow.activeRevision.libraryProvider ?? "");
       setNodes(workflowNodesFromSpec(copied.draft.spec));
       setDraft(copied);
       setSelectedNodeId(null);
@@ -388,8 +407,9 @@ export function WorkflowTemplatesPage({
         </div>
       );
     }
+    const activeGraph = selectedFlow.activeRevision.compiledWorkflow.graph;
     const selectedActiveNode =
-      activeSelections.find((node) => node.id === selectedNodeId) ?? null;
+      activeGraph.nodes.find((node) => node.id === selectedNodeId) ?? null;
     return (
       <>
         <FlowInspectorPortal>
@@ -448,7 +468,7 @@ export function WorkflowTemplatesPage({
             }
             subtitle={
               selectedActiveNode
-                ? workflowNodeLabel(selectedActiveNode, publishedTemplates)
+                ? selectedActiveNode.label
                 : `${selectedFlow.flowId}@${selectedFlow.activeRevision.compiledWorkflow.flowVersion}`
             }
             title={selectedActiveNode ? "Node 配置" : "Flow 配置"}
@@ -458,12 +478,7 @@ export function WorkflowTemplatesPage({
                 <dl className="enterprise-facts flow-inspector-facts">
                   <div>
                     <dt>名称</dt>
-                    <dd>
-                      {workflowNodeLabel(
-                        selectedActiveNode,
-                        publishedTemplates,
-                      )}
-                    </dd>
+                    <dd>{selectedActiveNode.label}</dd>
                   </div>
                   <div>
                     <dt>Node ID</dt>
@@ -476,10 +491,9 @@ export function WorkflowTemplatesPage({
                   <div>
                     <dt>Input</dt>
                     <dd>
-                      {activationLabel(
-                        selectedActiveNode.activation,
-                        activeSelections,
-                        publishedTemplates,
+                      {workflowGraphNodeInputLabel(
+                        selectedActiveNode,
+                        activeGraph,
                       )}
                     </dd>
                   </div>
@@ -508,6 +522,14 @@ export function WorkflowTemplatesPage({
                     <dt>输出</dt>
                     <dd>{outputLabel(selectedFlow.activeRevision.output)}</dd>
                   </div>
+                  <div>
+                    <dt>资料库</dt>
+                    <dd>
+                      {flowLibraryProviderLabel(
+                        selectedFlow.activeRevision.libraryProvider,
+                      )}
+                    </dd>
+                  </div>
                 </dl>
               </FlowInspectorSection>
             )}
@@ -522,10 +544,10 @@ export function WorkflowTemplatesPage({
           <section className="workflow-editor workflow-editor--canvas-only">
             <div className="workflow-editor__body">
               <WorkflowGraphEditor
-                layoutId={`active:${selectedFlow.flowId}@${selectedFlow.activeRevision.compiledWorkflow.flowVersion}`}
+                compiledGraph={activeGraph}
+                layoutId={`active-compiled-v2:${selectedFlow.flowId}@${selectedFlow.activeRevision.compiledWorkflow.flowVersion}`}
                 onSelectNode={setSelectedNodeId}
                 readOnly
-                selections={activeSelections}
                 selectedNodeId={selectedNodeId}
                 templates={publishedTemplates}
               />
@@ -595,10 +617,12 @@ export function WorkflowTemplatesPage({
               draft={draft}
               error={error}
               flowId={flowId}
+              libraryProvider={libraryProvider}
               name={name}
               nodes={nodes}
               notice={notice}
               onChangeFlow={changeFlowConfiguration}
+              onChangeLibraryProvider={changeLibraryProvider}
               onChangeNode={changeNode}
               onEditTrigger={(nodeId) =>
                 setDetailPage({ kind: "trigger", nodeId })
@@ -641,6 +665,18 @@ export function WorkflowTemplatesPage({
 
 function readableError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+async function ensureRuntimeLibraryProvider(
+  provider: FlowLibraryProviderSelection,
+): Promise<void> {
+  if (!provider) return;
+  const status = await ensureLibraryProviderService(provider);
+  if (status?.state === "unavailable") {
+    throw new Error(
+      status.message || `${flowLibraryProviderLabel(provider)} 服务尚未就绪`,
+    );
+  }
 }
 
 function isTerminal(status: string): boolean {

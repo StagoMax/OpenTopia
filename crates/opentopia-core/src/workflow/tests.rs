@@ -168,3 +168,35 @@ fn flow_revision_is_immutable_and_manual_inbox_scoped() {
     );
     assert_eq!(restored.active_revision.output, WorkflowOutputSpecV1::Inbox);
 }
+
+#[test]
+fn flow_revision_freezes_provider_without_binding_a_database() {
+    let (template, binding) = template_with_operation();
+    let agent =
+        WorkflowAgentSpecV1::compile("review", &template, &[binding]).expect("compile Agent node");
+    let compiled =
+        CompiledWorkflowV1::compile(&definition(&template), vec![agent]).expect("compile workflow");
+    let flow = ActiveFlowV1::new_with_runtime_options(
+        "Lead review with Graph RAG",
+        Uuid::new_v4(),
+        compiled,
+        WorkflowTriggerSpecV1::Manual,
+        crate::WorkflowIngressPolicyV1::RequireReview,
+        WorkflowOutputSpecV1::Inbox,
+        WorkflowOutputReviewPolicyV1::ExplicitNodesOnly,
+        Some(WorkflowLibraryProviderV1::GraphRag),
+        "release-manager",
+    )
+    .expect("active Flow");
+    let serialized = serde_json::to_value(&flow).expect("serialize Flow");
+    let restored: ActiveFlowV1 = serde_json::from_value(serialized.clone()).expect("restore Flow");
+
+    assert_eq!(
+        serialized["activeRevision"]["libraryProvider"],
+        json!("graph-rag")
+    );
+    assert_eq!(
+        restored.active_revision.library_provider,
+        Some(WorkflowLibraryProviderV1::GraphRag)
+    );
+}

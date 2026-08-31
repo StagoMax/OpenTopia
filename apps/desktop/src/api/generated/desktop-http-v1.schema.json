@@ -6173,6 +6173,16 @@
           ],
           "default": "immediate"
         },
+        "libraryProvider": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/WorkflowLibraryProviderV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "output": {
           "$ref": "#/definitions/WorkflowOutputSpecV1"
         },
@@ -14594,6 +14604,14 @@
         "toolCalls"
       ],
       "type": "object"
+    },
+    "WorkflowLibraryProviderV1": {
+      "description": "Selects the Library retrieval backend available to capability-approved Agent nodes in one immutable Flow revision. This binds only the provider; provider-owned projects, databases, and indexes remain runtime configuration so Agent templates stay reusable.",
+      "enum": [
+        "sag",
+        "graph-rag"
+      ],
+      "type": "string"
     },
     "WorkflowOutputReviewPolicyV1": {
       "enum": [

@@ -95,6 +95,7 @@ mod event_bus;
 mod events_api;
 mod flow_cases_api;
 mod flow_cases_service;
+mod flow_library_runtime;
 mod flows_api;
 mod human_tasks_api;
 mod interaction_api;

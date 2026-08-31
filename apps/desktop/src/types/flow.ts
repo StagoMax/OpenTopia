@@ -1,4 +1,5 @@
 import type { ExperienceMode } from "./base";
+import type { LibraryProviderId } from "./platform";
 import type {
   WorkflowDeliveryReceipt,
   WorkflowOutput,
@@ -339,6 +340,7 @@ export type FlowRevision = {
   ingressPolicy: "immediate" | "require_review";
   output: WorkflowOutput;
   outputReviewPolicy: WorkflowOutputReviewPolicy;
+  libraryProvider?: LibraryProviderId;
   contentHash: string;
   createdAt: string;
   createdBy: string;

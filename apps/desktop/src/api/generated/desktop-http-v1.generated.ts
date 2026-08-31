@@ -27,6 +27,10 @@ export type LoopExhaustionActionV1 = "require_human" | "return_partial" | "fail"
 export type GraphNodeKindV1 =
   "agent" | "skill" | "tool" | "condition" | "validator" | "approval" | "join" | "loop" | "output";
 export type WorkflowIngressPolicyV1 = "immediate" | "require_review";
+/**
+ * Selects the Library retrieval backend available to capability-approved Agent nodes in one immutable Flow revision. This binds only the provider; provider-owned projects, databases, and indexes remain runtime configuration so Agent templates stay reusable.
+ */
+export type WorkflowLibraryProviderV1 = "sag" | "graph-rag";
 export type WorkflowOutputSpecV1 =
   | {
       kind: "inbox";
@@ -1204,6 +1208,7 @@ export interface FlowRevisionV1 {
   createdBy: string;
   id: string;
   ingressPolicy?: WorkflowIngressPolicyV1 & string;
+  libraryProvider?: WorkflowLibraryProviderV1 | null;
   output: WorkflowOutputSpecV1;
   outputReviewPolicy?: WorkflowOutputReviewPolicyV1 & string;
   schemaVersion: number;

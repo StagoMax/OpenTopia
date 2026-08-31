@@ -7,6 +7,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use opentopia_core::{
     ModelContentPart, Tool, ToolCall, ToolExecutionPolicy, ToolInvocationContext, ToolResult,
+    WorkflowLibraryProviderV1,
 };
 use reqwest::Url;
 use schemars::JsonSchema;
@@ -342,6 +343,15 @@ impl LibraryProviderId {
         match self {
             Self::Sag => "SAG",
             Self::GraphRag => "Graph RAG",
+        }
+    }
+}
+
+impl From<WorkflowLibraryProviderV1> for LibraryProviderId {
+    fn from(value: WorkflowLibraryProviderV1) -> Self {
+        match value {
+            WorkflowLibraryProviderV1::Sag => Self::Sag,
+            WorkflowLibraryProviderV1::GraphRag => Self::GraphRag,
         }
     }
 }

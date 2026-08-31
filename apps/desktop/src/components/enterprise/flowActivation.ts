@@ -146,21 +146,40 @@ export function activationLabel(
   nodes: readonly import("./workflowNodeSelection").WorkflowNodeSelection[],
   templates: readonly AgentTemplateVersionView[],
 ): string {
+  return activationLabelWithAgentResolver(activation, (nodeId) => {
+    const node = nodes.find((item) => item.id === nodeId);
+    const template =
+      node?.kind === "agent"
+        ? templates.find((item) => templateKey(item) === node.templateKey)
+        : null;
+    return (
+      template?.template.name ??
+      (node?.kind === "approval" || node?.kind === "output"
+        ? node.label
+        : nodeId)
+    );
+  });
+}
+
+export function graphActivationLabel(
+  activation: FlowNodeActivation,
+  nodes: readonly Pick<FlowGraphNode, "id" | "label">[],
+): string {
+  return activationLabelWithAgentResolver(
+    activation,
+    (nodeId) => nodes.find((item) => item.id === nodeId)?.label ?? nodeId,
+  );
+}
+
+function activationLabelWithAgentResolver(
+  activation: FlowNodeActivation,
+  resolveAgentLabel: (nodeId: string) => string,
+): string {
   const labels: string[] = [];
   visitExpression(activation.expression, (source, negated) => {
     let label: string;
     if (source.kind === "agent_final") {
-      const node = nodes.find((item) => item.id === source.nodeId);
-      const template =
-        node?.kind === "agent"
-          ? templates.find((item) => templateKey(item) === node.templateKey)
-          : null;
-      label = `${
-        template?.template.name ??
-        (node?.kind === "approval" || node?.kind === "output"
-          ? node.label
-          : source.nodeId)
-      }.Final`;
+      label = `${resolveAgentLabel(source.nodeId)}.Final`;
     } else if (source.kind === "event_subscription") {
       label = `${source.source}.${source.eventType}`;
     } else if (source.kind === "webhook") {

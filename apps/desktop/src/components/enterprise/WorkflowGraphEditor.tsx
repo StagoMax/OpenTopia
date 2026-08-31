@@ -15,16 +15,13 @@ import {
 import "@xyflow/react/dist/base.css";
 import {
   useEffect,
+  useMemo,
   useRef,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
-import type { AgentTemplateVersionView } from "../../types";
-import {
-  activationLabel,
-  createFinalActivation,
-  templateKey,
-} from "./flowActivation";
+import type { AgentTemplateVersionView, FlowSpec } from "../../types";
+import { createFinalActivation } from "./flowActivation";
 import {
   canConnectWorkflowNodes,
   connectWorkflowNodes,
@@ -49,9 +46,12 @@ import {
   type WorkflowCanvasNodeType,
 } from "./WorkflowCanvasNode";
 import {
+  compiledWorkflowCanvasModel,
+  editableWorkflowCanvasModel,
+} from "./workflowCanvasModel";
+import {
   addWorkflowNode,
   removeWorkflowNode,
-  workflowNodeLabel,
   type AddableWorkflowNodeKind,
   type WorkflowNodeSelection,
 } from "./workflowNodeSelection";
@@ -60,6 +60,7 @@ import "./workflow-graph.css";
 const nodeTypes: NodeTypes = { workflowNode: WorkflowCanvasNode };
 const HISTORY_LIMIT = 50;
 const DEFAULT_VIEWPORT = { x: 0, y: 0, zoom: 0.9 };
+const EMPTY_SELECTIONS: WorkflowNodeSelection[] = [];
 
 type CanvasSnapshot = {
   layout: WorkflowCanvasLayout;
@@ -67,26 +68,36 @@ type CanvasSnapshot = {
 };
 
 export function WorkflowGraphEditor({
+  compiledGraph,
   disabled = false,
   layoutId,
   onChange,
   onEditTrigger,
   onSelectNode,
   readOnly = false,
-  selections,
+  selections = EMPTY_SELECTIONS,
   selectedNodeId,
   templates,
 }: {
+  compiledGraph?: FlowSpec["graph"];
   disabled?: boolean;
   layoutId: string;
   onChange?(selections: WorkflowNodeSelection[]): void;
   onEditTrigger?(nodeId: string): void;
   onSelectNode(nodeId: string | null): void;
   readOnly?: boolean;
-  selections: WorkflowNodeSelection[];
+  selections?: WorkflowNodeSelection[];
   selectedNodeId: string | null;
   templates: AgentTemplateVersionView[];
 }) {
+  const canvasReadOnly = readOnly || Boolean(compiledGraph);
+  const canvasModel = useMemo(
+    () =>
+      compiledGraph
+        ? compiledWorkflowCanvasModel(compiledGraph)
+        : editableWorkflowCanvasModel(selections, templates),
+    [compiledGraph, selections, templates],
+  );
   const canvasRef = useRef<HTMLElement | null>(null);
   const instanceRef = useRef<ReactFlowInstance<WorkflowCanvasNodeType> | null>(
     null,
@@ -98,15 +109,25 @@ export function WorkflowGraphEditor({
   }>({ future: [], past: [] });
   const [, setHistoryVersion] = useState(0);
   const [layout, setLayout] = useState(() =>
-    readWorkflowCanvasLayout(layoutId, selections),
+    readWorkflowCanvasLayout(
+      layoutId,
+      canvasModel.nodes,
+      canvasModel.connections,
+    ),
   );
   const [nodePickerOpen, setNodePickerOpen] = useState(false);
   const [quickCreate, setQuickCreate] = useState<QuickCreateState | null>(null);
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
-  const [tool, setTool] = useState<CanvasTool>(readOnly ? "pan" : "select");
+  const [tool, setTool] = useState<CanvasTool>(
+    canvasReadOnly ? "pan" : "select",
+  );
 
   useEffect(() => {
-    const next = readWorkflowCanvasLayout(layoutId, selections);
+    const next = readWorkflowCanvasLayout(
+      layoutId,
+      canvasModel.nodes,
+      canvasModel.connections,
+    );
     setLayout(next);
     setNodePickerOpen(false);
     setQuickCreate(null);
@@ -117,6 +138,8 @@ export function WorkflowGraphEditor({
       const instance = instanceRef.current;
       if (!instance) return;
       if (next.viewport) void instance.setViewport(next.viewport);
+      else if (compiledGraph)
+        void instance.fitView({ maxZoom: 1, minZoom: 0.3, padding: 0.12 });
       else void instance.setViewport(DEFAULT_VIEWPORT);
     });
     return () => window.cancelAnimationFrame(frame);
@@ -128,9 +151,13 @@ export function WorkflowGraphEditor({
   useEffect(() => {
     setLayout((current) => ({
       ...current,
-      positions: reconcileWorkflowPositions(selections, current.positions),
+      positions: reconcileWorkflowPositions(
+        canvasModel.nodes,
+        canvasModel.connections,
+        current.positions,
+      ),
     }));
-  }, [selections]);
+  }, [canvasModel]);
 
   useEffect(() => {
     const timer = window.setTimeout(
@@ -140,57 +167,47 @@ export function WorkflowGraphEditor({
     return () => window.clearTimeout(timer);
   }, [layout, layoutId]);
 
-  const flowNodes: WorkflowCanvasNodeType[] = selections.map((selection) => {
-    const template =
-      selection.kind === "agent"
-        ? templates.find((item) => templateKey(item) === selection.templateKey)
-        : null;
+  const flowNodes: WorkflowCanvasNodeType[] = canvasModel.nodes.map((node) => {
     return {
-      id: selection.id,
+      id: node.id,
       type: "workflowNode",
-      position: layout.positions[selection.id] ?? { x: 0, y: 0 },
-      selected: selectedNodeId === selection.id,
-      draggable: !readOnly && !disabled && tool === "select",
-      connectable: !readOnly && !disabled,
-      deletable: !readOnly && selection.kind !== "output",
+      position: layout.positions[node.id] ?? { x: 0, y: 0 },
+      selected: selectedNodeId === node.id,
+      draggable: !canvasReadOnly && !disabled && tool === "select",
+      connectable: !canvasReadOnly && !disabled,
+      deletable: !canvasReadOnly && node.kind !== "output",
       focusable: true,
-      ariaLabel: `${workflowNodeLabel(selection, templates)}，${selection.kind} node`,
+      ariaLabel: `${node.label}，${node.kind} node`,
       data: {
-        activationText: activationLabel(
-          selection.activation,
-          selections,
-          templates,
-        ),
+        activationText: node.inputText,
         disabled,
-        label: workflowNodeLabel(selection, templates),
+        kind: node.kind,
+        label: node.label,
         onEditTrigger: (nodeId) => onEditTrigger?.(nodeId),
         onRemove: removeNode,
         onSelect: (nodeId) => {
           setSelectedEdgeId(null);
           onSelectNode(nodeId);
         },
-        readOnly,
-        selection,
-        subtitle:
-          selection.kind === "agent" && template
-            ? `${template.template.templateId}@${template.template.version}`
-            : `${selection.kind} node`,
+        readOnly: canvasReadOnly,
+        subtitle: node.subtitle,
       },
     };
   });
 
-  const edges: Edge[] = workflowConnections(selections).map((edge) => ({
-    id: edgeId(edge.sourceId, edge.targetId),
+  const edges: Edge[] = canvasModel.connections.map((edge) => ({
+    id: edge.id ?? edgeId(edge.sourceId, edge.targetId),
     source: edge.sourceId,
     sourceHandle: "final",
     target: edge.targetId,
     targetHandle: "input",
     type: "smoothstep",
     className: "workflow-canvas__edge",
-    selected: selectedEdgeId === edgeId(edge.sourceId, edge.targetId),
+    selected:
+      selectedEdgeId === (edge.id ?? edgeId(edge.sourceId, edge.targetId)),
     selectable: true,
-    deletable: !readOnly && !disabled,
-    reconnectable: !readOnly && !disabled,
+    deletable: !canvasReadOnly && !disabled,
+    reconnectable: !canvasReadOnly && !disabled,
   }));
 
   function snapshot(
@@ -217,10 +234,11 @@ export function WorkflowGraphEditor({
     nextSelections: WorkflowNodeSelection[],
     nextPositions = reconcileWorkflowPositions(
       nextSelections,
+      workflowConnections(nextSelections),
       layout.positions,
     ),
   ) {
-    if (!onChange || readOnly || disabled) return;
+    if (!onChange || canvasReadOnly || disabled) return;
     pushPast(snapshot());
     setLayout((current) => ({ ...current, positions: nextPositions }));
     onChange(nextSelections);
@@ -246,7 +264,11 @@ export function WorkflowGraphEditor({
         )
       : next;
     commitSemanticChange(withSource, {
-      ...reconcileWorkflowPositions(withSource, layout.positions),
+      ...reconcileWorkflowPositions(
+        withSource,
+        workflowConnections(withSource),
+        layout.positions,
+      ),
       [added.id]: position,
     });
     onSelectNode(added.id);
@@ -364,7 +386,7 @@ export function WorkflowGraphEditor({
     connectionState: FinalConnectionState,
   ) {
     if (
-      readOnly ||
+      canvasReadOnly ||
       disabled ||
       connectionState.isValid ||
       connectionState.toNode ||
@@ -404,7 +426,10 @@ export function WorkflowGraphEditor({
       target.matches("input, textarea, select") || target.isContentEditable;
     if (isEditing) return;
 
-    const command = workflowCanvasCommand(event, { disabled, readOnly });
+    const command = workflowCanvasCommand(event, {
+      disabled,
+      readOnly: canvasReadOnly,
+    });
     if (!command) return;
 
     event.preventDefault();
@@ -473,8 +498,8 @@ export function WorkflowGraphEditor({
         minZoom={0.3}
         nodeTypes={nodeTypes}
         nodes={flowNodes}
-        nodesConnectable={!readOnly && !disabled}
-        nodesDraggable={!readOnly && !disabled && tool === "select"}
+        nodesConnectable={!canvasReadOnly && !disabled}
+        nodesDraggable={!canvasReadOnly && !disabled && tool === "select"}
         onConnect={connect}
         onConnectEnd={handleConnectEnd}
         onEdgeClick={(event, edge) => {
@@ -552,7 +577,7 @@ export function WorkflowGraphEditor({
           onUndo={undo}
           onZoomIn={() => void instanceRef.current?.zoomIn()}
           onZoomOut={() => void instanceRef.current?.zoomOut()}
-          readOnly={readOnly}
+          readOnly={canvasReadOnly}
           tool={tool}
         />
       </ReactFlow>

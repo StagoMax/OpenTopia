@@ -444,8 +444,8 @@ pub use turn_inbox::{BufferedTurnInbox, TurnInbox, TurnInboxItem};
 pub use work_form::{WorkForm, WorkFormStatus, WorkItem, WorkItemStatus, WorkScope};
 pub use workflow::{
     ActiveFlowV1, CompiledWorkflowV1, FlowRevisionV1, FlowStatusV1, WorkflowAgentSpecV1,
-    WorkflowCompileError, WorkflowOutputReviewPolicyV1, WorkflowOutputSpecV1,
-    WorkflowTriggerSpecV1,
+    WorkflowCompileError, WorkflowLibraryProviderV1, WorkflowOutputReviewPolicyV1,
+    WorkflowOutputSpecV1, WorkflowTriggerSpecV1,
 };
 pub use workflow_automation::{
     FlowCaseStatusV1, FlowCaseV1, WorkflowDeliveryReceiptV1, WorkflowDeliveryStatusV1,

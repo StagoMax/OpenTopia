@@ -1,6 +1,5 @@
 import type { Viewport, XYPosition } from "@xyflow/react";
-import { workflowConnections } from "./workflowGraphOperations.ts";
-import type { WorkflowNodeSelection } from "./workflowNodeSelection.ts";
+import type { WorkflowConnection } from "./workflowGraphOperations.ts";
 
 const STORAGE_PREFIX = "opentopia.flow-canvas-layout.v1:";
 const NODE_WIDTH = 260;
@@ -14,13 +13,14 @@ export type WorkflowCanvasLayout = {
 };
 
 export function automaticWorkflowPositions(
-  nodes: readonly WorkflowNodeSelection[],
+  nodes: readonly { id: string }[],
+  edges: readonly WorkflowConnection[],
 ): Record<string, XYPosition> {
   const ranks = new Map(nodes.map((node) => [node.id, 0]));
-  const edges = workflowConnections(nodes);
   for (let pass = 0; pass < nodes.length; pass += 1) {
     let changed = false;
     for (const edge of edges) {
+      if (edge.layoutFeedback) continue;
       const nextRank = (ranks.get(edge.sourceId) ?? 0) + 1;
       if (nextRank > (ranks.get(edge.targetId) ?? 0)) {
         ranks.set(edge.targetId, nextRank);
@@ -52,10 +52,11 @@ export function automaticWorkflowPositions(
 }
 
 export function reconcileWorkflowPositions(
-  nodes: readonly WorkflowNodeSelection[],
+  nodes: readonly { id: string }[],
+  edges: readonly WorkflowConnection[],
   positions: Record<string, XYPosition>,
 ): Record<string, XYPosition> {
-  const automatic = automaticWorkflowPositions(nodes);
+  const automatic = automaticWorkflowPositions(nodes, edges);
   return Object.fromEntries(
     nodes.map((node) => [node.id, positions[node.id] ?? automatic[node.id]!]),
   );
@@ -63,9 +64,10 @@ export function reconcileWorkflowPositions(
 
 export function readWorkflowCanvasLayout(
   layoutId: string,
-  nodes: readonly WorkflowNodeSelection[],
+  nodes: readonly { id: string }[],
+  edges: readonly WorkflowConnection[],
 ): WorkflowCanvasLayout {
-  const automatic = automaticWorkflowPositions(nodes);
+  const automatic = automaticWorkflowPositions(nodes, edges);
   if (typeof window === "undefined") return { positions: automatic };
   try {
     const raw = window.localStorage.getItem(storageKey(layoutId));
@@ -75,7 +77,7 @@ export function readWorkflowCanvasLayout(
       ? parsed.positions
       : automatic;
     return {
-      positions: reconcileWorkflowPositions(nodes, positions),
+      positions: reconcileWorkflowPositions(nodes, edges, positions),
       ...(isViewport(parsed.viewport) ? { viewport: parsed.viewport } : {}),
     };
   } catch {

@@ -22,6 +22,7 @@ import type {
   HumanTaskResolutionResult,
   HumanTaskStatus,
   HumanTaskType,
+  LibraryProviderId,
   MediaHandlerInvocationResponse,
   MediaHandlerOperation,
   MediaHandlerSelection,
@@ -355,10 +356,7 @@ export class ExtensionsApi extends ConfigurationApi {
   }
 
   async getFlow(flowId: string): Promise<ActiveFlow> {
-    return this.get(
-      "getFlow",
-      `/api/flows/${encodeURIComponent(flowId)}`,
-    );
+    return this.get("getFlow", `/api/flows/${encodeURIComponent(flowId)}`);
   }
 
   async invokeFlow(
@@ -450,11 +448,7 @@ export class ExtensionsApi extends ConfigurationApi {
     labels?: string[];
     note?: string;
   }): Promise<WorkflowEvaluation> {
-    return this.post(
-      "createFlowEvaluation",
-      "/api/flow-evaluations",
-      input,
-    );
+    return this.post("createFlowEvaluation", "/api/flow-evaluations", input);
   }
 
   async getFlowEvaluationSummary(
@@ -477,7 +471,10 @@ export class ExtensionsApi extends ConfigurationApi {
     );
   }
 
-  async resumeFlow(flowId: string, expectedRevision: number): Promise<ActiveFlow> {
+  async resumeFlow(
+    flowId: string,
+    expectedRevision: number,
+  ): Promise<ActiveFlow> {
     return this.post(
       "resumeFlow",
       `/api/flows/${encodeURIComponent(flowId)}/resume`,
@@ -559,11 +556,12 @@ export class ExtensionsApi extends ConfigurationApi {
     draftId: string,
     input: unknown = {},
     startedBy = "local-user",
+    libraryProvider?: LibraryProviderId | null,
   ): Promise<FlowRun> {
     return this.post(
       "startFlowTestRun",
       `/api/flow-drafts/${encodeURIComponent(draftId)}/test-run`,
-      { input, startedBy },
+      { input, startedBy, libraryProvider },
     );
   }
 
@@ -574,6 +572,7 @@ export class ExtensionsApi extends ConfigurationApi {
       expectedFlowRevision?: number;
       output?: WorkflowOutput;
       outputReviewPolicy?: WorkflowOutputReviewPolicy;
+      libraryProvider?: LibraryProviderId | null;
     },
   ): Promise<ActiveFlow> {
     return this.post(

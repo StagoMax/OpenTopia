@@ -9,6 +9,10 @@ import {
   SlidersHorizontal,
 } from "lucide-react";
 import type { AgentTemplateVersionView, FlowDraftView } from "../../types";
+import {
+  FLOW_LIBRARY_PROVIDER_OPTIONS,
+  type FlowLibraryProviderSelection,
+} from "../../flowLibraryBinding";
 import { Badge, Button, SelectField, TextField } from "../ui";
 import { activationLabel, templateKey } from "./flowActivation";
 import {
@@ -20,10 +24,12 @@ export function FlowEditorInspector({
   draft,
   error,
   flowId,
+  libraryProvider,
   name,
   nodes,
   notice,
   onChangeFlow,
+  onChangeLibraryProvider,
   onChangeNode,
   onEditTrigger,
   onSelectNode,
@@ -37,10 +43,12 @@ export function FlowEditorInspector({
   draft: FlowDraftView | null;
   error: string | null;
   flowId: string;
+  libraryProvider: FlowLibraryProviderSelection;
   name: string;
   nodes: WorkflowNodeSelection[];
   notice: string | null;
   onChangeFlow(change: Partial<FlowConfiguration>): void;
+  onChangeLibraryProvider(provider: FlowLibraryProviderSelection): void;
   onChangeNode(node: WorkflowNodeSelection): void;
   onEditTrigger(nodeId: string): void;
   onSelectNode(nodeId: string | null): void;
@@ -118,6 +126,13 @@ export function FlowEditorInspector({
                   onChangeFlow({ owner: event.target.value })
                 }
                 value={owner}
+              />
+              <SelectField<FlowLibraryProviderSelection>
+                hint="只选择检索后端，不绑定具体数据库或 namespace；Agent 仍需具备 library_search 权限。"
+                label="运行资料库"
+                onChange={onChangeLibraryProvider}
+                options={FLOW_LIBRARY_PROVIDER_OPTIONS}
+                value={libraryProvider}
               />
               <label className="flow-editor-inspector__textarea">
                 <span>业务结果</span>

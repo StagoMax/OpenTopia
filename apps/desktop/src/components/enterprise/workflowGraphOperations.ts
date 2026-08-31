@@ -7,6 +7,8 @@ import {
 import type { WorkflowNodeSelection } from "./workflowNodeSelection.ts";
 
 export type WorkflowConnection = {
+  id?: string;
+  layoutFeedback?: boolean;
   sourceId: string;
   targetId: string;
 };

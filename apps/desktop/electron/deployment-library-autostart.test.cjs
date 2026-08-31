@@ -6,10 +6,11 @@ const {
   requiredLibraryProvidersFromDeployments,
 } = require("./deployment-library-autostart.cjs");
 
-function deployment(status, namespaces) {
+function deployment(status, namespaces, libraryProvider) {
   return {
     status,
-    snapshot: {
+    activeRevision: {
+      ...(libraryProvider ? { libraryProvider } : {}),
       compiledWorkflow: {
         agentSpecs: {
           evidence: namespaces
@@ -21,13 +22,14 @@ function deployment(status, namespaces) {
   };
 }
 
-test("detects SAG only from active frozen deployment agent specs", () => {
+test("detects providers from active frozen Flow revisions", () => {
   assert.deepEqual(
     requiredLibraryProvidersFromDeployments([
       deployment("disabled", ["disabled.namespace"]),
       deployment("active", ["audit.namespace"]),
+      deployment("active", null, "graph-rag"),
     ]),
-    ["sag"],
+    ["sag", "graph-rag"],
   );
   assert.deepEqual(
     requiredLibraryProvidersFromDeployments([deployment("active")]),
@@ -45,7 +47,9 @@ test("starts required providers after authenticated deployment discovery", async
       requests.push({ url, options });
       return {
         ok: true,
-        json: async () => ({ items: [deployment("active", ["audit"])] }),
+        json: async () => ({
+          items: [deployment("active", null, "graph-rag")],
+        }),
       };
     },
     ensureProvider: async (provider) => {
@@ -54,11 +58,11 @@ test("starts required providers after authenticated deployment discovery", async
     },
   });
 
-  assert.deepEqual(providers, ["sag"]);
-  assert.deepEqual(started, ["sag"]);
+  assert.deepEqual(providers, ["graph-rag"]);
+  assert.deepEqual(started, ["graph-rag"]);
   assert.equal(
     requests[0].url,
-    "http://127.0.0.1:8787/api/workflow-deployments",
+    "http://127.0.0.1:8787/api/flows?status=active",
   );
   assert.equal(
     requests[0].options.headers.authorization,
