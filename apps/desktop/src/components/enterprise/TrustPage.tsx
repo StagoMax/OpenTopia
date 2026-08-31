@@ -4,7 +4,6 @@ import {
   CircleAlert,
   RefreshCw,
   ShieldAlert,
-  ShieldCheck,
   TriangleAlert,
 } from "lucide-react";
 import { useEffect } from "react";
@@ -124,30 +123,6 @@ export function TrustPage({
         </section>
       ) : null}
 
-      <section className="enterprise-core-detail__payload">
-        <header>
-          <strong>Execution invariants / 执行不变量</strong>
-        </header>
-        <ul className="enterprise-invariants">
-          <Invariant
-            detail="每个 Workflow Agent 节点固定模板版本、content hash 与 Connection 操作。"
-            title="Immutable identity / 不可变身份"
-          />
-          <Invariant
-            detail="节点权限只能从 Agent 配置与 Flow Revision 逐层收窄，不能从 Thread MCP 状态扩权。"
-            title="Least privilege / 最小权限"
-          />
-          <Invariant
-            detail="审批、补输入、重连、效果核对和输出审查统一形成 HumanTask。"
-            title="Durable control points / 持久化控制点"
-          />
-          <Invariant
-            detail="认证过期、能力移除、描述变更或快照缺失都会在外部调用前拒绝。"
-            title="Fail closed / 失败关闭"
-          />
-        </ul>
-      </section>
-
       <FlowInspectorPortal>
         <FlowInspectorPanel
           actions={
@@ -160,10 +135,9 @@ export function TrustPage({
               <RefreshCw aria-hidden="true" size={14} />
             </IconButton>
           }
-          status={signal?.level ?? snapshot.status}
+          status={trustStatusLabel(signal?.level, snapshot.status)}
           statusVariant={trustVariant(signal?.level)}
-          subtitle={signal?.id}
-          title="Trust center"
+          title="信任状态"
         >
           {snapshot.error ? (
             <p className="enterprise-page__message is-error" role="alert">
@@ -173,26 +147,14 @@ export function TrustPage({
           <FlowInspectorSection title="Current signal / 当前信号">
             <p>{signal?.detail ?? "当前没有信任信号。"}</p>
           </FlowInspectorSection>
-          <FlowInspectorSection title="Snapshot / 状态快照">
+          <FlowInspectorSection title="更新时间">
             <dl className="flow-inspector-facts">
               <div>
-                <dt>Connections</dt>
-                <dd>{snapshot.connections.length}</dd>
-              </div>
-              <div>
-                <dt>Runs</dt>
-                <dd>{snapshot.runs.length}</dd>
-              </div>
-              <div>
-                <dt>Human tasks</dt>
-                <dd>{snapshot.tasks.length}</dd>
-              </div>
-              <div>
-                <dt>Refreshed</dt>
+                <dt>最近刷新</dt>
                 <dd>
                   {snapshot.refreshedAt
                     ? new Date(snapshot.refreshedAt).toLocaleString()
-                    : "Not loaded"}
+                    : "尚未加载"}
                 </dd>
               </div>
             </dl>
@@ -203,20 +165,16 @@ export function TrustPage({
   );
 }
 
-function Invariant({ detail, title }: { detail: string; title: string }) {
-  return (
-    <li>
-      <ShieldCheck aria-hidden="true" size={16} />
-      <span>
-        <strong>{title}</strong>
-        <small>{detail}</small>
-      </span>
-    </li>
-  );
-}
-
 function trustVariant(level: string | undefined): FlowInspectorStatusVariant {
   if (level === "healthy") return "success";
   if (level === "warning") return "danger";
   return "warning";
+}
+
+function trustStatusLabel(level: string | undefined, fallback: string): string {
+  if (level === "healthy") return "正常";
+  if (level === "warning") return "需要处理";
+  if (level === "attention") return "需要关注";
+  if (fallback === "loading") return "刷新中";
+  return "待检查";
 }

@@ -1,4 +1,5 @@
 import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
+import { memo } from "react";
 import {
   BadgeCheck,
   Bot,
@@ -34,7 +35,7 @@ export type WorkflowCanvasNodeType = Node<
   "workflowNode"
 >;
 
-export function WorkflowCanvasNode({
+export const WorkflowCanvasNode = memo(function WorkflowCanvasNode({
   data,
   id,
   selected,
@@ -92,7 +93,7 @@ export function WorkflowCanvasNode({
       )}
       <button
         aria-pressed={selected}
-        className="workflow-node__body nodrag nopan"
+        className="workflow-node__body"
         onClick={() => onSelect(id)}
         type="button"
       >
@@ -135,6 +136,19 @@ export function WorkflowCanvasNode({
         />
       ) : null}
     </article>
+  );
+}, workflowCanvasNodePropsEqual);
+
+function workflowCanvasNodePropsEqual(
+  previous: NodeProps<WorkflowCanvasNodeType>,
+  next: NodeProps<WorkflowCanvasNodeType>,
+) {
+  // React Flow moves the wrapper with a transform. The card itself only needs
+  // to render again when its visible data or selection state changes.
+  return (
+    previous.id === next.id &&
+    previous.selected === next.selected &&
+    previous.data === next.data
   );
 }
 

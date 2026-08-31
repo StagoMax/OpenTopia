@@ -4,9 +4,7 @@ import { createPortal } from "react-dom";
 import { Button, IconButton, TextField } from "../ui";
 
 export type FlowCreateValues = {
-  flowId: string;
   name: string;
-  owner: string;
   outcome: string;
 };
 
@@ -65,11 +63,7 @@ export function FlowCreateDialog({
   }, [open]);
 
   if (!open) return null;
-  const complete =
-    values.flowId.trim() &&
-    values.name.trim() &&
-    values.owner.trim() &&
-    values.outcome.trim();
+  const complete = Boolean(values.name.trim() && values.outcome.trim());
 
   return createPortal(
     <div
@@ -93,7 +87,7 @@ export function FlowCreateDialog({
             </span>
             <span>
               <strong id={titleId}>创建 Flow</strong>
-              <small>先定义 Flow 的基本信息，随后进入节点画布。</small>
+              <small>先建立流程，Agent 和运行规则进入画布后再设置。</small>
             </span>
           </span>
           <IconButton
@@ -115,32 +109,17 @@ export function FlowCreateDialog({
           <div className="flow-create-dialog__grid">
             <TextField
               autoFocus
-              label="Workflow ID"
-              onChange={(event) =>
-                onChange({ ...values, flowId: event.target.value })
-              }
-              required
-              value={values.flowId}
-            />
-            <TextField
               label="名称"
               onChange={(event) =>
                 onChange({ ...values, name: event.target.value })
               }
+              placeholder="例如：新客户资料审核"
               required
               value={values.name}
-            />
-            <TextField
-              label="所有者"
-              onChange={(event) =>
-                onChange({ ...values, owner: event.target.value })
-              }
-              required
-              value={values.owner}
               wrapperClassName="flow-create-dialog__wide"
             />
             <label className="flow-create-dialog__outcome">
-              <span>希望完成的业务结果</span>
+              <span>这个 Flow 要完成什么？</span>
               <textarea
                 onChange={(event) =>
                   onChange({ ...values, outcome: event.target.value })
@@ -150,9 +129,7 @@ export function FlowCreateDialog({
                 rows={4}
                 value={values.outcome}
               />
-              <small>
-                使用自然语言描述目标，节点细节可以进入画布后继续配置。
-              </small>
+              <small>用业务语言描述最终结果，节点细节进入画布后再配置。</small>
             </label>
           </div>
         </form>
@@ -166,7 +143,7 @@ export function FlowCreateDialog({
             type="submit"
             variant="primary"
           >
-            创建并进入画布
+            创建 Flow 并进入画布
           </Button>
         </footer>
       </section>

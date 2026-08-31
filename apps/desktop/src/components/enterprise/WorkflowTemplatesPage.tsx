@@ -1,17 +1,20 @@
 import { Copy, PauseCircle, PlayCircle, Workflow } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ApiClient } from "../../api/client";
-import { ensureLibraryProviderService } from "../../platform";
 import type { ActiveFlow, FlowDraftView } from "../../types";
-import {
-  flowLibraryProviderLabel,
-  type FlowLibraryProviderSelection,
-} from "../../flowLibraryBinding";
 import { Button } from "../ui";
-import { FlowEditorInspector } from "./FlowEditorInspector";
+import {
+  FlowEditorInspector,
+  type FlowRuntimeConfiguration,
+} from "./FlowEditorInspector";
 import { FlowEditorToolbar } from "./FlowEditorToolbar";
+import { FlowCreateDialog, type FlowCreateValues } from "./FlowCreateDialog";
 import { FlowInspectorPanel, FlowInspectorSection } from "./FlowInspectorPanel";
-import { guidedWorkflowSpec } from "./model";
+import {
+  DEFAULT_GUIDED_FLOW_BUDGET,
+  DEFAULT_GUIDED_FLOW_RISK_CLASS,
+  guidedWorkflowSpec,
+} from "./model";
 import {
   useEnterpriseSubpageHeader,
   type EnterprisePageHeaderChange,
@@ -25,6 +28,11 @@ import {
 import { FlowTriggerConfigPage } from "./FlowTriggerConfigPage";
 import { templateKey } from "./flowActivation";
 import { WorkflowGraphEditor } from "./WorkflowGraphEditor";
+import {
+  configureWorkflowConnection,
+  workflowConnections,
+  type WorkflowConnection,
+} from "./workflowGraphOperations";
 import { workflowGraphNodeInputLabel } from "./workflowCanvasModel";
 import {
   createDefaultWorkflowNodes,
@@ -32,6 +40,7 @@ import {
   workflowNodeLabel,
   workflowNodesFromSpec,
   type WorkflowNodeSelection,
+  type WorkflowEdgeConfiguration,
 } from "./workflowNodeSelection";
 import "./workflow-editor.css";
 
@@ -61,15 +70,23 @@ export function WorkflowTemplatesPage({
   );
   const [owner, setOwner] = useState("local_operator");
   const [outcome, setOutcome] = useState("");
-  const [libraryProvider, setLibraryProvider] =
-    useState<FlowLibraryProviderSelection>("");
+  const [runtimeConfiguration, setRuntimeConfiguration] =
+    useState<FlowRuntimeConfiguration>(() => defaultRuntimeConfiguration());
   const [nodes, setNodes] = useState<WorkflowNodeSelection[]>([]);
   const [draft, setDraft] = useState<FlowDraftView | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [creating, setCreating] = useState(Boolean(selection?.creatingFlow));
+  const [creating, setCreating] = useState(false);
+  const [createDialogOpen, setCreateDialogOpen] = useState(
+    Boolean(selection?.creatingFlow),
+  );
+  const [createValues, setCreateValues] = useState<FlowCreateValues>(() =>
+    defaultCreateValues(),
+  );
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [selectedConnection, setSelectedConnection] =
+    useState<WorkflowConnection | null>(null);
   const [editorLayoutId, setEditorLayoutId] = useState(
     () => `draft:${crypto.randomUUID()}`,
   );
@@ -92,26 +109,24 @@ export function WorkflowTemplatesPage({
     const request = selection?.createFlowRequest ?? 0;
     if (request > handledCreateRequest.current) {
       handledCreateRequest.current = request;
-      const suffix = crypto.randomUUID().slice(0, 8);
-      setFlowId(`flow-${suffix}`);
-      setName("Untitled Flow / 未命名 Flow");
-      setOwner("local_operator");
-      setOutcome("");
-      setLibraryProvider("");
-      setNodes(createDefaultWorkflowNodes(publishedTemplates[0]));
+      setCreateValues(defaultCreateValues());
+      setRuntimeConfiguration(defaultRuntimeConfiguration());
+      setCreating(false);
+      setCreateDialogOpen(true);
       setDraft(null);
       setError(null);
       setNotice(null);
       setSelectedNodeId(null);
+      setSelectedConnection(null);
       setEditorLayoutId(`draft:${crypto.randomUUID()}`);
       setDetailPage(null);
-      setCreating(true);
     }
-  }, [publishedTemplates, selection?.createFlowRequest]);
+  }, [selection?.createFlowRequest]);
 
   useEffect(() => {
     if (selection?.selectedFlowId) {
       setCreating(false);
+      setCreateDialogOpen(false);
       setDetailPage(null);
     }
   }, [selection?.selectedFlowId]);
@@ -128,7 +143,9 @@ export function WorkflowTemplatesPage({
   const detailNode = detailPage
     ? (nodes.find((item) => item.id === detailPage.nodeId) ?? null)
     : null;
-  useFlowWorkspaceTitle(creating ? name : selectedFlow?.name);
+  useFlowWorkspaceTitle(
+    createDialogOpen ? "创建 Flow" : creating ? name : selectedFlow?.name,
+  );
   useEnterpriseSubpageHeader(onPageHeaderChange, Boolean(detailPage), {
     title: `Flows / ${name} / 配置 Trigger`,
     backLabel: "返回 Flow 图",
@@ -138,26 +155,17 @@ export function WorkflowTemplatesPage({
   });
 
   useEffect(() => {
+    if (!creating) return;
     const available = new Set(publishedTemplates.map(templateKey));
     setNodes((current) => {
-      if (current.length === 0) {
-        return createDefaultWorkflowNodes(publishedTemplates[0]);
-      }
-      const next = current
+      return current
         .filter(
-          (node) => node.kind === "agent" && !available.has(node.templateKey),
+          (node) =>
+            node.kind === "agent" &&
+            Boolean(node.templateKey) &&
+            !available.has(node.templateKey),
         )
         .reduce((result, node) => removeWorkflowNode(result, node.id), current);
-      if (
-        creating &&
-        publishedTemplates[0] &&
-        !next.some((node) => node.kind === "agent") &&
-        next.length === 1 &&
-        next[0]?.kind === "output"
-      ) {
-        return createDefaultWorkflowNodes(publishedTemplates[0]);
-      }
-      return next;
     });
   }, [creating, publishedTemplates]);
 
@@ -167,6 +175,9 @@ export function WorkflowTemplatesPage({
       (template) => templateKey(template) === node.templateKey,
     ),
   );
+  const graphReady =
+    nodes.some((node) => node.kind !== "output") &&
+    nodes.every(nodeConfigurationReady);
   const passedDryRun = Boolean(
     draft?.trials.some(
       (trial) =>
@@ -179,15 +190,12 @@ export function WorkflowTemplatesPage({
       (run) =>
         run.testDraftRevision === draft.draft.revision &&
         run.definitionContentHash === draft.draft.contentHash &&
-        (run.flowRevision?.libraryProvider ?? "") === libraryProvider &&
         run.status === "succeeded",
     ),
   );
   const activeTestRun = draft?.testRuns.find(
     (run) =>
-      run.testDraftRevision === draft.draft.revision &&
-      (run.flowRevision?.libraryProvider ?? "") === libraryProvider &&
-      !isTerminal(run.status),
+      run.testDraftRevision === draft.draft.revision && !isTerminal(run.status),
   );
 
   useEffect(() => {
@@ -229,13 +237,34 @@ export function WorkflowTemplatesPage({
     }
   }
 
+  function confirmCreateFlow() {
+    const nextNodes = createDefaultWorkflowNodes();
+    setFlowId(`flow-${crypto.randomUUID().slice(0, 8)}`);
+    setName(createValues.name);
+    setOwner("local_operator");
+    setOutcome(createValues.outcome);
+    setNodes(nextNodes);
+    setRuntimeConfiguration(defaultRuntimeConfiguration());
+    setDraft(null);
+    setError(null);
+    setNotice("Flow 已创建。请从空画布添加第一个节点。");
+    setSelectedNodeId(null);
+    setSelectedConnection(null);
+    setEditorLayoutId(`draft:${crypto.randomUUID()}`);
+    setDetailPage(null);
+    setCreateDialogOpen(false);
+    selection?.beginFlowDraft();
+    setCreating(true);
+  }
+
+  function cancelCreateFlow() {
+    setCreateDialogOpen(false);
+    setCreating(false);
+    selection?.cancelCreateFlow();
+  }
+
   function createDraft() {
-    if (
-      !threadId ||
-      agentNodes.length === 0 ||
-      !allAgentsAvailable ||
-      !outcome.trim()
-    )
+    if (!threadId || !graphReady || !allAgentsAvailable || !outcome.trim())
       return;
     void execute("create", async () => {
       const created = await client.createFlowDraft(
@@ -247,6 +276,8 @@ export function WorkflowTemplatesPage({
           outcome: outcome.trim(),
           nodes,
           templates: publishedTemplates,
+          budget: runtimeConfiguration.budget,
+          riskClass: runtimeConfiguration.riskClass,
         }),
       );
       setDraft(created);
@@ -262,6 +293,16 @@ export function WorkflowTemplatesPage({
     setDraft(null);
     setSelectedNodeId((current) =>
       current && next.some((node) => node.id === current) ? current : null,
+    );
+    setSelectedConnection((current) =>
+      current &&
+      workflowConnections(next).some(
+        (edge) =>
+          edge.sourceId === current.sourceId &&
+          edge.targetId === current.targetId,
+      )
+        ? current
+        : null,
     );
     if (hadDraft) setNotice("节点配置已修改，请重新创建草稿并验证。");
   }
@@ -283,15 +324,35 @@ export function WorkflowTemplatesPage({
     if (hadDraft) setNotice("Flow 配置已修改，请重新创建草稿并验证。");
   }
 
-  function changeLibraryProvider(provider: FlowLibraryProviderSelection) {
-    setLibraryProvider(provider);
-    if (draft) {
-      setNotice("运行资料库已修改；草稿仍有效，但需要重新执行真实 Test Run。");
-    }
-  }
-
   function changeNode(next: WorkflowNodeSelection) {
     changeNodes(nodes.map((node) => (node.id === next.id ? next : node)));
+  }
+
+  function changeRuntimeConfiguration(next: FlowRuntimeConfiguration) {
+    const hadDraft = Boolean(draft);
+    setRuntimeConfiguration(next);
+    setDraft(null);
+    if (hadDraft) setNotice("运行设置已修改，请重新创建草稿并验证。");
+  }
+
+  function changeConnection(
+    connection: WorkflowConnection,
+    configuration: WorkflowEdgeConfiguration,
+  ) {
+    const next = configureWorkflowConnection(
+      nodes,
+      connection.sourceId,
+      connection.targetId,
+      configuration,
+    );
+    changeNodes(next);
+    setSelectedConnection(
+      workflowConnections(next).find(
+        (edge) =>
+          edge.sourceId === connection.sourceId &&
+          edge.targetId === connection.targetId,
+      ) ?? null,
+    );
   }
 
   function validateDraft() {
@@ -318,12 +379,10 @@ export function WorkflowTemplatesPage({
   function startTestRun() {
     if (!draft) return;
     void execute("test-run", async () => {
-      await ensureRuntimeLibraryProvider(libraryProvider);
       const run = await client.startFlowTestRun(
         draft.draft.id,
         {},
         owner.trim(),
-        libraryProvider || null,
       );
       setDraft((current) =>
         current
@@ -350,7 +409,6 @@ export function WorkflowTemplatesPage({
   function activateDraft() {
     if (!draft) return;
     void execute("activate", async () => {
-      await ensureRuntimeLibraryProvider(libraryProvider);
       const activatedFlowId = draft.draft.spec.flowId;
       const active = snapshot.flows.find(
         (flow) => flow.flowId === activatedFlowId,
@@ -358,7 +416,6 @@ export function WorkflowTemplatesPage({
       await client.activateFlowDraft(draft.draft.id, {
         activatedBy: owner.trim(),
         expectedFlowRevision: active?.revision,
-        libraryProvider: libraryProvider || null,
       });
       await store.load(true);
       selection?.setSelectedFlowId(activatedFlowId);
@@ -384,11 +441,16 @@ export function WorkflowTemplatesPage({
       setName(copyName);
       setOwner(copied.draft.spec.owner);
       setOutcome(copied.draft.spec.description);
-      setLibraryProvider(selectedFlow.activeRevision.libraryProvider ?? "");
+      setRuntimeConfiguration({
+        budget: { ...copied.draft.spec.budget },
+        riskClass: copied.draft.spec.riskClass,
+      });
       setNodes(workflowNodesFromSpec(copied.draft.spec));
       setDraft(copied);
       setSelectedNodeId(null);
+      setSelectedConnection(null);
       setEditorLayoutId(`draft:${crypto.randomUUID()}`);
+      setCreateDialogOpen(false);
       selection?.beginFlowDraft();
       setCreating(true);
       setNotice(
@@ -397,14 +459,27 @@ export function WorkflowTemplatesPage({
     });
   }
 
+  const createDialog = (
+    <FlowCreateDialog
+      onCancel={cancelCreateFlow}
+      onChange={setCreateValues}
+      onSubmit={confirmCreateFlow}
+      open={createDialogOpen}
+      values={createValues}
+    />
+  );
+
   if (!creating) {
     if (!selectedFlow) {
       return (
-        <div className="enterprise-agent-prompt-empty" role="status">
-          <Workflow aria-hidden="true" size={20} />
-          <strong>尚未创建 Flow</strong>
-          <p>使用左侧新建按钮创建一个 Flow。</p>
-        </div>
+        <>
+          {createDialog}
+          <div className="enterprise-agent-prompt-empty" role="status">
+            <Workflow aria-hidden="true" size={20} />
+            <strong>尚未创建 Flow</strong>
+            <p>使用左侧新建按钮创建一个 Flow。</p>
+          </div>
+        </>
       );
     }
     const activeGraph = selectedFlow.activeRevision.compiledWorkflow.graph;
@@ -412,6 +487,7 @@ export function WorkflowTemplatesPage({
       activeGraph.nodes.find((node) => node.id === selectedNodeId) ?? null;
     return (
       <>
+        {createDialog}
         <FlowInspectorPortal>
           <FlowInspectorPanel
             actions={
@@ -522,14 +598,6 @@ export function WorkflowTemplatesPage({
                     <dt>输出</dt>
                     <dd>{outputLabel(selectedFlow.activeRevision.output)}</dd>
                   </div>
-                  <div>
-                    <dt>资料库</dt>
-                    <dd>
-                      {flowLibraryProviderLabel(
-                        selectedFlow.activeRevision.libraryProvider,
-                      )}
-                    </dd>
-                  </div>
                 </dl>
               </FlowInspectorSection>
             )}
@@ -560,6 +628,7 @@ export function WorkflowTemplatesPage({
 
   return (
     <>
+      {createDialog}
       <FlowInspectorPortal>
         <section
           className="flow-workspace-inspector workflow-editor-inspector-shell"
@@ -574,10 +643,7 @@ export function WorkflowTemplatesPage({
               successfulTestRun,
             )}
             canCreateDraft={Boolean(
-              threadId &&
-              agentNodes.length > 0 &&
-              allAgentsAvailable &&
-              outcome.trim(),
+              threadId && graphReady && allAgentsAvailable && outcome.trim(),
             )}
             canDryRun={Boolean(draft?.draft.lastValidation?.valid)}
             canTestRun={Boolean(
@@ -617,21 +683,24 @@ export function WorkflowTemplatesPage({
               draft={draft}
               error={error}
               flowId={flowId}
-              libraryProvider={libraryProvider}
               name={name}
               nodes={nodes}
               notice={notice}
               onChangeFlow={changeFlowConfiguration}
-              onChangeLibraryProvider={changeLibraryProvider}
+              onChangeConnection={changeConnection}
               onChangeNode={changeNode}
+              onChangeRuntimeConfiguration={changeRuntimeConfiguration}
               onEditTrigger={(nodeId) =>
                 setDetailPage({ kind: "trigger", nodeId })
               }
               onSelectNode={setSelectedNodeId}
+              onSelectConnection={setSelectedConnection}
               outcome={outcome}
               owner={owner}
               passedDryRun={passedDryRun}
+              runtimeConfiguration={runtimeConfiguration}
               selectedNodeId={selectedNodeId}
+              selectedConnection={selectedConnection}
               successfulTestRun={successfulTestRun}
               templates={publishedTemplates}
             />
@@ -652,7 +721,9 @@ export function WorkflowTemplatesPage({
                 setDetailPage({ kind: "trigger", nodeId })
               }
               onSelectNode={setSelectedNodeId}
+              onSelectConnection={setSelectedConnection}
               selections={nodes}
+              selectedConnection={selectedConnection}
               selectedNodeId={selectedNodeId}
               templates={publishedTemplates}
             />
@@ -663,24 +734,34 @@ export function WorkflowTemplatesPage({
   );
 }
 
+function defaultCreateValues(): FlowCreateValues {
+  return {
+    name: "",
+    outcome: "",
+  };
+}
+
+function defaultRuntimeConfiguration(): FlowRuntimeConfiguration {
+  return {
+    budget: { ...DEFAULT_GUIDED_FLOW_BUDGET },
+    riskClass: DEFAULT_GUIDED_FLOW_RISK_CLASS,
+  };
+}
+
 function readableError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-async function ensureRuntimeLibraryProvider(
-  provider: FlowLibraryProviderSelection,
-): Promise<void> {
-  if (!provider) return;
-  const status = await ensureLibraryProviderService(provider);
-  if (status?.state === "unavailable") {
-    throw new Error(
-      status.message || `${flowLibraryProviderLabel(provider)} 服务尚未就绪`,
-    );
-  }
-}
-
 function isTerminal(status: string): boolean {
   return ["succeeded", "failed", "cancelled"].includes(status);
+}
+
+function nodeConfigurationReady(node: WorkflowNodeSelection) {
+  if (node.kind === "skill" || node.kind === "tool") {
+    return Boolean(node.reference.trim());
+  }
+  if (node.kind === "condition") return Boolean(node.expression.trim());
+  return true;
 }
 
 function triggerLabel(

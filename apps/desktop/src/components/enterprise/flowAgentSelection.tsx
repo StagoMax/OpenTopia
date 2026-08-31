@@ -26,6 +26,7 @@ type FlowWorkspaceSelectionValue = {
   createFlowRequest: number;
   beginFlowDraft(): void;
   requestCreateFlow(): void;
+  cancelCreateFlow(): void;
   selectedInboxItemId: string | null;
   setSelectedInboxItemId(itemId: string | null): void;
   selectedRunId: string | null;
@@ -97,6 +98,7 @@ export function FlowWorkspaceProvider({ children }: { children: ReactNode }) {
     beginFlowDraft();
     setCreateFlowRequest((current) => current + 1);
   }, [beginFlowDraft]);
+  const cancelCreateFlow = useCallback(() => setCreatingFlow(false), []);
 
   const value = useMemo(
     () => ({
@@ -116,6 +118,7 @@ export function FlowWorkspaceProvider({ children }: { children: ReactNode }) {
       createFlowRequest,
       beginFlowDraft,
       requestCreateFlow,
+      cancelCreateFlow,
       selectedInboxItemId,
       setSelectedInboxItemId,
       selectedRunId,
@@ -133,6 +136,7 @@ export function FlowWorkspaceProvider({ children }: { children: ReactNode }) {
       cancelCreateAgent,
       createFlowRequest,
       beginFlowDraft,
+      cancelCreateFlow,
       creatingAgent,
       creatingFlow,
       inspectorTarget,

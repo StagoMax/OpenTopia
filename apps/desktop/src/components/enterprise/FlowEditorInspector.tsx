@@ -1,61 +1,81 @@
 import {
+  BadgeCheck,
   Bot,
   CheckCircle2,
   ChevronLeft,
   FileJson2,
+  Gauge,
+  GitBranch,
   Inbox,
-  RadioTower,
+  Link2,
+  Merge,
+  Repeat2,
   ShieldCheck,
   SlidersHorizontal,
+  Sparkles,
+  Settings2,
+  Wrench,
 } from "lucide-react";
-import type { AgentTemplateVersionView, FlowDraftView } from "../../types";
-import {
-  FLOW_LIBRARY_PROVIDER_OPTIONS,
-  type FlowLibraryProviderSelection,
-} from "../../flowLibraryBinding";
+import type {
+  AgentTemplateVersionView,
+  FlowDraftView,
+  FlowSpec,
+} from "../../types";
 import { Badge, Button, SelectField, TextField } from "../ui";
-import { activationLabel, templateKey } from "./flowActivation";
 import {
   workflowNodeLabel,
   type WorkflowNodeSelection,
 } from "./workflowNodeSelection";
+import { FlowConnectionConfiguration } from "./FlowConnectionConfiguration";
+import type { WorkflowConnection } from "./workflowGraphOperations";
+import type { WorkflowEdgeConfiguration } from "./workflowNodeSelection";
+import { FlowNodeConfiguration } from "./FlowNodeConfiguration";
 
 export function FlowEditorInspector({
   draft,
   error,
   flowId,
-  libraryProvider,
   name,
   nodes,
   notice,
   onChangeFlow,
-  onChangeLibraryProvider,
   onChangeNode,
+  onChangeConnection,
   onEditTrigger,
+  onChangeRuntimeConfiguration,
+  onSelectConnection,
   onSelectNode,
   outcome,
   owner,
   passedDryRun,
+  runtimeConfiguration,
   selectedNodeId,
+  selectedConnection,
   successfulTestRun,
   templates,
 }: {
   draft: FlowDraftView | null;
   error: string | null;
   flowId: string;
-  libraryProvider: FlowLibraryProviderSelection;
   name: string;
   nodes: WorkflowNodeSelection[];
   notice: string | null;
   onChangeFlow(change: Partial<FlowConfiguration>): void;
-  onChangeLibraryProvider(provider: FlowLibraryProviderSelection): void;
   onChangeNode(node: WorkflowNodeSelection): void;
+  onChangeConnection(
+    connection: WorkflowConnection,
+    configuration: WorkflowEdgeConfiguration,
+  ): void;
+  onChangeRuntimeConfiguration(configuration: FlowRuntimeConfiguration): void;
   onEditTrigger(nodeId: string): void;
+  onSelectConnection(connection: WorkflowConnection | null): void;
   onSelectNode(nodeId: string | null): void;
   outcome: string;
   owner: string;
   passedDryRun: boolean;
+  runtimeConfiguration: FlowRuntimeConfiguration;
   selectedNodeId: string | null;
+  selectedConnection: WorkflowConnection | null;
   successfulTestRun: boolean;
   templates: AgentTemplateVersionView[];
 }) {
@@ -65,34 +85,56 @@ export function FlowEditorInspector({
     <aside className="flow-editor-inspector" aria-label="Flow 配置">
       <header className="flow-editor-inspector__header">
         <span className="flow-editor-inspector__title">
-          {selectedNode ? (
+          {selectedConnection ? (
+            <Link2 aria-hidden="true" size={16} />
+          ) : selectedNode ? (
             <NodeIcon kind={selectedNode.kind} />
           ) : (
             <SlidersHorizontal aria-hidden="true" size={16} />
           )}
           <span>
-            <strong>{selectedNode ? "Node 配置" : "Flow 配置"}</strong>
+            <strong>
+              {selectedConnection
+                ? "连线配置"
+                : selectedNode
+                  ? "节点设置"
+                  : "Flow 设置"}
+            </strong>
             <small>
-              {selectedNode
-                ? workflowNodeLabel(selectedNode, templates)
-                : `${nodes.length} 个节点 · ${draft ? "草稿已保存" : "未保存"}`}
+              {selectedConnection
+                ? `${selectedConnection.sourceId} → ${selectedConnection.targetId}`
+                : selectedNode
+                  ? workflowNodeLabel(selectedNode, templates)
+                  : `${nodes.length} 个节点 · ${draft ? "草稿已保存" : "尚未保存"}`}
             </small>
           </span>
         </span>
-        {selectedNode ? (
+        {selectedNode || selectedConnection ? (
           <Button
-            onClick={() => onSelectNode(null)}
+            onClick={() => {
+              onSelectConnection(null);
+              onSelectNode(null);
+            }}
             size="compact"
             variant="quiet"
           >
-            <ChevronLeft aria-hidden="true" size={14} /> Flow
+            <ChevronLeft aria-hidden="true" size={14} /> Flow 设置
           </Button>
         ) : null}
       </header>
 
       <div className="flow-editor-inspector__body">
-        {selectedNode ? (
-          <NodeConfiguration
+        {selectedConnection ? (
+          <FlowConnectionConfiguration
+            connection={selectedConnection}
+            nodes={nodes}
+            onChange={(configuration) =>
+              onChangeConnection(selectedConnection, configuration)
+            }
+            templates={templates}
+          />
+        ) : selectedNode ? (
+          <FlowNodeConfiguration
             node={selectedNode}
             nodes={nodes}
             onChange={onChangeNode}
@@ -103,39 +145,21 @@ export function FlowEditorInspector({
           <>
             <section className="flow-editor-inspector__section">
               <header>
-                <strong>基本信息</strong>
+                <span>
+                  <strong>Flow 目标</strong>
+                  <small>先说明要做什么；技术标识放在高级设置中。</small>
+                </span>
                 <Badge variant={draft ? "neutral" : "warning"}>
-                  {draft ? "Draft" : "Unsaved"}
+                  {draft ? "已保存" : "未保存"}
                 </Badge>
               </header>
-              <TextField
-                label="Workflow ID"
-                onChange={(event) =>
-                  onChangeFlow({ flowId: event.target.value })
-                }
-                value={flowId}
-              />
               <TextField
                 label="名称"
                 onChange={(event) => onChangeFlow({ name: event.target.value })}
                 value={name}
               />
-              <TextField
-                label="所有者"
-                onChange={(event) =>
-                  onChangeFlow({ owner: event.target.value })
-                }
-                value={owner}
-              />
-              <SelectField<FlowLibraryProviderSelection>
-                hint="只选择检索后端，不绑定具体数据库或 namespace；Agent 仍需具备 library_search 权限。"
-                label="运行资料库"
-                onChange={onChangeLibraryProvider}
-                options={FLOW_LIBRARY_PROVIDER_OPTIONS}
-                value={libraryProvider}
-              />
               <label className="flow-editor-inspector__textarea">
-                <span>业务结果</span>
+                <span>要完成的结果</span>
                 <textarea
                   onChange={(event) =>
                     onChangeFlow({ outcome: event.target.value })
@@ -157,14 +181,131 @@ export function FlowEditorInspector({
               />
             </section>
 
-            {draft ? (
-              <details className="flow-editor-inspector__advanced">
-                <summary>
-                  <FileJson2 aria-hidden="true" size={14} /> Advanced JSON
-                </summary>
-                <pre>{JSON.stringify(draft.draft.spec, null, 2)}</pre>
-              </details>
-            ) : null}
+            <details className="flow-editor-inspector__advanced">
+              <summary>
+                <Settings2 aria-hidden="true" size={14} /> 高级设置
+              </summary>
+              <div className="flow-editor-inspector__advanced-body">
+                <TextField
+                  hint="用于 API、日志和版本引用。"
+                  label="Workflow ID"
+                  onChange={(event) =>
+                    onChangeFlow({ flowId: event.target.value })
+                  }
+                  value={flowId}
+                />
+                <TextField
+                  label="所有者"
+                  onChange={(event) =>
+                    onChangeFlow({ owner: event.target.value })
+                  }
+                  value={owner}
+                />
+                <SelectField<FlowSpec["riskClass"]>
+                  hint="高风险 Flow 会在运行边界采用更严格的人工控制。"
+                  label="风险级别"
+                  onChange={(riskClass) =>
+                    onChangeRuntimeConfiguration({
+                      ...runtimeConfiguration,
+                      riskClass,
+                    })
+                  }
+                  options={[
+                    { value: "low", label: "低" },
+                    { value: "medium", label: "中" },
+                    { value: "high", label: "高" },
+                    { value: "critical", label: "关键" },
+                  ]}
+                  value={runtimeConfiguration.riskClass}
+                />
+                <fieldset className="flow-editor-budget">
+                  <legend>
+                    <Gauge aria-hidden="true" size={14} /> 运行预算
+                  </legend>
+                  <TextField
+                    label="最多节点执行次数"
+                    min={1}
+                    onChange={(event) =>
+                      onChangeRuntimeConfiguration({
+                        ...runtimeConfiguration,
+                        budget: {
+                          ...runtimeConfiguration.budget,
+                          maxNodeExecutions: positiveInteger(
+                            event.target.value,
+                            runtimeConfiguration.budget.maxNodeExecutions,
+                          ),
+                        },
+                      })
+                    }
+                    type="number"
+                    value={runtimeConfiguration.budget.maxNodeExecutions}
+                  />
+                  <TextField
+                    label="最多工具调用次数"
+                    min={1}
+                    onChange={(event) =>
+                      onChangeRuntimeConfiguration({
+                        ...runtimeConfiguration,
+                        budget: {
+                          ...runtimeConfiguration.budget,
+                          maxToolCalls: positiveInteger(
+                            event.target.value,
+                            runtimeConfiguration.budget.maxToolCalls,
+                          ),
+                        },
+                      })
+                    }
+                    type="number"
+                    value={runtimeConfiguration.budget.maxToolCalls}
+                  />
+                  <TextField
+                    hint="单位：秒"
+                    label="最长运行时间"
+                    min={1}
+                    onChange={(event) =>
+                      onChangeRuntimeConfiguration({
+                        ...runtimeConfiguration,
+                        budget: {
+                          ...runtimeConfiguration.budget,
+                          maxDurationSeconds: positiveInteger(
+                            event.target.value,
+                            runtimeConfiguration.budget.maxDurationSeconds,
+                          ),
+                        },
+                      })
+                    }
+                    type="number"
+                    value={runtimeConfiguration.budget.maxDurationSeconds}
+                  />
+                  <TextField
+                    label="最多循环次数"
+                    min={1}
+                    onChange={(event) =>
+                      onChangeRuntimeConfiguration({
+                        ...runtimeConfiguration,
+                        budget: {
+                          ...runtimeConfiguration.budget,
+                          maxLoopIterations: positiveInteger(
+                            event.target.value,
+                            runtimeConfiguration.budget.maxLoopIterations,
+                          ),
+                        },
+                      })
+                    }
+                    type="number"
+                    value={runtimeConfiguration.budget.maxLoopIterations}
+                  />
+                </fieldset>
+                {draft ? (
+                  <details className="flow-editor-inspector__json">
+                    <summary>
+                      <FileJson2 aria-hidden="true" size={14} /> 查看草稿 JSON
+                    </summary>
+                    <pre>{JSON.stringify(draft.draft.spec, null, 2)}</pre>
+                  </details>
+                ) : null}
+              </div>
+            </details>
           </>
         )}
 
@@ -190,104 +331,36 @@ type FlowConfiguration = {
   outcome: string;
 };
 
-function NodeConfiguration({
-  node,
-  nodes,
-  onChange,
-  onEditTrigger,
-  templates,
-}: {
-  node: WorkflowNodeSelection;
-  nodes: WorkflowNodeSelection[];
-  onChange(node: WorkflowNodeSelection): void;
-  onEditTrigger(nodeId: string): void;
-  templates: AgentTemplateVersionView[];
-}) {
-  return (
-    <>
-      <section className="flow-editor-inspector__section">
-        <header>
-          <strong>节点</strong>
-          <Badge variant={node.kind === "approval" ? "warning" : "neutral"}>
-            {node.kind}
-          </Badge>
-        </header>
-        <TextField label="Node ID" readOnly value={node.id} />
-        {node.kind === "agent" ? (
-          <SelectField
-            label="Agent"
-            onChange={(nextTemplateKey) =>
-              onChange({ ...node, templateKey: nextTemplateKey })
-            }
-            options={templates.map((item) => ({
-              value: templateKey(item),
-              label: `${item.template.name} · ${item.template.templateId}@${item.template.version}`,
-            }))}
-            value={node.templateKey}
-          />
-        ) : null}
-        {node.kind === "approval" ? (
-          <>
-            <TextField
-              label="名称"
-              onChange={(event) =>
-                onChange({ ...node, label: event.target.value })
-              }
-              value={node.label}
-            />
-            <label className="flow-editor-inspector__textarea">
-              <span>审批说明</span>
-              <textarea
-                onChange={(event) =>
-                  onChange({ ...node, instructions: event.target.value })
-                }
-                rows={5}
-                value={node.instructions}
-              />
-            </label>
-          </>
-        ) : null}
-        {node.kind === "output" ? (
-          <>
-            <TextField label="名称" readOnly value={node.label} />
-            <p className="flow-editor-inspector__note">
-              Output 是当前 Flow 的固定终点，负责将最终结果写入 Inbox。
-            </p>
-          </>
-        ) : null}
-      </section>
-
-      <section className="flow-editor-inspector__section">
-        <header>
-          <strong>Activation</strong>
-        </header>
-        <div className="flow-editor-inspector__activation">
-          <RadioTower aria-hidden="true" size={14} />
-          <span>
-            <small>Trigger / 上游来源</small>
-            <strong>
-              {activationLabel(node.activation, nodes, templates)}
-            </strong>
-          </span>
-        </div>
-        {node.kind !== "output" ? (
-          <Button
-            onClick={() => onEditTrigger(node.id)}
-            size="compact"
-            variant="secondary"
-          >
-            <RadioTower aria-hidden="true" size={14} /> 配置 Trigger
-          </Button>
-        ) : null}
-      </section>
-    </>
-  );
-}
+export type FlowRuntimeConfiguration = {
+  budget: FlowSpec["budget"];
+  riskClass: FlowSpec["riskClass"];
+};
 
 function NodeIcon({ kind }: { kind: WorkflowNodeSelection["kind"] }) {
   const Icon =
-    kind === "agent" ? Bot : kind === "approval" ? ShieldCheck : Inbox;
+    kind === "agent"
+      ? Bot
+      : kind === "skill"
+        ? Sparkles
+        : kind === "tool"
+          ? Wrench
+          : kind === "condition"
+            ? GitBranch
+            : kind === "validator"
+              ? BadgeCheck
+              : kind === "approval"
+                ? ShieldCheck
+                : kind === "join"
+                  ? Merge
+                  : kind === "loop"
+                    ? Repeat2
+                    : Inbox;
   return <Icon aria-hidden="true" size={16} />;
+}
+
+function positiveInteger(value: string, fallback: number) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function WorkflowProgress({
@@ -300,11 +373,11 @@ function WorkflowProgress({
   successfulTestRun: boolean;
 }) {
   const steps = [
-    ["Draft", Boolean(draft)],
-    ["Validated", Boolean(draft?.draft.lastValidation?.valid)],
-    ["Dry Run", passedDryRun],
-    ["Test Run", successfulTestRun],
-    ["Activated", draft?.draft.status === "published"],
+    ["保存草稿", Boolean(draft)],
+    ["通过校验", Boolean(draft?.draft.lastValidation?.valid)],
+    ["完成模拟运行", passedDryRun],
+    ["通过真实测试", successfulTestRun],
+    ["激活 Flow", draft?.draft.status === "published"],
   ] as const;
   return (
     <ol className="flow-editor-progress" aria-label="Flow 激活进度">

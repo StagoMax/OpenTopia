@@ -54,7 +54,11 @@ export function editableWorkflowCanvasModel(
         subtitle:
           selection.kind === "agent" && template
             ? `${template.template.templateId}@${template.template.version}`
-            : `${selection.kind} node`,
+            : selection.kind === "agent"
+              ? "未关联 Agent"
+              : selection.kind === "tool"
+                ? "deterministic action"
+                : `${selection.kind} node`,
       };
     }),
   };
@@ -65,8 +69,13 @@ export function compiledWorkflowCanvasModel(
 ): WorkflowCanvasGraphModel {
   return {
     connections: graph.edges.map((edge, index) => ({
+      allowedFields: edge.allowedFields,
+      condition: edge.condition ?? "",
+      dataClassification: edge.dataClassification,
       id: `compiled-edge-${index}`,
       layoutFeedback: Boolean(edge.loopPolicy),
+      loopPolicy: edge.loopPolicy,
+      onError: edge.onError,
       sourceId: edge.from,
       targetId: edge.to,
     })),
@@ -107,5 +116,6 @@ function compiledNodeSubtitle(node: FlowGraphNode): string {
   if (typeof reference === "string") {
     return typeof version === "number" ? `${reference}@${version}` : reference;
   }
+  if (node.kind === "tool") return "deterministic action";
   return `${node.kind} node`;
 }

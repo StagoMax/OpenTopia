@@ -34,13 +34,33 @@ export const workflowCanvasAriaShortcuts = {
   zoomOut: "-",
 } as const;
 
-type ShortcutEvent = Pick<
+export type WorkflowCanvasShortcutEvent = Pick<
   KeyboardEvent,
   "altKey" | "code" | "ctrlKey" | "key" | "metaKey" | "shiftKey"
 >;
 
+export function isWorkflowCanvasSpaceKey(
+  event: Pick<WorkflowCanvasShortcutEvent, "code" | "key">,
+) {
+  return (
+    event.code === "Space" || event.key === " " || event.key === "Spacebar"
+  );
+}
+
+export function isWorkflowCanvasTemporaryPanKey(
+  event: WorkflowCanvasShortcutEvent,
+) {
+  return (
+    !event.altKey &&
+    !event.ctrlKey &&
+    !event.metaKey &&
+    !event.shiftKey &&
+    isWorkflowCanvasSpaceKey(event)
+  );
+}
+
 export function workflowCanvasCommand(
-  event: ShortcutEvent,
+  event: WorkflowCanvasShortcutEvent,
   {
     disabled,
     readOnly,

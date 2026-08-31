@@ -180,6 +180,27 @@
   gap: var(--space-3);
 }
 
+.flow-editor-inspector__section > header > span,
+.flow-editor-inspector__switch-row > span {
+  display: grid;
+  min-inline-size: 0;
+  gap: var(--space-1);
+}
+
+.flow-editor-inspector__section > header small,
+.flow-editor-inspector__switch-row small {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-regular);
+}
+
+.flow-editor-inspector__switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
 .flow-editor-inspector__textarea,
 .flow-create-dialog__outcome {
   display: grid;
@@ -229,6 +250,107 @@
   font-size: var(--font-size-xs);
 }
 
+.flow-editor-inspector__note > svg {
+  flex: 0 0 auto;
+  margin-inline-end: var(--space-2);
+  vertical-align: text-bottom;
+}
+
+.flow-state-writes {
+  display: grid;
+  gap: var(--space-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.flow-state-writes > li {
+  display: grid;
+  gap: var(--space-4);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface-subtle);
+  padding: var(--space-4);
+}
+
+.flow-state-writes__heading,
+.flow-loop-policy > label,
+.flow-connection-route {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.flow-state-writes__heading strong,
+.flow-loop-policy > label > span {
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+}
+
+.flow-connection-route {
+  justify-content: flex-start;
+  min-inline-size: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface-subtle);
+  padding: var(--space-3);
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.flow-connection-route > span {
+  overflow: hidden;
+  min-inline-size: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.flow-connection-route > svg {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+}
+
+.flow-loop-policy {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.flow-agent-capabilities {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+}
+
+.flow-agent-capabilities > div {
+  display: grid;
+  grid-template-columns: minmax(0, auto) minmax(0, 1fr);
+  align-items: start;
+  gap: var(--space-4);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface-subtle);
+  padding: var(--space-3);
+}
+
+.flow-agent-capabilities dt {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+}
+
+.flow-agent-capabilities dd {
+  overflow-wrap: anywhere;
+  margin: 0;
+  color: var(--text);
+  font-size: var(--font-size-xs);
+  line-height: var(--line-height-relaxed);
+}
+
 .flow-editor-inspector__activation strong {
   overflow-wrap: anywhere;
   font-size: var(--font-size-sm);
@@ -265,7 +387,8 @@
   padding-top: var(--space-4);
 }
 
-.flow-editor-inspector__advanced summary {
+.flow-editor-inspector__advanced > summary,
+.flow-editor-inspector__json > summary {
   display: flex;
   align-items: center;
   gap: var(--space-2);
@@ -274,7 +397,38 @@
   font-size: var(--font-size-sm);
 }
 
-.flow-editor-inspector__advanced pre {
+.flow-editor-inspector__advanced-body {
+  display: grid;
+  gap: var(--space-5);
+  padding-top: var(--space-5);
+}
+
+.flow-editor-budget {
+  display: grid;
+  gap: var(--space-4);
+  min-inline-size: 0;
+  margin: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: var(--space-4);
+}
+
+.flow-editor-budget legend {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding-inline: var(--space-2);
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+}
+
+.flow-editor-inspector__json {
+  border-top: 1px solid var(--border-subtle);
+  padding-top: var(--space-4);
+}
+
+.flow-editor-inspector__json pre {
   overflow: auto;
   max-block-size: calc(var(--control-height-lg) * 8);
   margin: var(--space-3) 0 0;
@@ -357,7 +511,6 @@
 
 .flow-create-dialog__grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--space-5);
 }
 
@@ -390,10 +543,6 @@
   .flow-editor-inspector {
     border-top: 1px solid var(--border);
     border-left: 0;
-  }
-
-  .flow-create-dialog__grid {
-    grid-template-columns: minmax(0, 1fr);
   }
 
   .flow-create-dialog__wide,

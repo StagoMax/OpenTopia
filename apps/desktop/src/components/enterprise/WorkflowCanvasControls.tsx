@@ -1,7 +1,9 @@
 import { Panel, type XYPosition } from "@xyflow/react";
 import {
+  BadgeCheck,
   Bot,
   Hand,
+  Merge,
   Minus,
   MousePointer2,
   Plus,
@@ -9,12 +11,13 @@ import {
   Scan,
   ShieldCheck,
   Undo2,
+  Wrench,
+  type LucideIcon,
 } from "lucide-react";
 import type { ReactNode } from "react";
 import {
   Button,
   IconButton,
-  Popover,
   Tooltip,
   type TooltipPlacement,
   type TooltipTriggerProps,
@@ -114,44 +117,21 @@ export function WorkflowCanvasToolbar({
               shortcut={workflowCanvasShortcutLabels.openNodePicker}
             >
               {(tooltipProps) => (
-                <Popover
-                  align="start"
-                  autoFocus
-                  label="选择要添加的节点类型"
-                  onOpenChange={onNodePickerOpenChange}
-                  open={nodePickerOpen}
-                  placement="bottom"
-                  trigger={(popoverProps) => (
-                    <Button
-                      {...tooltipProps}
-                      {...popoverProps}
-                      aria-keyshortcuts={
-                        workflowCanvasAriaShortcuts.openNodePicker
-                      }
-                      aria-label="新建节点"
-                      className="workflow-canvas-toolbar__add"
-                      disabled={disabled}
-                      ref={(node) => {
-                        tooltipProps.ref(node);
-                        popoverProps.ref(node);
-                      }}
-                      size="compact"
-                      variant="secondary"
-                    >
-                      <Plus aria-hidden="true" size={14} /> 节点
-                    </Button>
-                  )}
+                <Button
+                  {...tooltipProps}
+                  aria-controls="workflow-canvas-node-menu"
+                  aria-expanded={nodePickerOpen}
+                  aria-haspopup="dialog"
+                  aria-keyshortcuts={workflowCanvasAriaShortcuts.openNodePicker}
+                  aria-label="新建节点"
+                  className="workflow-canvas-toolbar__add"
+                  disabled={disabled}
+                  onClick={() => onNodePickerOpenChange(!nodePickerOpen)}
+                  size="compact"
+                  variant="secondary"
                 >
-                  {({ close }) => (
-                    <WorkflowNodePicker
-                      disableAgent={disableAgent}
-                      onAdd={(kind) => {
-                        onAdd(kind);
-                        close();
-                      }}
-                    />
-                  )}
-                </Popover>
+                  <Plus aria-hidden="true" size={14} /> 节点
+                </Button>
               )}
             </CanvasActionTooltip>
           ) : null}
@@ -201,6 +181,24 @@ export function WorkflowCanvasToolbar({
           ) : null}
         </div>
       </Panel>
+      {nodePickerOpen && !readOnly ? (
+        <Panel className="workflow-canvas-node-menu nopan" position="top-left">
+          <div
+            aria-label="选择要添加的节点类型"
+            id="workflow-canvas-node-menu"
+            role="dialog"
+          >
+            <WorkflowNodePicker
+              autoFocus
+              disableAgent={disableAgent}
+              onAdd={(kind) => {
+                onAdd(kind);
+                onNodePickerOpenChange(false);
+              }}
+            />
+          </div>
+        </Panel>
+      ) : null}
       <Panel className="workflow-canvas-controls nopan" position="bottom-left">
         <div aria-label="画布缩放" role="toolbar">
           <CanvasActionTooltip
@@ -322,32 +320,116 @@ export function WorkflowCanvasQuickCreate({
 }
 
 function WorkflowNodePicker({
+  autoFocus = false,
   disableAgent,
   onAdd,
 }: {
+  autoFocus?: boolean;
   disableAgent: boolean;
   onAdd(kind: AddableWorkflowNodeKind): void;
 }) {
+  const primaryItems: WorkflowNodePickerItem[] = [
+    {
+      kind: "agent",
+      label: "Agent",
+      description: "创建节点后，在右侧选择具体 Agent 和版本",
+      icon: Bot,
+      disabled: disableAgent,
+    },
+    {
+      kind: "tool",
+      label: "Action",
+      description: "固定调用一个 Tool 或 API，不经过 Agent 推理",
+      icon: Wrench,
+    },
+    {
+      kind: "approval",
+      label: "Human approval",
+      description: "暂停 Flow 并等待人工确认后继续",
+      icon: ShieldCheck,
+    },
+  ];
+  const advancedItems: WorkflowNodePickerItem[] = [
+    {
+      kind: "validator",
+      label: "Validator",
+      description: "执行独立、确定性的跨步骤业务校验",
+      icon: BadgeCheck,
+    },
+    {
+      kind: "join",
+      label: "Join",
+      description: "等待所有上游并行分支完成后汇合",
+      icon: Merge,
+    },
+  ];
   return (
     <div className="workflow-node-picker">
-      <button
-        disabled={disableAgent}
-        onClick={() => onAdd("agent")}
-        type="button"
-      >
-        <Bot aria-hidden="true" size={16} />
-        <span>
-          <strong>Agent</strong>
-          <small>运行一个已发布的 Agent 模板</small>
-        </span>
-      </button>
-      <button onClick={() => onAdd("approval")} type="button">
-        <ShieldCheck aria-hidden="true" size={16} />
-        <span>
-          <strong>Approval</strong>
-          <small>暂停流程并等待人工审批</small>
-        </span>
-      </button>
+      <section>
+        <small className="workflow-node-picker__group">主要节点</small>
+        {primaryItems.map((item) => (
+          <WorkflowNodePickerButton
+            autoFocus={
+              autoFocus &&
+              ((item.kind === "agent" && !disableAgent) ||
+                (item.kind === "tool" && disableAgent))
+            }
+            item={item}
+            key={item.kind}
+            onAdd={onAdd}
+          />
+        ))}
+      </section>
+      <details className="workflow-node-picker__advanced">
+        <summary>高级控制</summary>
+        <section>
+          {advancedItems.map((item) => (
+            <WorkflowNodePickerButton
+              item={item}
+              key={item.kind}
+              onAdd={onAdd}
+            />
+          ))}
+        </section>
+      </details>
+      <p className="workflow-node-picker__hint">
+        分支条件配置在连线上；连接回上游会自动创建受限循环。
+      </p>
     </div>
+  );
+}
+
+type WorkflowNodePickerItem = {
+  description: string;
+  disabled?: boolean;
+  icon: LucideIcon;
+  kind: AddableWorkflowNodeKind;
+  label: string;
+};
+
+function WorkflowNodePickerButton({
+  autoFocus,
+  item,
+  onAdd,
+}: {
+  autoFocus?: boolean;
+  item: WorkflowNodePickerItem;
+  onAdd(kind: AddableWorkflowNodeKind): void;
+}) {
+  const Icon = item.icon;
+  return (
+    <button
+      autoFocus={autoFocus}
+      className="workflow-node-picker__item"
+      disabled={item.disabled}
+      onClick={() => onAdd(item.kind)}
+      type="button"
+    >
+      <Icon aria-hidden="true" size={16} />
+      <span>
+        <strong>{item.label}</strong>
+        <small>{item.description}</small>
+      </span>
+    </button>
   );
 }

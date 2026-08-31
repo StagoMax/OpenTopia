@@ -5,22 +5,33 @@ import {
   type FlowTriggerExpression,
 } from "./flowActivation.ts";
 import type { WorkflowNodeSelection } from "./workflowNodeSelection.ts";
+import {
+  createDefaultEdgeConfiguration,
+  type WorkflowEdgeConfiguration,
+} from "./workflowNodeSelection.ts";
 
 export type WorkflowConnection = {
   id?: string;
   layoutFeedback?: boolean;
   sourceId: string;
   targetId: string;
-};
+} & WorkflowEdgeConfiguration;
 
 export function workflowConnections(
   nodes: readonly WorkflowNodeSelection[],
 ): WorkflowConnection[] {
   return nodes.flatMap((target) =>
-    sourceNodeIds(target.activation.expression).map((sourceId) => ({
-      sourceId,
-      targetId: target.id,
-    })),
+    sourceNodeIds(target.activation.expression).map((sourceId) => {
+      const configuration =
+        target.incomingEdgeConfigs?.[sourceId] ??
+        createDefaultEdgeConfiguration();
+      return {
+        ...configuration,
+        layoutFeedback: Boolean(configuration.loopPolicy),
+        sourceId,
+        targetId: target.id,
+      };
+    }),
   );
 }
 
@@ -41,7 +52,7 @@ export function canConnectWorkflowNodes(
     return false;
   }
 
-  return !hasPath(nodes, targetId, sourceId);
+  return true;
 }
 
 export function connectWorkflowNodes(
@@ -50,9 +61,45 @@ export function connectWorkflowNodes(
   targetId: string,
 ): WorkflowNodeSelection[] {
   if (!canConnectWorkflowNodes(nodes, sourceId, targetId)) return [...nodes];
+  const loop = hasPath(nodes, targetId, sourceId);
   return nodes.map((node) =>
     node.id === targetId
-      ? { ...node, activation: addFinalSource(node.activation, sourceId) }
+      ? {
+          ...node,
+          activation: addFinalSource(node.activation, sourceId),
+          incomingEdgeConfigs: {
+            ...node.incomingEdgeConfigs,
+            [sourceId]:
+              node.incomingEdgeConfigs?.[sourceId] ??
+              createDefaultEdgeConfiguration(loop),
+          },
+        }
+      : node,
+  );
+}
+
+export function configureWorkflowConnection(
+  nodes: readonly WorkflowNodeSelection[],
+  sourceId: string,
+  targetId: string,
+  configuration: WorkflowEdgeConfiguration,
+): WorkflowNodeSelection[] {
+  if (
+    !workflowConnections(nodes).some(
+      (edge) => edge.sourceId === sourceId && edge.targetId === targetId,
+    )
+  ) {
+    return [...nodes];
+  }
+  return nodes.map((node) =>
+    node.id === targetId
+      ? {
+          ...node,
+          incomingEdgeConfigs: {
+            ...node.incomingEdgeConfigs,
+            [sourceId]: configuration,
+          },
+        }
       : node,
   );
 }
@@ -67,11 +114,21 @@ export function disconnectWorkflowNodes(
     const expression = removeFinalSource(node.activation.expression, sourceId);
     return {
       ...node,
+      incomingEdgeConfigs: withoutKey(node.incomingEdgeConfigs, sourceId),
       activation: expression
         ? { ...node.activation, expression }
         : createManualActivation(),
     };
   });
+}
+
+function withoutKey<T>(
+  record: Record<string, T> | undefined,
+  key: string,
+): Record<string, T> | undefined {
+  if (!record?.[key]) return record;
+  const { [key]: _removed, ...remaining } = record;
+  return Object.keys(remaining).length > 0 ? remaining : undefined;
 }
 
 function addFinalSource(

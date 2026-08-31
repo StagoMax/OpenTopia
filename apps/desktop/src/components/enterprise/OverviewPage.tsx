@@ -1,11 +1,25 @@
-import { Activity, Bot, Cable, Inbox, RefreshCw, Workflow } from "lucide-react";
+import {
+  Activity,
+  ArrowRight,
+  Cable,
+  CheckCircle2,
+  CircleAlert,
+  Inbox,
+  RefreshCw,
+} from "lucide-react";
+import type { ApiClient } from "../../api/client";
 import type { FlowPrimaryView } from "../../workspaceNavigation";
+import { connectionProblems } from "../connections/model";
+import { getConnectionsStore } from "../connections/store";
 import { Badge, IconButton, Panel } from "../ui";
 import { flowCaseCoreLabel } from "./enterpriseSidebarPresentation";
-import { useFlowWorkspaceTitle } from "./flowAgentSelection";
-import { activeRunCount, latestPublishedTemplateCount, shortId } from "./model";
+import {
+  useFlowWorkspaceSelection,
+  useFlowWorkspaceTitle,
+} from "./flowAgentSelection";
+import { activeRunCount } from "./model";
+import { runStatusPresentation } from "./runPresentation";
 import { useEnterpriseStore } from "./store";
-import type { ApiClient } from "../../api/client";
 
 export function OverviewPage({
   client,
@@ -15,154 +29,200 @@ export function OverviewPage({
   onNavigate(view: Exclude<FlowPrimaryView, "conversation">): void;
 }) {
   const { snapshot, store } = useEnterpriseStore(client);
+  const workspace = useFlowWorkspaceSelection();
   useFlowWorkspaceTitle("Operations overview / 运行总览");
+
   const pendingEvents = snapshot.cases.filter(
     (item) => item.status === "accepted" && !item.flowRunId,
   );
-  const metrics = [
-    {
-      label: "Published Agents",
-      value: latestPublishedTemplateCount(snapshot),
-      detail: `${snapshot.agents.length} 个实例`,
-      icon: Bot,
-      view: "agents" as const,
-    },
-    {
-      label: "Flows",
-      value: snapshot.flows.length,
-      detail: `${snapshot.flows.filter((item) => item.status === "active").length} 个已激活`,
-      icon: Workflow,
-      view: "workflow-templates" as const,
-    },
-    {
-      label: "Active Runs",
-      value: activeRunCount(snapshot),
-      detail: `${snapshot.runs.length} 个最近运行`,
-      icon: Activity,
-      view: "runs" as const,
-    },
-    {
-      label: "Inbox",
-      value: snapshot.tasks.length + pendingEvents.length,
-      detail: `${pendingEvents.length} 个事件待确认`,
-      icon: Inbox,
-      view: "inbox" as const,
-    },
-    {
-      label: "Connections",
-      value: snapshot.connections.filter((item) => item.status === "ready")
-        .length,
-      detail: `${snapshot.connections.length} 个已配置`,
-      icon: Cable,
-      view: "connections" as const,
-    },
-  ];
+  const unhealthyConnections = snapshot.connections.filter(
+    (connection) => connectionProblems(connection).length > 0,
+  );
+  const recentRuns = snapshot.runs.slice(0, 6);
+  const failedRuns = recentRuns.filter((run) => run.status === "failed");
+  const humanAttentionCount = snapshot.tasks.length + pendingEvents.length;
+  const attentionCount =
+    humanAttentionCount + unhealthyConnections.length + failedRuns.length;
+  const activeCount = activeRunCount(snapshot);
+  const headline = snapshot.error
+    ? "暂时无法读取运行状态"
+    : attentionCount > 0
+      ? `${attentionCount} 项需要处理`
+      : activeCount > 0
+        ? `${activeCount} 个流程正在运行`
+        : "当前运行正常";
+  const summary = snapshot.error
+    ? "保留现有状态，刷新后可重新检查。"
+    : attentionCount > 0
+      ? "优先处理阻塞流程或外部连接的问题。"
+      : "没有阻塞事项或连接异常。";
+
+  const attentionItems = [
+    ...unhealthyConnections.map((connection) => {
+      const problem = connectionProblems(connection)[0];
+      return {
+        id: `connection:${connection.id}`,
+        title: connection.name,
+        detail: problem?.title ?? "连接需要处理",
+        label: "连接",
+        variant: "danger" as const,
+        activate: () => {
+          getConnectionsStore(client).reveal(connection.id);
+          onNavigate("connections");
+        },
+      };
+    }),
+    ...snapshot.tasks.map((task) => ({
+      id: `task:${task.id}`,
+      title: task.title,
+      detail: task.dueAt ? `截止 ${formatTime(task.dueAt)}` : task.description,
+      label: "人工处理",
+      variant: "warning" as const,
+      activate: () => {
+        workspace?.setSelectedInboxItemId(`task:${task.id}`);
+        onNavigate("inbox");
+      },
+    })),
+    ...pendingEvents.map((event) => {
+      const flow = snapshot.flows.find((item) => item.flowId === event.flowId);
+      return {
+        id: `case:${event.id}`,
+        title: flow?.name ?? event.flowId,
+        detail: flowCaseCoreLabel(event),
+        label: "等待确认",
+        variant: "warning" as const,
+        activate: () => {
+          workspace?.setSelectedInboxItemId(`case:${event.id}`);
+          onNavigate("inbox");
+        },
+      };
+    }),
+    ...failedRuns.map((run) => {
+      const flow = snapshot.flows.find((item) => item.flowId === run.flowId);
+      return {
+        id: `run:${run.id}`,
+        title: flow?.name ?? run.flowId,
+        detail: run.error || `失败于 ${formatTime(run.updatedAt)}`,
+        label: "运行失败",
+        variant: "danger" as const,
+        activate: () => {
+          workspace?.setSelectedRunId(run.id);
+          onNavigate("runs");
+        },
+      };
+    }),
+  ].slice(0, 6);
 
   return (
-    <div className="enterprise-page enterprise-overview">
-      <Panel
-        actions={
-          <IconButton
-            aria-label="刷新企业运行总览"
-            disabled={snapshot.status === "loading"}
-            onClick={() => void store.load(true)}
-            size="compact"
-          >
-            <RefreshCw aria-hidden="true" size={14} />
-          </IconButton>
-        }
-        title="System state / 系统态势"
+    <div className="enterprise-page enterprise-overview enterprise-core-detail">
+      <section
+        className={`enterprise-core-detail__summary ${snapshot.error ? "is-warning" : attentionCount > 0 ? "is-attention" : "is-healthy"}`}
       >
-        <p className="enterprise-page__lede">
-          从
-          Flow、运行到人工控制点的统一视图。所有数字来自服务端持久化对象，不扫描会话消息。
-        </p>
-        {snapshot.error ? (
-          <p className="enterprise-page__message is-error" role="alert">
-            {snapshot.error}
+        <span className="enterprise-core-detail__icon" aria-hidden="true">
+          {attentionCount > 0 || snapshot.error ? (
+            <CircleAlert size={22} />
+          ) : (
+            <CheckCircle2 size={22} />
+          )}
+        </span>
+        <div>
+          <small>运行总览</small>
+          <span className="enterprise-overview__title-row">
+            <h2>{headline}</h2>
+            <IconButton
+              aria-label="刷新运行总览"
+              disabled={snapshot.status === "loading"}
+              onClick={() => void store.load(true)}
+              size="compact"
+            >
+              <RefreshCw aria-hidden="true" size={14} />
+            </IconButton>
+          </span>
+          <p>
+            {summary}
+            {snapshot.refreshedAt
+              ? ` 最近更新：${formatTime(snapshot.refreshedAt)}。`
+              : ""}
           </p>
-        ) : null}
-        <div className="enterprise-metrics" aria-label="Flow 运行指标">
-          {metrics.map((metric) => {
-            const Icon = metric.icon;
-            return (
-              <button
-                className="enterprise-metric"
-                key={metric.label}
-                onClick={() => onNavigate(metric.view)}
-                type="button"
-              >
-                <span className="enterprise-metric__icon">
-                  <Icon aria-hidden="true" size={17} />
-                </span>
-                <strong>{metric.value}</strong>
-                <span>{metric.label}</span>
-                <small>{metric.detail}</small>
-              </button>
-            );
-          })}
         </div>
-      </Panel>
+      </section>
+
+      {snapshot.error ? (
+        <p className="enterprise-page__message is-error" role="alert">
+          {snapshot.error}
+        </p>
+      ) : null}
+
+      <nav className="enterprise-overview__signals" aria-label="关键运行状态">
+        <SignalButton
+          icon={<Inbox aria-hidden="true" size={16} />}
+          label="待人工处理"
+          onClick={() => onNavigate("inbox")}
+          value={humanAttentionCount}
+        />
+        <SignalButton
+          icon={<Activity aria-hidden="true" size={16} />}
+          label="运行中"
+          onClick={() => onNavigate("runs")}
+          value={activeCount}
+        />
+        <SignalButton
+          icon={<Cable aria-hidden="true" size={16} />}
+          label="连接异常"
+          onClick={() => onNavigate("connections")}
+          value={unhealthyConnections.length}
+        />
+      </nav>
 
       <div className="enterprise-page__columns">
-        <Panel title="Recent runs / 最近运行">
-          <ol className="enterprise-card-list">
-            {snapshot.runs.slice(0, 8).map((run) => {
-              const flow = snapshot.flows.find(
-                (item) => item.flowId === run.flowId,
-              );
-              return (
-                <li key={run.id}>
-                  <Activity aria-hidden="true" size={15} />
+        <Panel title="需要处理">
+          <ol className="enterprise-action-list">
+            {attentionItems.map((item) => (
+              <li key={item.id}>
+                <button onClick={item.activate} type="button">
                   <span>
-                    <strong>{flow?.name ?? run.flowId}</strong>
-                    <small>
-                      {shortId(run.id)} · {formatTime(run.updatedAt)}
-                    </small>
+                    <strong>{item.title}</strong>
+                    <small>{item.detail}</small>
                   </span>
-                  <Badge variant={runVariant(run.status)}>{run.status}</Badge>
-                </li>
-              );
-            })}
-            {snapshot.runs.length === 0 ? (
-              <li className="enterprise-list__empty">尚无 Workflow Run。</li>
+                  <Badge variant={item.variant}>{item.label}</Badge>
+                  <ArrowRight aria-hidden="true" size={14} />
+                </button>
+              </li>
+            ))}
+            {attentionItems.length === 0 ? (
+              <li className="enterprise-list__empty">当前没有待处理事项。</li>
             ) : null}
           </ol>
         </Panel>
-        <Panel title="Attention / 待处理">
-          <ol className="enterprise-card-list">
-            {snapshot.tasks.slice(0, 8).map((task) => (
-              <li key={task.id}>
-                <Inbox aria-hidden="true" size={15} />
-                <span>
-                  <strong>{task.title}</strong>
-                  <small>{task.taskType.replaceAll("_", " ")}</small>
-                </span>
-                <Badge variant="warning">pending</Badge>
-              </li>
-            ))}
-            {pendingEvents
-              .slice(0, Math.max(0, 8 - snapshot.tasks.length))
-              .map((event) => {
-                const flow = snapshot.flows.find(
-                  (item) => item.flowId === event.flowId,
-                );
-                return (
-                  <li key={event.id}>
-                    <Inbox aria-hidden="true" size={15} />
+
+        <Panel title="最近运行">
+          <ol className="enterprise-action-list">
+            {recentRuns.map((run) => {
+              const flow = snapshot.flows.find(
+                (item) => item.flowId === run.flowId,
+              );
+              const status = runStatusPresentation(run.status);
+              return (
+                <li key={run.id}>
+                  <button
+                    onClick={() => {
+                      workspace?.setSelectedRunId(run.id);
+                      onNavigate("runs");
+                    }}
+                    type="button"
+                  >
                     <span>
-                      <strong>
-                        {flow?.name ?? event.flowId} ·{" "}
-                        {flowCaseCoreLabel(event)}
-                      </strong>
-                      <small>{event.idempotencyKey}</small>
+                      <strong>{flow?.name ?? run.flowId}</strong>
+                      <small>{formatTime(run.updatedAt)}</small>
                     </span>
-                    <Badge variant="warning">review</Badge>
-                  </li>
-                );
-              })}
-            {snapshot.tasks.length === 0 && pendingEvents.length === 0 ? (
-              <li className="enterprise-list__empty">当前没有待处理事项。</li>
+                    <Badge variant={status.variant}>{status.label}</Badge>
+                    <ArrowRight aria-hidden="true" size={14} />
+                  </button>
+                </li>
+              );
+            })}
+            {recentRuns.length === 0 ? (
+              <li className="enterprise-list__empty">尚无运行记录。</li>
             ) : null}
           </ol>
         </Panel>
@@ -171,14 +231,26 @@ export function OverviewPage({
   );
 }
 
-function runVariant(
-  status: string,
-): "success" | "danger" | "warning" | "info" | "neutral" {
-  if (status === "succeeded") return "success";
-  if (status === "failed" || status === "cancelled") return "danger";
-  if (status.includes("waiting") || status === "paused") return "warning";
-  if (status === "running" || status === "resuming") return "info";
-  return "neutral";
+function SignalButton({
+  icon,
+  label,
+  onClick,
+  value,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  onClick(): void;
+  value: number;
+}) {
+  return (
+    <button onClick={onClick} type="button">
+      {icon}
+      <span>
+        <strong>{value}</strong>
+        <small>{label}</small>
+      </span>
+    </button>
+  );
 }
 
 function formatTime(value: string): string {

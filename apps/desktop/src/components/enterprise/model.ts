@@ -1,8 +1,6 @@
 import type { AgentTemplateVersionView, FlowSpec } from "../../types";
-import {
-  activationSourceNodeIds,
-  activationHasIngress,
-} from "./flowActivation.ts";
+import { activationHasIngress } from "./flowActivation.ts";
+import { workflowConnections } from "./workflowGraphOperations.ts";
 import type { WorkflowNodeSelection } from "./workflowNodeSelection.ts";
 import type { EnterpriseSnapshot } from "./store";
 import {
@@ -30,6 +28,15 @@ export type TrustSignal = {
   findings: readonly TrustSignalFinding[];
 };
 
+export const DEFAULT_GUIDED_FLOW_BUDGET: FlowSpec["budget"] = {
+  maxNodeExecutions: 24,
+  maxToolCalls: 40,
+  maxDurationSeconds: 1800,
+  maxLoopIterations: 4,
+};
+
+export const DEFAULT_GUIDED_FLOW_RISK_CLASS: FlowSpec["riskClass"] = "medium";
+
 export function activeRunCount(snapshot: EnterpriseSnapshot): number {
   return snapshot.runs.filter(
     (run) => !["succeeded", "failed", "cancelled"].includes(run.status),
@@ -39,11 +46,21 @@ export function activeRunCount(snapshot: EnterpriseSnapshot): number {
 export function latestPublishedTemplateCount(
   snapshot: EnterpriseSnapshot,
 ): number {
-  return new Set(
-    snapshot.templates
-      .filter((view) => view.template.status === "published")
-      .map((view) => view.template.templateId),
-  ).size;
+  return latestPublishedTemplateVersions(snapshot.templates).length;
+}
+
+export function latestPublishedTemplateVersions(
+  templates: readonly AgentTemplateVersionView[],
+): AgentTemplateVersionView[] {
+  const latest = new Map<string, AgentTemplateVersionView>();
+  for (const view of templates) {
+    if (view.template.status !== "published") continue;
+    const current = latest.get(view.template.templateId);
+    if (!current || view.template.version > current.template.version) {
+      latest.set(view.template.templateId, view);
+    }
+  }
+  return [...latest.values()];
 }
 
 export function trustSignals(snapshot: EnterpriseSnapshot): TrustSignal[] {
@@ -139,6 +156,8 @@ export function guidedWorkflowSpec(input: {
   outcome: string;
   nodes: WorkflowNodeSelection[];
   templates: AgentTemplateVersionView[];
+  budget?: FlowSpec["budget"];
+  riskClass?: FlowSpec["riskClass"];
 }): FlowSpec {
   const objectSchema = { type: "object" };
   const nodes: FlowSpec["graph"]["nodes"] = input.nodes.map((selection) => {
@@ -161,36 +180,39 @@ export function guidedWorkflowSpec(input: {
           reference: template.template.templateId,
           templateVersion: template.template.version,
           activation: selection.activation,
+          ...(selection.stateWrites?.length
+            ? { stateWrites: selection.stateWrites }
+            : {}),
         },
         inputSchema: objectSchema,
         outputSchema: objectSchema,
       };
     }
+    const nodeConfig = selectionConfig(selection);
     return {
       id: selection.id,
       label: selection.label,
       kind: selection.kind,
       config: {
         activation: selection.activation,
-        ...(selection.kind === "approval"
-          ? { instructions: selection.instructions }
+        ...nodeConfig,
+        ...(selection.stateWrites?.length
+          ? { stateWrites: selection.stateWrites }
           : {}),
       },
       inputSchema: objectSchema,
       outputSchema: objectSchema,
     };
   });
-  const edges = input.nodes.flatMap((selection) =>
-    activationSourceNodeIds(selection.activation).map((from) => ({
-      from,
-      to: selection.id,
-      condition: null,
-      allowedFields: [],
-      dataClassification: "internal" as const,
-      onError: null,
-      loopPolicy: null,
-    })),
-  );
+  const edges = workflowConnections(input.nodes).map((edge) => ({
+    from: edge.sourceId,
+    to: edge.targetId,
+    condition: edge.condition.trim() || null,
+    allowedFields: edge.allowedFields,
+    dataClassification: edge.dataClassification,
+    onError: edge.onError,
+    loopPolicy: edge.loopPolicy,
+  }));
   const entryNodeId =
     input.nodes.find((selection) => activationHasIngress(selection.activation))
       ?.id ??
@@ -213,9 +235,9 @@ export function guidedWorkflowSpec(input: {
     },
     requestedCapabilities: {
       allowAllTools: false,
-      tools: [],
+      tools: requestedNodeReferences(input.nodes, "tool"),
       allowAllSkills: false,
-      skills: [],
+      skills: requestedNodeReferences(input.nodes, "skill"),
       allowAllPlugins: false,
       plugins: [],
       allowAllMcpServers: false,
@@ -223,13 +245,51 @@ export function guidedWorkflowSpec(input: {
       allowAllWorkspaceRoots: false,
       workspaceRoots: [],
     },
-    budget: {
-      maxNodeExecutions: 24,
-      maxToolCalls: 40,
-      maxDurationSeconds: 1800,
-      maxLoopIterations: 4,
-    },
-    riskClass: "medium",
+    budget: { ...(input.budget ?? DEFAULT_GUIDED_FLOW_BUDGET) },
+    riskClass: input.riskClass ?? DEFAULT_GUIDED_FLOW_RISK_CLASS,
     pendingDecisions: [],
   };
+}
+
+function selectionConfig(
+  selection: Exclude<WorkflowNodeSelection, { kind: "agent" }>,
+): Record<string, unknown> {
+  if (selection.kind === "skill") {
+    return { reference: selection.reference.trim() };
+  }
+  if (selection.kind === "tool") {
+    return {
+      reference: selection.reference.trim(),
+      parallelSafe: selection.parallelSafe,
+      sideEffect: "none",
+    };
+  }
+  if (selection.kind === "condition") {
+    return { expression: selection.expression.trim() || "true" };
+  }
+  if (selection.kind === "validator") {
+    return {
+      ...(selection.expression.trim()
+        ? { expression: selection.expression.trim() }
+        : {}),
+      requiredFields: selection.requiredFields,
+    };
+  }
+  if (selection.kind === "approval") {
+    return { instructions: selection.instructions };
+  }
+  if (selection.kind === "loop") {
+    return { feedbackSchema: selection.feedbackSchema };
+  }
+  return {};
+}
+
+function requestedNodeReferences(
+  nodes: WorkflowNodeSelection[],
+  kind: "skill" | "tool",
+) {
+  return nodes.flatMap((node) => {
+    if (node.kind !== kind || !node.reference.trim()) return [];
+    return [node.reference.trim()];
+  });
 }

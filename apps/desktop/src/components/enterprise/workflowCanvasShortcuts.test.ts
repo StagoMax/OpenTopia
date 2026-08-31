@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { workflowCanvasCommand } from "./workflowCanvasShortcuts.ts";
+import {
+  isWorkflowCanvasTemporaryPanKey,
+  workflowCanvasCommand,
+} from "./workflowCanvasShortcuts.ts";
 
 function key(
   input: Partial<
@@ -97,4 +100,18 @@ test("does not steal unrelated modified shortcuts", () => {
     workflowCanvasCommand(key({ key: "Escape" }), editable),
     "deselect",
   );
+});
+
+test("recognizes only an unmodified Space as temporary pan", () => {
+  assert.equal(
+    isWorkflowCanvasTemporaryPanKey(key({ code: "Space", key: " " })),
+    true,
+  );
+  assert.equal(
+    isWorkflowCanvasTemporaryPanKey(
+      key({ code: "Space", ctrlKey: true, key: " " }),
+    ),
+    false,
+  );
+  assert.equal(isWorkflowCanvasTemporaryPanKey(key({ key: "h" })), false);
 });

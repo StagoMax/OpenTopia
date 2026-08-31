@@ -3,6 +3,7 @@ import test from "node:test";
 import type { FlowGraphEdge, FlowGraphNode, FlowSpec } from "../../types";
 import { automaticWorkflowPositions } from "./workflowCanvasLayout.ts";
 import { compiledWorkflowCanvasModel } from "./workflowCanvasModel.ts";
+import { createDefaultEdgeConfiguration } from "./workflowNodeSelection.ts";
 
 const objectSchema = { type: "object" };
 
@@ -116,6 +117,7 @@ test("compiled graph layout ranks the complete dependency chain", () => {
   const positions = automaticWorkflowPositions(model.nodes, [
     ...model.connections,
     {
+      ...createDefaultEdgeConfiguration(true),
       id: "feedback",
       layoutFeedback: true,
       sourceId: "output",

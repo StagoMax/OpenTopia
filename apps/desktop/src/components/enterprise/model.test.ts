@@ -4,6 +4,7 @@ import {
   activeRunCount,
   guidedWorkflowSpec,
   latestPublishedTemplateCount,
+  latestPublishedTemplateVersions,
   trustSignals,
 } from "./model.ts";
 import type { EnterpriseSnapshot } from "./store.ts";
@@ -45,6 +46,23 @@ test("published templates are counted by stable template identity", () => {
     { template: { templateId: "b", status: "draft" } },
   ] as unknown as EnterpriseSnapshot["templates"];
   assert.equal(latestPublishedTemplateCount(value), 1);
+});
+
+test("Flow creation offers only the latest published version of each Agent", () => {
+  const value = snapshot();
+  value.templates = [
+    { template: { templateId: "a", version: 1, status: "published" } },
+    { template: { templateId: "a", version: 3, status: "published" } },
+    { template: { templateId: "a", version: 4, status: "draft" } },
+    { template: { templateId: "b", version: 2, status: "published" } },
+  ] as unknown as EnterpriseSnapshot["templates"];
+
+  assert.deepEqual(
+    latestPublishedTemplateVersions(value.templates).map(
+      (view) => `${view.template.templateId}@${view.template.version}`,
+    ),
+    ["a@3", "b@2"],
+  );
 });
 
 test("trust signals fail closed for degraded connections", () => {
@@ -139,4 +157,88 @@ test("guided workflow pins reusable Agents and derives graph edges from Final su
       ["review", "output"],
     ],
   );
+});
+
+test("guided workflow persists state writes and condition routing", () => {
+  const spec = guidedWorkflowSpec({
+    flowId: "conditional-flow",
+    name: "Conditional flow",
+    owner: "ops",
+    outcome: "Route accepted records",
+    nodes: [
+      {
+        id: "check",
+        kind: "condition",
+        label: "Check score",
+        expression: "score != 0",
+        activation: createManualActivation(),
+        stateWrites: [
+          { channel: "checks", reducer: "append", valuePath: "$.value" },
+        ],
+      },
+      {
+        id: "output",
+        kind: "output",
+        label: "Output",
+        activation: createFinalActivation("check"),
+        incomingEdgeConfigs: {
+          check: {
+            allowedFields: ["value"],
+            condition: "matched == true",
+            dataClassification: "confidential",
+            loopPolicy: null,
+            onError: null,
+          },
+        },
+      },
+    ],
+    templates: [],
+  });
+
+  assert.equal(spec.graph.nodes[0]?.config.expression, "score != 0");
+  assert.deepEqual(spec.graph.nodes[0]?.config.stateWrites, [
+    { channel: "checks", reducer: "append", valuePath: "$.value" },
+  ]);
+  assert.deepEqual(spec.graph.edges[0], {
+    from: "check",
+    to: "output",
+    condition: "matched == true",
+    allowedFields: ["value"],
+    dataClassification: "confidential",
+    onError: null,
+    loopPolicy: null,
+  });
+});
+
+test("guided workflow persists creator-selected risk and runtime budgets", () => {
+  const spec = guidedWorkflowSpec({
+    flowId: "custom-runtime",
+    name: "Custom runtime",
+    owner: "ops",
+    outcome: "Run within explicit limits",
+    nodes: [
+      {
+        id: "output",
+        kind: "output",
+        label: "Output",
+        activation: createManualActivation(),
+      },
+    ],
+    templates: [],
+    budget: {
+      maxNodeExecutions: 12,
+      maxToolCalls: 18,
+      maxDurationSeconds: 600,
+      maxLoopIterations: 2,
+    },
+    riskClass: "high",
+  });
+
+  assert.deepEqual(spec.budget, {
+    maxNodeExecutions: 12,
+    maxToolCalls: 18,
+    maxDurationSeconds: 600,
+    maxLoopIterations: 2,
+  });
+  assert.equal(spec.riskClass, "high");
 });

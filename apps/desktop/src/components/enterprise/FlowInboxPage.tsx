@@ -21,7 +21,9 @@ import {
   useFlowWorkspaceSelection,
   useFlowWorkspaceTitle,
 } from "./flowAgentSelection";
+import { workflowTriggerLabel } from "./enterpriseSidebarPresentation";
 import { useEnterpriseStore } from "./store";
+import { StructuredPayload } from "./StructuredPayload";
 
 type InboxItem =
   | { id: string; kind: "task"; task: HumanTask }
@@ -48,7 +50,9 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
         kind: "case" as const,
         flowCase,
       }));
-    return [...tasks, ...cases];
+    return [...tasks, ...cases].sort(
+      (left, right) => inboxTime(left) - inboxTime(right),
+    );
   }, [snapshot.cases, snapshot.tasks]);
 
   const selected =
@@ -173,6 +177,10 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
     ["reconciliation", "reconnect"].includes(selected.task.taskType);
   const payload =
     selected.kind === "task" ? selected.task.payload : selected.flowCase.input;
+  const payloadSchema =
+    selected.kind === "case"
+      ? selected.flowCase.flowRevision.compiledWorkflow.inputSchema
+      : undefined;
 
   return (
     <div className="enterprise-page enterprise-inbox-page enterprise-core-detail">
@@ -200,12 +208,18 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
       </section>
       <section className="enterprise-core-detail__payload">
         <header>
-          <strong>Input / 核心输入</strong>
+          <strong>需要确认的信息</strong>
           <Badge variant="neutral">
-            {selected.kind === "task" ? selected.task.sourceKind : "event"}
+            {selected.kind === "task"
+              ? humanTaskSourceLabel(selected.task.sourceKind)
+              : workflowTriggerLabel(selected.flowCase.flowRevision.trigger)}
           </Badge>
         </header>
-        <pre>{JSON.stringify(payload, null, 2)}</pre>
+        <StructuredPayload
+          emptyLabel="此事项没有附加信息。"
+          schema={payloadSchema}
+          value={payload}
+        />
       </section>
 
       <FlowInspectorPortal>
@@ -247,10 +261,14 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
               })
             )
           }
-          status="pending"
+          status="待处理"
           statusVariant="warning"
-          subtitle={selected.id.replace(/^(task|case):/, "")}
-          title={selected.kind === "task" ? "Human task" : "Pending event"}
+          subtitle={
+            selected.kind === "task"
+              ? humanTaskTypeLabel(selected.task.taskType)
+              : selectedFlow?.name
+          }
+          title="处理事项"
         >
           {snapshot.error || error ? (
             <p className="enterprise-page__message is-error" role="alert">
@@ -262,16 +280,24 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
               <>
                 <dl className="flow-inspector-facts">
                   <div>
-                    <dt>Assigned</dt>
-                    <dd>{selected.task.assignedTo ?? "Unassigned"}</dd>
+                    <dt>负责人</dt>
+                    <dd>{selected.task.assignedTo ?? "尚未分配"}</dd>
                   </div>
                   <div>
-                    <dt>Claimed</dt>
-                    <dd>{selected.task.claimedBy ?? "Not claimed"}</dd>
+                    <dt>领取状态</dt>
+                    <dd>
+                      {selected.task.claimedBy
+                        ? `${selected.task.claimedBy} 已领取`
+                        : "待领取"}
+                    </dd>
                   </div>
                   <div>
-                    <dt>Created</dt>
-                    <dd>{formatTime(selected.task.createdAt)}</dd>
+                    <dt>{selected.task.dueAt ? "截止时间" : "收到时间"}</dt>
+                    <dd>
+                      {formatTime(
+                        selected.task.dueAt ?? selected.task.createdAt,
+                      )}
+                    </dd>
                   </div>
                 </dl>
                 {!selected.task.claimedBy ? (
@@ -288,15 +314,19 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
             ) : (
               <dl className="flow-inspector-facts">
                 <div>
-                  <dt>Flow revision</dt>
-                  <dd>{selected.flowCase.flowRevisionId}</dd>
+                  <dt>Flow</dt>
+                  <dd>{selectedFlow?.name ?? selected.flowCase.flowId}</dd>
                 </div>
                 <div>
-                  <dt>Trigger</dt>
-                  <dd>{selected.flowCase.triggerId}</dd>
+                  <dt>触发方式</dt>
+                  <dd>
+                    {workflowTriggerLabel(
+                      selected.flowCase.flowRevision.trigger,
+                    )}
+                  </dd>
                 </div>
                 <div>
-                  <dt>Created</dt>
+                  <dt>收到时间</dt>
                   <dd>{formatTime(selected.flowCase.createdAt)}</dd>
                 </div>
               </dl>
@@ -335,18 +365,46 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
                 />
               )}
               {!inputRequest && selected.task.actionSchema ? (
-                <label className="flow-workspace-inspector__textarea">
-                  <span>Response JSON / 响应</span>
-                  <textarea
-                    onChange={(event) => setResponse(event.currentTarget.value)}
-                    placeholder="{}"
-                    rows={8}
-                    value={response}
-                  />
-                </label>
+                <details className="enterprise-technical-details">
+                  <summary>高级响应（JSON）</summary>
+                  <label className="flow-workspace-inspector__textarea">
+                    <span>结构化响应</span>
+                    <textarea
+                      onChange={(event) =>
+                        setResponse(event.currentTarget.value)
+                      }
+                      placeholder="{}"
+                      rows={6}
+                      value={response}
+                    />
+                  </label>
+                </details>
               ) : null}
             </FlowInspectorSection>
           ) : null}
+          <FlowInspectorSection title="Technical details / 技术信息">
+            <details className="enterprise-technical-details">
+              <summary>查看技术标识</summary>
+              <dl className="flow-inspector-facts">
+                <div>
+                  <dt>事项 ID</dt>
+                  <dd>{selected.id.replace(/^(task|case):/, "")}</dd>
+                </div>
+                {selected.kind === "case" ? (
+                  <>
+                    <div>
+                      <dt>Flow revision</dt>
+                      <dd>{selected.flowCase.flowRevisionId}</dd>
+                    </div>
+                    <div>
+                      <dt>Trigger</dt>
+                      <dd>{selected.flowCase.triggerId}</dd>
+                    </div>
+                  </>
+                ) : null}
+              </dl>
+            </details>
+          </FlowInspectorSection>
         </FlowInspectorPanel>
       </FlowInspectorPortal>
     </div>
@@ -360,4 +418,17 @@ function readableError(error: unknown): string {
 
 function formatTime(value: string): string {
   return new Date(value).toLocaleString();
+}
+
+function humanTaskSourceLabel(source: HumanTask["sourceKind"]): string {
+  return source === "flow_run" ? "流程运行" : "外部交付";
+}
+
+function inboxTime(item: InboxItem): number {
+  const value =
+    item.kind === "task"
+      ? (item.task.dueAt ?? item.task.createdAt)
+      : item.flowCase.createdAt;
+  const timestamp = new Date(value).getTime();
+  return Number.isFinite(timestamp) ? timestamp : Number.MAX_SAFE_INTEGER;
 }
