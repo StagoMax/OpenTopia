@@ -32,6 +32,8 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--after-url", required=True)
     parser.add_argument("--before-provider", default="default")
     parser.add_argument("--after-provider", default="default")
+    parser.add_argument("--before-artifact-sha256", required=True)
+    parser.add_argument("--after-artifact-sha256", required=True)
     parser.add_argument("--model", default="gpt-5.6-terra")
     parser.add_argument("--reasoning-effort", default="high")
     parser.add_argument("--before-concurrency", type=int, default=2)
@@ -294,6 +296,7 @@ def _write_report(path: Path, payload: dict[str, Any]) -> None:
         f"- 评测集：Qihoo360/Harness-Bench，固定提交 `{payload['benchmark_commit']}`",
         f"- 试点规模：{payload['selected_tasks']} 道离线任务，Before/After 严格配对",
         f"- 模型配置：`{payload['model']}`，推理强度 `{payload['reasoning_effort']}`",
+        f"- Artifact：Before `{payload['artifact_sha256']['before']}`；After `{payload['artifact_sha256']['after']}`",
         f"- 并发结构：每个快照 1 个常驻 Server；Before {payload['concurrency']['before']} 会话、After {payload['concurrency']['after']} 会话并发",
         "- 本阶段目的：验证 Oracle、共享 Server 多会话、Round/Token/缓存/工具日志链路；过程分 LLM 在试点阶段关闭，避免在链路校准前产生额外阅卷成本。",
         "",
@@ -406,17 +409,30 @@ def main() -> int:
     adapter_script = Path(__file__).resolve().parents[2] / "adapters" / "opentopia-http.mjs"
     output_root.mkdir(parents=True, exist_ok=True)
     status_path = output_root / args.status_file
+    artifact_sha256 = {
+        "before": args.before_artifact_sha256.upper(),
+        "after": args.after_artifact_sha256.upper(),
+    }
     status_lock = threading.Lock()
     final_rows: dict[tuple[str, str], dict[str, Any]] = {}
     attempts: list[dict[str, Any]] = []
     if status_path.is_file():
         try:
             previous_status = json.loads(status_path.read_text(encoding="utf-8"))
-            attempts = [
+            previous_attempts = [
                 item
                 for item in previous_status.get("attempts", [])
                 if isinstance(item, dict)
             ]
+            if (
+                previous_attempts
+                and previous_status.get("artifact_sha256") != artifact_sha256
+            ):
+                raise SystemExit(
+                    "status file belongs to different Before/After artifacts; "
+                    "use a fresh output root instead of mixing snapshots"
+                )
+            attempts = previous_attempts
             for item in attempts:
                 key = (str(item.get("snapshot") or ""), str(item.get("task_id") or ""))
                 if item.get("valid") is True:
@@ -443,6 +459,18 @@ def main() -> int:
         name: threading.Semaphore(int(cfg["concurrency"]))
         for name, cfg in variants.items()
     }
+    circuit_lock = threading.Lock()
+    circuit_events = {name: threading.Event() for name in variants}
+    circuit_failure_times: dict[str, list[float]] = {name: [] for name in variants}
+    circuit_state: dict[str, dict[str, Any]] = {
+        name: {
+            "open": False,
+            "opened_at": None,
+            "reason": None,
+            "immediate_failures_in_window": 0,
+        }
+        for name in variants
+    }
 
     def persist_status() -> None:
         with status_lock:
@@ -452,15 +480,76 @@ def main() -> int:
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                     "selected_tasks": len(selected_tasks),
                     "valid_results": len(final_rows),
+                    "artifact_sha256": artifact_sha256,
+                    "circuit_breakers": circuit_state,
                     "attempts": attempts,
                 },
+            )
+
+    def update_shared_provider_circuit(snapshot: str, row: dict[str, Any]) -> None:
+        """Stop dispatch when one shared provider becomes globally unusable.
+
+        OpenTopia deliberately blocks a provider after a permanent quota error.
+        Once that happens, every new session fails before its first model round.
+        A short-window circuit breaker prevents the queued benchmark tasks from
+        being turned into a long sequence of meaningless invalid attempts.
+        """
+
+        usage = row.get("usage") if isinstance(row.get("usage"), dict) else {}
+        immediate_provider_failure = (
+            row.get("valid") is not True
+            and row.get("adapter_ok") is False
+            and int(row.get("rounds") or 0) == 0
+            and int(usage.get("total_tokens") or 0) == 0
+            and float(row.get("elapsed_sec") or 0.0) <= 10.0
+        )
+        if not immediate_provider_failure:
+            return
+
+        now = time.monotonic()
+        threshold = max(2, int(variants[snapshot]["concurrency"]))
+        with circuit_lock:
+            recent = [
+                observed_at
+                for observed_at in circuit_failure_times[snapshot]
+                if now - observed_at <= 30.0
+            ]
+            recent.append(now)
+            circuit_failure_times[snapshot] = recent
+            circuit_state[snapshot]["immediate_failures_in_window"] = len(recent)
+            if len(recent) < threshold or circuit_events[snapshot].is_set():
+                return
+            circuit_state[snapshot].update(
+                {
+                    "open": True,
+                    "opened_at": datetime.now(timezone.utc).isoformat(),
+                    "reason": "shared_provider_immediate_failure_burst",
+                }
+            )
+            circuit_events[snapshot].set()
+            print(
+                f"[harnessbench] {snapshot} shared-provider circuit opened "
+                f"after {len(recent)} immediate failures",
+                flush=True,
             )
 
     def execute(snapshot: str, task_id: str) -> dict[str, Any]:
         cfg = variants[snapshot]
         last_row: dict[str, Any] | None = None
+        if circuit_events[snapshot].is_set():
+            return {
+                "snapshot": snapshot,
+                "category": task_category[task_id],
+                "task_id": task_id,
+                "attempt": 0,
+                "valid": False,
+                "skipped": True,
+                "failure_class": "shared_provider_circuit_open",
+            }
         with semaphores[snapshot]:
             for attempt in range(1, args.max_invalid_retries + 2):
+                if circuit_events[snapshot].is_set():
+                    break
                 app = AppConfig(
                     project_root=harness_root,
                     data_dir=output_root / snapshot / "data",
@@ -518,6 +607,7 @@ def main() -> int:
                     }
                 with status_lock:
                     attempts.append(row)
+                update_shared_provider_circuit(snapshot, row)
                 persist_status()
                 last_row = row
                 if row.get("valid"):
@@ -531,8 +621,15 @@ def main() -> int:
                             flush=True,
                         )
                         time.sleep(delay)
-        assert last_row is not None
-        return last_row
+        return last_row or {
+            "snapshot": snapshot,
+            "category": task_category[task_id],
+            "task_id": task_id,
+            "attempt": 0,
+            "valid": False,
+            "skipped": True,
+            "failure_class": "shared_provider_circuit_open",
+        }
 
     started = time.perf_counter()
     futures: dict[Future[dict[str, Any]], tuple[str, str]] = {}
@@ -570,16 +667,28 @@ def main() -> int:
         for executor in executors.values():
             executor.shutdown(wait=True, cancel_futures=False)
 
-    rows = [
-        final_rows.get((snapshot, task_id))
-        or next(
-            item
-            for item in reversed(attempts)
-            if item["snapshot"] == snapshot and item["task_id"] == task_id
-        )
-        for snapshot in ("before", "after")
-        for task_id in selected_tasks
-    ]
+    rows = []
+    for snapshot in ("before", "after"):
+        for task_id in selected_tasks:
+            row = final_rows.get((snapshot, task_id))
+            if row is None:
+                row = next(
+                    (
+                        item
+                        for item in reversed(attempts)
+                        if item["snapshot"] == snapshot and item["task_id"] == task_id
+                    ),
+                    {
+                        "snapshot": snapshot,
+                        "category": task_category[task_id],
+                        "task_id": task_id,
+                        "attempt": 0,
+                        "valid": False,
+                        "skipped": True,
+                        "failure_class": "not_run_after_circuit_breaker",
+                    },
+                )
+            rows.append(row)
     pairs = []
     for task_id in selected_tasks:
         before = final_rows.get(("before", task_id))
@@ -612,6 +721,7 @@ def main() -> int:
         "selected_tasks": len(selected_tasks),
         "model": args.model,
         "reasoning_effort": args.reasoning_effort,
+        "artifact_sha256": artifact_sha256,
         "concurrency": {
             "before": args.before_concurrency,
             "after": args.after_concurrency,

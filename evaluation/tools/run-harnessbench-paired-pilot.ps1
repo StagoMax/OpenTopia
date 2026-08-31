@@ -3,6 +3,7 @@ param(
   [string]$Profile = "AUDIT_COPILOT_LLM",
   [string]$HarnessRoot = "J:\Project\HarnessBench",
   [string]$PlanRoot = "J:\Project\OpenTopia-evaluation-results\external-agent-benchmark-plan-20260824",
+  [string]$AfterArtifactPath = "",
   [string]$OutputRoot = "",
   [string]$WorkRoot = "",
   [string]$SelectionFile = "",
@@ -184,10 +185,17 @@ $selectionPath = if ($SelectionFile) {
 }
 $dockerfile = Join-Path $repoRoot "evaluation\integrations\harnessbench\Dockerfile.server"
 $beforeArtifact = Join-Path $PlanRoot "artifacts\opentopia-server-before-6d52-schema-compat-shim-musl"
-$afterArtifact = Join-Path $PlanRoot "artifacts\opentopia-server-after-404e596-schemafix-worktree-musl"
-foreach ($path in @($selectionPath, $dockerfile, $beforeArtifact, $afterArtifact)) {
+$afterArtifact = if ($AfterArtifactPath) {
+  (Resolve-Path -LiteralPath $AfterArtifactPath).Path
+} else {
+  Join-Path $PlanRoot "artifacts\opentopia-server-after-e135adbd-worktree-20260831-musl"
+}
+$afterProvenance = "$afterArtifact.provenance.json"
+foreach ($path in @($selectionPath, $dockerfile, $beforeArtifact, $afterArtifact, $afterProvenance)) {
   if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Required file not found: $path" }
 }
+$beforeArtifactSha256 = (Get-FileHash -LiteralPath $beforeArtifact -Algorithm SHA256).Hash
+$afterArtifactSha256 = (Get-FileHash -LiteralPath $afterArtifact -Algorithm SHA256).Hash
 
 $values = ConvertFrom-DotEnvFile $envPath
 $apiKey = @(
@@ -270,6 +278,8 @@ try {
     "--after-url", "http://127.0.0.1:$AfterPort",
     "--before-provider", $beforeProvider,
     "--after-provider", $afterProvider,
+    "--before-artifact-sha256", $beforeArtifactSha256,
+    "--after-artifact-sha256", $afterArtifactSha256,
     "--model", $model,
     "--reasoning-effort", "high",
     "--before-concurrency", $BeforeConcurrency,
