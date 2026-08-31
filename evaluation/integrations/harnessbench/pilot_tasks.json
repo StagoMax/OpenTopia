@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "benchmark": "Qihoo360/Harness-Bench",
+  "benchmarkCommit": "1025086a446653702b80cfb48babbeec35db6b2c",
+  "selection": "24-task offline stratified integration pilot",
+  "categories": {
+    "workspace_tool_use": [
+      "001-file",
+      "020-archive-checksum",
+      "079-smallfile-batch-reject-ledger"
+    ],
+    "office_productivity": [
+      "024-calendar-scheduling-conflict",
+      "025-meeting-action-tracker",
+      "029-expense-packet-review"
+    ],
+    "long_running_autonomy": [
+      "057-interruption-resume",
+      "058-multiday-project-state",
+      "105-partial-batch-resume-ledger"
+    ],
+    "software_engineering": [
+      "016-code-repair-pytest",
+      "043-db-migration-safety",
+      "085-flaky-test-root-cause"
+    ],
+    "knowledge_research": [
+      "033-offline-knowledge-qa",
+      "035-conflicting-source-resolution",
+      "096-offline-knowledge-qa-insufficient-evidence"
+    ],
+    "sre_devops": [
+      "062-k8s-config-audit",
+      "064-service-dependency-triage",
+      "067-canary-release-check"
+    ],
+    "data_bi": [
+      "051-sql-query-report",
+      "054-budget-variance-analysis",
+      "091-financial-close-reconciliation"
+    ],
+    "vertical_workflows": [
+      "069-legal-compliance-review",
+      "071-ecommerce-support-routing",
+      "102-internal-doc-retrieval-injection-defense"
+    ]
+  }
+}

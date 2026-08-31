@@ -190,6 +190,20 @@ node evaluation/src/cli.mjs run `
 
 旧的 `scripts/evaluate-long-horizon*.ps1` 保持兼容；新 Harness 不会 import 它们。
 
+### Harness-Bench 配对试点
+
+`integrations/harnessbench/` 提供固定版本 Qihoo360/Harness-Bench 的黑盒接入。配对入口分别启动一个 Before 和 After OpenTopia Server，并在每个常驻 Server 上创建多个相互隔离的任务会话；不为每道题重复启动 Server。官方 Oracle、模型轮次、Provider Token/Cache 字段和工具事件会统一写入汇总，Provider、Docker、Adapter 或 Oracle 基础设施错误不会按 0 分计入。
+
+```powershell
+.\evaluation\tools\run-harnessbench-paired-pilot.ps1 `
+  -EnvFile "J:\path\to\provider.env" `
+  -Profile AUDIT_COPILOT_LLM `
+  -BeforeConcurrency 2 `
+  -AfterConcurrency 2
+```
+
+Windows 下任务工作目录会与报告目录分离并挂载到容器的 `/bench-work`，避免官方 Oracle 通过 `CreateProcess` 启动子进程时触发传统路径长度限制。`pilot-status.json` 支持按快照恢复，只跳过已有有效结果。试点阶段关闭额外的 LLM 过程评分；最终简历指标需在全量任务和复测完成后冻结。
+
 ## 结果和安全属性
 
 每次 Run 生成：

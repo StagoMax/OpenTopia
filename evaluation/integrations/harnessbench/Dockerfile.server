@@ -1,0 +1,46 @@
+FROM milvusdb/milvus:v2.5.5
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LD_PRELOAD= \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        build-essential \
+        ca-certificates \
+        curl \
+        file \
+        git \
+        jq \
+        nodejs \
+        npm \
+        procps \
+        python3 \
+        python3-pip \
+        python-is-python3 \
+        ripgrep \
+        sqlite3 \
+        unzip \
+        xz-utils \
+        zip \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m pip install --no-cache-dir \
+        jsonschema \
+        lxml \
+        numpy \
+        odfpy \
+        openpyxl \
+        pandas \
+        pillow \
+        pypdf \
+        pytest \
+        python-docx \
+        python-pptx \
+        pyyaml \
+        rdflib \
+        reportlab \
+        requests
+
+WORKDIR /bench-output
