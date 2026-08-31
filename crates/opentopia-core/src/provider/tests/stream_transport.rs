@@ -950,6 +950,8 @@ async fn chat_provider_recovers_invalid_streamed_tool_json_once_without_streamin
         let second_request = read_http_request(&mut second).await;
         assert!(second_request.contains(r#""stream":false"#));
         assert!(!second_request.contains("stream_options"));
+        assert!(second_request.contains("previous response could not be decoded as a valid tool call"));
+        assert!(second_request.contains("Use double quotes for every object key and every string value"));
         let body = r#"{"choices":[{"message":{"tool_calls":[{"id":"call_shell","type":"function","function":{"name":"shell","arguments":"{\"command\":\"cargo test\"}"}}]},"finish_reason":"tool_calls"}]}"#;
         second
             .write_all(

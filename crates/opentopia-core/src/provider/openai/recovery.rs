@@ -29,6 +29,31 @@ pub(super) struct RecoveredToolResponse {
     pub(super) status: u16,
 }
 
+const TOOL_CALL_JSON_RECOVERY_INSTRUCTION: &str = "The previous response could not be decoded as a valid tool call because its function arguments were not strict JSON. Regenerate the same intended tool call and follow the advertised tool schema exactly. Encode the arguments as one JSON object. Use double quotes for every object key and every string value, including enum values, file paths, and resource identifiers. Do not use bare identifiers, comments, Markdown, single quotes, or trailing commas.";
+
+fn append_tool_call_json_recovery_instruction(
+    protocol: OpenAiRecoveryProtocol,
+    body: &mut Value,
+) -> anyhow::Result<()> {
+    let field = match protocol {
+        OpenAiRecoveryProtocol::ChatCompletions => "messages",
+        OpenAiRecoveryProtocol::Responses => "input",
+    };
+    let messages = body
+        .get_mut(field)
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "provider tool-call recovery requires an array-valued `{field}` request field"
+            )
+        })?;
+    messages.push(json!({
+        "role": "system",
+        "content": TOOL_CALL_JSON_RECOVERY_INSTRUCTION,
+    }));
+    Ok(())
+}
+
 /// Provider-declared rate limits inside an HTTP-200 SSE stream are transport
 /// failures, not malformed tool calls. Atomic tool streams have not committed
 /// deltas or executed tools yet, so retrying the original streaming request is
@@ -83,9 +108,10 @@ pub(super) async fn schedule_rate_limited_stream_retry(
 
 /// Tool-bearing streamed responses are atomic: no tool has run and no partial
 /// response has been committed when its stream cannot be decoded or validated.
-/// Retrying the same logical request once without streaming is therefore a safe
-/// transport-level recovery and avoids asking the model to regenerate a
-/// different action.
+/// Retrying the same intended action once without streaming is therefore safe.
+/// The retry also receives a narrow protocol correction: an identical replay
+/// gives a model that emitted malformed JSON no new information and commonly
+/// reproduces the same invalid tool call.
 pub(super) async fn recover_streamed_tool_call_non_streaming(
     protocol: OpenAiRecoveryProtocol,
     client: &reqwest::Client,
@@ -102,7 +128,10 @@ pub(super) async fn recover_streamed_tool_call_non_streaming(
         attempt: failed_attempt,
         status: Some(failed_status),
         response_id: None,
-        body: tool_call_protocol_error_observation(stream_error, Some("retry_non_streaming_once")),
+        body: tool_call_protocol_error_observation(
+            stream_error,
+            Some("retry_non_streaming_with_json_constraint_once"),
+        ),
     })?;
 
     let mut body = prepared.body.clone();
@@ -110,6 +139,7 @@ pub(super) async fn recover_streamed_tool_call_non_streaming(
     if let Some(object) = body.as_object_mut() {
         object.remove("stream_options");
     }
+    append_tool_call_json_recovery_instruction(protocol, &mut body)?;
     let observation_body = redact_transport_value(&body);
     let cache_trace = crate::build_provider_cache_trace(&body, None, false);
     on_transport(ProviderTransportEvent::Retry {
@@ -118,7 +148,7 @@ pub(super) async fn recover_streamed_tool_call_non_streaming(
         retry_index: Some(1),
         retry_limit: Some(1),
         reason: format!(
-            "atomic tool-call stream was invalid; retrying the same logical request once without streaming: {}",
+            "atomic tool-call stream was invalid; regenerating the same intended action once without streaming under an explicit strict-JSON constraint: {}",
             truncate_observation_text(&stream_error.to_string())
         ),
         cache_trace: cache_trace.clone(),
@@ -147,7 +177,7 @@ pub(super) async fn recover_streamed_tool_call_non_streaming(
             response_id: None,
             body: json!({
                 "error": truncate_observation_text(&response_body),
-                "recovery": "retry_non_streaming_once_failed"
+                "recovery": "retry_non_streaming_with_json_constraint_once_failed"
             }),
         })?;
         anyhow::bail!(
@@ -199,7 +229,7 @@ pub(super) async fn recover_streamed_tool_call_non_streaming(
                 response_id: None,
                 body: tool_call_protocol_error_observation(
                     &error,
-                    Some("retry_non_streaming_once_failed"),
+                    Some("retry_non_streaming_with_json_constraint_once_failed"),
                 ),
             })?;
             return Err(error);
@@ -216,4 +246,42 @@ pub(super) async fn recover_streamed_tool_call_non_streaming(
         attempt,
         status: status.as_u16(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn appends_protocol_specific_strict_json_recovery_instruction() {
+        for (protocol, field) in [
+            (OpenAiRecoveryProtocol::ChatCompletions, "messages"),
+            (OpenAiRecoveryProtocol::Responses, "input"),
+        ] {
+            let mut body = json!({});
+            body[field] = json!([{ "role": "user", "content": "work" }]);
+
+            append_tool_call_json_recovery_instruction(protocol, &mut body).unwrap();
+
+            let recovery = body[field].as_array().unwrap().last().unwrap();
+            assert_eq!(recovery["role"], "system");
+            assert_eq!(
+                recovery["content"],
+                Value::String(TOOL_CALL_JSON_RECOVERY_INSTRUCTION.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_to_retry_without_the_protocol_message_array() {
+        let mut body = json!({ "messages": "not-an-array" });
+
+        let error = append_tool_call_json_recovery_instruction(
+            OpenAiRecoveryProtocol::ChatCompletions,
+            &mut body,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("array-valued `messages`"));
+    }
 }
