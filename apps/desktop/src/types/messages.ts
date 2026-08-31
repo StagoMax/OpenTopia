@@ -19,7 +19,7 @@ export type MessagePart =
   | { type: "tool_call"; call: ToolCall }
   | { type: "tool_result"; result: ToolResult }
   | { type: "file_ref"; path: string }
-  | { type: "source_ref"; source: ContextSourceRef }
+  | { type: "source_ref"; source: ContextSourceRef; inline?: boolean }
   | { type: "skill_ref"; skill: SkillRef }
   | {
       type: "turn_context";

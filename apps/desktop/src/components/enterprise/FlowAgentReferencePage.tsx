@@ -1,4 +1,5 @@
 import { Bot, Cable, Database, ShieldCheck } from "lucide-react";
+import { agentKnowledgeBindingSummary } from "../../agentKnowledgeBinding";
 import type { AgentTemplateVersionView } from "../../types";
 import { Badge, SelectField } from "../ui";
 import { templateKey } from "./flowActivation";
@@ -71,9 +72,9 @@ export function FlowAgentReferencePage({
                 <Database aria-hidden="true" size={14} /> Knowledge
               </dt>
               <dd>
-                {selected.template.spec.knowledgeBinding?.namespaces.join(
-                  ", ",
-                ) || "未绑定"}
+                {agentKnowledgeBindingSummary(
+                  selected.template.spec.knowledgeBinding,
+                )}
               </dd>
             </div>
             <div>

@@ -22,7 +22,6 @@ import type {
   HumanTaskResolutionResult,
   HumanTaskStatus,
   HumanTaskType,
-  LibraryProviderId,
   MediaHandlerInvocationResponse,
   MediaHandlerOperation,
   MediaHandlerSelection,
@@ -556,12 +555,11 @@ export class ExtensionsApi extends ConfigurationApi {
     draftId: string,
     input: unknown = {},
     startedBy = "local-user",
-    libraryProvider?: LibraryProviderId | null,
   ): Promise<FlowRun> {
     return this.post(
       "startFlowTestRun",
       `/api/flow-drafts/${encodeURIComponent(draftId)}/test-run`,
-      { input, startedBy, libraryProvider },
+      { input, startedBy },
     );
   }
 
@@ -572,7 +570,6 @@ export class ExtensionsApi extends ConfigurationApi {
       expectedFlowRevision?: number;
       output?: WorkflowOutput;
       outputReviewPolicy?: WorkflowOutputReviewPolicy;
-      libraryProvider?: LibraryProviderId | null;
     },
   ): Promise<ActiveFlow> {
     return this.post(

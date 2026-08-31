@@ -332,12 +332,7 @@ impl FlowNodeHarness for PreparedAgentRun {
             agent.restrict_capabilities(&spec.capabilities);
             agent.align_execution_authority_with_capabilities()?;
             agent.retain_external_tools_for_projection();
-            agent.set_library_namespaces(
-                spec.knowledge_binding
-                    .as_ref()
-                    .into_iter()
-                    .flat_map(|binding| binding.namespaces.iter().cloned()),
-            );
+            agent.set_knowledge_binding(spec.knowledge_binding.as_ref());
         }
         let continuation = request.interrupt.continuation.decode()?;
         let node_authority = agent

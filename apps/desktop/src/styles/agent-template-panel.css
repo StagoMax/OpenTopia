@@ -23,8 +23,22 @@
 }
 
 .agent-template-panel--rail > .ot-panel > .ot-panel__header {
-  min-block-size: var(--control-height-lg);
-  padding-inline: var(--space-6);
+  min-block-size: calc(var(--control-height-lg) + var(--space-4));
+  padding: var(--space-3) var(--space-4);
+}
+
+.agent-template-panel--rail > .ot-panel > .ot-panel__header > .ot-panel__title {
+  flex: 1 1 auto;
+  min-inline-size: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-template-panel--rail .agent-template-panel__header-actions {
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+  gap: var(--space-2);
 }
 
 .agent-template-panel--rail > .ot-panel:first-child > .ot-panel__header {
@@ -73,6 +87,25 @@
 
 .agent-template-panel--rail .agent-template-panel__actions > .ot-button {
   inline-size: 100%;
+}
+
+.agent-template-panel__technical {
+  display: grid;
+  gap: var(--space-4);
+  min-inline-size: 0;
+  border-top: 1px solid var(--border-subtle);
+  padding-top: var(--space-4);
+}
+
+.agent-template-panel__technical > summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+}
+
+.agent-template-panel__technical[open] > summary {
+  margin-bottom: var(--space-3);
 }
 
 .context-rail-shell > .agent-template-panel {
@@ -273,7 +306,7 @@
 
 .agent-template-panel__knowledge-binding > header {
   display: grid;
-  grid-template-columns: var(--icon-size-sm) minmax(0, 1fr) auto;
+  grid-template-columns: var(--icon-size-sm) minmax(0, 1fr);
   align-items: start;
   gap: var(--space-3);
 }

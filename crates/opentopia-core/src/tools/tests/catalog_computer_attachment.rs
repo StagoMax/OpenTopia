@@ -560,6 +560,7 @@ async fn read_attachment_loads_text_only_after_an_id_scoped_tool_call() {
             bytes: source_text.len() as u64,
             truncated: false,
         },
+        inline: Some(false),
     });
     store.append_message(message).expect("persist attachment");
 

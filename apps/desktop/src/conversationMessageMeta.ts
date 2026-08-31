@@ -41,16 +41,51 @@ export function formatConversationMessageTimestamp(
 }
 
 export function conversationMessageCopyText(parts: MessagePart[]): string {
-  const text = parts
-    .flatMap((part) => {
-      if (part.type === "text") return [part.text];
-      if (part.type === "proposed_plan") return [part.text];
-      if (part.type === "error") return [part.message];
-      if (part.type === "file_ref") return [part.path];
-      if (part.type === "source_ref") return [part.source.path];
-      if (part.type === "skill_ref") return [part.skill.path];
-      return [];
-    })
-    .join("\n\n");
+  const chunks = parts.flatMap((part) => {
+    if (part.type === "text") {
+      return [{ text: part.text, inlineText: true, inlineAttachment: false }];
+    }
+    if (part.type === "proposed_plan") {
+      return [{ text: part.text, inlineText: false, inlineAttachment: false }];
+    }
+    if (part.type === "error") {
+      return [
+        { text: part.message, inlineText: false, inlineAttachment: false },
+      ];
+    }
+    if (part.type === "file_ref") {
+      return [{ text: part.path, inlineText: false, inlineAttachment: false }];
+    }
+    if (part.type === "source_ref") {
+      return [
+        part.inline
+          ? {
+              text: `[${part.source.name}]`,
+              inlineText: true,
+              inlineAttachment: true,
+            }
+          : {
+              text: part.source.path,
+              inlineText: false,
+              inlineAttachment: false,
+            },
+      ];
+    }
+    if (part.type === "skill_ref") {
+      return [
+        { text: part.skill.path, inlineText: false, inlineAttachment: false },
+      ];
+    }
+    return [];
+  });
+  const text = chunks.reduce((result, chunk, index) => {
+    if (index === 0) return chunk.text;
+    const previous = chunks[index - 1]!;
+    const joinsInline =
+      previous.inlineText &&
+      chunk.inlineText &&
+      (previous.inlineAttachment || chunk.inlineAttachment);
+    return `${result}${joinsInline ? "" : "\n\n"}${chunk.text}`;
+  }, "");
   return text.replace(leadingBlankLines, "").replace(trailingBlankLines, "");
 }

@@ -23,9 +23,10 @@ export async function generateAgentDraftWithModel({
 }: GenerateAgentDraftInput): Promise<AgentTemplateVersionView> {
   const baseline = new Set(existingTemplates.map(templateKey));
   const startedAt = Date.now();
-  const [connections, sagSources] = await Promise.all([
+  const [connections, sagSources, libraryProviders] = await Promise.all([
     client.listConnections(),
     client.listSagSources().catch(() => []),
+    client.listLibraryProviders().catch(() => []),
   ]);
   const connectionCatalog = await Promise.all(
     connections
@@ -60,9 +61,10 @@ export async function generateAgentDraftWithModel({
     threadId,
     [
       "为当前用户创建一个单 Agent 配置。先调用 agent_search 避免重复，然后调用 agent_create 恰好一次创建草稿；不要创建 Flow，不要发布，也不要创建多 Agent。",
-      "根据需求生成完整 instructions：明确角色、目标、任意来源参数的处理方式、Connection 工具使用策略、@Flow.input/@Trigger.input 引用策略和期望 Final JSON。只能选择下面已配置好的 Connection、SAG namespace 和当前模型；不能扩大权限。",
+      "根据需求生成完整 instructions：明确角色、目标、任意来源参数的处理方式、Connection 工具使用策略、@Flow.input/@Trigger.input 引用策略和期望 Final JSON。只能选择下面已配置好的 Connection、知识库 provider、SAG namespace 和当前模型；不能扩大权限。选择 knowledgeProvider 后，系统会自动派生 library_search 权限，不要要求用户去 Flow Revision 重复配置。",
       `用户需求：\n${requirement.trim()}`,
       `可用 Connection：\n${JSON.stringify(connectionCatalog, null, 2)}`,
+      `可用知识库 provider：\n${JSON.stringify(libraryProviders, null, 2)}`,
       `可用 SAG namespaces：\n${JSON.stringify(namespaces)}`,
       `当前模型：${activeProvider ? `${activeProvider.id}:${activeProvider.model}` : "未指定；modelPolicy 保持 deny-all"}`,
       "创建完成后用一句话说明草稿名称和仍需用户审核的配置。",

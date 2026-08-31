@@ -64,6 +64,7 @@ pub mod prompt_runtime;
 pub mod provider;
 mod provider_cache_trace;
 pub mod round_compaction;
+mod runtime_capability;
 pub mod sandbox;
 pub mod scm_connector;
 pub mod settings;
@@ -201,12 +202,12 @@ pub use effect_journal::{
 };
 pub use enterprise::{
     validate_json_schema_value, AgentBudgetV1, AgentDefinitionV1, AgentInstanceStatusV1,
-    AgentInstanceV1, AgentModelBindingV1, AgentModelPolicyV1, AgentRiskClassV1,
-    AgentTemplateDiffV1, AgentTemplateError, AgentTemplateSpecV1, AgentTemplateStatusV1,
-    AgentTemplateVersionV1, AuditEventV1, CapabilityChangeKindV1, CapabilityChangeV1,
-    CapabilityProjection, DataClassification, EnterpriseExecutionContextV1, EvidenceRecordV1,
-    ExecutionBoundaryError, ExecutionIdentityRoute, ExecutionIdentityRouter,
-    ExecutionResourceGrantV1, ExperienceSurfaceProfile, ResourceKind, SagKnowledgeBindingV1,
+    AgentInstanceV1, AgentKnowledgeBindingV1, AgentModelBindingV1, AgentModelPolicyV1,
+    AgentRiskClassV1, AgentTemplateDiffV1, AgentTemplateError, AgentTemplateSpecV1,
+    AgentTemplateStatusV1, AgentTemplateVersionV1, AuditEventV1, CapabilityChangeKindV1,
+    CapabilityChangeV1, CapabilityProjection, DataClassification, EnterpriseExecutionContextV1,
+    EvidenceRecordV1, ExecutionBoundaryError, ExecutionIdentityRoute, ExecutionIdentityRouter,
+    ExecutionResourceGrantV1, ExperienceSurfaceProfile, KnowledgeLibraryProviderV1, ResourceKind,
     ENTERPRISE_SCHEMA_VERSION_V1, MAX_AGENT_DELEGATION_DEPTH,
 };
 pub use enterprise_connection_grants::{
@@ -444,8 +445,8 @@ pub use turn_inbox::{BufferedTurnInbox, TurnInbox, TurnInboxItem};
 pub use work_form::{WorkForm, WorkFormStatus, WorkItem, WorkItemStatus, WorkScope};
 pub use workflow::{
     ActiveFlowV1, CompiledWorkflowV1, FlowRevisionV1, FlowStatusV1, WorkflowAgentSpecV1,
-    WorkflowCompileError, WorkflowLibraryProviderV1, WorkflowOutputReviewPolicyV1,
-    WorkflowOutputSpecV1, WorkflowTriggerSpecV1,
+    WorkflowCompileError, WorkflowOutputReviewPolicyV1, WorkflowOutputSpecV1,
+    WorkflowTriggerSpecV1,
 };
 pub use workflow_automation::{
     FlowCaseStatusV1, FlowCaseV1, WorkflowDeliveryReceiptV1, WorkflowDeliveryStatusV1,

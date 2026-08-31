@@ -5,6 +5,7 @@
 //! delegates to the established `SpreadsheetTool`, keeping one validation and
 //! staging path for both the modern protocol and legacy calls.
 
+use super::attachment_tool::stored_attachment_read_path;
 use super::spreadsheet_protocol_contract::{
     SpreadsheetOperationContract, SpreadsheetProtocolOperation,
 };
@@ -15,6 +16,7 @@ use super::{
 use crate::execution_authorization::ToolExecutionIntent;
 use crate::model::{ToolCall, ToolResult};
 use crate::office_runtime::OfficeRuntime;
+use crate::runtime_capability::OFFICE_PYTHON_EXECUTABLE_ENV;
 use crate::spreadsheet::DelimitedFormat;
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -34,13 +36,18 @@ enum SpreadsheetInspection {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct SpreadsheetInspectInput {
     resource: OfficeResourceRef,
+    /// Use `workbook` for XLS/XLSX/ODS files. Use `delimited` only for CSV/TSV text.
     #[serde(default)]
     inspection: Option<SpreadsheetInspection>,
-    #[serde(default)]
-    format: Option<DelimitedFormat>,
+    /// CSV/TSV parser format. Omit for workbook inspection; this is not the workbook file type.
+    #[serde(default, rename = "delimitedFormat", alias = "format")]
+    #[schemars(rename = "delimitedFormat")]
+    delimited_format: Option<DelimitedFormat>,
+    /// Number of CSV/TSV rows to sample. Omit for workbook inspection.
     #[serde(default)]
     #[schemars(range(min = 1, max = 20))]
     sample_rows: Option<usize>,
+    /// Strip trailing tab separators while reading TSV text. Omit for workbook inspection.
     #[serde(default)]
     rstrip_tabs: bool,
 }
@@ -97,7 +104,7 @@ impl TypedTool for SpreadsheetInspectTool {
         );
         legacy.insert(binding_key.to_string(), binding_value);
         if matches!(inspection, SpreadsheetInspection::Delimited) {
-            if let Some(format) = input.format {
+            if let Some(format) = input.delimited_format {
                 legacy.insert("format".to_string(), serde_json::to_value(format)?);
             }
             if let Some(sample_rows) = input.sample_rows {
@@ -155,11 +162,6 @@ impl TypedTool for SpreadsheetDescribeTool {
             resource,
             operations,
         } = input;
-        anyhow::ensure!(
-            resource.supports_mutation()
-                || operations.iter().all(|operation| !operation.is_mutation()),
-            "attachment resources are immutable; request observation contracts only, or use a workspaceFile resource for mutations"
-        );
         let resource_descriptor = resource.descriptor();
         let contracts = operations
             .into_iter()
@@ -299,8 +301,18 @@ impl TypedTool for SpreadsheetExecuteTool {
         if let Some(resource) = resource {
             let binding = operation.primary_binding();
             if operation.is_mutation() {
-                let path = resource.offline_path()?;
-                arguments.insert(binding.to_string(), Value::String(path.to_string()));
+                let path = match &resource {
+                    OfficeResourceRef::WorkspaceFile { .. } => {
+                        PathBuf::from(resource.offline_path()?)
+                    }
+                    OfficeResourceRef::Attachment { attachment_id } => {
+                        stored_attachment_read_path(&ctx, *attachment_id)?
+                    }
+                };
+                arguments.insert(
+                    binding.to_string(),
+                    Value::String(path.to_string_lossy().into_owned()),
+                );
             } else {
                 let (key, value) = resource.read_binding()?;
                 arguments.insert(key.to_string(), value);
@@ -349,13 +361,13 @@ fn operation_notes(operation: SpreadsheetProtocolOperation, resource: &Value) ->
     let mut notes = vec![format!("Resource backend: {backend}.")];
     if operation.is_mutation() {
         notes.push(
-            "outputPath must be a workspace-relative destination path; mutations are atomic."
+            "The resource is a read input; outputPath is a separate destination governed by the active sandbox policy. The input is never modified unless outputPath intentionally resolves to the same writable file. Mutations are atomic."
                 .to_string(),
         );
     }
     if matches!(operation, SpreadsheetProtocolOperation::FillTemplate) {
         notes.push(
-            "resource binds templatePath; dataPath remains a workspace-relative CSV/TSV source."
+            "resource binds templatePath; dataPath is a separate readable CSV/TSV source governed by the active sandbox policy."
                 .to_string(),
         );
     }
@@ -371,11 +383,13 @@ fn runtime_status_json(status: crate::office_runtime::OfficeRuntimeStatus) -> Va
         "reason": status.managed_error,
         "runtime": runtime.map(|runtime| json!({
             "version": runtime.runtime_version,
-            "root": runtime.root,
-            "executable": runtime.executable,
             "python": runtime.python_version,
             "openpyxl": runtime.openpyxl_version,
             "source": runtime.source,
+            "shell": {
+                "executableEnvironmentVariable": OFFICE_PYTHON_EXECUTABLE_ENV,
+                "note": "The host projects this runtime and its filesystem capability into shell executions. Resolve the executable from the environment variable instead of copying an internal installation path."
+            }
         })),
     })
 }
@@ -395,4 +409,38 @@ async fn execute_legacy_spreadsheet(
             ctx,
         )
         .await
+}
+
+#[cfg(test)]
+mod runtime_projection_tests {
+    use super::*;
+    use crate::office_runtime::{
+        ManagedOfficeRuntimeStatus, OfficePythonRuntime, OfficeRuntimeSource, OfficeRuntimeStatus,
+    };
+
+    #[test]
+    fn model_runtime_status_exposes_a_logical_shell_launcher_not_internal_paths() {
+        let status = OfficeRuntimeStatus {
+            runtime: Some(OfficePythonRuntime {
+                executable: PathBuf::from("internal/python/python.exe"),
+                root: PathBuf::from("internal"),
+                runtime_version: "office-test".to_string(),
+                python_version: "3.12.14".to_string(),
+                openpyxl_version: "3.1.5".to_string(),
+                source: OfficeRuntimeSource::Managed,
+            }),
+            managed_version: "office-test".to_string(),
+            managed_status: ManagedOfficeRuntimeStatus::Ready,
+            managed_error: None,
+        };
+
+        let projected = runtime_status_json(status);
+        let runtime = &projected["runtime"];
+        assert_eq!(
+            runtime["shell"]["executableEnvironmentVariable"],
+            OFFICE_PYTHON_EXECUTABLE_ENV
+        );
+        assert!(runtime.get("root").is_none());
+        assert!(runtime.get("executable").is_none());
+    }
 }

@@ -205,7 +205,7 @@ test("collects the distinct paths referenced by inline attachments", () => {
   );
 });
 
-test("flattens attachment references to text for the wire and keeps images", () => {
+test("preserves ordered attachment and image references for the wire", () => {
   const parts: InlineMessageContentPart[] = [
     { type: "text", text: "请按" },
     { type: "attachment_ref", path: attachmentPath, name: "需求说明.pdf" },
@@ -214,7 +214,7 @@ test("flattens attachment references to text for the wire and keeps images", () 
 
   assert.deepEqual(composerWireContentParts(parts), [
     { type: "text", text: "请按" },
-    { type: "text", text: "[需求说明.pdf]" },
+    { type: "attachment_ref", path: attachmentPath, name: "需求说明.pdf" },
     { type: "image_ref", imageId },
   ]);
 });

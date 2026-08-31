@@ -2,12 +2,9 @@ use super::{
     current_settings, ensure_experience_mode_enabled, ensure_thread, load_bound_agent_context,
     provider_settings_for_thread, sync_thread_bundled_plugin_activations, ApiError, AppState,
 };
+use crate::agent_library_runtime::register_workflow_library_tool;
 use crate::connection_operation_runtime::{
     connection_authority_for_context, ConnectionOperationUnavailable,
-};
-use crate::flow_library_runtime::{
-    register_workflow_library_tool, validate_workflow_library_provider,
-    WorkflowLibraryProviderUpdate,
 };
 use crate::thread_runtime::sync_runtime_connection_tools;
 use crate::workflow_compiler::compile_published_workflow;
@@ -24,8 +21,7 @@ use opentopia_core::{
     FlowRunStatusV1, FlowRunV1, FlowSourceV1, FlowSpecV1, FlowStatusV1, FlowStoreError,
     FlowTrialV1, HumanTaskActionV1, HumanTaskStoreError, RuntimeConnectionAuthorityV1,
     RuntimeSurface, SessionStore, ToolInvocationContext, ToolStateStore, TurnStatus,
-    WorkflowAgentSpecV1, WorkflowCompileError, WorkflowLibraryProviderV1,
-    WorkflowOutputReviewPolicyV1, WorkflowOutputSpecV1,
+    WorkflowAgentSpecV1, WorkflowCompileError, WorkflowOutputReviewPolicyV1, WorkflowOutputSpecV1,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -298,13 +294,11 @@ async fn start_flow_test_run(
     let candidate = definition_from_draft(&draft, draft.revision, request.started_by.trim());
     let compiled = compile_published_workflow(&state.store, &candidate)
         .map_err(|error| ApiError::conflict(error.to_string()))?;
-    validate_workflow_library_provider(&compiled, request.library_provider)?;
     let run = FlowRunV1::new_for_test_run(
         draft.thread_id,
         draft.id,
         draft.revision,
         compiled,
-        request.library_provider,
         request.input,
     )
     .map_err(ApiError::from)?;
@@ -374,13 +368,6 @@ async fn activate_flow_draft(
                 .map(|flow| flow.active_revision.output_review_policy)
         })
         .unwrap_or(WorkflowOutputReviewPolicyV1::ExplicitNodesOnly);
-    let library_provider = request.library_provider.resolve(
-        existing
-            .as_ref()
-            .and_then(|flow| flow.active_revision.library_provider),
-    );
-    validate_workflow_library_provider(&compiled, library_provider)?;
-
     let flow = if let Some(mut flow) = existing {
         let expected = flow.revision;
         flow.apply_revision(
@@ -390,7 +377,6 @@ async fn activate_flow_draft(
             ingress_policy,
             output,
             output_review_policy,
-            library_provider,
             request.activated_by,
         )
         .map_err(workflow_compile_error)?;
@@ -399,7 +385,7 @@ async fn activate_flow_draft(
             .update_active_flow(&flow, expected)
             .map_err(active_flow_error)?
     } else {
-        let flow = ActiveFlowV1::new_with_runtime_options(
+        let flow = ActiveFlowV1::new_with_ingress_policy(
             definition.name,
             draft.thread_id,
             compiled,
@@ -407,7 +393,6 @@ async fn activate_flow_draft(
             ingress_policy,
             output,
             output_review_policy,
-            library_provider,
             request.activated_by,
         )
         .map_err(workflow_compile_error)?;
@@ -787,7 +772,6 @@ pub(crate) async fn flow_runtime_context(
     register_workflow_library_tool(
         &mut agent,
         state.library_providers.clone(),
-        run,
         &workflow_agent_specs,
     );
     let agent = agent.finalize().map_err(ApiError::from)?;
@@ -976,8 +960,6 @@ struct SimulateFlowDraftRequest {
 struct StartFlowTestRunRequest {
     #[serde(default)]
     input: Value,
-    #[serde(default)]
-    library_provider: Option<WorkflowLibraryProviderV1>,
     started_by: String,
 }
 
@@ -991,8 +973,6 @@ struct ActivateFlowDraftRequest {
     output: Option<WorkflowOutputSpecV1>,
     #[serde(default)]
     output_review_policy: Option<WorkflowOutputReviewPolicyV1>,
-    #[serde(default)]
-    library_provider: WorkflowLibraryProviderUpdate,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

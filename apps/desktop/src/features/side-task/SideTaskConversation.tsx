@@ -447,7 +447,6 @@ export function SideTaskConversation({
           autoFocus
           sendShortcut={sendShortcut}
           fileDropHandleRef={composerFileDropHandle}
-          fileDropScope="conversation"
           value={composer}
           workForm={workForm}
           isSending={isSending}

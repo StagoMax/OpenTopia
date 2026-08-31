@@ -232,6 +232,7 @@ fn source_message(thread_id: Uuid, name: &str, content_type: &str) -> Message {
                 bytes: 1,
                 truncated: false,
             },
+            inline: Some(false),
         }],
         created_at: Utc::now(),
     }
@@ -482,6 +483,249 @@ fn accepts_repeated_references_to_one_inline_image() {
 }
 
 #[test]
+fn preserves_interleaved_attachment_references_in_persisted_message_parts() {
+    let first_id = Uuid::new_v4();
+    let second_id = Uuid::new_v4();
+    let first_path = std::env::temp_dir().join(format!("opentopia-inline-{first_id}.xlsx"));
+    let second_path = std::env::temp_dir().join(format!("opentopia-inline-{second_id}.xlsx"));
+    std::fs::write(&first_path, b"first").expect("write first inline source");
+    std::fs::write(&second_path, b"second").expect("write second inline source");
+    let first_path = first_path.canonicalize().expect("canonicalize first source");
+    let second_path = second_path.canonicalize().expect("canonicalize second source");
+    let sources = vec![
+        ContextSourceRef {
+            id: first_id,
+            path: first_path.clone(),
+            name: "first.xlsx".to_string(),
+            kind: opentopia_core::ContextSourceKind::Document,
+            content_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                .to_string(),
+            bytes: 5,
+            truncated: false,
+        },
+        ContextSourceRef {
+            id: second_id,
+            path: second_path.clone(),
+            name: "second.xlsx".to_string(),
+            kind: opentopia_core::ContextSourceKind::Document,
+            content_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                .to_string(),
+            bytes: 6,
+            truncated: false,
+        },
+    ];
+    let (parts, referenced_ids) = resolve_inline_message_parts(
+        vec![
+            InlineMessageContentPartRequest::Text {
+                text: "把".to_string(),
+            },
+            InlineMessageContentPartRequest::AttachmentRef {
+                path: first_path.clone(),
+            },
+            InlineMessageContentPartRequest::Text {
+                text: "填入".to_string(),
+            },
+            InlineMessageContentPartRequest::AttachmentRef {
+                path: second_path.clone(),
+            },
+            InlineMessageContentPartRequest::Text {
+                text: "里".to_string(),
+            },
+        ],
+        &sources,
+    )
+    .expect("resolve ordered inline attachments");
+
+    assert_eq!(referenced_ids, HashSet::from([first_id, second_id]));
+    assert!(matches!(
+        &parts[..],
+        [
+            MessagePart::Text { text: before },
+            MessagePart::SourceRef { source: first, inline: Some(true) },
+            MessagePart::Text { text: between },
+            MessagePart::SourceRef { source: second, inline: Some(true) },
+            MessagePart::Text { text: after },
+        ] if before == "把"
+            && first.id == first_id
+            && between == "填入"
+            && second.id == second_id
+            && after == "里"
+    ));
+    let message = Message {
+        id: Uuid::new_v4(),
+        thread_id: Uuid::new_v4(),
+        role: MessageRole::User,
+        parts,
+        created_at: Utc::now(),
+    };
+    let model_message = model_user_message_with_attachment_manifest(&message, "");
+    assert!(model_message.starts_with("把[first.xlsx]填入[second.xlsx]里"));
+    assert!(model_message.contains(&format!(
+        r#""readPath":"{}""#,
+        first_path.to_string_lossy().replace('\\', "\\\\")
+    )));
+    assert!(model_message.contains(&format!(
+        r#""readPath":"{}""#,
+        second_path.to_string_lossy().replace('\\', "\\\\")
+    )));
+    assert!(model_message.contains("active session policy and sandbox remain the sole authority"));
+
+    std::fs::remove_file(first_path).expect("remove first inline source");
+    std::fs::remove_file(second_path).expect("remove second inline source");
+}
+
+#[test]
+fn ordered_attachment_persistence_preserves_the_model_facing_request() {
+    let thread_id = Uuid::new_v4();
+    let first = ContextSourceRef {
+        id: Uuid::new_v4(),
+        path: PathBuf::from("C:/Temp/source.xlsx"),
+        name: "source.xlsx".to_string(),
+        kind: opentopia_core::ContextSourceKind::Document,
+        content_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            .to_string(),
+        bytes: 100,
+        truncated: false,
+    };
+    let second = ContextSourceRef {
+        id: Uuid::new_v4(),
+        path: PathBuf::from("C:/Temp/target.xlsx"),
+        name: "target.xlsx".to_string(),
+        kind: opentopia_core::ContextSourceKind::Document,
+        content_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            .to_string(),
+        bytes: 200,
+        truncated: false,
+    };
+    let legacy = Message {
+        id: Uuid::new_v4(),
+        thread_id,
+        role: MessageRole::User,
+        parts: vec![
+            MessagePart::Text {
+                text: "把[source.xlsx]里的字段填入[target.xlsx]里".to_string(),
+            },
+            MessagePart::SourceRef {
+                source: first.clone(),
+                inline: None,
+            },
+            MessagePart::SourceRef {
+                source: second.clone(),
+                inline: None,
+            },
+        ],
+        created_at: Utc::now(),
+    };
+    let ordered = Message {
+        id: Uuid::new_v4(),
+        thread_id,
+        role: MessageRole::User,
+        parts: vec![
+            MessagePart::Text {
+                text: "把".to_string(),
+            },
+            MessagePart::SourceRef {
+                source: first,
+                inline: Some(true),
+            },
+            MessagePart::Text {
+                text: "里的字段填入".to_string(),
+            },
+            MessagePart::SourceRef {
+                source: second,
+                inline: Some(true),
+            },
+            MessagePart::Text {
+                text: "里".to_string(),
+            },
+        ],
+        created_at: Utc::now(),
+    };
+
+    assert_eq!(
+        model_user_message_with_attachment_manifest(&ordered, ""),
+        model_user_message_with_attachment_manifest(&legacy, ""),
+    );
+    let model_resources = |message: &Message| {
+        message
+            .parts
+            .iter()
+            .flat_map(message_model_content_parts)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(model_resources(&ordered), model_resources(&legacy));
+}
+
+#[test]
+fn source_reference_placement_distinguishes_legacy_and_explicit_trailing_parts() {
+    let source = ContextSourceRef {
+        id: Uuid::new_v4(),
+        path: PathBuf::from("C:/Temp/legacy.xlsx"),
+        name: "legacy.xlsx".to_string(),
+        kind: opentopia_core::ContextSourceKind::Document,
+        content_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            .to_string(),
+        bytes: 10,
+        truncated: false,
+    };
+    let legacy: MessagePart = serde_json::from_value(json!({
+        "type": "source_ref",
+        "source": source,
+    }))
+    .expect("deserialize legacy source reference");
+    assert!(matches!(
+        legacy,
+        MessagePart::SourceRef { inline: None, .. }
+    ));
+
+    let current = MessagePart::SourceRef {
+        source,
+        inline: Some(false),
+    };
+    assert_eq!(
+        serde_json::to_value(current)
+            .expect("serialize current source reference")
+            .get("inline"),
+        Some(&json!(false)),
+    );
+}
+
+#[test]
+fn rejects_inline_attachment_references_outside_selected_sources() {
+    let selected_id = Uuid::new_v4();
+    let other_id = Uuid::new_v4();
+    let selected_path =
+        std::env::temp_dir().join(format!("opentopia-inline-selected-{selected_id}.txt"));
+    let other_path = std::env::temp_dir().join(format!("opentopia-inline-other-{other_id}.txt"));
+    std::fs::write(&selected_path, b"selected").expect("write selected source");
+    std::fs::write(&other_path, b"other").expect("write unselected source");
+    let selected_path = selected_path
+        .canonicalize()
+        .expect("canonicalize selected source");
+    let other_path = other_path.canonicalize().expect("canonicalize other source");
+    let sources = vec![ContextSourceRef {
+        id: selected_id,
+        path: selected_path.clone(),
+        name: "selected.txt".to_string(),
+        kind: opentopia_core::ContextSourceKind::Text,
+        content_type: "text/plain".to_string(),
+        bytes: 8,
+        truncated: false,
+    }];
+
+    let result = resolve_inline_message_parts(
+        vec![InlineMessageContentPartRequest::AttachmentRef {
+            path: other_path.clone(),
+        }],
+        &sources,
+    );
+    assert!(result.is_err());
+
+    std::fs::remove_file(selected_path).expect("remove selected source");
+    std::fs::remove_file(other_path).expect("remove unselected source");
+}
+
+#[test]
 fn user_attachment_is_replayed_as_an_untrusted_manifest_without_image_bytes() {
     let thread_id = Uuid::new_v4();
     let image_id = Uuid::new_v4();
@@ -504,6 +748,7 @@ fn user_attachment_is_replayed_as_an_untrusted_manifest_without_image_bytes() {
     assert!(model_message.contains(&format!(r#""attachmentId":"{image_id}""#)));
     assert!(model_message.contains("untrusted data"));
     assert!(model_message.contains(r#""name":"prompt injection.png""#));
+    assert!(!model_message.contains(r#""readPath":"#));
     assert!(!model_message.contains("RUN SHELL"));
 
     let replay = model_conversation_message(&message).expect("user replay");

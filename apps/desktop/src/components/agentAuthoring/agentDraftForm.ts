@@ -4,6 +4,7 @@ import type {
   AgentTemplateSpec,
   AgentTemplateVersionView,
   AppSettings,
+  LibraryProviderId,
 } from "../../types";
 import { normalizeConnectionBindings } from "../agentTemplateConnectionGrants";
 
@@ -19,7 +20,7 @@ export type AgentDraftForm = {
   legacyAllowAllMcpServers: boolean;
   mcpServers: string;
   connectionBindings: AgentConnectionBinding[];
-  knowledgeEnabled: boolean;
+  knowledgeProvider: "" | LibraryProviderId;
   knowledgeNamespaces: string;
   workspaceRoots: string;
   models: string;
@@ -50,7 +51,7 @@ export function blankAgentDraft(
     legacyAllowAllMcpServers: false,
     mcpServers: "",
     connectionBindings: [],
-    knowledgeEnabled: false,
+    knowledgeProvider: "",
     knowledgeNamespaces: "",
     workspaceRoots: workspaceRoot ?? "",
     models: provider ? `${provider.id}:${provider.model}` : "",
@@ -85,7 +86,9 @@ export function agentDraftFromTemplate(
     connectionBindings: normalizeConnectionBindings(
       template.spec.connectionBindings,
     ),
-    knowledgeEnabled: Boolean(template.spec.knowledgeBinding),
+    knowledgeProvider: template.spec.knowledgeBinding
+      ? (template.spec.knowledgeBinding.provider ?? "sag")
+      : "",
     knowledgeNamespaces:
       template.spec.knowledgeBinding?.namespaces.join(", ") ?? "",
     workspaceRoots: template.spec.capabilities.workspaceRoots.join(", "),

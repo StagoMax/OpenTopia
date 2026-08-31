@@ -3,12 +3,7 @@ import test from "node:test";
 
 import type * as FlowLibraryBindingModule from "./flowLibraryBinding";
 
-const {
-  FLOW_LIBRARY_PROVIDER_OPTIONS,
-  flowLibraryProviderLabel,
-  resolveFlowLibraryProvider,
-  updateFlowLibraryBindings,
-} = (await import(
+const { resolveFlowLibraryProvider, updateFlowLibraryBindings } = (await import(
   "./flowLibraryBinding" + ".ts"
 )) as typeof FlowLibraryBindingModule;
 
@@ -32,13 +27,4 @@ test("adds, changes, and removes a thread Lib binding", () => {
 
   const removed = updateFlowLibraryBindings(changed, "thread-1", null);
   assert.deepEqual(removed, {});
-});
-
-test("offers provider-only Flow deployment choices", () => {
-  assert.deepEqual(
-    FLOW_LIBRARY_PROVIDER_OPTIONS.map((option) => option.value),
-    ["", "graph-rag", "sag"],
-  );
-  assert.equal(flowLibraryProviderLabel("graph-rag"), "Graph RAG");
-  assert.equal(flowLibraryProviderLabel(null), "未启用");
 });

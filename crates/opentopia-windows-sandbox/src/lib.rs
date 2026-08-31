@@ -287,7 +287,8 @@ fn parse_request(args: impl IntoIterator<Item = String>) -> Result<SandboxReques
         anyhow::ensure!(
             read_execute.iter().any(|capability| {
                 capability.provisioning == ReadProvisioning::Managed
-                    && path_is_within(&capability.path, root)
+                    && (path_is_within(&capability.path, root)
+                        || path_is_within(root, &capability.path))
             }),
             "managed runtime root {} does not contain any managed read capability",
             root.display()
@@ -486,5 +487,38 @@ mod tests {
         assert_eq!(request.filesystem.managed_runtime_roots.len(), 1);
         assert_eq!(request.filesystem.read_execute.len(), 1);
         std::fs::remove_dir_all(root).expect("remove managed runtime fixture");
+    }
+
+    #[test]
+    fn managed_runtime_root_accepts_a_managed_parent_read_capability() {
+        let parent = std::env::temp_dir().join(format!(
+            "opentopia-managed-runtime-parent-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root = parent.join("workspace-tools").join("pnpm");
+        std::fs::create_dir_all(&root).expect("create managed runtime fixture");
+        let parent_arg = parent.to_string_lossy().into_owned();
+        let root_arg = root.to_string_lossy().into_owned();
+        let request = parse_request(
+            vec![
+                "run".to_string(),
+                "--cwd".to_string(),
+                parent_arg.clone(),
+                "--read-root".to_string(),
+                parent_arg,
+                "--managed-runtime-root".to_string(),
+                root_arg,
+                "--network".to_string(),
+                "internet".to_string(),
+                "--".to_string(),
+                "cmd.exe".to_string(),
+            ]
+            .into_iter(),
+        )
+        .expect("a parent read capability covers the managed runtime");
+
+        assert_eq!(request.filesystem.managed_runtime_roots.len(), 1);
+        assert_eq!(request.filesystem.read_execute.len(), 1);
+        std::fs::remove_dir_all(parent).expect("remove managed runtime fixture");
     }
 }

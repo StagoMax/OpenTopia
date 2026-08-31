@@ -5,6 +5,7 @@
 //! same contract apply to foreground, background, and persistent executions
 //! without parsing opaque shell source.
 
+use crate::runtime_capability::{registered_child_process_runtimes, ChildProcessRuntimeCapability};
 use anyhow::{anyhow, Context};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -41,6 +42,7 @@ impl WorkspaceExecutionCapsule {
         builder.add_agent_tools_runtime();
         builder.add_rust_toolchain();
         builder.add_package_manager(&workspace_root);
+        builder.add_registered_child_process_runtimes();
         builder.finish()
     }
 
@@ -135,10 +137,13 @@ impl CapsuleBuilder {
 
         match prepare_managed_pnpm(&version) {
             Ok(runtime) => {
-                self.insert_env("COREPACK_HOME", runtime.corepack_home.as_os_str());
-                self.push_path_entry(runtime.shims);
-                self.push_read_root(runtime.root);
-                self.push_managed_runtime_root(runtime.permission_root);
+                self.project_runtime_capability(
+                    ChildProcessRuntimeCapability::default()
+                        .with_environment("COREPACK_HOME", runtime.corepack_home.as_os_str())
+                        .with_path_entry(runtime.shims)
+                        .with_read_root(runtime.root)
+                        .with_managed_runtime_root(runtime.permission_root),
+                );
             }
             Err(error) => {
                 self.issues.push(WorkspaceCapabilityIssue {
@@ -146,6 +151,27 @@ impl CapsuleBuilder {
                     reason: error.to_string(),
                 });
             }
+        }
+    }
+
+    fn add_registered_child_process_runtimes(&mut self) {
+        for capability in registered_child_process_runtimes() {
+            self.project_runtime_capability(capability);
+        }
+    }
+
+    fn project_runtime_capability(&mut self, capability: ChildProcessRuntimeCapability) {
+        for (key, value) in capability.environment {
+            self.insert_env(key, value);
+        }
+        for path in capability.path_entries {
+            self.push_path_entry(path);
+        }
+        for path in capability.read_roots {
+            self.push_read_root(path);
+        }
+        for path in capability.managed_runtime_roots {
+            self.push_managed_runtime_root(path);
         }
     }
 
@@ -732,5 +758,48 @@ mod tests {
         );
         assert_eq!(capsule.fingerprint().len(), 64);
         fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn child_process_runtime_is_projected_without_implicit_path_changes() {
+        let root = fixture("office-python");
+        let executable = root.join("python").join(if cfg!(windows) {
+            "python.exe"
+        } else {
+            "python"
+        });
+        fs::create_dir_all(executable.parent().expect("python parent"))
+            .expect("create Office Python fixture");
+        fs::write(&executable, b"fixture").expect("write Office Python fixture");
+        let mut builder = CapsuleBuilder::default();
+        builder.project_runtime_capability(
+            ChildProcessRuntimeCapability::default()
+                .with_environment("TEST_RUNTIME", executable.as_os_str())
+                .with_read_root(root.clone())
+                .with_managed_runtime_root(root.clone()),
+        );
+        let capsule = builder.finish();
+        let environment = capsule
+            .environment()
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            environment.get("TEST_RUNTIME").map(PathBuf::from),
+            Some(executable)
+        );
+        assert_eq!(capsule.read_roots(), [normalized_canonical_path(&root)]);
+        assert_eq!(
+            capsule.managed_runtime_roots(),
+            [normalized_canonical_path(&root)]
+        );
+        assert!(capsule.path_entries().is_empty());
+        fs::remove_dir_all(root).expect("remove Office Python fixture");
     }
 }

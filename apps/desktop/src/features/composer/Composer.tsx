@@ -6,19 +6,19 @@ import {
   useRef,
   useState,
   type ClipboardEvent as ReactClipboardEvent,
-  type DragEvent as ReactDragEvent,
 } from "react";
-import { Paperclip } from "lucide-react";
 import {
   composerContentText,
   composerExternalValueSyncAction,
-  filterComposerAttachmentReferences,
   composerInputCommitPending,
   composerLineBreakText,
+  composerTextLength,
   composerUndoEntries,
   composerUsesOrderedListIndentation,
   composerVisibleText,
   composerWireContentParts,
+  filterComposerAttachmentReferences,
+  normalizeComposerContentParts,
   normalizeComposerImageDeletionSnapshot,
   referencedAttachmentPaths,
   referencedImageIds,
@@ -29,7 +29,6 @@ import {
   type ComposerEnterCommand,
 } from "../../composerInput";
 import type { ConversationMetrics } from "../../conversationMetrics";
-import { hasFileDragPayload } from "../../fileDrop";
 import { useDismissiblePopover } from "../../hooks/useDismissiblePopover";
 import type { SendShortcut } from "../../editorPreferences";
 import { workspaceRootKey } from "../../workspaceRootKey";
@@ -46,19 +45,20 @@ import { ComposerSendButton } from "./ComposerSendButton";
 import { ImageLightbox } from "./ImageLightbox";
 import {
   cloneComposerHistorySnapshot,
-  composerRangeAtPoint,
   composerRangesEqual,
   composerSnapshotAtSelection,
   createComposerAttachmentReferenceNode,
   createComposerImageReferenceNode,
   endOfComposerRange,
   imageFileFingerprint,
+  insertComposerAtomicNodeAtRange,
   insertComposerTextAtSelection,
   isComposerImageFile,
   rangeBelongsToEditor,
   readComposerContent,
   readComposerContentParts,
   renderComposerSnapshot,
+  stabilizeComposerCaretRange,
   type ComposerImageAttachment,
 } from "./composerDom";
 import { collaborationModePlaceholder } from "./composerModes";
@@ -96,13 +96,19 @@ const MAX_COMPOSER_IMAGES = 10;
 const MAX_COMPOSER_IMAGE_BYTES = 25 * 1024 * 1024;
 const MAX_COMPOSER_HISTORY_ENTRIES = 200;
 const COMPOSER_DRAFT_PUBLISH_DELAY_MS = 300;
+const EMPTY_COMPOSER_CONTENT_PARTS: InlineMessageContentPart[] = [];
+
+type PendingComposerPublish = {
+  value: string;
+  contentParts: InlineMessageContentPart[];
+};
 
 export type ComposerProps = {
   autoFocus?: boolean;
   sendShortcut: SendShortcut;
-  fileDropHandleRef?: { current: ComposerFileDropHandle | null };
-  fileDropScope?: "composer" | "conversation";
+  fileDropHandleRef: { current: ComposerFileDropHandle | null };
   value: string;
+  contentParts?: InlineMessageContentPart[];
   workForm?: WorkForm | null;
   isSending: boolean;
   isRunning: boolean;
@@ -123,7 +129,7 @@ export type ComposerProps = {
   projectName: string | null;
   projects: Project[];
   launchMode?: NewTaskLaunchMode;
-  onChange(value: string): void;
+  onChange(value: string, contentParts: InlineMessageContentPart[]): void;
   onSubmit(
     value: string,
     imageAttachments: InlineImageAttachment[],
@@ -151,8 +157,8 @@ const MemoizedComposer = memo(function ComposerView({
   autoFocus = false,
   sendShortcut,
   fileDropHandleRef,
-  fileDropScope = "composer",
   value,
+  contentParts = EMPTY_COMPOSER_CONTENT_PARTS,
   workForm,
   isSending,
   isRunning,
@@ -207,11 +213,8 @@ const MemoizedComposer = memo(function ComposerView({
   const [hasInlineImageReferences, setHasInlineImageReferences] =
     useState(false);
   const [previewIndex, setPreviewIndex] = useState<number | null>(null);
-  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const [imageContextMenu, setImageContextMenu] =
     useState<ComposerImageContextMenuState | null>(null);
-  const dragDepthRef = useRef(0);
-  const preDragComposerRangeRef = useRef<Range | null>(null);
   const imageAttachmentsRef = useRef(imageAttachments);
   const editorRef = useRef<HTMLDivElement>(null);
   const contextFileInputRef = useRef<HTMLInputElement>(null);
@@ -232,8 +235,8 @@ const MemoizedComposer = memo(function ComposerView({
   );
   const isComposingRef = useRef(false);
   const lastLocallyPublishedValueRef = useRef<string | null>(null);
-  const deferredExternalValueRef = useRef<{ value: string } | null>(null);
-  const pendingComposerPublishRef = useRef<string | null>(null);
+  const deferredExternalValueRef = useRef<PendingComposerPublish | null>(null);
+  const pendingComposerPublishRef = useRef<PendingComposerPublish | null>(null);
   const composerPublishTimerRef = useRef<number | null>(null);
   const lastExternalComposerValueRef = useRef(value);
 
@@ -250,22 +253,28 @@ const MemoizedComposer = memo(function ComposerView({
   }
 
   function flushPendingComposerPublish() {
-    const nextText = pendingComposerPublishRef.current;
+    const next = pendingComposerPublishRef.current;
     cancelPendingComposerPublish();
-    if (nextText !== null) onChange(nextText);
+    if (next) onChange(next.value, next.contentParts);
   }
 
-  function scheduleComposerPublish(text: string) {
-    pendingComposerPublishRef.current = text;
+  function scheduleComposerPublish(
+    nextValue: string,
+    nextContentParts: InlineMessageContentPart[],
+  ) {
+    pendingComposerPublishRef.current = {
+      value: nextValue,
+      contentParts: nextContentParts.map((part) => ({ ...part })),
+    };
     if (composerPublishTimerRef.current !== null) {
       window.clearTimeout(composerPublishTimerRef.current);
     }
     composerPublishTimerRef.current = window.setTimeout(() => {
       composerPublishTimerRef.current = null;
-      const nextText = pendingComposerPublishRef.current;
+      const next = pendingComposerPublishRef.current;
       pendingComposerPublishRef.current = null;
-      if (nextText === null) return;
-      onChange(nextText);
+      if (!next) return;
+      onChange(next.value, next.contentParts);
     }, COMPOSER_DRAFT_PUBLISH_DELAY_MS);
   }
 
@@ -285,22 +294,32 @@ const MemoizedComposer = memo(function ComposerView({
     [],
   );
 
-  function applyExternalComposerValue(nextValue: string) {
+  function applyExternalComposerValue(
+    nextValue: string,
+    nextContentParts: InlineMessageContentPart[],
+  ) {
     const editor = editorRef.current;
     if (!editor) return;
     cancelPendingComposerPublish();
     deferredExternalValueRef.current = null;
     lastLocallyPublishedValueRef.current = null;
-    const current = composerSnapshotAtSelection(editor);
-    const currentText = composerVisibleText(current.parts);
-    setUsesOrderedListIndentation(
-      composerUsesOrderedListIndentation(nextValue),
+    const nextParts = normalizeComposerContentParts(
+      nextContentParts.length > 0
+        ? nextContentParts
+        : nextValue
+          ? [{ type: "text", text: nextValue }]
+          : [],
     );
-    if (currentComposerSnapshotRef.current && currentText === nextValue) return;
-    if (!currentComposerSnapshotRef.current && currentText === nextValue) {
-      currentComposerSnapshotRef.current = current;
-      return;
-    }
+    const nextText = composerVisibleText(nextParts);
+    const next: ComposerHistorySnapshot = {
+      parts: nextParts,
+      caretOffset: nextParts.reduce(
+        (length, part) =>
+          length + (part.type === "text" ? composerTextLength(part.text) : 1),
+        0,
+      ),
+    };
+    setUsesOrderedListIndentation(composerUsesOrderedListIndentation(nextText));
 
     imageAttachmentsRef.current.forEach((attachment) =>
       URL.revokeObjectURL(attachment.previewUrl),
@@ -309,13 +328,12 @@ const MemoizedComposer = memo(function ComposerView({
     setImageAttachments([]);
     setHasInlineImageReferences(false);
     setPreviewIndex(null);
-    editor.textContent = nextValue;
-    const next = readComposerContent(editor);
-    currentComposerSnapshotRef.current = next;
+    renderComposerSnapshot(editor, next, []);
+    currentComposerSnapshotRef.current = cloneComposerHistorySnapshot(next);
     composerUndoHistoryRef.current = [];
     composerRedoHistoryRef.current = [];
-    draftRef.current = nextValue;
-    setHasDraftText(Boolean(nextValue.trim()));
+    draftRef.current = nextText;
+    setHasDraftText(Boolean(nextText.trim()));
   }
 
   useLayoutEffect(() => {
@@ -338,11 +356,14 @@ const MemoizedComposer = memo(function ComposerView({
       return;
     }
     if (action === "defer") {
-      deferredExternalValueRef.current = { value };
+      deferredExternalValueRef.current = {
+        value,
+        contentParts: contentParts.map((part) => ({ ...part })),
+      };
       return;
     }
-    applyExternalComposerValue(value);
-  }, [value]);
+    applyExternalComposerValue(value, contentParts);
+  }, [contentParts, value]);
 
   // Source chips can also be removed by draft restoration or another parent
   // action, not only by ComposerSources' button. Reconcile the DOM at the
@@ -373,8 +394,15 @@ const MemoizedComposer = memo(function ComposerView({
       const editor = editorRef.current;
       const selection = window.getSelection();
       if (!editor || !selection || selection.rangeCount === 0) return;
-      const range = selection.getRangeAt(0);
-      if (rangeBelongsToEditor(editor, range)) {
+      const sourceRange = selection.getRangeAt(0);
+      if (rangeBelongsToEditor(editor, sourceRange)) {
+        const range = isComposingRef.current
+          ? sourceRange
+          : stabilizeComposerCaretRange(editor, sourceRange);
+        if (!composerRangesEqual(sourceRange, range)) {
+          selection.removeAllRanges();
+          selection.addRange(range);
+        }
         if (composerRangesEqual(savedComposerRangeRef.current, range)) return;
         savedComposerRangeRef.current = range.cloneRange();
         if (!isComposingRef.current && currentComposerSnapshotRef.current) {
@@ -442,7 +470,7 @@ const MemoizedComposer = memo(function ComposerView({
     draftRef.current = text;
     setHasDraftText(Boolean(text.trim()));
     lastLocallyPublishedValueRef.current = text;
-    scheduleComposerPublish(text);
+    scheduleComposerPublish(text, snapshot.parts);
   }
 
   function commitComposerMutation(
@@ -582,14 +610,11 @@ const MemoizedComposer = memo(function ComposerView({
       ? requestedRange!.cloneRange()
       : endOfComposerRange(editor);
     const node = createComposerImageReferenceNode(attachment);
-    range.deleteContents();
-    range.insertNode(node);
-    range.setStartAfter(node);
-    range.collapse(true);
+    const caretRange = insertComposerAtomicNodeAtRange(range, node);
     const selection = window.getSelection();
     selection?.removeAllRanges();
-    selection?.addRange(range);
-    savedComposerRangeRef.current = range.cloneRange();
+    selection?.addRange(caretRange);
+    savedComposerRangeRef.current = caretRange.cloneRange();
     editor.focus();
   }
 
@@ -736,8 +761,9 @@ const MemoizedComposer = memo(function ComposerView({
     const submittedValue = hasInlineReferences
       ? composerContentText(parts, submittedAttachments)
       : draftRef.current;
-    const submittedContentParts =
-      submittedAttachments.length > 0 ? composerWireContentParts(parts) : [];
+    const submittedContentParts = hasInlineReferences
+      ? composerWireContentParts(parts)
+      : [];
     const accepted = await onSubmit(
       submittedValue,
       submittedAttachments,
@@ -774,7 +800,7 @@ const MemoizedComposer = memo(function ComposerView({
     setHasDraftText(false);
     setUsesOrderedListIndentation(false);
     lastLocallyPublishedValueRef.current = "";
-    onChange("");
+    onChange("", []);
   };
 
   function executeComposerEnterCommand(
@@ -826,21 +852,16 @@ const MemoizedComposer = memo(function ComposerView({
         const insertionRange = rangeBelongsToEditor(editor, range)
           ? range!.cloneRange()
           : endOfComposerRange(editor);
-        insertionRange.deleteContents();
         const node = createComposerAttachmentReferenceNode(
           source.path,
           source.name,
         );
-        insertionRange.insertNode(node);
-        insertionRange.setStartAfter(node);
-        insertionRange.collapse(true);
-        range = insertionRange;
+        range = insertComposerAtomicNodeAtRange(insertionRange, node);
       }
       if (editor && before && rangeBelongsToEditor(editor, range)) {
-        // `insertNode` only updates this detached Range. Move the browser
-        // selection as well so the next typed character follows the newly
-        // inserted reference (and so commitComposerMutation records the same
-        // caret position in the history snapshot).
+        // Move the browser selection to the editable text boundary returned by
+        // the atomic-node insertion transaction so the next IME composition
+        // has a stable target and history records the same caret position.
         const selection = window.getSelection();
         selection?.removeAllRanges();
         selection?.addRange(range!);
@@ -856,48 +877,6 @@ const MemoizedComposer = memo(function ComposerView({
     },
   }));
 
-  function handleDragEnter(event: ReactDragEvent<HTMLDivElement>) {
-    if (!hasFileDragPayload(event.dataTransfer.types)) return;
-    event.preventDefault();
-    if (dragDepthRef.current === 0) {
-      const editor = editorRef.current;
-      const savedRange = savedComposerRangeRef.current;
-      preDragComposerRangeRef.current =
-        editor && rangeBelongsToEditor(editor, savedRange)
-          ? savedRange!.cloneRange()
-          : null;
-    }
-    dragDepthRef.current += 1;
-    setIsDraggingFiles(true);
-  }
-
-  function handleDragOver(event: ReactDragEvent<HTMLDivElement>) {
-    if (!hasFileDragPayload(event.dataTransfer.types)) return;
-    event.preventDefault();
-    event.dataTransfer.dropEffect = "copy";
-  }
-
-  function handleDragLeave() {
-    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
-    if (dragDepthRef.current === 0) {
-      preDragComposerRangeRef.current = null;
-      setIsDraggingFiles(false);
-    }
-  }
-
-  function handleDrop(event: ReactDragEvent<HTMLDivElement>) {
-    if (!hasFileDragPayload(event.dataTransfer.types)) return;
-    event.preventDefault();
-    dragDepthRef.current = 0;
-    setIsDraggingFiles(false);
-    const files = Array.from(event.dataTransfer.files);
-    const range =
-      preDragComposerRangeRef.current?.cloneRange() ??
-      composerRangeAtPoint(event.clientX, event.clientY);
-    preDragComposerRangeRef.current = null;
-    addSelectedFiles(files, range);
-  }
-
   const hasMediaOrSources =
     imageAttachments.length > 0 ||
     contextSources.length > 0 ||
@@ -912,12 +891,8 @@ const MemoizedComposer = memo(function ComposerView({
     <div className={`composer-shell${metrics ? " has-metrics" : ""}`}>
       {workForm ? <ComposerWorkForm form={workForm} /> : null}
       <div
-        className={`composer ${workspaceRoot || projectName ? "has-context" : ""} ${hasMediaOrSources ? "has-sources" : ""} ${isDraggingFiles ? "is-dragging-files" : ""}`}
+        className={`composer ${workspaceRoot || projectName ? "has-context" : ""} ${hasMediaOrSources ? "has-sources" : ""}`}
         ref={popoverRef}
-        onDragEnter={fileDropScope === "composer" ? handleDragEnter : undefined}
-        onDragOver={fileDropScope === "composer" ? handleDragOver : undefined}
-        onDragLeave={fileDropScope === "composer" ? handleDragLeave : undefined}
-        onDrop={fileDropScope === "composer" ? handleDrop : undefined}
       >
         <ComposerContextBar
           openMenu={openMenu}
@@ -955,12 +930,6 @@ const MemoizedComposer = memo(function ComposerView({
           onRemoveContextSource={removeContextSource}
           onToggleSkill={onToggleSkill}
         />
-        {isDraggingFiles ? (
-          <div className="composer-drop-target" aria-hidden="true">
-            <Paperclip size={20} />
-            <span>释放以添加文件</span>
-          </div>
-        ) : null}
         <div
           ref={editorRef}
           autoFocus={autoFocus}
@@ -1027,7 +996,10 @@ const MemoizedComposer = memo(function ComposerView({
               pendingBeforeInputSnapshotRef.current = null;
               const deferredExternalValue = deferredExternalValueRef.current;
               if (deferredExternalValue) {
-                applyExternalComposerValue(deferredExternalValue.value);
+                applyExternalComposerValue(
+                  deferredExternalValue.value,
+                  deferredExternalValue.contentParts,
+                );
                 return;
               }
               commitComposerMutation(true, before);

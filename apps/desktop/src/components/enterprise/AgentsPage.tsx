@@ -1,4 +1,4 @@
-import { FileText } from "lucide-react";
+import { Bot, Cable, FileText, Workflow } from "lucide-react";
 import { useEffect } from "react";
 import type { ApiClient } from "../../api/client";
 import type { AppSettings } from "../../types";
@@ -60,6 +60,30 @@ export function AgentsPage({
       ? "New Agent / 新建 Agent"
       : selectedTemplate?.template.name,
   );
+  const selectedAgent = selectedTemplate?.template;
+  const usedByFlows = selectedAgent
+    ? snapshot.flows.filter((flow) =>
+        Object.values(flow.activeRevision.compiledWorkflow.agentSpecs).some(
+          (agent) =>
+            agent.templateId === selectedAgent.templateId &&
+            agent.templateVersion === selectedAgent.version,
+        ),
+      )
+    : [];
+  const matchingInstances = selectedAgent
+    ? snapshot.agents.filter(
+        (agent) =>
+          agent.templateId === selectedAgent.templateId &&
+          agent.templateVersion === selectedAgent.version,
+      )
+    : [];
+  const activeInstances = matchingInstances.filter(
+    (agent) => agent.status === "active",
+  ).length;
+  const connectionCount =
+    selectedAgent?.spec.connectionBindings?.length ??
+    selectedAgent?.spec.capabilities.mcpServers.length ??
+    0;
 
   return (
     <>
@@ -76,42 +100,90 @@ export function AgentsPage({
       <div className="enterprise-page enterprise-agents-page">
         {selectedTemplate ? (
           <article
-            aria-labelledby="enterprise-agent-prompt-title"
-            className="enterprise-agent-prompt"
+            aria-labelledby="enterprise-agent-title"
+            className="enterprise-agent-overview"
           >
-            <header className="enterprise-agent-prompt__header">
-              <div className="enterprise-agent-prompt__title-row">
-                <h2 id="enterprise-agent-prompt-title">
-                  {selectedTemplate.template.name}
-                </h2>
-                <Badge
-                  variant={
-                    selectedTemplate.template.status === "published"
-                      ? "success"
-                      : "warning"
-                  }
-                >
-                  {selectedTemplate.template.status === "published"
-                    ? "已发布"
-                    : "草稿"}
-                </Badge>
-              </div>
-              <div className="enterprise-agent-prompt__metadata">
-                <FileText aria-hidden="true" size={14} />
-                <span>
-                  {selectedTemplate.template.templateId}@
+            <section className="enterprise-core-detail__summary">
+              <span className="enterprise-core-detail__icon" aria-hidden="true">
+                <Bot size={20} />
+              </span>
+              <div>
+                <small>
+                  {selectedTemplate.template.owner} · 版本{" "}
                   {selectedTemplate.template.version}
+                </small>
+                <span className="enterprise-agent-overview__title-row">
+                  <h2 id="enterprise-agent-title">
+                    {selectedTemplate.template.name}
+                  </h2>
+                  <Badge
+                    variant={
+                      selectedTemplate.template.status === "published"
+                        ? "success"
+                        : "warning"
+                    }
+                  >
+                    {selectedTemplate.template.status === "published"
+                      ? "已发布"
+                      : "草稿"}
+                  </Badge>
                 </span>
-                <span aria-hidden="true">·</span>
-                <span>System prompt / 系统提示词</span>
+                <p>
+                  {selectedTemplate.template.spec.description ||
+                    "此 Agent 尚未填写用途说明。"}
+                </p>
               </div>
-              {selectedTemplate.template.spec.description ? (
-                <p>{selectedTemplate.template.spec.description}</p>
-              ) : null}
-            </header>
-            <pre>
-              {selectedTemplate.template.spec.instructions || "暂无系统提示词"}
-            </pre>
+            </section>
+
+            <dl
+              className="enterprise-agent-overview__facts"
+              aria-label="Agent 使用摘要"
+            >
+              <div>
+                <Workflow aria-hidden="true" size={16} />
+                <span>
+                  <strong>{usedByFlows.length}</strong>
+                  <small>使用中的 Flow</small>
+                </span>
+              </div>
+              <div>
+                <Bot aria-hidden="true" size={16} />
+                <span>
+                  <strong>{activeInstances}</strong>
+                  <small>活跃实例</small>
+                </span>
+              </div>
+              <div>
+                <Cable aria-hidden="true" size={16} />
+                <span>
+                  <strong>{connectionCount}</strong>
+                  <small>外部连接</small>
+                </span>
+              </div>
+            </dl>
+
+            {usedByFlows.length > 0 ? (
+              <section className="enterprise-core-detail__payload enterprise-agent-overview__usage">
+                <header>
+                  <strong>用于这些 Flow</strong>
+                </header>
+                <ul>
+                  {usedByFlows.slice(0, 5).map((flow) => (
+                    <li key={flow.flowId}>{flow.name}</li>
+                  ))}
+                </ul>
+              </section>
+            ) : null}
+
+            <details className="enterprise-agent-instructions">
+              <summary>
+                <FileText aria-hidden="true" size={14} />
+                查看完整职责说明
+              </summary>
+              <pre>
+                {selectedTemplate.template.spec.instructions || "暂无职责说明"}
+              </pre>
+            </details>
           </article>
         ) : (
           <div className="enterprise-agent-prompt-empty" role="status">

@@ -8,17 +8,15 @@ function requiredLibraryProvidersFromDeployments(payload) {
   for (const deployment of deploymentItems(payload)) {
     if (deployment?.status !== "active") continue;
     const revision = deployment.activeRevision || deployment.snapshot;
-    if (["sag", "graph-rag"].includes(revision?.libraryProvider)) {
-      providers.add(revision.libraryProvider);
-    }
-    const requiresScopedSag = Object.values(
+    for (const agent of Object.values(
       revision?.compiledWorkflow?.agentSpecs || {},
-    ).some(
-      (agent) =>
-        Array.isArray(agent?.knowledgeBinding?.namespaces) &&
-        agent.knowledgeBinding.namespaces.length > 0,
-    );
-    if (requiresScopedSag) providers.add("sag");
+    )) {
+      const binding = agent?.knowledgeBinding;
+      if (!binding) continue;
+      // Namespace-only bindings predate provider selection and are SAG.
+      const provider = binding.provider || "sag";
+      if (["sag", "graph-rag"].includes(provider)) providers.add(provider);
+    }
   }
   return ["sag", "graph-rag"].filter((provider) => providers.has(provider));
 }

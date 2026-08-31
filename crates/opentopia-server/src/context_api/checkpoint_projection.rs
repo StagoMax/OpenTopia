@@ -306,7 +306,7 @@ fn project_artifacts(messages: &[Message]) -> Vec<ContextCheckpointArtifact> {
                 summary: "Referenced by the durable conversation.".to_string(),
                 source_seqs: Vec::new(),
             }),
-            MessagePart::SourceRef { source } => Some(ContextCheckpointArtifact {
+            MessagePart::SourceRef { source, .. } => Some(ContextCheckpointArtifact {
                 id: Some(source.id),
                 path: Some(source.path.clone()),
                 kind: "context_source".to_string(),

@@ -11,6 +11,23 @@ import type {
   InlineImageAttachment,
   InlineMessageContentPart,
 } from "../../types";
+import {
+  endOfComposerRange,
+  ensureComposerAtomicTextBoundaries,
+  ensureComposerAtomicTextBoundariesIn,
+  isComposerAtomicReferenceNode,
+  isComposerTextNode,
+  rangeBelongsToEditor,
+} from "./composerSelection.ts";
+
+export {
+  composerRangesEqual,
+  endOfComposerRange,
+  ensureComposerAtomicTextBoundaries,
+  insertComposerAtomicNodeAtRange,
+  rangeBelongsToEditor,
+  stabilizeComposerCaretRange,
+} from "./composerSelection.ts";
 
 const COMPOSER_IMAGE_EXTENSIONS = new Set([
   "bmp",
@@ -187,11 +204,15 @@ export function renderComposerSnapshot(
   editor.replaceChildren();
   for (const part of normalizeComposerContentParts(snapshot.parts)) {
     if (part.type === "text") {
-      editor.append(document.createTextNode(composerTextInsertionValue(part.text)));
+      editor.append(
+        document.createTextNode(composerTextInsertionValue(part.text)),
+      );
       continue;
     }
     if (part.type === "attachment_ref") {
-      editor.append(createComposerAttachmentReferenceNode(part.path, part.name));
+      editor.append(
+        createComposerAttachmentReferenceNode(part.path, part.name),
+      );
       continue;
     }
     const attachment = attachmentsById.get(part.imageId);
@@ -200,10 +221,12 @@ export function renderComposerSnapshot(
     }
   }
 
+  ensureComposerAtomicTextBoundariesIn(editor);
+
   let remaining = Math.max(0, snapshot.caretOffset);
-  const range = document.createRange();
+  const range = editor.ownerDocument.createRange();
   for (const node of editor.childNodes) {
-    if (node.nodeType === Node.TEXT_NODE) {
+    if (isComposerTextNode(node)) {
       const text = node.textContent ?? "";
       const visibleText = text.replaceAll(COMPOSER_CARET_MARKER, "");
       const graphemes = splitComposerText(visibleText);
@@ -220,28 +243,22 @@ export function renderComposerSnapshot(
       remaining -= graphemes.length;
       continue;
     }
-    if (node instanceof HTMLElement) {
-      const isInlineReference = Boolean(
-        node.dataset.composerImageId || node.dataset.composerAttachmentPath,
-      );
-      if (isInlineReference) {
-        if (remaining === 0) {
-          range.setStartBefore(node);
-          range.collapse(true);
-          return range;
-        }
-        remaining -= 1;
-        if (remaining === 0) {
-          range.setStartAfter(node);
-          range.collapse(true);
-          return range;
-        }
+    if (isComposerAtomicReferenceNode(node)) {
+      const boundaries = ensureComposerAtomicTextBoundaries(node);
+      if (remaining === 0 && boundaries) {
+        range.setStart(boundaries.before, boundaries.before.data.length);
+        range.collapse(true);
+        return range;
+      }
+      remaining -= 1;
+      if (remaining === 0 && boundaries) {
+        range.setStart(boundaries.after, 0);
+        range.collapse(true);
+        return range;
       }
     }
   }
-  range.selectNodeContents(editor);
-  range.collapse(false);
-  return range;
+  return endOfComposerRange(editor);
 }
 
 export function createComposerImageReferenceNode(
@@ -249,6 +266,7 @@ export function createComposerImageReferenceNode(
 ): HTMLElement {
   const wrapper = document.createElement("span");
   wrapper.className = "composer-inline-image-reference";
+  wrapper.dataset.composerAtomicReference = "true";
   wrapper.dataset.composerImageId = attachment.id;
   wrapper.contentEditable = "false";
 
@@ -271,41 +289,13 @@ export function createComposerAttachmentReferenceNode(
 ): HTMLElement {
   const reference = document.createElement("span");
   reference.className = "composer-attachment-reference";
+  reference.dataset.composerAtomicReference = "true";
   reference.dataset.composerAttachmentPath = path;
   reference.dataset.composerAttachmentName = name;
   reference.contentEditable = "false";
   reference.textContent = composerAttachmentReferenceText(name);
   reference.title = name;
   return reference;
-}
-
-export function rangeBelongsToEditor(
-  editor: HTMLElement,
-  range: Range | null,
-): boolean {
-  if (!range) return false;
-  const container =
-    range.commonAncestorContainer.nodeType === Node.TEXT_NODE
-      ? range.commonAncestorContainer.parentNode
-      : range.commonAncestorContainer;
-  return Boolean(container && editor.contains(container));
-}
-
-export function composerRangesEqual(left: Range | null, right: Range): boolean {
-  return Boolean(
-    left &&
-    left.startContainer === right.startContainer &&
-    left.startOffset === right.startOffset &&
-    left.endContainer === right.endContainer &&
-    left.endOffset === right.endOffset,
-  );
-}
-
-export function endOfComposerRange(editor: HTMLElement): Range {
-  const range = document.createRange();
-  range.selectNodeContents(editor);
-  range.collapse(false);
-  return range;
 }
 
 export function insertComposerTextAtSelection(

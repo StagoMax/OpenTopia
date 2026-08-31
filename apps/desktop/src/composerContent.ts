@@ -492,20 +492,9 @@ export function composerVisibleText(parts: InlineMessageContentPart[]): string {
     .join("");
 }
 
-/**
- * The wire accepts only text and image reference parts. Attachment references
- * are flattened to their `[文件名]` text for submission; the actual file
- * linkage still flows through the separate `sourcePaths` channel.
- */
+/** Keeps the composer's ordered references intact for message persistence. */
 export function composerWireContentParts(
   parts: InlineMessageContentPart[],
 ): InlineMessageContentPart[] {
-  return normalizeComposerContentParts(parts).map((part) =>
-    part.type === "attachment_ref"
-      ? {
-          type: "text" as const,
-          text: composerAttachmentReferenceText(part.name),
-        }
-      : part,
-  );
+  return normalizeComposerContentParts(parts);
 }

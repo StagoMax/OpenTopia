@@ -361,7 +361,7 @@ fn resolve_resource_lease(
                 .into_iter()
                 .flat_map(|message| message.parts)
                 .find_map(|part| match part {
-                    MessagePart::SourceRef { source } if source.id == *attachment_id => {
+                    MessagePart::SourceRef { source, .. } if source.id == *attachment_id => {
                         Some(source)
                     }
                     _ => None,
@@ -423,7 +423,7 @@ pub(super) fn resolve_preview_target(
                 .into_iter()
                 .flat_map(|message| message.parts)
                 .find_map(|part| match part {
-                    MessagePart::SourceRef { source } if source.id == *attachment_id => {
+                    MessagePart::SourceRef { source, .. } if source.id == *attachment_id => {
                         Some(source)
                     }
                     _ => None,

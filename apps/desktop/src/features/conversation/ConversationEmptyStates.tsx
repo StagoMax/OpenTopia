@@ -16,6 +16,7 @@ import {
 import { useEffect, useState } from "react";
 import {
   Composer,
+  type ComposerFileDropHandle,
   type ExecutionPermissionMode,
   type NewTaskLaunchMode,
 } from "../composer/Composer";
@@ -40,7 +41,9 @@ import {
 } from "./backendStartupProgress";
 
 export function NewTaskState({
+  fileDropHandleRef,
   value,
+  contentParts,
   workspaceRoot,
   projectName,
   projects,
@@ -71,7 +74,9 @@ export function NewTaskState({
   onToggleSkill,
   onSubmit,
 }: {
+  fileDropHandleRef: { current: ComposerFileDropHandle | null };
   value: string;
+  contentParts: InlineMessageContentPart[];
   workspaceRoot: string | null;
   projectName: string | null;
   projects: Project[];
@@ -88,7 +93,7 @@ export function NewTaskState({
   sendShortcut: SendShortcut;
   launchMode: NewTaskLaunchMode;
   experienceMode: ExperienceMode;
-  onChange(value: string): void;
+  onChange(value: string, contentParts: InlineMessageContentPart[]): void;
   onChangeLaunchMode(mode: NewTaskLaunchMode): void;
   onPickWorkspace(): void;
   onSelectProject(projectId: string): void;
@@ -203,7 +208,11 @@ export function NewTaskState({
               <button
                 key={suggestion.label}
                 type="button"
-                onClick={() => onChange(suggestion.prompt)}
+                onClick={() =>
+                  onChange(suggestion.prompt, [
+                    { type: "text", text: suggestion.prompt },
+                  ])
+                }
               >
                 <Icon size={15} />
                 <span>{suggestion.label}</span>
@@ -219,7 +228,9 @@ export function NewTaskState({
         )}
       </div>
       <Composer
+        fileDropHandleRef={fileDropHandleRef}
         value={value}
+        contentParts={contentParts}
         sendShortcut={sendShortcut}
         isSending={isSending}
         isRunning={false}
@@ -283,8 +294,7 @@ export function OfflineState({
     startupStatus?.startedAt ?? openedAt,
     now,
   );
-  const canRetry =
-    !startupStatus || startupStatus.phase === "failed";
+  const canRetry = !startupStatus || startupStatus.phase === "failed";
 
   return (
     <div className="empty-state offline">

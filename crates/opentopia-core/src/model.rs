@@ -260,6 +260,11 @@ pub enum MessagePart {
     },
     SourceRef {
         source: ContextSourceRef,
+        /// Whether the user placed this source at this exact position in the
+        /// request. Legacy and context-only sources remain trailing parts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(with = "bool")]
+        inline: Option<bool>,
     },
     SkillRef {
         skill: SkillRef,

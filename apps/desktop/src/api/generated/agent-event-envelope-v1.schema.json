@@ -2509,6 +2509,10 @@
         },
         {
           "properties": {
+            "inline": {
+              "description": "Whether the user placed this source at this exact position in the request. Legacy and context-only sources remain trailing parts.",
+              "type": "boolean"
+            },
             "source": {
               "$ref": "#/definitions/ContextSourceRef"
             },

@@ -17,6 +17,10 @@ import type {
   ExecutionResourceGrant,
 } from "../types";
 import type { AgentTemplateConnectionAccessView } from "../api/generated/desktop-http-v1.generated";
+import {
+  agentKnowledgeBindingSummary,
+  agentToolsWithKnowledgeAccess,
+} from "../agentKnowledgeBinding";
 import { Badge, Button, Panel, SelectField, TextField } from "./ui";
 import {
   useEnterpriseSubpageHeader,
@@ -241,13 +245,13 @@ export function AgentTemplatePanel({
         "输出 Schema",
       );
       const knowledgeNamespaces = parseAgentDraftList(form.knowledgeNamespaces);
-      if (form.knowledgeEnabled && knowledgeNamespaces.length === 0) {
-        throw new Error("启用 SAG 知识绑定后，至少需要一个 namespace");
+      if (
+        form.knowledgeProvider === "sag" &&
+        knowledgeNamespaces.length === 0
+      ) {
+        throw new Error("选择 SAG 后，至少需要一个 namespace");
       }
       const tools = parseAgentDraftList(form.tools);
-      if (form.knowledgeEnabled && !tools.includes("library_search")) {
-        tools.push("library_search");
-      }
       const created = await client.createAgentTemplateVersion({
         templateId: form.templateId.trim(),
         name: form.name.trim(),
@@ -268,8 +272,12 @@ export function AgentTemplatePanel({
             workspaceRoots: parseAgentDraftList(form.workspaceRoots),
           },
           connectionBindings: form.connectionBindings,
-          knowledgeBinding: form.knowledgeEnabled
-            ? { namespaces: knowledgeNamespaces }
+          knowledgeBinding: form.knowledgeProvider
+            ? {
+                provider: form.knowledgeProvider,
+                namespaces:
+                  form.knowledgeProvider === "sag" ? knowledgeNamespaces : [],
+              }
             : undefined,
           resourceGrants,
           modelPolicy: {
@@ -550,14 +558,11 @@ export function AgentTemplatePanel({
               <section className="agent-studio__composer">
                 <span>
                   <strong>Describe the Agent / 描述你需要的 Agent</strong>
-                  <small>
-                    模型会通过受控的 agent_create 工具生成配置；Flow
-                    创建不使用这条自然语言路径。
-                  </small>
+                  <small>描述职责、可用数据和需要人工介入的边界。</small>
                 </span>
                 <textarea
                   onChange={(event) => setRequirement(event.target.value)}
-                  placeholder="例如：当收到理赔案件参数时，查询案件详情和工伤政策知识库，输出结构化审核结论；金额异常时请求人工审批。"
+                  placeholder="例如：接收业务请求后，查询指定系统与知识库，输出结构化结果；遇到高风险或信息不足时请求人工确认。"
                   value={requirement}
                 />
                 <div className="agent-studio__composer-actions">
@@ -634,10 +639,14 @@ export function AgentTemplatePanel({
                 />
                 <AgentTemplateKnowledgeBindingField
                   disabled={Boolean(busy)}
-                  enabled={form.knowledgeEnabled}
+                  provider={form.knowledgeProvider}
                   namespaces={form.knowledgeNamespaces}
-                  onEnabledChange={(knowledgeEnabled) =>
-                    setFormValue(setForm, "knowledgeEnabled", knowledgeEnabled)
+                  onProviderChange={(knowledgeProvider) =>
+                    setFormValue(
+                      setForm,
+                      "knowledgeProvider",
+                      knowledgeProvider,
+                    )
                   }
                   onNamespacesChange={(knowledgeNamespaces) =>
                     setFormValue(
@@ -748,11 +757,22 @@ export function AgentTemplatePanel({
                 name: form.name,
                 instructions: form.instructions,
                 connectionCount: form.connectionBindings.length,
-                knowledgeNamespaces: form.knowledgeEnabled
-                  ? parseAgentDraftList(form.knowledgeNamespaces)
-                  : [],
+                knowledge: agentKnowledgeBindingSummary(
+                  form.knowledgeProvider
+                    ? {
+                        provider: form.knowledgeProvider,
+                        namespaces:
+                          form.knowledgeProvider === "sag"
+                            ? parseAgentDraftList(form.knowledgeNamespaces)
+                            : [],
+                      }
+                    : undefined,
+                ),
                 riskClass: form.riskClass,
-                tools: parseAgentDraftList(form.tools),
+                tools: agentToolsWithKnowledgeAccess(
+                  parseAgentDraftList(form.tools),
+                  form.knowledgeProvider,
+                ),
                 outputSchema: form.outputSchema,
               }}
             />
@@ -810,30 +830,6 @@ export function AgentTemplatePanel({
               <dd>{selected.template.owner}</dd>
             </div>
             <div>
-              <dt>内容哈希</dt>
-              <dd className="is-mono">{selected.template.contentHash}</dd>
-            </div>
-            <div>
-              <dt>工具</dt>
-              <dd>
-                {capabilitySummary(selected.template.spec.capabilities.tools)}
-              </dd>
-            </div>
-            <div>
-              <dt>Skill</dt>
-              <dd>
-                {capabilitySummary(selected.template.spec.capabilities.skills)}
-              </dd>
-            </div>
-            <div>
-              <dt>目录</dt>
-              <dd>
-                {capabilitySummary(
-                  selected.template.spec.capabilities.workspaceRoots,
-                )}
-              </dd>
-            </div>
-            <div>
               <dt>Connections</dt>
               <dd>
                 {selected.template.spec.connectionBindings?.length
@@ -844,11 +840,11 @@ export function AgentTemplatePanel({
               </dd>
             </div>
             <div>
-              <dt>SAG 知识</dt>
+              <dt>知识库</dt>
               <dd>
-                {selected.template.spec.knowledgeBinding?.namespaces.join(
-                  ", ",
-                ) || "无"}
+                {agentKnowledgeBindingSummary(
+                  selected.template.spec.knowledgeBinding,
+                )}
               </dd>
             </div>
             <div>
@@ -860,48 +856,84 @@ export function AgentTemplatePanel({
               </dd>
             </div>
           </dl>
-          <AgentTemplateConnectionAccessSummary
-            access={connectionAccess}
-            error={connectionAccessError}
-            loading={connectionAccessLoading}
-            onRetry={() => setConnectionAccessRefresh((current) => current + 1)}
-          />
-          <div className="agent-template-panel__diff">
-            <div className="agent-template-panel__section-title">
-              <GitCompareArrows size={14} aria-hidden="true" />
-              权限差异
-              {selected.diff.widensCapabilities ? (
-                <Badge variant="warning">包含扩权</Badge>
+          <details className="agent-template-panel__technical">
+            <summary>权限与技术配置</summary>
+            <dl className="agent-template-panel__facts">
+              <div>
+                <dt>内容哈希</dt>
+                <dd className="is-mono">{selected.template.contentHash}</dd>
+              </div>
+              <div>
+                <dt>工具</dt>
+                <dd>
+                  {capabilitySummary(selected.template.spec.capabilities.tools)}
+                </dd>
+              </div>
+              <div>
+                <dt>Skill</dt>
+                <dd>
+                  {capabilitySummary(
+                    selected.template.spec.capabilities.skills,
+                  )}
+                </dd>
+              </div>
+              <div>
+                <dt>目录</dt>
+                <dd>
+                  {capabilitySummary(
+                    selected.template.spec.capabilities.workspaceRoots,
+                  )}
+                </dd>
+              </div>
+            </dl>
+            <AgentTemplateConnectionAccessSummary
+              access={connectionAccess}
+              error={connectionAccessError}
+              loading={connectionAccessLoading}
+              onRetry={() =>
+                setConnectionAccessRefresh((current) => current + 1)
+              }
+            />
+          </details>
+          {selected.template.status === "draft" ||
+          selected.diff.changes.length ? (
+            <div className="agent-template-panel__diff">
+              <div className="agent-template-panel__section-title">
+                <GitCompareArrows size={14} aria-hidden="true" />
+                权限差异
+                {selected.diff.widensCapabilities ? (
+                  <Badge variant="warning">包含扩权</Badge>
+                ) : (
+                  <Badge variant="success">未扩权</Badge>
+                )}
+              </div>
+              {selected.diff.changes.length ? (
+                <ul>
+                  {selected.diff.changes.map((change, index) => (
+                    <li
+                      key={`${change.scope}:${change.value}:${change.kind}:${index}`}
+                    >
+                      <Badge
+                        variant={
+                          change.kind === "added" || change.kind === "expanded"
+                            ? "warning"
+                            : "neutral"
+                        }
+                      >
+                        {changeKindLabel(change.kind)}
+                      </Badge>
+                      <span>{change.scope}</span>
+                      <code>{change.value}</code>
+                    </li>
+                  ))}
+                </ul>
               ) : (
-                <Badge variant="success">未扩权</Badge>
+                <p className="agent-template-panel__empty">
+                  与上一发布版本没有权限变化。
+                </p>
               )}
             </div>
-            {selected.diff.changes.length ? (
-              <ul>
-                {selected.diff.changes.map((change, index) => (
-                  <li
-                    key={`${change.scope}:${change.value}:${change.kind}:${index}`}
-                  >
-                    <Badge
-                      variant={
-                        change.kind === "added" || change.kind === "expanded"
-                          ? "warning"
-                          : "neutral"
-                      }
-                    >
-                      {changeKindLabel(change.kind)}
-                    </Badge>
-                    <span>{change.scope}</span>
-                    <code>{change.value}</code>
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p className="agent-template-panel__empty">
-                与上一发布版本没有权限变化。
-              </p>
-            )}
-          </div>
+          ) : null}
           <div className="agent-template-panel__actions">
             <Button
               variant="quiet"
@@ -929,9 +961,7 @@ export function AgentTemplatePanel({
           title="当前会话 Agent"
           actions={
             boundInstance ? (
-              <Badge variant="success">
-                已绑定 {shortId(boundInstance.id)}
-              </Badge>
+              <Badge variant="success">已绑定</Badge>
             ) : (
               <Badge>未绑定</Badge>
             )
@@ -939,12 +969,15 @@ export function AgentTemplatePanel({
         >
           {selected?.template.status === "published" ? (
             <div className="agent-template-panel__instantiate">
-              <TextAreaField
-                label="初始状态 JSON"
-                value={initialState}
-                onChange={setInitialState}
-                mono
-              />
+              <details className="agent-template-panel__technical">
+                <summary>初始状态（可选）</summary>
+                <TextAreaField
+                  label="初始状态 JSON"
+                  value={initialState}
+                  onChange={setInitialState}
+                  mono
+                />
+              </details>
               <Button
                 variant="primary"
                 disabled={!threadId || Boolean(busy)}
@@ -960,58 +993,62 @@ export function AgentTemplatePanel({
             </p>
           )}
           {instances.length ? (
-            <div className="agent-template-panel__instances">
-              {instances.map((instance) => (
-                <article
-                  key={instance.id}
-                  className="agent-template-panel__instance"
-                >
-                  <div>
-                    <strong>
-                      {instance.templateId}@{instance.templateVersion}
-                    </strong>
-                    <small>
-                      {shortId(instance.id)} · 状态修订 {instance.stateRevision}
-                    </small>
-                  </div>
-                  <Badge
-                    variant={
-                      instance.status === "active"
-                        ? "success"
-                        : instance.status === "revoked"
-                          ? "danger"
-                          : "neutral"
-                    }
+            <details className="agent-template-panel__technical">
+              <summary>{instances.length} 个实例</summary>
+              <div className="agent-template-panel__instances">
+                {instances.map((instance) => (
+                  <article
+                    key={instance.id}
+                    className="agent-template-panel__instance"
                   >
-                    {instanceStatusLabel(instance.status)}
-                  </Badge>
-                  <div className="agent-template-panel__instance-actions">
-                    {instance.status === "active" &&
-                    !instance.parentInstanceId &&
-                    boundInstance?.id !== instance.id ? (
-                      <Button
-                        size="compact"
-                        variant="quiet"
-                        disabled={Boolean(busy)}
-                        onClick={() => void bindInstance(instance.id)}
-                      >
-                        绑定
-                      </Button>
-                    ) : null}
-                    {instance.status === "active" ? (
-                      <Button
-                        size="compact"
-                        variant="quiet"
-                        disabled={Boolean(busy)}
-                        onClick={() => void revokeInstance(instance.id)}
-                      >
-                        撤销
-                      </Button>
-                    ) : null}
-                  </div>
-                </article>
-              ))}
-            </div>
+                    <div>
+                      <strong>
+                        {instance.templateId}@{instance.templateVersion}
+                      </strong>
+                      <small>
+                        {shortId(instance.id)} · 状态修订{" "}
+                        {instance.stateRevision}
+                      </small>
+                    </div>
+                    <Badge
+                      variant={
+                        instance.status === "active"
+                          ? "success"
+                          : instance.status === "revoked"
+                            ? "danger"
+                            : "neutral"
+                      }
+                    >
+                      {instanceStatusLabel(instance.status)}
+                    </Badge>
+                    <div className="agent-template-panel__instance-actions">
+                      {instance.status === "active" &&
+                      !instance.parentInstanceId &&
+                      boundInstance?.id !== instance.id ? (
+                        <Button
+                          size="compact"
+                          variant="quiet"
+                          disabled={Boolean(busy)}
+                          onClick={() => void bindInstance(instance.id)}
+                        >
+                          绑定
+                        </Button>
+                      ) : null}
+                      {instance.status === "active" ? (
+                        <Button
+                          size="compact"
+                          variant="quiet"
+                          disabled={Boolean(busy)}
+                          onClick={() => void revokeInstance(instance.id)}
+                        >
+                          撤销
+                        </Button>
+                      ) : null}
+                    </div>
+                  </article>
+                ))}
+              </div>
+            </details>
           ) : null}
         </Panel>
       ) : null}

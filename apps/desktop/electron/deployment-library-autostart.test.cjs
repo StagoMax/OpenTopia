@@ -10,12 +10,17 @@ function deployment(status, namespaces, libraryProvider) {
   return {
     status,
     activeRevision: {
-      ...(libraryProvider ? { libraryProvider } : {}),
       compiledWorkflow: {
         agentSpecs: {
-          evidence: namespaces
-            ? { knowledgeBinding: { namespaces } }
-            : { connectionBindings: [] },
+          evidence:
+            namespaces || libraryProvider
+              ? {
+                  knowledgeBinding: {
+                    ...(libraryProvider ? { provider: libraryProvider } : {}),
+                    namespaces: namespaces || [],
+                  },
+                }
+              : { connectionBindings: [] },
         },
       },
     },

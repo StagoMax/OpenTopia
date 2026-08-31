@@ -496,9 +496,11 @@ export function App() {
     : newTaskComposerDraftKey(experienceMode, draftProjectId);
   const {
     text: composer,
+    contentParts: composerContentParts,
     contextSources,
     selectedSkillIds,
     setText: setComposer,
+    setContent: setComposerContent,
     setContextSources,
     setSelectedSkillIds,
   } = useComposerDraft(composerDraftKey);
@@ -2828,7 +2830,7 @@ export function App() {
           skillIds: submittedSkillIds,
           collaborationMode: submittedCollaborationMode,
           imageAttachments,
-          contentParts: imageAttachments.length > 0 ? contentParts : [],
+          contentParts,
           libraryProvider: submittedLibraryProvider ?? undefined,
         });
         if (!result) {
@@ -2981,7 +2983,7 @@ export function App() {
         collaborationMode: submittedCollaborationMode,
         goalId: submittedGoalId,
         imageAttachments,
-        contentParts: imageAttachments.length > 0 ? contentParts : [],
+        contentParts,
         libraryProvider:
           activeThread.experienceMode === "flow"
             ? (flowLibraryBindings[threadId] ?? undefined)
@@ -4217,12 +4219,13 @@ export function App() {
                     />
                   ) : (
                     <LiveConversationComposer
+                      key={composerDraftKey}
                       conversationRegistry={conversationRegistry!}
                       threadId={activeThread.id}
                       goalSnapshot={conversationGoalSnapshot}
                       fileDropHandleRef={conversationComposerFileDropHandle}
-                      fileDropScope="conversation"
                       value={composer}
+                      contentParts={composerContentParts}
                       sendShortcut={editorPreferences.sendShortcut}
                       isSending={isSending}
                       isRunning={conversationTurnCanBeCancelled}
@@ -4247,7 +4250,7 @@ export function App() {
                       workspaceRoot={null}
                       projectName={null}
                       projects={projects}
-                      onChange={setComposer}
+                      onChange={setComposerContent}
                       onSubmit={submitMessage}
                       onCancel={() => void cancelTurn()}
                       onPickWorkspace={() => void chooseWorkspace()}
@@ -4265,7 +4268,10 @@ export function App() {
                 </>
               ) : (
                 <NewTaskState
+                  key={composerDraftKey}
+                  fileDropHandleRef={conversationComposerFileDropHandle}
                   value={composer}
+                  contentParts={composerContentParts}
                   sendShortcut={editorPreferences.sendShortcut}
                   workspaceRoot={currentWorkspaceRoot}
                   projectName={draftProject?.name ?? null}
@@ -4284,7 +4290,7 @@ export function App() {
                   isSending={isSending}
                   launchMode={newTaskLaunchMode}
                   experienceMode={experienceMode}
-                  onChange={setComposer}
+                  onChange={setComposerContent}
                   onChangeLaunchMode={setNewTaskLaunchMode}
                   onPickWorkspace={() => void chooseWorkspace(true)}
                   onSelectProject={selectProject}

@@ -20,6 +20,10 @@ export type RuntimeConnectionAuthorityV1 =
       operations?: ExecutionConnectionOperationV1[];
       [k: string]: unknown;
     };
+/**
+ * Knowledge retrieval backend selected by an Agent template. The provider is part of the immutable Agent version; provider-owned databases and indexes remain deployment configuration rather than template identity.
+ */
+export type KnowledgeLibraryProviderV1 = "sag" | "graph-rag";
 export type ResourceKind = "file" | "network" | "database";
 export type DataClassification = "public" | "internal" | "confidential" | "restricted";
 export type AgentRiskClassV1 = "low" | "medium" | "high" | "critical";
@@ -27,10 +31,6 @@ export type LoopExhaustionActionV1 = "require_human" | "return_partial" | "fail"
 export type GraphNodeKindV1 =
   "agent" | "skill" | "tool" | "condition" | "validator" | "approval" | "join" | "loop" | "output";
 export type WorkflowIngressPolicyV1 = "immediate" | "require_review";
-/**
- * Selects the Library retrieval backend available to capability-approved Agent nodes in one immutable Flow revision. This binds only the provider; provider-owned projects, databases, and indexes remain runtime configuration so Agent templates stay reusable.
- */
-export type WorkflowLibraryProviderV1 = "sag" | "graph-rag";
 export type WorkflowOutputSpecV1 =
   | {
       kind: "inbox";
@@ -908,6 +908,10 @@ export type MessagePart =
       [k: string]: unknown;
     }
   | {
+      /**
+       * Whether the user placed this source at this exact position in the request. Legacy and context-only sources remain trailing parts.
+       */
+      inline?: boolean;
       source: ContextSourceRef;
       type: "source_ref";
       [k: string]: unknown;
@@ -1208,7 +1212,6 @@ export interface FlowRevisionV1 {
   createdBy: string;
   id: string;
   ingressPolicy?: WorkflowIngressPolicyV1 & string;
-  libraryProvider?: WorkflowLibraryProviderV1 | null;
   output: WorkflowOutputSpecV1;
   outputReviewPolicy?: WorkflowOutputReviewPolicyV1 & string;
   schemaVersion: number;
@@ -1239,7 +1242,7 @@ export interface WorkflowAgentSpecV1 {
   connectionAuthority: RuntimeConnectionAuthorityV1;
   connectionBindings: ConnectionBindingV1[];
   instructions: string;
-  knowledgeBinding?: SagKnowledgeBindingV1 | null;
+  knowledgeBinding?: AgentKnowledgeBindingV1 | null;
   modelPolicy: AgentModelPolicyV1;
   name: string;
   nodeId: string;
@@ -1296,10 +1299,11 @@ export interface OperationGrantV1 {
   operationId: string;
 }
 /**
- * Immutable, server-enforced SAG scope available to an Agent. Namespaces are intentionally absent from the model-facing tool schema so the model cannot widen the template's knowledge boundary at invocation time.
+ * Immutable, server-enforced knowledge scope available to an Agent. Provider selection and any provider-specific namespace restriction are intentionally absent from the model-facing tool schema, so a tool call cannot widen the template's knowledge boundary.
  */
-export interface SagKnowledgeBindingV1 {
-  namespaces: string[];
+export interface AgentKnowledgeBindingV1 {
+  namespaces?: string[];
+  provider?: KnowledgeLibraryProviderV1;
   [k: string]: unknown;
 }
 export interface AgentModelPolicyV1 {
@@ -1482,7 +1486,7 @@ export interface EnterpriseExecutionContextV1 {
   connectionBindings?: ConnectionBindingV1[];
   connectionOperations?: ExecutionConnectionOperationV1[];
   delegationChain: string[];
-  knowledgeBinding?: SagKnowledgeBindingV1 | null;
+  knowledgeBinding?: AgentKnowledgeBindingV1 | null;
   mode: ExperienceMode;
   modelPolicy: AgentModelPolicyV1;
   parentAgentId?: string | null;
@@ -1954,7 +1958,7 @@ export interface AgentTemplateSpecV1 {
   delegateTemplateIds: string[];
   description: string;
   instructions: string;
-  knowledgeBinding?: SagKnowledgeBindingV1 | null;
+  knowledgeBinding?: AgentKnowledgeBindingV1 | null;
   modelPolicy: AgentModelPolicyV1;
   outputSchema: unknown;
   resourceGrants: ExecutionResourceGrantV1[];

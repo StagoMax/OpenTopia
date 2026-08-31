@@ -1,5 +1,7 @@
 use super::*;
-use crate::enterprise::{AgentBudgetV1, AgentTemplateSpecV1, DataClassification};
+use crate::enterprise::{
+    AgentBudgetV1, AgentTemplateSpecV1, DataClassification, KnowledgeLibraryProviderV1,
+};
 use crate::enterprise_connection_grants::{OperationGrantV1, ResolvedConnectionBindingV1};
 use crate::flow::{
     definition_from_draft, FlowDraftV1, FlowSourceV1, FlowSpecV1, GraphEdgeV1, GraphNodeV1,
@@ -170,21 +172,26 @@ fn flow_revision_is_immutable_and_manual_inbox_scoped() {
 }
 
 #[test]
-fn flow_revision_freezes_provider_without_binding_a_database() {
-    let (template, binding) = template_with_operation();
+fn workflow_agent_spec_freezes_the_agent_selected_knowledge_provider() {
+    let (mut template, binding) = template_with_operation();
+    template.spec.knowledge_binding = Some(AgentKnowledgeBindingV1 {
+        provider: KnowledgeLibraryProviderV1::GraphRag,
+        namespaces: BTreeSet::new(),
+    });
+    template.spec.apply_derived_capabilities();
+    template.content_hash = template.calculate_content_hash();
     let agent =
         WorkflowAgentSpecV1::compile("review", &template, &[binding]).expect("compile Agent node");
     let compiled =
         CompiledWorkflowV1::compile(&definition(&template), vec![agent]).expect("compile workflow");
-    let flow = ActiveFlowV1::new_with_runtime_options(
-        "Lead review with Graph RAG",
+    let flow = ActiveFlowV1::new_with_ingress_policy(
+        "Lead review with Agent-bound Graph RAG",
         Uuid::new_v4(),
         compiled,
         WorkflowTriggerSpecV1::Manual,
         crate::WorkflowIngressPolicyV1::RequireReview,
         WorkflowOutputSpecV1::Inbox,
         WorkflowOutputReviewPolicyV1::ExplicitNodesOnly,
-        Some(WorkflowLibraryProviderV1::GraphRag),
         "release-manager",
     )
     .expect("active Flow");
@@ -192,11 +199,17 @@ fn flow_revision_freezes_provider_without_binding_a_database() {
     let restored: ActiveFlowV1 = serde_json::from_value(serialized.clone()).expect("restore Flow");
 
     assert_eq!(
-        serialized["activeRevision"]["libraryProvider"],
+        serialized["activeRevision"]["compiledWorkflow"]["agentSpecs"]["review"]
+            ["knowledgeBinding"]["provider"],
         json!("graph-rag")
     );
     assert_eq!(
-        restored.active_revision.library_provider,
-        Some(WorkflowLibraryProviderV1::GraphRag)
+        restored
+            .active_revision
+            .compiled_workflow
+            .agent_spec("review")
+            .and_then(|spec| spec.knowledge_binding.as_ref())
+            .map(|binding| binding.provider),
+        Some(KnowledgeLibraryProviderV1::GraphRag)
     );
 }

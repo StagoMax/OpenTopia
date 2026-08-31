@@ -1258,25 +1258,6 @@ button:disabled {
   padding: 8px 8px 6px 10px;
 }
 
-.composer.is-dragging-files {
-  border-color: var(--accent);
-  background: var(--accent-subtle);
-}
-
-.composer-drop-target {
-  position: absolute;
-  inset: var(--space-2);
-  display: grid;
-  place-items: center;
-  gap: var(--space-2);
-  border: 1px dashed var(--accent);
-  border-radius: var(--radius-md);
-  background: var(--accent-subtle);
-  color: var(--accent);
-  font-size: var(--font-size-base);
-  pointer-events: none;
-}
-
 .composer textarea {
   grid-column: 1 / -1;
   min-height: 54px;

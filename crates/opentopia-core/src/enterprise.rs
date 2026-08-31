@@ -607,15 +607,38 @@ pub struct EnterpriseExecutionContextV1 {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub connection_operations: Vec<ExecutionConnectionOperationV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub knowledge_binding: Option<SagKnowledgeBindingV1>,
+    pub knowledge_binding: Option<AgentKnowledgeBindingV1>,
 }
 
-/// Immutable, server-enforced SAG scope available to an Agent. Namespaces are
-/// intentionally absent from the model-facing tool schema so the model cannot
-/// widen the template's knowledge boundary at invocation time.
+/// Knowledge retrieval backend selected by an Agent template. The provider is
+/// part of the immutable Agent version; provider-owned databases and indexes
+/// remain deployment configuration rather than template identity.
+#[derive(
+    Debug, Default, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum KnowledgeLibraryProviderV1 {
+    #[default]
+    Sag,
+    GraphRag,
+}
+
+impl KnowledgeLibraryProviderV1 {
+    pub fn is_sag(&self) -> bool {
+        *self == Self::Sag
+    }
+}
+
+/// Immutable, server-enforced knowledge scope available to an Agent. Provider
+/// selection and any provider-specific namespace restriction are intentionally
+/// absent from the model-facing tool schema, so a tool call cannot widen the
+/// template's knowledge boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct SagKnowledgeBindingV1 {
+pub struct AgentKnowledgeBindingV1 {
+    #[serde(default, skip_serializing_if = "KnowledgeLibraryProviderV1::is_sag")]
+    pub provider: KnowledgeLibraryProviderV1,
+    #[serde(default)]
     pub namespaces: BTreeSet<String>,
 }
 
@@ -727,7 +750,18 @@ pub struct AgentTemplateSpecV1 {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub connection_bindings: Vec<ConnectionBindingV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub knowledge_binding: Option<SagKnowledgeBindingV1>,
+    pub knowledge_binding: Option<AgentKnowledgeBindingV1>,
+}
+
+impl AgentTemplateSpecV1 {
+    /// Knowledge access is a declarative Agent binding, not a second manual
+    /// permission toggle. Persist the derived tool capability so compilation,
+    /// diffs, and runtime attenuation all observe the same authority.
+    pub fn apply_derived_capabilities(&mut self) {
+        if self.knowledge_binding.is_some() && !self.capabilities.allow_all_tools {
+            self.capabilities.tools.insert("library_search".to_string());
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -768,8 +802,9 @@ impl AgentTemplateVersionV1 {
         version: u32,
         name: impl Into<String>,
         owner: impl Into<String>,
-        spec: AgentTemplateSpecV1,
+        mut spec: AgentTemplateSpecV1,
     ) -> Result<Self, AgentTemplateError> {
+        spec.apply_derived_capabilities();
         let mut template = Self {
             schema_version: ENTERPRISE_SCHEMA_VERSION_V1,
             template_id: template_id.into(),
@@ -1438,7 +1473,9 @@ pub enum AgentTemplateError {
     InvalidKnowledgeNamespaceCount,
     #[error("invalid SAG knowledge namespace: {0}")]
     InvalidKnowledgeNamespace(String),
-    #[error("SAG knowledge binding requires the library_search tool capability")]
+    #[error("Graph RAG knowledge binding does not accept SAG namespaces")]
+    GraphRagNamespacesUnsupported,
+    #[error("knowledge binding requires the derived library_search tool capability")]
     MissingLibrarySearchCapability,
     #[error("{0} must be a JSON Schema object or boolean")]
     InvalidSchema(String),
@@ -1497,14 +1534,22 @@ fn valid_template_id(value: &str) -> bool {
 }
 
 fn validate_knowledge_binding_shape(
-    binding: Option<&SagKnowledgeBindingV1>,
+    binding: Option<&AgentKnowledgeBindingV1>,
     capabilities: &CapabilityProjection,
 ) -> Result<(), AgentTemplateError> {
     let Some(binding) = binding else {
         return Ok(());
     };
-    if binding.namespaces.is_empty() || binding.namespaces.len() > 12 {
-        return Err(AgentTemplateError::InvalidKnowledgeNamespaceCount);
+    match binding.provider {
+        KnowledgeLibraryProviderV1::Sag => {
+            if binding.namespaces.is_empty() || binding.namespaces.len() > 12 {
+                return Err(AgentTemplateError::InvalidKnowledgeNamespaceCount);
+            }
+        }
+        KnowledgeLibraryProviderV1::GraphRag if !binding.namespaces.is_empty() => {
+            return Err(AgentTemplateError::GraphRagNamespacesUnsupported);
+        }
+        KnowledgeLibraryProviderV1::GraphRag => {}
     }
     for namespace in &binding.namespaces {
         if namespace.is_empty()
@@ -1887,10 +1932,28 @@ fn connection_grant_changes(
 }
 
 fn knowledge_binding_changes(
-    previous: Option<&SagKnowledgeBindingV1>,
-    next: Option<&SagKnowledgeBindingV1>,
+    previous: Option<&AgentKnowledgeBindingV1>,
+    next: Option<&AgentKnowledgeBindingV1>,
     changes: &mut Vec<CapabilityChangeV1>,
 ) {
+    let previous_provider = previous.map(|binding| binding.provider);
+    let next_provider = next.map(|binding| binding.provider);
+    if previous_provider != next_provider {
+        if let Some(provider) = next_provider {
+            changes.push(CapabilityChangeV1 {
+                scope: "knowledge_provider".to_string(),
+                value: knowledge_provider_id(provider).to_string(),
+                kind: CapabilityChangeKindV1::Added,
+            });
+        }
+        if let Some(provider) = previous_provider {
+            changes.push(CapabilityChangeV1 {
+                scope: "knowledge_provider".to_string(),
+                value: knowledge_provider_id(provider).to_string(),
+                kind: CapabilityChangeKindV1::Removed,
+            });
+        }
+    }
     let empty = BTreeSet::new();
     diff_scope(
         "knowledge_namespace",
@@ -1902,6 +1965,13 @@ fn knowledge_binding_changes(
         next.map(|binding| &binding.namespaces).unwrap_or(&empty),
         changes,
     );
+}
+
+fn knowledge_provider_id(provider: KnowledgeLibraryProviderV1) -> &'static str {
+    match provider {
+        KnowledgeLibraryProviderV1::Sag => "sag",
+        KnowledgeLibraryProviderV1::GraphRag => "graph-rag",
+    }
 }
 
 fn diff_scope(
@@ -2135,22 +2205,23 @@ mod tests {
     }
 
     #[test]
-    fn sag_knowledge_binding_requires_library_tool_and_is_a_capability_diff() {
+    fn knowledge_binding_derives_library_tool_and_is_a_capability_diff() {
         let namespace = "opentopia.audit.work-injury.v1".to_string();
-        let mut invalid = template_spec(&[], &[("provider", "model")]);
-        invalid.knowledge_binding = Some(SagKnowledgeBindingV1 {
-            namespaces: BTreeSet::from([namespace.clone()]),
-        });
-        assert_eq!(
-            AgentTemplateVersionV1::new_draft("audit", 1, "Audit", "owner", invalid).unwrap_err(),
-            AgentTemplateError::MissingLibrarySearchCapability
-        );
-
-        let mut first_spec = template_spec(&["library_search"], &[("provider", "model")]);
-        first_spec.knowledge_binding = Some(SagKnowledgeBindingV1 {
+        let mut first_spec = template_spec(&[], &[("provider", "model")]);
+        first_spec.knowledge_binding = Some(AgentKnowledgeBindingV1 {
+            provider: KnowledgeLibraryProviderV1::Sag,
             namespaces: BTreeSet::from([namespace.clone()]),
         });
         let first = published_template("audit", 1, first_spec);
+        assert!(first.spec.capabilities.allows_tool("library_search"));
+        let serialized = serde_json::to_value(&first).expect("serialize legacy-compatible SAG");
+        assert!(serialized["spec"]["knowledgeBinding"]
+            .get("provider")
+            .is_none());
+        let restored: AgentTemplateVersionV1 =
+            serde_json::from_value(serialized).expect("restore SAG template");
+        restored.validate().expect("validate restored SAG template");
+        assert_eq!(restored.content_hash, restored.calculate_content_hash());
         let mut next_spec = first.spec.clone();
         next_spec
             .knowledge_binding
@@ -2167,6 +2238,47 @@ mod tests {
                 && change.value == "opentopia.audit.shared.v1"
                 && change.kind == CapabilityChangeKindV1::Added
         }));
+    }
+
+    #[test]
+    fn graph_rag_binding_derives_access_without_binding_a_database() {
+        let mut spec = template_spec(&[], &[("provider", "model")]);
+        spec.knowledge_binding = Some(AgentKnowledgeBindingV1 {
+            provider: KnowledgeLibraryProviderV1::GraphRag,
+            namespaces: BTreeSet::new(),
+        });
+
+        let template = AgentTemplateVersionV1::new_draft("techqa", 1, "TechQA", "owner", spec)
+            .expect("Graph RAG Agent template");
+
+        assert!(template.spec.capabilities.allows_tool("library_search"));
+        assert_eq!(
+            template
+                .spec
+                .knowledge_binding
+                .as_ref()
+                .map(|binding| binding.provider),
+            Some(KnowledgeLibraryProviderV1::GraphRag)
+        );
+        assert_eq!(
+            serde_json::to_value(&template).expect("serialize template")["spec"]
+                ["knowledgeBinding"]["provider"],
+            serde_json::json!("graph-rag")
+        );
+    }
+
+    #[test]
+    fn graph_rag_binding_rejects_sag_namespaces() {
+        let mut spec = template_spec(&[], &[("provider", "model")]);
+        spec.knowledge_binding = Some(AgentKnowledgeBindingV1 {
+            provider: KnowledgeLibraryProviderV1::GraphRag,
+            namespaces: BTreeSet::from(["sag.only".to_string()]),
+        });
+
+        assert_eq!(
+            AgentTemplateVersionV1::new_draft("techqa", 1, "TechQA", "owner", spec).unwrap_err(),
+            AgentTemplateError::GraphRagNamespacesUnsupported
+        );
     }
 
     #[test]

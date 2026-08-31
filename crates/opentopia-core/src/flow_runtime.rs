@@ -13,8 +13,7 @@ use crate::workflow_interrupt::{
 use crate::workflow_state::{apply_state_writes, parse_state_writes};
 use crate::{
     ActiveFlowV1, CompiledWorkflowV1, FlowRevisionV1, FlowStatusV1, RuntimeConnectionAuthorityV1,
-    WorkflowAgentSpecV1, WorkflowLibraryProviderV1, WorkflowOutputReviewPolicyV1,
-    WorkflowOutputSpecV1, WorkflowTriggerSpecV1,
+    WorkflowAgentSpecV1, WorkflowOutputReviewPolicyV1, WorkflowOutputSpecV1, WorkflowTriggerSpecV1,
 };
 use anyhow::Context;
 use async_trait::async_trait;
@@ -458,11 +457,10 @@ impl FlowRunV1 {
         draft_id: Uuid,
         draft_revision: u32,
         compiled_workflow: CompiledWorkflowV1,
-        library_provider: Option<WorkflowLibraryProviderV1>,
         input: Value,
     ) -> anyhow::Result<Self> {
         let trigger = default_graph_trigger(&compiled_workflow.graph);
-        let flow = ActiveFlowV1::new_with_runtime_options(
+        let flow = ActiveFlowV1::new_with_ingress_policy(
             "Workflow test run",
             thread_id,
             compiled_workflow,
@@ -470,7 +468,6 @@ impl FlowRunV1 {
             crate::WorkflowIngressPolicyV1::Immediate,
             WorkflowOutputSpecV1::Inbox,
             WorkflowOutputReviewPolicyV1::ExplicitNodesOnly,
-            library_provider,
             "workflow-test-runner",
         )?;
         let mut run = Self::new_from_flow(&flow, input)?;

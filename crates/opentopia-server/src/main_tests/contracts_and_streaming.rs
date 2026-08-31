@@ -107,6 +107,7 @@ fn preview_attachment_resolution_is_scoped_to_the_route_thread() {
                     bytes: 8,
                     truncated: false,
                 },
+                inline: Some(false),
             }],
             created_at: Utc::now(),
         })

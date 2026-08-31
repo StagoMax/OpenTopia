@@ -12,7 +12,7 @@ use crate::computer::{
     ComputerAccessPolicy, ComputerRuntime, ComputerRuntimeConfig, LocalComputerRuntime,
 };
 use crate::effect_journal::{EffectIntent, EffectKind, EffectSideEffectClass, EffectStatus};
-use crate::enterprise::CapabilityProjection;
+use crate::enterprise::{AgentKnowledgeBindingV1, CapabilityProjection};
 use crate::execution_authority::ExecutionAuthority;
 use crate::guardian::{
     GuardianApprovalAction, GuardianApprovalRequest, GuardianReviewContext, GuardianReviewResult,
@@ -77,7 +77,7 @@ pub struct ToolRuntimeHost {
     pub(crate) mcp_host: Option<McpExtensionHost>,
     pub(crate) active_mcp_tools: Vec<McpToolDescriptor>,
     pub(crate) active_connection_operations: BTreeMap<String, ConnectionOperationRuntimeRoute>,
-    pub(crate) library_namespaces: Vec<String>,
+    pub(crate) knowledge_binding: Option<AgentKnowledgeBindingV1>,
     pub(crate) model_supports_vision: bool,
     pub(crate) sandbox_config: LocalSandboxConfig,
     pub(crate) browser: Arc<dyn BrowserRuntime>,
@@ -97,7 +97,7 @@ impl ToolRuntimeHost {
             mcp_host: None,
             active_mcp_tools: Vec::new(),
             active_connection_operations: BTreeMap::new(),
-            library_namespaces: Vec::new(),
+            knowledge_binding: None,
             model_supports_vision,
             sandbox_config,
             browser: Arc::new(LocalBrowserRuntime::new(BrowserRuntimeConfig::default())),

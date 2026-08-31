@@ -177,6 +177,7 @@ async fn native_office_tools_read_real_thread_attachments_by_id() {
                 bytes: bytes.len() as u64,
                 truncated: false,
             },
+            inline: Some(false),
         });
         attachment_ids.push(id);
     }

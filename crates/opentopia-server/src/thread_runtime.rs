@@ -247,7 +247,7 @@ pub(super) fn attachment_preloaded_tools(messages: &[Message]) -> BTreeSet<&'sta
     let mut tools = BTreeSet::new();
     for source in messages.iter().rev().flat_map(|message| {
         message.parts.iter().filter_map(|part| match part {
-            MessagePart::SourceRef { source } => Some(source),
+            MessagePart::SourceRef { source, .. } => Some(source),
             _ => None,
         })
     }) {
@@ -503,7 +503,7 @@ pub(super) async fn freeze_root_runtime_snapshot_with_connection_authority(
         .into_iter()
         .flat_map(|message| message.parts)
         .filter_map(|part| match part {
-            MessagePart::SourceRef { source } => Some(source),
+            MessagePart::SourceRef { source, .. } => Some(source),
             _ => None,
         })
         .collect::<Vec<_>>();

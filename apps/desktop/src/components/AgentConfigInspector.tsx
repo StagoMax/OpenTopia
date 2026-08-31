@@ -13,7 +13,7 @@ export type AgentConfigPreview = {
   name: string;
   instructions: string;
   connectionCount: number;
-  knowledgeNamespaces: string[];
+  knowledge: string;
   riskClass: "low" | "medium" | "high" | "critical";
   tools: string[];
   outputSchema: string;
@@ -53,7 +53,7 @@ export function AgentConfigInspector({
         <InspectorRow
           icon={Database}
           label="Knowledge"
-          value={preview.knowledgeNamespaces.join(", ") || "未绑定"}
+          value={preview.knowledge}
         />
         <InspectorRow
           icon={Wrench}

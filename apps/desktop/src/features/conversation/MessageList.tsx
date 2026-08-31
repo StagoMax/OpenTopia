@@ -35,6 +35,7 @@ import {
   conversationMessageCopyText,
   formatConversationMessageTimestamp,
 } from "../../conversationMessageMeta";
+import { conversationDisplayParts } from "../../conversationMessageParts";
 import { isConversationScrollNearEnd } from "../../conversationScroll";
 import {
   projectConversationEvents,
@@ -550,20 +551,24 @@ const MessageBubble = memo(function MessageBubble({
   const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "error">(
     "idle",
   );
+  const displayParts = useMemo(
+    () => conversationDisplayParts(message),
+    [message],
+  );
   const renderedParts = useMemo(() => {
     const referencedImageIds = new Set(
-      message.parts.flatMap((part) =>
+      displayParts.flatMap((part) =>
         part.type === "image_ref" ? [part.image_id] : [],
       ),
     );
     const imagesById = new Map(
-      message.parts.flatMap((part) =>
+      displayParts.flatMap((part) =>
         part.type === "image" && part.id ? [[part.id, part] as const] : [],
       ),
     );
     let nextImagePreviewIndex = 0;
 
-    return message.parts
+    return displayParts
       .filter(
         (part) =>
           part.type !== "turn_context" &&
@@ -582,13 +587,13 @@ const MessageBubble = memo(function MessageBubble({
         const previewIndex = previewImage ? nextImagePreviewIndex++ : null;
         return { part, referencedImage, previewImage, previewIndex };
       });
-  }, [message.parts]);
+  }, [displayParts]);
   const [imagePreviews, setImagePreviews] = useState<ImageLightboxAttachment[]>(
     [],
   );
   const copyText = useMemo(
-    () => conversationMessageCopyText(message.parts),
-    [message.parts],
+    () => conversationMessageCopyText(displayParts),
+    [displayParts],
   );
   const timestamp = useMemo(
     () => formatConversationMessageTimestamp(message.createdAt),

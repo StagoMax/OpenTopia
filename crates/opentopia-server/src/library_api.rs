@@ -6,14 +6,16 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use opentopia_core::{
-    ModelContentPart, Tool, ToolCall, ToolExecutionPolicy, ToolInvocationContext, ToolResult,
-    WorkflowLibraryProviderV1,
+    AgentKnowledgeBindingV1, KnowledgeLibraryProviderV1, ModelContentPart, Tool, ToolCall,
+    ToolExecutionPolicy, ToolInvocationContext, ToolResult,
 };
 use reqwest::Url;
 use schemars::JsonSchema;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -347,11 +349,11 @@ impl LibraryProviderId {
     }
 }
 
-impl From<WorkflowLibraryProviderV1> for LibraryProviderId {
-    fn from(value: WorkflowLibraryProviderV1) -> Self {
+impl From<KnowledgeLibraryProviderV1> for LibraryProviderId {
+    fn from(value: KnowledgeLibraryProviderV1) -> Self {
         match value {
-            WorkflowLibraryProviderV1::Sag => Self::Sag,
-            WorkflowLibraryProviderV1::GraphRag => Self::GraphRag,
+            KnowledgeLibraryProviderV1::Sag => Self::Sag,
+            KnowledgeLibraryProviderV1::GraphRag => Self::GraphRag,
         }
     }
 }
@@ -359,14 +361,13 @@ impl From<WorkflowLibraryProviderV1> for LibraryProviderId {
 #[derive(Clone)]
 pub(crate) struct LibrarySearchTool {
     providers: Arc<LibraryProviderRegistry>,
-    provider: LibraryProviderId,
-    namespace_scope: LibraryNamespaceScope,
+    binding_scope: LibraryBindingScope,
 }
 
 #[derive(Clone)]
-enum LibraryNamespaceScope {
-    Unrestricted,
-    Fixed(Vec<String>),
+enum LibraryBindingScope {
+    Unrestricted(LibraryProviderId),
+    Fixed(AgentKnowledgeBindingV1),
     RuntimeBound,
 }
 
@@ -377,45 +378,58 @@ impl LibrarySearchTool {
     ) -> Self {
         Self {
             providers,
-            provider,
-            namespace_scope: LibraryNamespaceScope::Unrestricted,
+            binding_scope: LibraryBindingScope::Unrestricted(provider),
         }
     }
 
-    pub(crate) fn scoped(
+    pub(crate) fn bound(
         providers: Arc<LibraryProviderRegistry>,
-        namespaces: impl IntoIterator<Item = String>,
+        binding: AgentKnowledgeBindingV1,
     ) -> Self {
         Self {
             providers,
-            provider: LibraryProviderId::Sag,
-            namespace_scope: LibraryNamespaceScope::Fixed(normalize_namespaces(namespaces)),
+            binding_scope: LibraryBindingScope::Fixed(binding),
         }
     }
 
-    pub(crate) fn runtime_scoped(providers: Arc<LibraryProviderRegistry>) -> Self {
+    pub(crate) fn runtime_bound(providers: Arc<LibraryProviderRegistry>) -> Self {
         Self {
             providers,
-            provider: LibraryProviderId::Sag,
-            namespace_scope: LibraryNamespaceScope::RuntimeBound,
+            binding_scope: LibraryBindingScope::RuntimeBound,
         }
     }
 
-    fn namespaces(&self, context: &ToolInvocationContext) -> anyhow::Result<Vec<String>> {
-        match &self.namespace_scope {
-            LibraryNamespaceScope::Unrestricted => Ok(Vec::new()),
-            LibraryNamespaceScope::Fixed(namespaces) if !namespaces.is_empty() => {
-                Ok(namespaces.clone())
+    fn resolved_binding(
+        &self,
+        context: &ToolInvocationContext,
+    ) -> anyhow::Result<(LibraryProviderId, Vec<String>)> {
+        let binding = match &self.binding_scope {
+            LibraryBindingScope::Unrestricted(provider) => return Ok((*provider, Vec::new())),
+            LibraryBindingScope::Fixed(binding) => binding,
+            LibraryBindingScope::RuntimeBound => {
+                context.knowledge_binding.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("library_search requires an Agent knowledge binding")
+                })?
             }
-            LibraryNamespaceScope::Fixed(_) => {
-                anyhow::bail!("library_search has an empty fixed SAG namespace binding")
+        };
+        let provider = LibraryProviderId::from(binding.provider);
+        let namespaces = normalize_namespaces(binding.namespaces.iter().cloned());
+        match provider {
+            LibraryProviderId::Sag if namespaces.is_empty() => {
+                anyhow::bail!("library_search requires at least one Agent-bound SAG namespace")
             }
-            LibraryNamespaceScope::RuntimeBound if !context.library_namespaces.is_empty() => {
-                Ok(normalize_namespaces(context.library_namespaces.clone()))
+            LibraryProviderId::GraphRag if !namespaces.is_empty() => {
+                anyhow::bail!("Graph RAG Agent bindings cannot include SAG namespaces")
             }
-            LibraryNamespaceScope::RuntimeBound => {
-                anyhow::bail!("library_search requires a runtime SAG namespace binding")
-            }
+            _ => Ok((provider, namespaces)),
+        }
+    }
+
+    fn described_provider(&self) -> Option<LibraryProviderId> {
+        match &self.binding_scope {
+            LibraryBindingScope::Unrestricted(provider) => Some(*provider),
+            LibraryBindingScope::Fixed(binding) => Some(binding.provider.into()),
+            LibraryBindingScope::RuntimeBound => None,
         }
     }
 }
@@ -450,13 +464,14 @@ impl Tool for LibrarySearchTool {
     }
 
     fn description(&self) -> &str {
-        match self.provider {
-            LibraryProviderId::Sag => {
+        match self.described_provider() {
+            Some(LibraryProviderId::Sag) => {
                 "Search the selected SAG knowledge and memory library when the user's request would benefit from stored personal, enterprise, event, entity, or temporal evidence. The tool returns evidence only; use its source titles and paths when explaining the answer. Do not call it for questions answerable from the current conversation alone."
             }
-            LibraryProviderId::GraphRag => {
+            Some(LibraryProviderId::GraphRag) => {
                 "Search the selected Graph RAG knowledge library when the user's request would benefit from enterprise documents, entities, or relationship evidence. The tool returns evidence and graph paths only; use its source titles and anchors when explaining the answer. Do not call it for questions answerable from the current conversation alone."
             }
+            None => "Search the knowledge library selected by the current Agent when the request would benefit from stored evidence. The Agent's immutable binding chooses the provider and scope; tool arguments cannot change either. Use returned source anchors when explaining the answer.",
         }
     }
 
@@ -495,7 +510,11 @@ impl Tool for LibrarySearchTool {
     }
 
     fn execution_policy(&self, _call: &ToolCall) -> ToolExecutionPolicy {
-        ToolExecutionPolicy::read_only(vec![format!("library:{}", self.provider.as_str())])
+        let provider = self
+            .described_provider()
+            .map(LibraryProviderId::as_str)
+            .unwrap_or("agent-bound");
+        ToolExecutionPolicy::read_only(vec![format!("library:{provider}")])
     }
 
     async fn execute(
@@ -505,7 +524,7 @@ impl Tool for LibrarySearchTool {
     ) -> anyhow::Result<ToolResult> {
         let input: LibraryToolInput = serde_json::from_value(call.input)
             .map_err(|error| anyhow::anyhow!("invalid library_search arguments: {error}"))?;
-        let namespaces = self.namespaces(&ctx)?;
+        let (provider, namespaces) = self.resolved_binding(&ctx)?;
         let request = LibrarySearchRequest {
             query: input.query,
             purpose: default_search_purpose(),
@@ -518,7 +537,7 @@ impl Tool for LibrarySearchTool {
         };
         let value = self
             .providers
-            .search_context_pack(self.provider, request)
+            .search_context_pack(provider, request)
             .await
             .map_err(|error| anyhow::anyhow!(error.message))?;
         let output = serde_json::to_string_pretty(&value)
@@ -529,8 +548,8 @@ impl Tool for LibrarySearchTool {
             content: vec![ModelContentPart::json(value.clone())],
             metadata: json!({
                 "toolName": "library_search",
-                "provider": self.provider.as_str(),
-                "providerName": self.provider.display_name(),
+                "provider": provider.as_str(),
+                "providerName": provider.display_name(),
                 "success": true,
                 "reviewOnly": true,
                 "namespaces": namespaces,
@@ -1213,9 +1232,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_scoped_library_tool_fails_closed_without_namespaces() {
-        let tool =
-            LibrarySearchTool::runtime_scoped(Arc::new(LibraryProviderRegistry::for_tests()));
+    fn runtime_bound_library_tool_uses_the_agent_provider_and_fails_closed() {
+        let tool = LibrarySearchTool::runtime_bound(Arc::new(LibraryProviderRegistry::for_tests()));
         let authority = opentopia_core::ExecutionAuthority::new(
             std::env::current_dir().unwrap(),
             opentopia_core::PermissionMode::ReadOnly,
@@ -1224,11 +1242,25 @@ mod tests {
         )
         .unwrap();
         let mut context = authority.local_tool_context();
-        assert!(tool.namespaces(&context).is_err());
-        context.library_namespaces = vec!["opentopia.audit.credit-review.v1".to_string()];
+        assert!(tool.resolved_binding(&context).is_err());
+        context.knowledge_binding = Some(AgentKnowledgeBindingV1 {
+            provider: KnowledgeLibraryProviderV1::Sag,
+            namespaces: BTreeSet::from(["opentopia.audit.credit-review.v1".to_string()]),
+        });
         assert_eq!(
-            tool.namespaces(&context).unwrap(),
-            vec!["opentopia.audit.credit-review.v1"]
+            tool.resolved_binding(&context).unwrap(),
+            (
+                LibraryProviderId::Sag,
+                vec!["opentopia.audit.credit-review.v1".to_string()]
+            )
+        );
+        context.knowledge_binding = Some(AgentKnowledgeBindingV1 {
+            provider: KnowledgeLibraryProviderV1::GraphRag,
+            namespaces: BTreeSet::new(),
+        });
+        assert_eq!(
+            tool.resolved_binding(&context).unwrap(),
+            (LibraryProviderId::GraphRag, Vec::new())
         );
     }
 

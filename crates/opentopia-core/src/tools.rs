@@ -3,7 +3,7 @@ use crate::background::BackgroundProcessRegistry;
 use crate::browser::BrowserRuntime;
 use crate::collaboration::AgentCollaborationInvocation;
 use crate::computer::{ComputerAccessPolicy, ComputerRuntime};
-use crate::enterprise::CapabilityProjection;
+use crate::enterprise::{AgentKnowledgeBindingV1, CapabilityProjection};
 #[cfg(test)]
 use crate::execution::ExecRequest;
 #[cfg(test)]
@@ -99,9 +99,10 @@ pub struct ToolInvocationContext {
     /// Exact structured Connection routes keyed by the model-facing alias.
     /// Legacy MCP contexts leave this empty.
     pub connection_operations: BTreeMap<String, ConnectionOperationRuntimeRoute>,
-    /// Runtime-owned SAG namespaces. Knowledge tools treat this as an exact,
-    /// fail-closed scope; model arguments cannot add or replace namespaces.
-    pub library_namespaces: Vec<String>,
+    /// Runtime-owned Agent knowledge binding. Knowledge tools treat the
+    /// provider and provider-specific scope as fail-closed authority; model
+    /// arguments cannot select a backend or widen its scope.
+    pub knowledge_binding: Option<AgentKnowledgeBindingV1>,
     /// Whether the provider selected for this thread accepts native image input.
     /// `view_attachment` uses this to choose native image delivery or an explicitly
     /// declared MCP attachment-inspection capability.
@@ -182,7 +183,7 @@ impl ToolInvocationContext {
             mcp_host: None,
             mcp_tools: Vec::new(),
             connection_operations: BTreeMap::new(),
-            library_namespaces: Vec::new(),
+            knowledge_binding: None,
             model_supports_vision: true,
             fork_conversation: Vec::new(),
             fork_model_context: None,
@@ -237,7 +238,7 @@ impl ToolInvocationContext {
             mcp_host: None,
             mcp_tools: Vec::new(),
             connection_operations: BTreeMap::new(),
-            library_namespaces: Vec::new(),
+            knowledge_binding: None,
             model_supports_vision: true,
             fork_conversation: Vec::new(),
             fork_model_context: None,

@@ -1162,7 +1162,7 @@ pub(crate) fn render_message_for_summary(message: &Message) -> String {
                 truncate_chars(&result.output, 4_000)
             ),
             MessagePart::FileRef { path } => format!("file_ref {}", path.display()),
-            MessagePart::SourceRef { source } => format!(
+            MessagePart::SourceRef { source, .. } => format!(
                 "source_ref {} {} {} bytes{}",
                 source.name,
                 source.path.display(),

@@ -186,7 +186,34 @@ async fn spreadsheet_protocol_progressively_describes_and_executes_offline_workb
     let inspect_schema_text = serde_json::to_string(&inspect_schema).unwrap();
     assert!(inspect_schema_text.contains("workspaceFile"));
     assert!(inspect_schema_text.contains("attachment"));
+    assert!(inspect_schema_text.contains("attachmentId"));
+    assert!(!inspect_schema_text.contains("attachment_id"));
+    assert!(inspect_schema
+        .pointer("/properties/delimitedFormat")
+        .is_some());
+    assert!(inspect_schema.pointer("/properties/format").is_none());
     assert!(!inspect_schema_text.contains("liveSession"));
+
+    let attachment_id = Uuid::new_v4();
+    let mut legacy_resource_key = json!({
+        "resource": {
+            "kind": "attachment",
+            "attachment_id": attachment_id
+        }
+    });
+    let normalizations =
+        crate::provider::normalize_tool_argument_keys(&inspect_schema, &mut legacy_resource_key);
+    assert_eq!(
+        legacy_resource_key["resource"]["attachmentId"],
+        json!(attachment_id)
+    );
+    assert!(legacy_resource_key["resource"]
+        .get("attachment_id")
+        .is_none());
+    assert_eq!(normalizations.len(), 1);
+    assert!(SpreadsheetInspectTool
+        .input_error(&legacy_resource_key)
+        .is_none());
 
     assert!(SpreadsheetDescribeTool
         .input_error(&json!({
@@ -235,10 +262,312 @@ async fn spreadsheet_protocol_progressively_describes_and_executes_offline_workb
             ToolInvocationContext::local(workspace_root.clone(), policy),
         )
         .await
-        .expect_err("attachments must not receive mutation contracts");
-    assert!(attachment_mutation
-        .to_string()
-        .contains("attachment resources are immutable"));
+        .expect("describe an attachment-backed mutation");
+    let attachment_mutation: Value = serde_json::from_str(&attachment_mutation.output).unwrap();
+    assert_eq!(attachment_mutation["resource"]["kind"], "attachment");
+    assert!(attachment_mutation["resource"]
+        .get("writeSupported")
+        .is_none());
+    assert_eq!(
+        attachment_mutation["operations"][0]["primaryResourceBinding"],
+        "sourcePath"
+    );
+    assert!(attachment_mutation["operations"][0]["notes"]
+        .as_array()
+        .is_some_and(|notes| notes.iter().any(|note| note
+            .as_str()
+            .is_some_and(|note| note.contains("resource is a read input")))));
+
+    fs::remove_dir_all(workspace_root).unwrap();
+}
+
+#[tokio::test]
+async fn spreadsheet_protocol_uses_an_immutable_attachment_as_a_mutation_input() {
+    let case_root =
+        std::env::temp_dir().join(format!("opentopia-sheet-attachment-{}", Uuid::new_v4()));
+    let workspace_root = case_root.join("workspace");
+    let attachment_root = case_root.join("selected-files");
+    fs::create_dir_all(&workspace_root).unwrap();
+    fs::create_dir_all(&attachment_root).unwrap();
+    let policy = Arc::new(BasicPolicyEngine::new(
+        workspace_root.clone(),
+        PermissionMode::FullAccess,
+    ));
+    let sandbox = crate::sandbox::LocalSandboxConfig::default();
+
+    SpreadsheetExecuteTool
+        .execute(
+            ToolCall::new(
+                "spreadsheet_execute",
+                json!({
+                    "operation": "write",
+                    "arguments": {
+                        "outputPath": "template.xlsx",
+                        "sheets": [{
+                            "name": "Summary",
+                            "cells": [{
+                                "address": { "row": 0, "column": 0 },
+                                "value": { "type": "string", "value": "template" }
+                            }]
+                        }]
+                    }
+                }),
+            ),
+            ToolInvocationContext::local_with_sandbox_config(
+                workspace_root.clone(),
+                policy.clone(),
+                sandbox.clone(),
+            ),
+        )
+        .await
+        .expect("create attachment fixture");
+    let attachment_path = attachment_root.join("template.xlsx");
+    fs::rename(workspace_root.join("template.xlsx"), &attachment_path).unwrap();
+    let attachment_path = attachment_path.canonicalize().unwrap();
+
+    let store: Arc<dyn SessionStore> =
+        Arc::new(SqliteSessionStore::open(":memory:").expect("open memory store"));
+    let thread = store
+        .create_thread(
+            Some("spreadsheet attachment".to_string()),
+            workspace_root.clone(),
+        )
+        .expect("create thread");
+    let attachment_id = Uuid::new_v4();
+    let mut message = Message::text(thread.id, MessageRole::User, "update the selected template");
+    message.parts.push(MessagePart::SourceRef {
+        source: ContextSourceRef {
+            id: attachment_id,
+            path: attachment_path.clone(),
+            name: "template.xlsx".to_string(),
+            kind: ContextSourceKind::Document,
+            content_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                .to_string(),
+            bytes: fs::metadata(&attachment_path).unwrap().len(),
+            truncated: false,
+        },
+        inline: Some(true),
+    });
+    store.append_message(message).expect("persist attachment");
+
+    let mut context = ToolInvocationContext::local_with_sandbox_config(
+        workspace_root.clone(),
+        policy.clone(),
+        sandbox.clone(),
+    );
+    context.state = Some(ToolStateStore::new(store));
+    context.thread_id = Some(thread.id);
+    let result = SpreadsheetExecuteTool
+        .execute(
+            ToolCall::new(
+                "spreadsheet_execute",
+                json!({
+                    "resource": {
+                        "kind": "attachment",
+                        "attachmentId": attachment_id
+                    },
+                    "operation": "write_rows",
+                    "arguments": {
+                        "outputPath": "attachment-copy.xlsx",
+                        "sheet": "Summary",
+                        "start": { "row": 1, "column": 0 },
+                        "rows": [[{ "type": "string", "value": "written in one mutation" }]]
+                    }
+                }),
+            ),
+            context,
+        )
+        .await
+        .expect("write a separate output from the immutable attachment input");
+    assert_eq!(result.metadata["success"], true);
+
+    let output = SpreadsheetTool
+        .execute(
+            ToolCall::new(
+                "spreadsheet",
+                json!({
+                    "action": "read_range",
+                    "path": "attachment-copy.xlsx",
+                    "sheet": "Summary",
+                    "range": {
+                        "start": { "row": 0, "column": 0 },
+                        "end": { "row": 1, "column": 0 }
+                    }
+                }),
+            ),
+            ToolInvocationContext::local_with_sandbox_config(
+                workspace_root.clone(),
+                policy.clone(),
+                sandbox.clone(),
+            ),
+        )
+        .await
+        .expect("read generated output");
+    assert!(output.output.contains("template"));
+    assert!(output.output.contains("written in one mutation"));
+
+    let original = SpreadsheetTool
+        .execute(
+            ToolCall::new(
+                "spreadsheet",
+                json!({
+                    "action": "read_range",
+                    "path": attachment_path.to_string_lossy(),
+                    "sheet": "Summary",
+                    "range": {
+                        "start": { "row": 0, "column": 0 },
+                        "end": { "row": 1, "column": 0 }
+                    }
+                }),
+            ),
+            ToolInvocationContext::local_with_sandbox_config(workspace_root, policy, sandbox),
+        )
+        .await
+        .expect("read original attachment");
+    assert!(original.output.contains("template"));
+    assert!(!original.output.contains("written in one mutation"));
+
+    fs::remove_dir_all(case_root).unwrap();
+}
+
+/// Manual regression for the two external workbooks from the original failure.
+/// The paths stay outside source control and are supplied only when this ignored
+/// test is explicitly requested.
+#[tokio::test]
+#[ignore = "requires OPENTOPIA_PRIOR_CASE_SOURCE and OPENTOPIA_PRIOR_CASE_TEMPLATE"]
+async fn prior_two_workbook_case_runs_as_one_attachment_backed_batch() {
+    let source_path = PathBuf::from(
+        std::env::var("OPENTOPIA_PRIOR_CASE_SOURCE").expect("source workbook environment variable"),
+    )
+    .canonicalize()
+    .expect("canonicalize source workbook");
+    let template_path = PathBuf::from(
+        std::env::var("OPENTOPIA_PRIOR_CASE_TEMPLATE")
+            .expect("template workbook environment variable"),
+    )
+    .canonicalize()
+    .expect("canonicalize template workbook");
+    let source_before = fs::read(&source_path).expect("snapshot source workbook");
+    let template_before = fs::read(&template_path).expect("snapshot template workbook");
+
+    let workspace_root =
+        std::env::temp_dir().join(format!("opentopia-prior-sheet-case-{}", Uuid::new_v4()));
+    fs::create_dir_all(&workspace_root).unwrap();
+    let policy = Arc::new(BasicPolicyEngine::new(
+        workspace_root.clone(),
+        PermissionMode::FullAccess,
+    ));
+    let sandbox = crate::sandbox::LocalSandboxConfig::danger_full_access();
+    let store: Arc<dyn SessionStore> =
+        Arc::new(SqliteSessionStore::open(":memory:").expect("open memory store"));
+    let thread = store
+        .create_thread(
+            Some("prior spreadsheet case".to_string()),
+            workspace_root.clone(),
+        )
+        .expect("create thread");
+    let source_id = Uuid::new_v4();
+    let template_id = Uuid::new_v4();
+    let mut message = Message::text(
+        thread.id,
+        MessageRole::User,
+        "fill the order template from the selected source and use J&T",
+    );
+    for (id, path, name) in [
+        (source_id, source_path.clone(), "Todo pedido.xlsx"),
+        (template_id, template_path.clone(), "订单模板.xlsx"),
+    ] {
+        message.parts.push(MessagePart::SourceRef {
+            source: ContextSourceRef {
+                id,
+                bytes: fs::metadata(&path).unwrap().len(),
+                path,
+                name: name.to_string(),
+                kind: ContextSourceKind::Document,
+                content_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    .to_string(),
+                truncated: false,
+            },
+            inline: Some(true),
+        });
+    }
+    store
+        .append_message(message)
+        .expect("persist selected files");
+
+    let mut context = ToolInvocationContext::local_with_sandbox_config(
+        workspace_root.clone(),
+        policy.clone(),
+        sandbox.clone(),
+    );
+    context.state = Some(ToolStateStore::new(store));
+    context.thread_id = Some(thread.id);
+    let result = SpreadsheetExecuteTool
+        .execute(
+            ToolCall::new(
+                "spreadsheet_execute",
+                json!({
+                    "resource": {
+                        "kind": "attachment",
+                        "attachmentId": template_id
+                    },
+                    "operation": "batch",
+                    "arguments": {
+                        "outputPath": "prior-case-regression.xlsx",
+                        "atomic": true,
+                        "operations": [
+                            {
+                                "type": "copy_rows",
+                                "sourcePath": source_path.to_string_lossy(),
+                                "sourceSheet": "OrderSKUList",
+                                "sourceStart": { "row": 2, "column": 0 },
+                                "rowCount": 1,
+                                "columnCount": 1,
+                                "destinationSheet": "订单明细",
+                                "destinationStart": { "row": 2, "column": 0 },
+                                "contentMode": "values"
+                            },
+                            {
+                                "type": "write_rows",
+                                "sheet": "订单明细",
+                                "start": { "row": 2, "column": 9 },
+                                "rows": [[{ "type": "string", "value": "J&T" }]]
+                            }
+                        ]
+                    }
+                }),
+            ),
+            context,
+        )
+        .await
+        .expect("execute the prior two-workbook case as one batch");
+    assert_eq!(result.metadata["success"], true);
+
+    let output = SpreadsheetTool
+        .execute(
+            ToolCall::new(
+                "spreadsheet",
+                json!({
+                    "action": "read_range",
+                    "path": "prior-case-regression.xlsx",
+                    "sheet": "订单明细",
+                    "range": {
+                        "start": { "row": 2, "column": 0 },
+                        "end": { "row": 2, "column": 9 }
+                    }
+                }),
+            ),
+            ToolInvocationContext::local_with_sandbox_config(
+                workspace_root.clone(),
+                policy,
+                sandbox,
+            ),
+        )
+        .await
+        .expect("read prior-case output");
+    assert!(output.output.contains("J&T"));
+    assert_eq!(fs::read(&source_path).unwrap(), source_before);
+    assert_eq!(fs::read(&template_path).unwrap(), template_before);
 
     fs::remove_dir_all(workspace_root).unwrap();
 }

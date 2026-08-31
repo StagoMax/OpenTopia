@@ -1,6 +1,7 @@
 use crate::enterprise::{
-    AgentBudgetV1, AgentModelPolicyV1, AgentRiskClassV1, AgentTemplateSpecV1, CapabilityProjection,
-    DataClassification, ExecutionResourceGrantV1, SagKnowledgeBindingV1,
+    AgentBudgetV1, AgentKnowledgeBindingV1, AgentModelPolicyV1, AgentRiskClassV1,
+    AgentTemplateSpecV1, CapabilityProjection, DataClassification, ExecutionResourceGrantV1,
+    KnowledgeLibraryProviderV1,
 };
 use crate::enterprise_connection_grants::ConnectionBindingV1;
 use crate::model::{ExperienceMode, ToolCall, ToolResult};
@@ -105,6 +106,8 @@ struct AgentCreateInput {
     #[serde(default)]
     knowledge_namespaces: BTreeSet<String>,
     #[serde(default)]
+    knowledge_provider: Option<KnowledgeLibraryProviderV1>,
+    #[serde(default)]
     resource_grants: Vec<ExecutionResourceGrantV1>,
     #[serde(default)]
     model_policy: Option<AgentModelPolicyV1>,
@@ -153,7 +156,17 @@ impl Tool for AgentTool {
                     "instructions": {"type": "string", "minLength": 1, "description": "Complete role, objective, tool-use policy, input handling and expected Final instructions."},
                     "capabilities": {"type": "object", "description": "Requested capability projection. It is intersected with the current ExecutionContext."},
                     "connectionBindings": {"type": "array", "items": {"type": "object"}},
-                    "knowledgeNamespaces": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+                    "knowledgeProvider": {
+                        "type": "string",
+                        "enum": ["sag", "graph-rag"],
+                        "description": "Knowledge library selected for this Agent. Selecting one automatically derives the library_search capability."
+                    },
+                    "knowledgeNamespaces": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "uniqueItems": true,
+                        "description": "Required immutable namespace scope for SAG; omit for Graph RAG."
+                    },
                     "resourceGrants": {"type": "array", "items": {"type": "object"}},
                     "modelPolicy": {"type": "object"},
                     "stateSchema": {"type": "object"},
@@ -232,10 +245,21 @@ impl Tool for AgentTool {
                     .capabilities
                     .unwrap_or_else(CapabilityProjection::deny_all);
                 let capabilities = requested.intersect(&ctx.capability_projection);
+                let knowledge_provider = input.knowledge_provider.or_else(|| {
+                    (!input.knowledge_namespaces.is_empty())
+                        .then_some(KnowledgeLibraryProviderV1::Sag)
+                });
                 let knowledge_binding =
-                    (!input.knowledge_namespaces.is_empty()).then_some(SagKnowledgeBindingV1 {
+                    knowledge_provider.map(|provider| AgentKnowledgeBindingV1 {
+                        provider,
                         namespaces: input.knowledge_namespaces,
                     });
+                if knowledge_binding.is_some() {
+                    anyhow::ensure!(
+                        ctx.capability_projection.allows_tool("library_search"),
+                        "the current ExecutionContext does not allow knowledge library access"
+                    );
+                }
                 let spec = AgentTemplateSpecV1 {
                     description: input.description.trim().to_string(),
                     instructions: input.instructions.trim().to_string(),

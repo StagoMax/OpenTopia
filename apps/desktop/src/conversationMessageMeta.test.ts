@@ -42,6 +42,27 @@ test("keeps message indentation while removing blank outer lines", () => {
   );
 });
 
+test("copies inline attachments in the same order as the visible request", () => {
+  const source = {
+    id: "source-inline",
+    path: "docs/source.xlsx",
+    name: "source.xlsx",
+    kind: "document" as const,
+    contentType:
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    bytes: 42,
+    truncated: false,
+  };
+  assert.equal(
+    conversationMessageCopyText([
+      { type: "text", text: "把" },
+      { type: "source_ref", source, inline: true },
+      { type: "text", text: "填入目标文件" },
+    ]),
+    "把[source.xlsx]填入目标文件",
+  );
+});
+
 test("copies a proposed plan as visible message text", () => {
   assert.equal(
     conversationMessageCopyText([

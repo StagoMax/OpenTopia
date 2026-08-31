@@ -555,6 +555,7 @@ async fn run_smoke(workspace: &Path) -> anyhow::Result<()> {
             bytes: fs::metadata(workspace.join("attachment.txt"))?.len(),
             truncated: false,
         },
+        inline: Some(false),
     });
     attachment_message.parts.push(MessagePart::Image {
         id: Some(image_attachment_id),

@@ -78,6 +78,12 @@ async fn send_message(
     let sources =
         load_context_source_metadata(&request.source_paths, &ContextSourcePolicy::default())
             .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let source_refs = sources
+        .iter()
+        .map(ContextSourceRef::from)
+        .collect::<Vec<_>>();
+    let (ordered_content_parts, inline_source_ids) =
+        resolve_inline_message_parts(content_parts, &source_refs)?;
     // Explicit Skill selection is structured user input. Load its bounded main prompt once,
     // persist only the reference, and inject the instructions into this Turn's user context.
     let loaded_skills = load_selected_skills(Some(&thread.workspace_root), &request.skill_ids)
@@ -158,17 +164,9 @@ async fn send_message(
     }
     send_trace.phase("admission_checks_completed", thread_id, None);
 
-    let mut pending_message = if !content_parts.is_empty() {
+    let mut pending_message = if !ordered_content_parts.is_empty() {
         let mut message = Message::text(thread_id, MessageRole::User, "");
-        message.parts = content_parts
-            .into_iter()
-            .map(|part| match part {
-                InlineMessageContentPartRequest::Text { text } => MessagePart::Text { text },
-                InlineMessageContentPartRequest::ImageRef { image_id } => {
-                    MessagePart::ImageRef { image_id }
-                }
-            })
-            .collect();
+        message.parts = ordered_content_parts;
         message
     } else {
         Message::text(thread_id, MessageRole::User, prompt.clone())
@@ -178,11 +176,15 @@ async fn send_message(
         goal_id: goal_snapshot.as_ref().map(|snapshot| snapshot.goal.id),
         library_provider: library_provider.map(|provider| provider.as_str().to_string()),
     });
-    pending_message
-        .parts
-        .extend(sources.iter().map(|source| MessagePart::SourceRef {
-            source: ContextSourceRef::from(source),
-        }));
+    pending_message.parts.extend(
+        source_refs
+            .into_iter()
+            .filter(|source| !inline_source_ids.contains(&source.id))
+            .map(|source| MessagePart::SourceRef {
+                source,
+                inline: Some(false),
+            }),
+    );
     pending_message.parts.extend(
         image_attachments
             .into_iter()
@@ -623,6 +625,9 @@ pub(super) enum InlineMessageContentPartRequest {
         #[serde(rename = "imageId")]
         image_id: Uuid,
     },
+    AttachmentRef {
+        path: PathBuf,
+    },
 }
 
 const MAX_INLINE_IMAGE_ATTACHMENTS: usize = 10;
@@ -671,7 +676,8 @@ pub(super) fn validate_inline_image_attachments(
             .iter()
             .filter_map(|part| match part {
                 InlineMessageContentPartRequest::ImageRef { image_id } => Some(*image_id),
-                InlineMessageContentPartRequest::Text { .. } => None,
+                InlineMessageContentPartRequest::Text { .. }
+                | InlineMessageContentPartRequest::AttachmentRef { .. } => None,
             })
             .collect::<HashSet<_>>();
         if referenced_ids.iter().any(|id| !attachment_ids.contains(id)) {
@@ -686,4 +692,43 @@ pub(super) fn validate_inline_image_attachments(
         }
     }
     Ok(())
+}
+
+pub(super) fn resolve_inline_message_parts(
+    content_parts: Vec<InlineMessageContentPartRequest>,
+    sources: &[ContextSourceRef],
+) -> Result<(Vec<MessagePart>, HashSet<Uuid>), ApiError> {
+    let mut referenced_source_ids = HashSet::new();
+    let parts = content_parts
+        .into_iter()
+        .map(|part| match part {
+            InlineMessageContentPartRequest::Text { text } => Ok(MessagePart::Text { text }),
+            InlineMessageContentPartRequest::ImageRef { image_id } => {
+                Ok(MessagePart::ImageRef { image_id })
+            }
+            InlineMessageContentPartRequest::AttachmentRef { path, .. } => {
+                let canonical_path = path.canonicalize().map_err(|_| {
+                    ApiError::bad_request(format!(
+                        "inline attachment reference was not found: {}",
+                        path.display()
+                    ))
+                })?;
+                let source = sources
+                    .iter()
+                    .find(|source| source.path == canonical_path)
+                    .ok_or_else(|| {
+                        ApiError::bad_request(format!(
+                            "inline attachment reference is not a selected source: {}",
+                            path.display()
+                        ))
+                    })?;
+                referenced_source_ids.insert(source.id);
+                Ok(MessagePart::SourceRef {
+                    source: source.clone(),
+                    inline: Some(true),
+                })
+            }
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    Ok((parts, referenced_source_ids))
 }

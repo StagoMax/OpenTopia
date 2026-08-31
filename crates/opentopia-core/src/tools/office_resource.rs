@@ -3,9 +3,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-/// A spreadsheet target is independent of its offline storage binding.
-/// Workspace files are mutable under workspace policy; user attachments are
-/// opaque, immutable sources addressed by attachment ID.
+/// A spreadsheet input is independent of the operation's output destination.
+/// Workspace files can be addressed directly; user attachments are immutable
+/// inputs addressed by attachment ID. Whether a separate destination may be
+/// written is decided by the execution policy and sandbox, not by this type.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(
     tag = "kind",
@@ -14,8 +15,18 @@ use uuid::Uuid;
     deny_unknown_fields
 )]
 pub(super) enum OfficeResourceRef {
-    WorkspaceFile { path: String },
-    Attachment { attachment_id: Uuid },
+    WorkspaceFile {
+        path: String,
+    },
+    Attachment {
+        // Keep the generated JSON Schema and serde's enum-field contract
+        // identical. `rename_all_fields` is not interpreted consistently by
+        // every schema consumer, which previously advertised `attachment_id`
+        // while runtime deserialization required `attachmentId`.
+        #[serde(rename = "attachmentId", alias = "attachment_id")]
+        #[schemars(rename = "attachmentId")]
+        attachment_id: Uuid,
+    },
 }
 
 impl OfficeResourceRef {
@@ -61,20 +72,14 @@ impl OfficeResourceRef {
             Self::WorkspaceFile { path } => json!({
                 "kind": "workspaceFile",
                 "backend": "offlineFile",
-                "path": path,
-                "writeSupported": true
+                "path": path
             }),
             Self::Attachment { attachment_id } => json!({
                 "kind": "attachment",
                 "backend": "offlineAttachment",
-                "attachmentId": attachment_id,
-                "writeSupported": false
+                "attachmentId": attachment_id
             }),
         }
-    }
-
-    pub(super) fn supports_mutation(&self) -> bool {
-        matches!(self, Self::WorkspaceFile { .. })
     }
 }
 
@@ -83,13 +88,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resource_contract_distinguishes_mutable_files_from_immutable_attachments() {
+    fn resource_contract_distinguishes_paths_from_immutable_attachment_inputs() {
         let workspace_file: OfficeResourceRef = serde_json::from_value(json!({
             "kind": "workspaceFile",
             "path": "reports/book.xlsx"
         }))
         .expect("workspace file resource");
-        assert!(workspace_file.supports_mutation());
         assert_eq!(workspace_file.resource_key(), "file:reports/book.xlsx");
 
         let attachment_id = Uuid::new_v4();
@@ -98,13 +102,24 @@ mod tests {
             "attachmentId": attachment_id
         }))
         .expect("attachment resource");
-        assert!(!attachment.supports_mutation());
         assert_eq!(
             attachment.resource_key(),
             format!("attachment:{attachment_id}")
         );
         assert_eq!(attachment.read_binding().unwrap().0, "attachmentId");
         assert!(attachment.offline_path().is_err());
+
+        let legacy_attachment: OfficeResourceRef = serde_json::from_value(json!({
+            "kind": "attachment",
+            "attachment_id": attachment_id
+        }))
+        .expect("legacy snake-case attachment resource remains compatible");
+        assert_eq!(legacy_attachment.resource_key(), attachment.resource_key());
+
+        let schema = serde_json::to_value(schemars::schema_for!(OfficeResourceRef)).unwrap();
+        let schema_text = schema.to_string();
+        assert!(schema_text.contains("attachmentId"));
+        assert!(!schema_text.contains("attachment_id"));
     }
 
     #[test]

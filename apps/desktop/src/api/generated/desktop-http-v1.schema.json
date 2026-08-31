@@ -1693,6 +1693,23 @@
       ],
       "type": "object"
     },
+    "AgentKnowledgeBindingV1": {
+      "description": "Immutable, server-enforced knowledge scope available to an Agent. Provider selection and any provider-specific namespace restriction are intentionally absent from the model-facing tool schema, so a tool call cannot widen the template's knowledge boundary.",
+      "properties": {
+        "namespaces": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "provider": {
+          "$ref": "#/definitions/KnowledgeLibraryProviderV1"
+        }
+      },
+      "type": "object"
+    },
     "AgentListItem": {
       "properties": {
         "activity": {
@@ -2028,7 +2045,7 @@
         "knowledgeBinding": {
           "anyOf": [
             {
-              "$ref": "#/definitions/SagKnowledgeBindingV1"
+              "$ref": "#/definitions/AgentKnowledgeBindingV1"
             },
             {
               "type": "null"
@@ -5382,7 +5399,7 @@
         "knowledgeBinding": {
           "anyOf": [
             {
-              "$ref": "#/definitions/SagKnowledgeBindingV1"
+              "$ref": "#/definitions/AgentKnowledgeBindingV1"
             },
             {
               "type": "null"
@@ -6172,16 +6189,6 @@
             }
           ],
           "default": "immediate"
-        },
-        "libraryProvider": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/WorkflowLibraryProviderV1"
-            },
-            {
-              "type": "null"
-            }
-          ]
         },
         "output": {
           "$ref": "#/definitions/WorkflowOutputSpecV1"
@@ -7675,6 +7682,14 @@
       ],
       "type": "string"
     },
+    "KnowledgeLibraryProviderV1": {
+      "description": "Knowledge retrieval backend selected by an Agent template. The provider is part of the immutable Agent version; provider-owned databases and indexes remain deployment configuration rather than template identity.",
+      "enum": [
+        "sag",
+        "graph-rag"
+      ],
+      "type": "string"
+    },
     "LibraryIngestionResponseView": {
       "additionalProperties": true,
       "properties": {
@@ -8718,6 +8733,10 @@
         },
         {
           "properties": {
+            "inline": {
+              "description": "Whether the user placed this source at this exact position in the request. Legacy and context-only sources remain trailing parts.",
+              "type": "boolean"
+            },
             "source": {
               "$ref": "#/definitions/ContextSourceRef"
             },
@@ -11449,22 +11468,6 @@
       ],
       "type": "object"
     },
-    "SagKnowledgeBindingV1": {
-      "description": "Immutable, server-enforced SAG scope available to an Agent. Namespaces are intentionally absent from the model-facing tool schema so the model cannot widen the template's knowledge boundary at invocation time.",
-      "properties": {
-        "namespaces": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array",
-          "uniqueItems": true
-        }
-      },
-      "required": [
-        "namespaces"
-      ],
-      "type": "object"
-    },
     "SagStatus": {
       "properties": {
         "agent_loop_integration": {
@@ -14191,7 +14194,7 @@
         "knowledgeBinding": {
           "anyOf": [
             {
-              "$ref": "#/definitions/SagKnowledgeBindingV1"
+              "$ref": "#/definitions/AgentKnowledgeBindingV1"
             },
             {
               "type": "null"
@@ -14604,14 +14607,6 @@
         "toolCalls"
       ],
       "type": "object"
-    },
-    "WorkflowLibraryProviderV1": {
-      "description": "Selects the Library retrieval backend available to capability-approved Agent nodes in one immutable Flow revision. This binds only the provider; provider-owned projects, databases, and indexes remain runtime configuration so Agent templates stay reusable.",
-      "enum": [
-        "sag",
-        "graph-rag"
-      ],
-      "type": "string"
     },
     "WorkflowOutputReviewPolicyV1": {
       "enum": [

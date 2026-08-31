@@ -5,18 +5,23 @@ import {
   type SetStateAction,
 } from "react";
 import {
+  composerDraftContentPartsFromLegacyText,
   emptyComposerDraft,
   getComposerDraftsSnapshot,
+  normalizeComposerDraftContentParts,
   subscribeComposerDrafts,
   updateComposerDraft,
 } from "./composerDrafts";
-import type { ContextSourceFile } from "./types";
+import type { ComposerDraftContentPart } from "./composerDrafts";
+import type { ContextSourceFile, InlineMessageContentPart } from "./types";
 
 export function useComposerDraft(draftKey: string): {
   text: string;
+  contentParts: ComposerDraftContentPart[];
   contextSources: ContextSourceFile[];
   selectedSkillIds: string[];
   setText: Dispatch<SetStateAction<string>>;
+  setContent(text: string, contentParts: InlineMessageContentPart[]): void;
   setContextSources: Dispatch<SetStateAction<ContextSourceFile[]>>;
   setSelectedSkillIds: Dispatch<SetStateAction<string[]>>;
 } {
@@ -26,12 +31,32 @@ export function useComposerDraft(draftKey: string): {
     getComposerDraftsSnapshot,
   );
   const draft = drafts[draftKey] ?? emptyComposerDraft();
+  const contentParts =
+    draft.contentParts ??
+    composerDraftContentPartsFromLegacyText(draft.text, draft.contextSources);
 
   const setText = useCallback<Dispatch<SetStateAction<string>>>(
     (update) => {
       updateComposerDraft(draftKey, (current) => ({
         ...current,
-        text: typeof update === "function" ? update(current.text) : update,
+        contentParts: [
+          {
+            type: "text",
+            text: typeof update === "function" ? update(current.text) : update,
+          },
+        ],
+      }));
+    },
+    [draftKey],
+  );
+  const setContent = useCallback(
+    (_text: string, contentParts: InlineMessageContentPart[]) => {
+      updateComposerDraft(draftKey, (current) => ({
+        ...current,
+        contentParts: normalizeComposerDraftContentParts(
+          contentParts,
+          current.contextSources,
+        ),
       }));
     },
     [draftKey],
@@ -65,9 +90,11 @@ export function useComposerDraft(draftKey: string): {
 
   return {
     text: draft.text,
+    contentParts,
     contextSources: draft.contextSources,
     selectedSkillIds: draft.selectedSkillIds,
     setText,
+    setContent,
     setContextSources,
     setSelectedSkillIds,
   };

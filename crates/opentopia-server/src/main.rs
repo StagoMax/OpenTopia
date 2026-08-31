@@ -78,6 +78,7 @@ use uuid::Uuid;
 
 mod agent_connection_access;
 mod agent_factory;
+mod agent_library_runtime;
 mod agent_runs;
 mod agent_templates_api;
 mod agent_turn_coordinator;
@@ -95,7 +96,6 @@ mod event_bus;
 mod events_api;
 mod flow_cases_api;
 mod flow_cases_service;
-mod flow_library_runtime;
 mod flows_api;
 mod human_tasks_api;
 mod interaction_api;
@@ -159,8 +159,8 @@ use mcp_api::{ensure_mcp_server_status, McpServerView, ThreadMcpServerView};
 use message_api::{launch_next_queued_turn, message_library_provider};
 #[cfg(test)]
 use message_api::{
-    legacy_direct_tool_command, validate_inline_image_attachments, InlineImageAttachmentRequest,
-    InlineMessageContentPartRequest,
+    legacy_direct_tool_command, resolve_inline_message_parts, validate_inline_image_attachments,
+    InlineImageAttachmentRequest, InlineMessageContentPartRequest,
 };
 use provider_api::{current_settings, ProviderModelSyncResult};
 #[cfg(test)]
@@ -1558,11 +1558,10 @@ async fn run_new_agent_turn(
         .as_ref()
         .and_then(|instance| instance.execution_context.knowledge_binding.as_ref())
     {
-        let namespaces = binding.namespaces.iter().cloned().collect::<Vec<_>>();
-        agent.set_library_namespaces(namespaces.clone());
-        agent.register_runtime_tool(Arc::new(library_api::LibrarySearchTool::scoped(
+        agent.set_knowledge_binding(Some(binding));
+        agent.register_runtime_tool(Arc::new(library_api::LibrarySearchTool::bound(
             state.library_providers.clone(),
-            namespaces,
+            binding.clone(),
         )));
     } else if let Some(provider) = library_provider {
         agent.register_runtime_tool(Arc::new(library_api::LibrarySearchTool::new(
@@ -2243,11 +2242,10 @@ async fn run_resumed_agent_turn(
         .as_ref()
         .and_then(|instance| instance.execution_context.knowledge_binding.as_ref())
     {
-        let namespaces = binding.namespaces.iter().cloned().collect::<Vec<_>>();
-        agent.set_library_namespaces(namespaces.clone());
-        agent.register_runtime_tool(Arc::new(library_api::LibrarySearchTool::scoped(
+        agent.set_knowledge_binding(Some(binding));
+        agent.register_runtime_tool(Arc::new(library_api::LibrarySearchTool::bound(
             state.library_providers.clone(),
-            namespaces,
+            binding.clone(),
         )));
     } else if let Some(provider) = library_provider {
         agent.register_runtime_tool(Arc::new(library_api::LibrarySearchTool::new(

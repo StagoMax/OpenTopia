@@ -947,7 +947,7 @@ Goal mode manages durable execution state but does not broaden what the user's r
         context.mcp_host = self.tool_host.mcp_host.clone();
         context.mcp_tools = self.tool_host.active_mcp_tools.clone();
         context.connection_operations = self.tool_host.active_connection_operations.clone();
-        context.library_namespaces = self.tool_host.library_namespaces.clone();
+        context.knowledge_binding = self.tool_host.knowledge_binding.clone();
         context.model_supports_vision = self.tool_host.model_supports_vision;
         context.collaboration_mode = self.collaboration_mode;
         context.goal_id = self.goal.as_ref().map(|goal| goal.id);
@@ -961,7 +961,7 @@ Goal mode manages durable execution state but does not broaden what the user's r
         context.mcp_host = self.tool_host.mcp_host.clone();
         context.mcp_tools = self.tool_host.active_mcp_tools.clone();
         context.connection_operations = self.tool_host.active_connection_operations.clone();
-        context.library_namespaces = self.tool_host.library_namespaces.clone();
+        context.knowledge_binding = self.tool_host.knowledge_binding.clone();
         context.model_supports_vision = self.tool_host.model_supports_vision;
     }
 
@@ -974,15 +974,11 @@ Goal mode manages durable execution state but does not broaden what the user's r
         self.tool_host.mcp_host = Some(host);
     }
 
-    pub fn set_library_namespaces(&mut self, namespaces: impl IntoIterator<Item = String>) {
-        let mut namespaces = namespaces
-            .into_iter()
-            .map(|item| item.trim().to_string())
-            .filter(|item| !item.is_empty())
-            .collect::<Vec<_>>();
-        namespaces.sort();
-        namespaces.dedup();
-        self.tool_host.library_namespaces = namespaces;
+    pub fn set_knowledge_binding(
+        &mut self,
+        binding: Option<&crate::enterprise::AgentKnowledgeBindingV1>,
+    ) {
+        self.tool_host.knowledge_binding = binding.cloned();
     }
 
     pub fn clear_mcp_host(&mut self) {
@@ -1719,12 +1715,7 @@ impl AgentCore {
             agent.restrict_capabilities(&spec.capabilities);
             agent.align_execution_authority_with_capabilities()?;
             agent.retain_external_tools_for_projection();
-            agent.set_library_namespaces(
-                spec.knowledge_binding
-                    .as_ref()
-                    .into_iter()
-                    .flat_map(|binding| binding.namespaces.iter().cloned()),
-            );
+            agent.set_knowledge_binding(spec.knowledge_binding.as_ref());
             agent.append_additional_developer_instructions(&format!(
                 "[Flow Revision Agent identity]\nTemplate: {}@{}\nTemplate content hash: {}\nName: {}\nOwner: {}\nRisk class: {:?}\nInstructions:\n{}",
                 spec.template_id,

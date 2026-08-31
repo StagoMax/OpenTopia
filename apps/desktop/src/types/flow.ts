@@ -45,7 +45,8 @@ export type AgentConnectionBinding = {
   operationGrants: AgentConnectionOperationGrant[];
 };
 
-export type SagKnowledgeBinding = {
+export type AgentKnowledgeBinding = {
+  provider?: LibraryProviderId;
   namespaces: string[];
 };
 
@@ -77,7 +78,7 @@ export type AgentTemplateSpec = {
    * the legacy `capabilities.mcpServers` projection instead.
    */
   connectionBindings?: AgentConnectionBinding[];
-  knowledgeBinding?: SagKnowledgeBinding;
+  knowledgeBinding?: AgentKnowledgeBinding;
   resourceGrants: ExecutionResourceGrant[];
   modelPolicy: AgentModelPolicy;
   stateSchema: unknown;
@@ -137,7 +138,7 @@ export type EnterpriseExecutionContext = {
   capabilities: CapabilityProjection;
   connectionBindings?: AgentConnectionBinding[];
   connectionOperations?: ExecutionConnectionOperation[];
-  knowledgeBinding?: SagKnowledgeBinding;
+  knowledgeBinding?: AgentKnowledgeBinding;
   resourceGrants: ExecutionResourceGrant[];
   modelPolicy: AgentModelPolicy;
 };
@@ -311,7 +312,7 @@ export type WorkflowAgentSpec = {
   outputSchema: unknown;
   riskClass: "low" | "medium" | "high" | "critical";
   connectionBindings: AgentConnectionBinding[];
-  knowledgeBinding?: SagKnowledgeBinding;
+  knowledgeBinding?: AgentKnowledgeBinding;
   connectionAuthority: RuntimeConnectionAuthority;
 };
 
@@ -340,7 +341,6 @@ export type FlowRevision = {
   ingressPolicy: "immediate" | "require_review";
   output: WorkflowOutput;
   outputReviewPolicy: WorkflowOutputReviewPolicy;
-  libraryProvider?: LibraryProviderId;
   contentHash: string;
   createdAt: string;
   createdBy: string;

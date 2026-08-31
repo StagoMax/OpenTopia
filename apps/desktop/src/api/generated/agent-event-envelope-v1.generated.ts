@@ -413,6 +413,10 @@ export type MessagePart =
       [k: string]: unknown;
     }
   | {
+      /**
+       * Whether the user placed this source at this exact position in the request. Legacy and context-only sources remain trailing parts.
+       */
+      inline?: boolean;
       source: ContextSourceRef;
       type: "source_ref";
       [k: string]: unknown;
