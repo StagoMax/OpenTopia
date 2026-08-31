@@ -4,6 +4,7 @@ import {
   activityVirtualChunkSize,
   buildActivityVirtualChunks,
   estimateActivityEntryHeight,
+  shouldKeepActivityVirtualChunkMounted,
 } from "./activityVirtualization.ts";
 import type { ActivityEntry } from "./model";
 
@@ -39,4 +40,11 @@ test("estimates narrative placeholders without allowing unbounded height", () =>
     estimateActivityEntryHeight(commentary(2, "long".repeat(20_000))),
     320,
   );
+});
+
+test("keeps a bounded activity tail mounted for bottom-pinned jumps", () => {
+  assert.equal(shouldKeepActivityVirtualChunkMounted(3, 7), false);
+  assert.equal(shouldKeepActivityVirtualChunkMounted(4, 7), true);
+  assert.equal(shouldKeepActivityVirtualChunkMounted(5, 7), true);
+  assert.equal(shouldKeepActivityVirtualChunkMounted(6, 7), true);
 });

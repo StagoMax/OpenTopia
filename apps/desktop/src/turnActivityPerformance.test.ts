@@ -118,6 +118,10 @@ test("mounts only nearby variable-height activity chunks", () => {
   assert.match(activityEntryListSource, /new ResizeObserver/);
   assert.match(activityEntryListSource, /rootMargin: "800px 0px"/);
   assert.match(activityEntryListSource, /focusedRef\.current/);
+  assert.match(
+    activityEntryListSource,
+    /shouldKeepActivityVirtualChunkMounted/,
+  );
 });
 
 test("keeps completed activity groups behind progressive disclosure", () => {
@@ -242,7 +246,7 @@ test("keeps the submitted composer draft until the server accepts it", () => {
   );
   const acceptedAt = submitDraft.indexOf("const accepted = await onSubmit");
   const rejectedAt = submitDraft.indexOf("if (!accepted) return");
-  const clearedAt = submitDraft.indexOf('onChange("")');
+  const clearedAt = submitDraft.indexOf('onChange("", [])');
   assert.ok(acceptedAt >= 0);
   assert.ok(rejectedAt > acceptedAt);
   assert.ok(clearedAt > rejectedAt);

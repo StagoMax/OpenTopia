@@ -11,6 +11,7 @@ import { ActivityEntryView } from "./activityGroups";
 import {
   activityVirtualizationThreshold,
   buildActivityVirtualChunks,
+  shouldKeepActivityVirtualChunkMounted,
   type ActivityVirtualChunk,
 } from "./activityVirtualization";
 import { activityEntryKey, type ActivityEntry } from "./model";
@@ -41,17 +42,23 @@ export function ActivityEntryList(props: ActivityEntryListProps) {
     ));
   }
 
-  return chunks.map((chunk, index) => (
-    <VirtualActivityChunk
-      key={chunk.key}
-      chunk={chunk}
-      initiallyMounted={index === 0 || index >= chunks.length - 2}
-      keepMounted={isActive && index === chunks.length - 1}
-      measuredHeights={measuredHeights.current}
-      isActive={isActive}
-      {...entryProps}
-    />
-  ));
+  return chunks.map((chunk, index) => {
+    const keepMounted = shouldKeepActivityVirtualChunkMounted(
+      index,
+      chunks.length,
+    );
+    return (
+      <VirtualActivityChunk
+        key={chunk.key}
+        chunk={chunk}
+        initiallyMounted={index === 0 || keepMounted}
+        keepMounted={keepMounted}
+        measuredHeights={measuredHeights.current}
+        isActive={isActive}
+        {...entryProps}
+      />
+    );
+  });
 }
 
 function VirtualActivityChunk({

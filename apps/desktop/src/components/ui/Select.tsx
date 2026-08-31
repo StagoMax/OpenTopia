@@ -81,6 +81,9 @@ export function Select<T extends string>({
   const selectedOptionIndex = options.findIndex(
     (option) => option.value === value,
   );
+  const opensAboveModal = Boolean(
+    triggerRef.current?.closest('[aria-modal="true"]'),
+  );
   const { "aria-labelledby": labelledBy, ...buttonProps } = props;
 
   const close = useCallback((restoreFocus: boolean) => {
@@ -286,7 +289,12 @@ export function Select<T extends string>({
             <div
               aria-label={labelledBy ? undefined : label}
               aria-labelledby={labelledBy}
-              className="ot-select__menu"
+              className={[
+                "ot-select__menu",
+                opensAboveModal ? "ot-select__menu--modal" : "",
+              ]
+                .filter(Boolean)
+                .join(" ")}
               id={menuId}
               ref={menuRef}
               role="menu"

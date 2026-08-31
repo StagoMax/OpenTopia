@@ -242,6 +242,7 @@
   --z-sticky: 10;
   --z-popover: 20;
   --z-modal: 30;
+  --z-modal-popover: 31;
   --z-toast: 40;
 }
 

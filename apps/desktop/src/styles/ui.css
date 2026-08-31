@@ -405,6 +405,10 @@
   padding: var(--space-1);
 }
 
+.ot-select__menu--modal {
+  z-index: var(--z-modal-popover);
+}
+
 .ot-select__option {
   display: flex;
   width: 100%;

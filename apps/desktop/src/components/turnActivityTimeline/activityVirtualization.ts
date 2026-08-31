@@ -2,6 +2,10 @@ import type { ActivityEntry } from "./model.ts";
 
 export const activityVirtualizationThreshold = 24;
 export const activityVirtualChunkSize = 8;
+// Bottom-follow can move the viewport before IntersectionObserver publishes its
+// next intersection set. Keep one bounded viewport-sized tail rendered so a
+// programmatic jump never lands on height-only placeholders.
+export const activityVirtualPinnedTailChunkCount = 3;
 
 export type ActivityVirtualChunk = {
   key: string;
@@ -26,6 +30,13 @@ export function buildActivityVirtualChunks(
     });
   }
   return chunks;
+}
+
+export function shouldKeepActivityVirtualChunkMounted(
+  index: number,
+  chunkCount: number,
+): boolean {
+  return index >= Math.max(0, chunkCount - activityVirtualPinnedTailChunkCount);
 }
 
 function activityVirtualEntryKey(entry: ActivityEntry): string {

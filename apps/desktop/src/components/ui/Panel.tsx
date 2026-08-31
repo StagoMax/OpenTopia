@@ -19,7 +19,12 @@ export function Panel({
     <section className={classes} {...props}>
       {title ? (
         <header className="ot-panel__header">
-          <h2 className="ot-panel__title">{title}</h2>
+          <h2
+            className="ot-panel__title"
+            title={typeof title === "string" ? title : undefined}
+          >
+            {title}
+          </h2>
           {actions}
         </header>
       ) : null}

@@ -402,12 +402,10 @@ export function Sidebar({
           <button disabled title="拉取请求 · 未实现">
             <GitPullRequest size={15} />
             <span>拉取请求</span>
-            <small>未实现</small>
           </button>
           <button disabled title="已安排 · 未实现">
             <Clock3 size={15} />
             <span>已安排</span>
-            <small>未实现</small>
           </button>
           <button
             aria-current={pluginsOpen ? "page" : undefined}
@@ -416,7 +414,6 @@ export function Sidebar({
           >
             <Plug size={15} />
             <span>插件</span>
-            <small>插件</small>
           </button>
         </nav>
 

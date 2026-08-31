@@ -18,6 +18,7 @@ import {
   FlowInspectorPortal,
   useFlowWorkspaceTitle,
 } from "../enterprise/flowAgentSelection";
+import { useEnterpriseStore } from "../enterprise/store";
 import {
   useEnterpriseSubpageHeader,
   type EnterprisePageHeaderChange,
@@ -43,6 +44,7 @@ export function ConnectionsWorkspacePanel({
   onPageHeaderChange?: EnterprisePageHeaderChange;
 }) {
   const { snapshot, store } = useConnectionsStore(client);
+  const { snapshot: enterpriseSnapshot } = useEnterpriseStore(client);
   const selected = snapshot.connections.find(
     (connection) => connection.id === snapshot.selectedConnectionId,
   );
@@ -50,6 +52,9 @@ export function ConnectionsWorkspacePanel({
     snapshot.editorMode === "edit"
       ? `Edit ${selected?.name ?? "Connection"}`
       : "New Connection / 新建 Connection";
+  const selectedUsage = selected
+    ? connectionUsage(enterpriseSnapshot, selected.id)
+    : undefined;
   useFlowWorkspaceTitle(snapshot.editorMode ? editorTitle : selected?.name);
   useEnterpriseSubpageHeader(onPageHeaderChange, Boolean(snapshot.editorMode), {
     title:
@@ -154,6 +159,7 @@ export function ConnectionsWorkspacePanel({
             definition={definitionForConnection(snapshot.definitions, selected)}
             snapshot={snapshot}
             store={store}
+            usage={selectedUsage}
             variant="core"
           />
         ) : (
@@ -214,6 +220,7 @@ export function ConnectionsWorkspacePanel({
               )}
               snapshot={snapshot}
               store={store}
+              usage={selectedUsage}
               variant="inspector"
             />
           </FlowInspectorPanel>
@@ -242,4 +249,32 @@ export function ConnectionsWorkspacePanel({
       </FlowInspectorPortal>
     </div>
   );
+}
+
+function connectionUsage(
+  snapshot: ReturnType<typeof useEnterpriseStore>["snapshot"],
+  connectionId: string,
+) {
+  const agentNames = Array.from(
+    new Set(
+      snapshot.templates
+        .filter((view) =>
+          view.template.spec.connectionBindings?.some(
+            (binding) => binding.connectionId === connectionId,
+          ),
+        )
+        .map((view) => view.template.name),
+    ),
+  );
+  const flowNames = snapshot.flows
+    .filter((flow) =>
+      Object.values(flow.activeRevision.compiledWorkflow.agentSpecs).some(
+        (agent) =>
+          agent.connectionBindings.some(
+            (binding) => binding.connectionId === connectionId,
+          ),
+      ),
+    )
+    .map((flow) => flow.name);
+  return { agentNames, flowNames };
 }
