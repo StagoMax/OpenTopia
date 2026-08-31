@@ -15,192 +15,31 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use uuid::Uuid;
 
 pub(crate) fn context_summary_system_prompt() -> &'static str {
-    "You compress the complete current context of an AI coding-agent session into one durable structured checkpoint. Return only JSON matching the supplied schema. The response is a complete self-contained replacement checkpoint: if the context contains an earlier checkpoint, retain every still-relevant fact and phase from it, then incorporate the later history. Maintain an evidence-backed phase history: each phase records when it happened by event sequence range, the objective, problem encountered, root cause, resolution, outcome, remaining risks, and measurable results. Do not create a phase merely because compaction occurred. Preserve exact file paths, commands, errors, identifiers, active user constraints, unresolved risks, pending interactions, artifact references, and verification metrics. Source sequence numbers must refer only to supplied event seq values. Mark resolved or superseded facts explicitly instead of silently deleting them. Omit greetings, repetition, transient progress narration, large raw tool output, and secrets. Never claim unfinished work or failed validation is completed."
+    "Compress the complete current context of an AI coding-agent session into a concise, self-contained semantic summary. Return ordinary plain text or Markdown, never JSON. Focus on the current goal, active user constraints, decisions and their rationale, root causes, completed outcomes, unresolved issues, remaining risks, and next actions. The local application separately projects commands, file changes, work-form state, event coverage, and other deterministic facts from its durable event log, so do not reproduce exhaustive machine metadata. If the context contains an earlier checkpoint, retain every still-relevant semantic fact and incorporate the later history. Omit greetings, repetition, transient progress narration, large raw tool output, and secrets. Never claim unfinished work or failed validation is completed."
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ContextCheckpointDraft {
-    goal: String,
+    pub(super) goal: String,
     #[serde(default)]
-    phases: Vec<ContextCheckpointPhase>,
+    pub(super) phases: Vec<ContextCheckpointPhase>,
     #[serde(default)]
-    user_constraints: Vec<ContextCheckpointFact>,
+    pub(super) user_constraints: Vec<ContextCheckpointFact>,
     #[serde(default)]
-    decisions: Vec<ContextCheckpointFact>,
+    pub(super) decisions: Vec<ContextCheckpointFact>,
     #[serde(default)]
-    workspace_state: ContextCheckpointWorkspace,
+    pub(super) workspace_state: ContextCheckpointWorkspace,
     #[serde(default)]
-    commands_and_validation: Vec<ContextCheckpointCommand>,
+    pub(super) commands_and_validation: Vec<ContextCheckpointCommand>,
     #[serde(default)]
-    open_issues: Vec<ContextCheckpointFact>,
+    pub(super) open_issues: Vec<ContextCheckpointFact>,
     #[serde(default)]
-    next_steps: Vec<ContextCheckpointStep>,
+    pub(super) next_steps: Vec<ContextCheckpointStep>,
     #[serde(default)]
-    pending_interactions: Vec<ContextCheckpointInteraction>,
+    pub(super) pending_interactions: Vec<ContextCheckpointInteraction>,
     #[serde(default)]
-    artifacts: Vec<ContextCheckpointArtifact>,
-}
-
-pub(crate) fn context_checkpoint_schema() -> Value {
-    let source_seqs = json!({
-        "type": "array",
-        "items": { "type": "integer", "minimum": 1 },
-        "maxItems": 32
-    });
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-            "goal", "phases", "userConstraints", "decisions", "workspaceState",
-            "commandsAndValidation", "openIssues", "nextSteps",
-            "pendingInteractions", "artifacts"
-        ],
-        "properties": {
-            "goal": { "type": "string", "maxLength": 12000 },
-            "phases": { "type": "array", "maxItems": 96, "items": { "$ref": "#/$defs/phase" } },
-            "userConstraints": { "type": "array", "maxItems": 96, "items": { "$ref": "#/$defs/fact" } },
-            "decisions": { "type": "array", "maxItems": 96, "items": { "$ref": "#/$defs/fact" } },
-            "workspaceState": { "$ref": "#/$defs/workspace" },
-            "commandsAndValidation": { "type": "array", "maxItems": 96, "items": { "$ref": "#/$defs/command" } },
-            "openIssues": { "type": "array", "maxItems": 96, "items": { "$ref": "#/$defs/fact" } },
-            "nextSteps": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/step" } },
-            "pendingInteractions": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/interaction" } },
-            "artifacts": { "type": "array", "maxItems": 96, "items": { "$ref": "#/$defs/artifact" } }
-        },
-        "$defs": {
-            "metric": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["name", "value", "unit", "sourceSeqs"],
-                "properties": {
-                    "name": { "type": "string", "maxLength": 160 },
-                    "value": { "type": "string", "maxLength": 1000 },
-                    "unit": { "type": ["string", "null"], "maxLength": 160 },
-                    "sourceSeqs": source_seqs.clone()
-                }
-            },
-            "phase": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": [
-                    "id", "title", "status", "fromSeq", "throughSeq", "startedAt",
-                    "endedAt", "objective", "problem", "rootCause", "resolution",
-                    "outcome", "metrics", "remainingRisks", "sourceSeqs"
-                ],
-                "properties": {
-                    "id": { "type": "string", "maxLength": 160 },
-                    "title": { "type": "string", "maxLength": 500 },
-                    "status": { "type": "string", "maxLength": 160 },
-                    "fromSeq": { "type": "integer", "minimum": 0 },
-                    "throughSeq": { "type": "integer", "minimum": 0 },
-                    "startedAt": { "type": ["string", "null"], "format": "date-time" },
-                    "endedAt": { "type": ["string", "null"], "format": "date-time" },
-                    "objective": { "type": "string", "maxLength": 4000 },
-                    "problem": { "type": ["string", "null"], "maxLength": 4000 },
-                    "rootCause": { "type": ["string", "null"], "maxLength": 4000 },
-                    "resolution": { "type": ["string", "null"], "maxLength": 4000 },
-                    "outcome": { "type": ["string", "null"], "maxLength": 4000 },
-                    "metrics": { "type": "array", "maxItems": 32, "items": { "$ref": "#/$defs/metric" } },
-                    "remainingRisks": { "type": "array", "maxItems": 32, "items": { "type": "string", "maxLength": 2000 } },
-                    "sourceSeqs": source_seqs.clone()
-                }
-            },
-            "fact": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["id", "text", "status", "sourceSeqs", "confidence"],
-                "properties": {
-                    "id": { "type": "string", "maxLength": 160 },
-                    "text": { "type": "string", "maxLength": 4000 },
-                    "status": { "type": "string", "enum": ["active", "resolved", "superseded"] },
-                    "sourceSeqs": source_seqs.clone(),
-                    "confidence": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 }
-                }
-            },
-            "file": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["path", "status", "summary", "sourceSeqs"],
-                "properties": {
-                    "path": { "type": "string", "maxLength": 2000 },
-                    "status": { "type": "string", "maxLength": 160 },
-                    "summary": { "type": "string", "maxLength": 4000 },
-                    "sourceSeqs": source_seqs.clone()
-                }
-            },
-            "workspace": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["branch", "gitStatus", "filesChanged"],
-                "properties": {
-                    "branch": { "type": ["string", "null"], "maxLength": 500 },
-                    "gitStatus": { "type": ["string", "null"], "maxLength": 4000 },
-                    "filesChanged": { "type": "array", "maxItems": 160, "items": { "$ref": "#/$defs/file" } }
-                }
-            },
-            "command": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["command", "outcome", "summary", "sourceSeqs"],
-                "properties": {
-                    "command": { "type": "string", "maxLength": 4000 },
-                    "outcome": { "type": "string", "maxLength": 160 },
-                    "summary": { "type": "string", "maxLength": 4000 },
-                    "sourceSeqs": source_seqs.clone()
-                }
-            },
-            "step": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["id", "text", "status", "sourceSeqs"],
-                "properties": {
-                    "id": { "type": "string", "maxLength": 160 },
-                    "text": { "type": "string", "maxLength": 4000 },
-                    "status": { "type": "string", "maxLength": 160 },
-                    "sourceSeqs": source_seqs.clone()
-                }
-            },
-            "interaction": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["kind", "summary", "sourceSeqs"],
-                "properties": {
-                    "kind": { "type": "string", "maxLength": 160 },
-                    "summary": { "type": "string", "maxLength": 4000 },
-                    "sourceSeqs": source_seqs.clone()
-                }
-            },
-            "artifact": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["id", "path", "kind", "summary", "sourceSeqs"],
-                "properties": {
-                    "id": { "type": ["string", "null"], "format": "uuid" },
-                    "path": { "type": ["string", "null"], "maxLength": 2000 },
-                    "kind": { "type": "string", "maxLength": 160 },
-                    "summary": { "type": "string", "maxLength": 4000 },
-                    "sourceSeqs": source_seqs
-                }
-            }
-        }
-    })
-}
-
-pub(crate) fn parse_checkpoint_response(text: &str) -> Result<Value, ApiError> {
-    let mut candidate = text.trim();
-    if candidate.starts_with("```") {
-        candidate = candidate
-            .split_once('\n')
-            .map(|(_, rest)| rest)
-            .unwrap_or_default();
-        candidate = candidate
-            .strip_suffix("```")
-            .map(str::trim)
-            .unwrap_or(candidate);
-    }
-    serde_json::from_str(candidate)
-        .map_err(|error| ApiError::bad_gateway(format!("checkpoint response is not JSON: {error}")))
+    pub(super) artifacts: Vec<ContextCheckpointArtifact>,
 }
 
 pub(crate) fn sanitize_checkpoint_draft(
@@ -863,12 +702,44 @@ pub(crate) fn render_context_checkpoint(checkpoint: &ContextCheckpoint) -> Strin
         .unwrap_or_else(|_| format!("{{\"goal\":{}}}", json!(checkpoint.goal)))
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DurableContextPayload<'a> {
+    semantic_summary: &'a str,
+    local_checkpoint: &'a ContextCheckpoint,
+}
+
+/// The provider contributes only the semantic prose. The application owns the
+/// outer JSON envelope and the structured projection, so arbitrary model text
+/// can never make the durable checkpoint syntactically invalid.
+pub(crate) fn render_durable_context(
+    checkpoint: &ContextCheckpoint,
+    semantic_summary: &str,
+) -> Result<String, ApiError> {
+    serde_json::to_string_pretty(&DurableContextPayload {
+        semantic_summary,
+        local_checkpoint: checkpoint,
+    })
+    .map_err(|error| ApiError::internal(format!("durable context serialization failed: {error}")))
+}
+
+pub(crate) fn semantic_summary_from_rendered_context(rendered: &str) -> Option<String> {
+    serde_json::from_str::<Value>(rendered)
+        .ok()?
+        .get("semanticSummary")?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         checkpoint_retention_percentages, checkpoint_token_budget, checkpoint_token_estimate,
-        merge_context_checkpoint, parse_checkpoint_response, sanitize_checkpoint_draft,
-        trim_checkpoint_to_budget, validate_checkpoint_draft, ContextCheckpointDraft,
+        merge_context_checkpoint, render_durable_context, sanitize_checkpoint_draft,
+        semantic_summary_from_rendered_context, trim_checkpoint_to_budget,
+        validate_checkpoint_draft, ContextCheckpointDraft,
     };
     use opentopia_core::{
         AgentEvent, AgentEventPayload, ContextCheckpoint, ContextCheckpointArtifact,
@@ -880,8 +751,8 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn checkpoint_response_is_parsed_sanitized_and_bounded() {
-        let payload = json!({
+    fn checkpoint_draft_is_sanitized_and_bounded() {
+        let mut draft: ContextCheckpointDraft = serde_json::from_value(json!({
             "goal": "  preserve the current implementation  ",
             "userConstraints": [{
                 "id": "constraint-1",
@@ -897,11 +768,8 @@ mod tests {
             "nextSteps": [],
             "pendingInteractions": [],
             "artifacts": []
-        });
-        let fenced = format!("```json\n{}\n```", payload);
-        let value = parse_checkpoint_response(&fenced).expect("parse fenced JSON");
-        let mut draft: ContextCheckpointDraft =
-            serde_json::from_value(value).expect("deserialize draft");
+        }))
+        .expect("deserialize draft");
         sanitize_checkpoint_draft(&mut draft, 10, &[]).expect("sanitize draft");
 
         assert_eq!(draft.goal, "preserve the current implementation");
@@ -909,6 +777,25 @@ mod tests {
         assert_eq!(draft.user_constraints[0].confidence, Some(100));
         assert_eq!(checkpoint_token_budget(128_000), 12_800);
         assert_eq!(checkpoint_token_budget(4_096), 1_024);
+    }
+
+    #[test]
+    fn application_serializes_arbitrary_semantic_text_into_durable_json() {
+        let checkpoint = ContextCheckpoint::manual(
+            Uuid::new_v4(),
+            ContextCheckpointCoverage::default(),
+            "keep working",
+        );
+        let semantic_summary = "普通文本，包含 ```json 和 { 不完整标记也没关系";
+
+        let rendered =
+            render_durable_context(&checkpoint, semantic_summary).expect("render durable context");
+
+        serde_json::from_str::<serde_json::Value>(&rendered).expect("application-owned JSON");
+        assert_eq!(
+            semantic_summary_from_rendered_context(&rendered).as_deref(),
+            Some(semantic_summary)
+        );
     }
 
     #[test]

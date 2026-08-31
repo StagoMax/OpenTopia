@@ -2,10 +2,10 @@ use super::progress_deadline::{
     await_with_progress_deadlines, record_progress, ProgressDeadlineExceeded,
 };
 use super::{
-    checkpoint_retention_percentages, checkpoint_token_budget, context_checkpoint_schema,
-    context_summary_system_prompt, merge_context_checkpoint, parse_checkpoint_response,
-    render_context_checkpoint, sanitize_checkpoint_draft, trim_checkpoint_to_budget,
-    validate_checkpoint_draft, ContextCheckpointDraft, ContextStatusResponse, ContextUsageMetrics,
+    checkpoint_token_budget, context_summary_system_prompt, local_projection_retention_percentages,
+    merge_context_checkpoint, project_checkpoint_draft, render_durable_context,
+    sanitize_checkpoint_draft, semantic_summary_from_rendered_context, trim_checkpoint_to_budget,
+    validate_checkpoint_draft, ContextStatusResponse, ContextUsageMetrics,
 };
 use super::{
     estimate_tokens, historical_tool_artifact_reference, project_model_conversation,
@@ -20,9 +20,9 @@ use crate::{
     ProviderTransportKind, SessionStore, CONTEXT_CHECKPOINT_SCHEMA_VERSION,
 };
 use opentopia_core::{
-    AgentEventSender, ContextAssembler, ContextAssemblyInput, ContextCacheScope, ContextItemKind,
-    ContextRole, ContextSensitivity, DefaultContextAssembler, ModelContextItem,
-    ModelGatewayMetricEvent, ModelRequest,
+    content_fingerprint, AgentEventSender, ContextAssembler, ContextAssemblyInput,
+    ContextCacheScope, ContextItemKind, ContextRole, ContextSensitivity, DefaultContextAssembler,
+    ModelContextItem, ModelGatewayMetricEvent, ModelRequest,
 };
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -454,7 +454,7 @@ fn assemble_current_context_compaction_request(
         .unwrap_or_default();
     let time_index = compact_event_time_index(events, previous_seq);
     let user_message = format!(
-        "{}\n\n<opentopia_context_compaction_control>\nThe complete current model context above is the only semantic source to compress. Produce one replacement checkpoint for it. The following sampled durable time index is metadata for phase ordering and timestamps, not a second history to catch up.\n{}\n</opentopia_context_compaction_control>",
+        "{}\n\n<opentopia_context_compaction_control>\nThe complete current model context above is the only semantic source to compress. Produce one replacement plain-text semantic summary for it. The following sampled durable time index is metadata for chronology, not a second history to catch up and not data that you need to serialize.\n{}\n</opentopia_context_compaction_control>",
         current.input.current_user.message,
         time_index,
     );
@@ -481,7 +481,9 @@ fn assemble_current_context_compaction_request(
         previous_response_id: None,
         branch_developer_instructions: None,
         prompt_cache_breakpoint_policy: current.prompt_cache_breakpoint_policy,
-        final_output_json_schema: Some(context_checkpoint_schema()),
+        // The provider writes only semantic prose. The application projects
+        // typed event facts and serializes the durable JSON envelope locally.
+        final_output_json_schema: None,
     })
 }
 
@@ -813,10 +815,52 @@ pub(crate) async fn generate_context_summary(
             | ProviderTransportEvent::ResponseCommitStarted { .. } => {}
         }
     }
-    let response = response_result
-        .map_err(context_summarization_timeout_error)?
-        .map_err(|err| ApiError::bad_gateway(format!("context summarization failed: {err}")))?;
-    let usage = response.usage.as_ref().or(streamed_usage.as_ref()).cloned();
+    let (response, mut semantic_summary_status, degradation_reason) = match response_result {
+        Ok(Ok(response)) if !response.text.trim().is_empty() => (Some(response), "generated", None),
+        Ok(Ok(_)) => (
+            None,
+            "empty_response",
+            Some("context summarization provider returned empty text".to_string()),
+        ),
+        Ok(Err(error)) => (
+            None,
+            "provider_error",
+            Some(format!("context summarization failed: {error}")),
+        ),
+        Err(timeout) => {
+            let error = context_summarization_timeout_error(timeout);
+            (None, "timeout", Some(error.message))
+        }
+    };
+    if let Some(reason) = degradation_reason.as_deref() {
+        tracing::warn!(
+            %thread_id,
+            ?turn_id,
+            %request_id,
+            provider_id = %active.id,
+            model = %active.model,
+            source,
+            reason,
+            "context semantic summary degraded; continuing with the local event projection"
+        );
+        emit_context_compaction_payload(
+            state,
+            thread_id,
+            turn_id,
+            event_sender,
+            AgentEventPayload::ContextWarning {
+                stage: "context_semantic_summary_degraded".to_string(),
+                message: format!(
+                    "Semantic summary unavailable ({reason}); generated the checkpoint from the durable local event projection."
+                ),
+            },
+        );
+    }
+    let usage = response
+        .as_ref()
+        .and_then(|response| response.usage.as_ref())
+        .or(streamed_usage.as_ref())
+        .cloned();
     if let Some(usage) = usage.as_ref() {
         emit_context_compaction_payload(
             state,
@@ -838,16 +882,44 @@ pub(crate) async fn generate_context_summary(
             },
         );
     }
-    if response.text.trim().is_empty() {
-        return Err(ApiError::bad_gateway(
-            "context summarization provider returned empty text",
-        ));
+    let provider_semantic_summary = response.as_ref().map(|response| {
+        let redacted = redact_model_observation(&Value::String(response.text.trim().to_string()));
+        redacted.as_str().unwrap_or_default().trim().to_string()
+    });
+    if let Some(summary) = provider_semantic_summary.as_deref() {
+        tracing::info!(
+            %thread_id,
+            ?turn_id,
+            %request_id,
+            provider_id = %active.id,
+            model = %active.model,
+            source,
+            response_chars = summary.chars().count(),
+            response_bytes = summary.len(),
+            response_fingerprint = %content_fingerprint(summary.as_bytes()),
+            "context semantic summary retained in the durable checkpoint"
+        );
     }
-
-    let checkpoint_value = parse_checkpoint_response(&response.text)?;
-    let checkpoint_value = redact_model_observation(&checkpoint_value);
-    let mut draft: ContextCheckpointDraft = serde_json::from_value(checkpoint_value)
-        .map_err(|error| ApiError::bad_gateway(format!("invalid checkpoint payload: {error}")))?;
+    let previous_checkpoint = previous_summary
+        .as_ref()
+        .and_then(|summary| summary.checkpoint.as_ref());
+    let fallback_semantic_summary = previous_summary
+        .as_ref()
+        .and_then(|summary| semantic_summary_from_rendered_context(&summary.summary))
+        .or_else(|| previous_checkpoint.map(|checkpoint| checkpoint.goal.clone()));
+    let semantic_summary_source = if provider_semantic_summary.is_some() {
+        "provider"
+    } else if fallback_semantic_summary.is_some() {
+        "previous_checkpoint"
+    } else {
+        "none"
+    };
+    let semantic_summary = provider_semantic_summary
+        .filter(|summary| !summary.is_empty())
+        .or(fallback_semantic_summary)
+        .unwrap_or_default();
+    let mut draft =
+        project_checkpoint_draft(messages, events, &semantic_summary, previous_checkpoint);
     sanitize_checkpoint_draft(&mut draft, covered_through_seq, events)?;
     validate_checkpoint_draft(&draft, events)?;
     let provider_compatibility_hash = state
@@ -859,13 +931,6 @@ pub(crate) async fn generate_context_summary(
             provider_state.provider_id == active.id && provider_state.model == active.model
         })
         .map(|provider_state| provider_state.compatibility_hash);
-    let previous_checkpoint = previous_summary
-        .as_ref()
-        .and_then(|summary| summary.checkpoint.as_ref());
-    // The exact current request already contains the previous checkpoint and
-    // every later history item. The model therefore returns one complete
-    // replacement checkpoint; merging the old object again here would create
-    // a second, hidden old-history path and could resurrect superseded state.
     let mut checkpoint = merge_context_checkpoint(
         None,
         draft,
@@ -881,7 +946,9 @@ pub(crate) async fn generate_context_summary(
     );
     checkpoint.previous_checkpoint_id = previous_checkpoint.map(|checkpoint| checkpoint.id);
     let checkpoint_budget = checkpoint_token_budget(active.resolved_context_window_tokens());
-    trim_checkpoint_to_budget(&mut checkpoint, checkpoint_budget);
+    // Reserve room for the application-owned envelope before adding semantic
+    // prose. Deterministic fields retain priority when the two compete.
+    trim_checkpoint_to_budget(&mut checkpoint, checkpoint_budget.saturating_sub(128));
     let checkpoint_tokens =
         estimate_tokens(&serde_json::to_string(&checkpoint).map_err(|error| {
             ApiError::internal(format!("checkpoint serialization failed: {error}"))
@@ -891,13 +958,33 @@ pub(crate) async fn generate_context_summary(
             "checkpoint exceeds its token budget ({checkpoint_tokens} > {checkpoint_budget})"
         )));
     }
-    let rendered_summary = render_context_checkpoint(&checkpoint);
+    let empty_rendered = render_durable_context(&checkpoint, "")?;
+    let semantic_budget = checkpoint_budget
+        .saturating_sub(estimate_tokens(&empty_rendered))
+        .min(checkpoint_budget / 4);
+    let semantic_summary_was_available = !semantic_summary.is_empty();
+    let mut semantic_summary = truncate_text_to_token_budget(&semantic_summary, semantic_budget);
+    if semantic_summary_was_available && semantic_summary.is_empty() {
+        semantic_summary_status = "dropped_for_budget";
+    }
+    let mut rendered_summary = render_durable_context(&checkpoint, &semantic_summary)?;
+    if estimate_tokens(&rendered_summary) > checkpoint_budget {
+        semantic_summary.clear();
+        semantic_summary_status = "dropped_for_budget";
+        rendered_summary = render_durable_context(&checkpoint, "")?;
+    }
+    if estimate_tokens(&rendered_summary) > checkpoint_budget {
+        return Err(ApiError::bad_gateway(format!(
+            "locally projected checkpoint exceeds its token budget ({} > {checkpoint_budget})",
+            estimate_tokens(&rendered_summary)
+        )));
+    }
     // This is the representation that the next logical request actually
     // materializes. Keep the raw checkpoint JSON size as a budget metric, but
     // use the rendered checkpoint for before/after request reduction.
     let rendered_checkpoint_tokens = estimate_tokens(&rendered_summary);
     let (fact_retention_percent, active_constraint_retention_percent) =
-        checkpoint_retention_percentages(previous_checkpoint, &checkpoint);
+        local_projection_retention_percentages(previous_checkpoint, &checkpoint);
     let latency_ms = compaction_started
         .elapsed()
         .as_millis()
@@ -955,9 +1042,38 @@ pub(crate) async fn generate_context_summary(
         "coveredThroughSeq": covered_through_seq,
         "coveredMessageCount": covered_message_count,
         "previousSummaryId": previous_summary.as_ref().map(|summary| summary.id),
+        "semanticSummaryStatus": semantic_summary_status,
+        "semanticSummarySource": semantic_summary_source,
+        "semanticSummaryChars": semantic_summary.chars().count(),
+        "semanticSummaryFingerprint": (!semantic_summary.is_empty()).then(|| content_fingerprint(semantic_summary.as_bytes())),
+        "semanticSummaryDegradationReason": degradation_reason,
     });
     summary.checkpoint = Some(checkpoint);
     Ok(summary)
+}
+
+fn truncate_text_to_token_budget(value: &str, token_budget: usize) -> String {
+    let value = value.trim();
+    if value.is_empty() || token_budget == 0 {
+        return String::new();
+    }
+    if estimate_tokens(value) <= token_budget {
+        return value.to_string();
+    }
+
+    let chars = value.chars().collect::<Vec<_>>();
+    let mut low = 0;
+    let mut high = chars.len();
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        let candidate = chars[..middle].iter().collect::<String>();
+        if estimate_tokens(&candidate) <= token_budget {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    chars[..low].iter().collect::<String>().trim().to_string()
 }
 
 pub(crate) fn context_compaction_details(
@@ -1110,7 +1226,7 @@ pub(crate) fn truncate_with_flag(value: &str, max_bytes: usize) -> (String, bool
 mod tests {
     use super::{
         assemble_current_context_compaction_request, historical_context_model_request,
-        send_context_compaction_payload,
+        send_context_compaction_payload, truncate_text_to_token_budget,
     };
     use crate::{
         AgentEventPayload, ContextCheckpoint, ContextCheckpointCoverage, ContextSummary, Message,
@@ -1149,13 +1265,16 @@ mod tests {
             assemble_current_context_compaction_request(&current, &[], Some(&previous))
                 .expect("compaction request");
         assert!(compaction.logical().previous_response_id.is_none());
+        assert!(compaction.logical().final_output_json_schema.is_none());
         assert_eq!(compaction.logical().input.conversation.len(), 1);
-        assert!(compaction
+        let compaction_instruction = compaction
             .logical()
             .instructions
             .items
             .iter()
-            .any(|item| item.source == "opentopia:context_compaction"));
+            .find(|item| item.source == "opentopia:context_compaction")
+            .expect("semantic compaction instruction");
+        assert!(compaction_instruction.text_content().contains("never JSON"));
     }
 
     #[test]
@@ -1175,5 +1294,16 @@ mod tests {
                 if stage == "round_context_compaction" && message == "checkpoint started"
         ));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn semantic_text_is_bounded_without_requiring_a_parseable_format() {
+        let input = "普通 Markdown ```json { 任意文本 } ".repeat(1_000);
+
+        let bounded = truncate_text_to_token_budget(&input, 128);
+
+        assert!(!bounded.is_empty());
+        assert!(super::estimate_tokens(&bounded) <= 128);
+        assert!(bounded.contains("```json"));
     }
 }

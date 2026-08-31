@@ -1,6 +1,7 @@
 //! HTTP context and compaction domain.
 
 mod checkpoint;
+mod checkpoint_projection;
 mod compaction;
 mod conversation;
 mod http;
@@ -12,10 +13,13 @@ use crate::AppState;
 use axum::Router;
 
 pub(super) use checkpoint::{
-    checkpoint_retention_percentages, checkpoint_token_budget, checkpoint_token_estimate,
-    context_checkpoint_schema, context_summary_system_prompt, merge_context_checkpoint,
-    parse_checkpoint_response, render_context_checkpoint, sanitize_checkpoint_draft,
-    trim_checkpoint_to_budget, validate_checkpoint_draft, ContextCheckpointDraft,
+    checkpoint_token_budget, checkpoint_token_estimate, context_summary_system_prompt,
+    merge_context_checkpoint, render_context_checkpoint, render_durable_context,
+    sanitize_checkpoint_draft, semantic_summary_from_rendered_context, trim_checkpoint_to_budget,
+    validate_checkpoint_draft, ContextCheckpointDraft,
+};
+pub(super) use checkpoint_projection::{
+    local_projection_retention_percentages, project_checkpoint_draft,
 };
 pub(super) use compaction::{
     build_context_projection, context_compaction_details, context_status, context_window_tokens,
