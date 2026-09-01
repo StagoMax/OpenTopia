@@ -43,6 +43,7 @@ export type SpreadsheetRangeResponse = {
     Array<{
       value: { type: string; value?: unknown };
       formula?: string | null;
+      formatted?: string | null;
     }>
   >;
 };

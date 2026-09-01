@@ -3094,7 +3094,7 @@ export interface PreviewSheet {
 export interface PreviewRange {
   previewId: string;
   range: CellRange;
-  rows: SpreadsheetCell[][];
+  rows: PreviewCell[][];
   sheet: string;
   [k: string]: unknown;
 }
@@ -3112,7 +3112,8 @@ export interface CellAddress {
   column: number;
   row: number;
 }
-export interface SpreadsheetCell {
+export interface PreviewCell {
+  formatted?: string | null;
   formula?: string | null;
   value: SpreadsheetCellValue;
   [k: string]: unknown;

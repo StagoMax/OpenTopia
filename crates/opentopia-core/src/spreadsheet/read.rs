@@ -1,3 +1,4 @@
+use super::display::{date_time_display_kinds, formatted_cell_value};
 use super::{
     add_used_positions, cell_value_from_data, collect_sheet_stats, ensure_return_size,
     ensure_sheet_count, ensure_workbook_cell_count, open_workbook_reader, sheet_info,
@@ -12,7 +13,27 @@ use super::{
     MAX_READ_CELLS, MAX_READ_COLUMNS, MAX_READ_RANGES, MAX_READ_ROWS, MAX_WORKBOOK_CELLS,
 };
 use calamine::{Data, Reader};
+use serde::Serialize;
 use std::collections::HashSet;
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DisplayReadRangeResult {
+    pub path: std::path::PathBuf,
+    pub sheet: String,
+    pub range: CellRange,
+    pub rows: Vec<Vec<DisplaySpreadsheetCell>>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DisplaySpreadsheetCell {
+    pub value: SpreadsheetCellValue,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formula: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formatted: Option<String>,
+}
 
 pub fn list_sheets(request: &ListSheetsRequest) -> Result<ListSheetsResult, SpreadsheetError> {
     let (workbook, file_size_bytes) = open_workbook_reader(&request.path)?;
@@ -77,6 +98,40 @@ pub fn inspect_workbook(
 }
 
 pub fn read_range(request: &ReadRangeRequest) -> Result<ReadRangeResult, SpreadsheetError> {
+    let loaded = load_range(request, false)?;
+    let result = ReadRangeResult {
+        path: loaded.path,
+        sheet: loaded.sheet,
+        range: loaded.range,
+        rows: loaded
+            .rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|cell| SpreadsheetCell {
+                        value: cell.value,
+                        formula: cell.formula,
+                    })
+                    .collect()
+            })
+            .collect(),
+    };
+    ensure_return_size(&result)?;
+    Ok(result)
+}
+
+pub(crate) fn read_range_for_display(
+    request: &ReadRangeRequest,
+) -> Result<DisplayReadRangeResult, SpreadsheetError> {
+    let result = load_range(request, true)?;
+    ensure_return_size(&result)?;
+    Ok(result)
+}
+
+fn load_range(
+    request: &ReadRangeRequest,
+    include_formatted: bool,
+) -> Result<DisplayReadRangeResult, SpreadsheetError> {
     validate_read_range(request.range)?;
     let (mut workbook, _) = open_workbook_reader(&request.path)?;
     let metadata = workbook.sheets_metadata().to_vec();
@@ -99,6 +154,16 @@ pub fn read_range(request: &ReadRangeRequest) -> Result<ReadRangeResult, Spreads
     let formulas = worksheet_formulas(&mut workbook, &request.path, &request.sheet)?;
     let stats = collect_sheet_stats(&values, &formulas, &request.sheet)?;
     ensure_workbook_cell_count(stats.populated_cells)?;
+    let has_serial_dates = include_formatted
+        && (request.range.start.row..=request.range.end.row).any(|row| {
+            (request.range.start.column..=request.range.end.column)
+                .any(|column| matches!(values.get_value((row, column)), Some(Data::DateTime(_))))
+        });
+    let display_kinds = if has_serial_dates {
+        date_time_display_kinds(&request.path, &request.sheet, request.range).unwrap_or_default()
+    } else {
+        Default::default()
+    };
 
     let row_count = request.range.row_count().expect("validated range") as usize;
     let column_count = request.range.column_count().expect("validated range") as usize;
@@ -114,22 +179,25 @@ pub fn read_range(request: &ReadRangeRequest) -> Result<ReadRangeResult, Spreads
             if let Some(formula) = &formula {
                 validate_return_text(formula, &request.sheet, row, column)?;
             }
-            cells.push(SpreadsheetCell {
+            cells.push(DisplaySpreadsheetCell {
                 value: cell_value_from_data(value, &request.sheet, row, column)?,
                 formula,
+                formatted: if include_formatted {
+                    formatted_cell_value(value, display_kinds.get(&(row, column)).copied())
+                } else {
+                    None
+                },
             });
         }
         rows.push(cells);
     }
 
-    let result = ReadRangeResult {
+    Ok(DisplayReadRangeResult {
         path: request.path.clone(),
         sheet: request.sheet.clone(),
         range: request.range,
         rows,
-    };
-    ensure_return_size(&result)?;
-    Ok(result)
+    })
 }
 
 pub fn read_ranges(request: &ReadRangesRequest) -> Result<ReadRangesResult, SpreadsheetError> {

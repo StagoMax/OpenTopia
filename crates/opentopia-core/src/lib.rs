@@ -348,7 +348,7 @@ pub use preview::{
     decode_preview_id, encode_preview_id, preview_spreadsheet_range, preview_workbook,
     read_preview_content, resolve_artifact_preview, resolve_attachment_preview,
     resolve_local_preview, resolve_workspace_preview, write_preview_content, PreviewCapabilities,
-    PreviewContentSource, PreviewDescriptor, PreviewError, PreviewKind, PreviewRange,
+    PreviewCell, PreviewContentSource, PreviewDescriptor, PreviewError, PreviewKind, PreviewRange,
     PreviewRangeRequest, PreviewSheet, PreviewSource, PreviewTarget, PreviewWorkbook,
     ResolvedPreview, MAX_PREVIEW_CONTENT_BYTES,
 };

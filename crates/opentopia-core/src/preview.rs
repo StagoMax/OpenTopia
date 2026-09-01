@@ -1,7 +1,7 @@
 use crate::model::{Artifact, ArtifactStorage, ContextSourceRef};
 use crate::spreadsheet::{
-    inspect_workbook, read_range, CellAddress, CellRange, InspectWorkbookRequest, ReadRangeRequest,
-    SheetKind, SheetVisibility, SpreadsheetCell, SpreadsheetCellValue, SpreadsheetError,
+    inspect_workbook, read_range_for_display, CellAddress, CellRange, InspectWorkbookRequest,
+    ReadRangeRequest, SheetKind, SheetVisibility, SpreadsheetCellValue, SpreadsheetError,
     SpreadsheetFileFormat, EXCEL_MAX_COLUMNS, EXCEL_MAX_ROWS,
     MAX_INPUT_FILE_BYTES as MAX_SPREADSHEET_INPUT_BYTES, MAX_READ_CELLS, MAX_READ_COLUMNS,
     MAX_READ_ROWS,
@@ -136,7 +136,17 @@ pub struct PreviewRange {
     pub preview_id: String,
     pub sheet: String,
     pub range: CellRange,
-    pub rows: Vec<Vec<SpreadsheetCell>>,
+    pub rows: Vec<Vec<PreviewCell>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewCell {
+    pub value: SpreadsheetCellValue,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formula: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formatted: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -602,7 +612,7 @@ pub fn preview_spreadsheet_range(
             column: end_column,
         },
     };
-    let result = read_range(&ReadRangeRequest {
+    let result = read_range_for_display(&ReadRangeRequest {
         path: path.as_path().to_path_buf(),
         sheet: request.sheet.clone(),
         range,
@@ -611,7 +621,19 @@ pub fn preview_spreadsheet_range(
         preview_id: preview.descriptor.id.clone(),
         sheet: result.sheet,
         range: result.range,
-        rows: result.rows,
+        rows: result
+            .rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|cell| PreviewCell {
+                        value: cell.value,
+                        formula: cell.formula,
+                        formatted: cell.formatted,
+                    })
+                    .collect()
+            })
+            .collect(),
     })
 }
 
@@ -698,9 +720,10 @@ fn preview_delimited_range(
                 .get(column as usize)
                 .map(|field| delimited_cell_value(field, row_index, column))
                 .unwrap_or(SpreadsheetCellValue::Empty);
-            cells.push(SpreadsheetCell {
+            cells.push(PreviewCell {
                 value,
                 formula: None,
+                formatted: None,
             });
         }
         rows.push(cells);
@@ -708,9 +731,10 @@ fn preview_delimited_range(
     while rows.len() < request.row_count as usize {
         rows.push(
             (0..request.column_count)
-                .map(|_| SpreadsheetCell {
+                .map(|_| PreviewCell {
                     value: SpreadsheetCellValue::Empty,
                     formula: None,
+                    formatted: None,
                 })
                 .collect(),
         );
@@ -1108,6 +1132,7 @@ mod tests {
         write_workbook, CellUpdate, SheetWriteRequest, SpreadsheetCellInput, WriteWorkbookRequest,
     };
     use chrono::Utc;
+    use rust_xlsxwriter::{Format, Workbook};
     use serde_json::json;
 
     struct TestDirectory(PathBuf);
@@ -1352,6 +1377,57 @@ mod tests {
             range.rows[0][0].value,
             crate::spreadsheet::SpreadsheetCellValue::String("OpenTopia".to_string())
         );
+    }
+
+    #[test]
+    fn spreadsheet_preview_formats_excel_dates_without_losing_raw_values() {
+        let directory = TestDirectory::new();
+        let workbook_path = directory.path().join("dates.xlsx");
+        let mut workbook = Workbook::new();
+        let worksheet = workbook.add_worksheet();
+        worksheet.set_name("Orders").expect("set sheet name");
+        worksheet
+            .write_number_with_format(
+                0,
+                0,
+                46_252.932_719_907_41,
+                &Format::new().set_num_format("yyyy-mm-dd"),
+            )
+            .expect("write date-only cell");
+        worksheet
+            .write_number_with_format(
+                0,
+                1,
+                46_252.932_719_907_41,
+                &Format::new().set_num_format("yyyy-mm-dd hh:mm:ss"),
+            )
+            .expect("write date-time cell");
+        workbook.save(&workbook_path).expect("save workbook");
+
+        let preview = resolve_workspace_preview(directory.path(), Path::new("dates.xlsx"))
+            .expect("resolve workbook preview");
+        let range = preview_spreadsheet_range(
+            &preview,
+            PreviewRangeRequest {
+                sheet: "Orders".to_string(),
+                start_row: 0,
+                start_column: 0,
+                row_count: 1,
+                column_count: 2,
+            },
+        )
+        .expect("read formatted workbook range");
+
+        assert_eq!(range.rows[0][0].formatted.as_deref(), Some("2026-08-18"));
+        assert_eq!(
+            range.rows[0][1].formatted.as_deref(),
+            Some("2026-08-18 22:23:07")
+        );
+        assert!(matches!(
+            range.rows[0][0].value,
+            SpreadsheetCellValue::DateTime(value)
+                if (value.serial - 46_252.932_719_907_41).abs() < f64::EPSILON
+        ));
     }
 
     #[test]

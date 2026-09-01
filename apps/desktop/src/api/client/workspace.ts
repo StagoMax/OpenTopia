@@ -537,6 +537,7 @@ export class WorkspaceApi extends ConversationApi {
         column: response.range.start.column + columnOffset,
         value: spreadsheetCellValue(cell.value),
         formula: cell.formula,
+        formatted: cell.formatted,
       })),
     );
     return {

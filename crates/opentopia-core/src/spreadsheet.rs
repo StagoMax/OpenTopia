@@ -20,13 +20,16 @@ use wait_timeout::ChildExt;
 use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
 
+mod display;
 mod format;
+mod ooxml;
 mod read;
 mod template_patch;
 mod transfer;
 mod workbook_write;
 
 pub use format::SpreadsheetFileFormat;
+pub(crate) use read::read_range_for_display;
 pub use read::{filter_rows, find_cells, inspect_workbook, list_sheets, read_range, read_ranges};
 pub use transfer::*;
 

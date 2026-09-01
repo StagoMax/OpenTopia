@@ -10168,6 +10168,29 @@
       ],
       "type": "object"
     },
+    "PreviewCell": {
+      "properties": {
+        "formatted": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "formula": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value": {
+          "$ref": "#/definitions/SpreadsheetCellValue"
+        }
+      },
+      "required": [
+        "value"
+      ],
+      "type": "object"
+    },
     "PreviewDescriptor": {
       "properties": {
         "bytes": {
@@ -10257,7 +10280,7 @@
         "rows": {
           "items": {
             "items": {
-              "$ref": "#/definitions/SpreadsheetCell"
+              "$ref": "#/definitions/PreviewCell"
             },
             "type": "array"
           },
@@ -12259,23 +12282,6 @@
         "user"
       ],
       "type": "string"
-    },
-    "SpreadsheetCell": {
-      "properties": {
-        "formula": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "value": {
-          "$ref": "#/definitions/SpreadsheetCellValue"
-        }
-      },
-      "required": [
-        "value"
-      ],
-      "type": "object"
     },
     "SpreadsheetCellValue": {
       "oneOf": [
