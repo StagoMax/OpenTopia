@@ -630,6 +630,11 @@ pub struct ProviderToolCandidate {
     pub disclosure: ProviderToolDisclosure,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<ProviderToolNamespace>,
+    /// Internal provenance for a contract loaded by a trusted discovery tool.
+    /// Provider adapters ignore this field; continuations use it to preserve
+    /// the loaded schema only while the underlying static contract is stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loaded_contract: Option<ProviderLoadedToolContract>,
 }
 
 impl ProviderToolCandidate {
@@ -644,9 +649,41 @@ impl ProviderToolCandidate {
             input_schema,
             disclosure: ProviderToolDisclosure::Direct,
             namespace: None,
+            loaded_contract: None,
         }
     }
 }
+
+/// A precise provider-facing contract returned by a discovery tool.
+///
+/// This is control-plane data carried in tool-result metadata. The harness
+/// validates ownership and catalog eligibility before applying it; it never
+/// changes the executable implementation or its authorization policy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderToolContractLoad {
+    pub name: String,
+    pub input_schema: Value,
+}
+
+impl ProviderToolContractLoad {
+    pub fn new(name: impl Into<String>, input_schema: Value) -> Self {
+        Self {
+            name: name.into(),
+            input_schema,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderLoadedToolContract {
+    pub loader_name: String,
+    pub loader_input_schema_fingerprint: String,
+    pub target_base_input_schema_fingerprint: String,
+}
+
+pub const PROVIDER_TOOL_CONTRACT_LOADS_METADATA_KEY: &str = "loadedToolContracts";
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

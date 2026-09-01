@@ -27,6 +27,7 @@ pub(in crate::provider) fn portable_function_tool_candidate(
         }),
         disclosure: candidate.disclosure,
         namespace: candidate.namespace.clone(),
+        loaded_contract: candidate.loaded_contract.clone(),
     }
 }
 

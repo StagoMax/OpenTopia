@@ -191,7 +191,6 @@ impl AgentCore {
         let mut completed_streaming_call_ids = self.commit_streaming_tool_execution(
             streaming_execution,
             budget,
-            tool_candidates,
             provider_tool_results,
             events,
         )?;
@@ -263,13 +262,13 @@ impl AgentCore {
                 if let Ok(response) = retry.as_ref() {
                     retry_streaming_execution.validate_terminal_calls(&response.tool_calls)?;
                 }
-                completed_streaming_call_ids.extend(self.commit_streaming_tool_execution(
+                let retry_completed_call_ids = self.commit_streaming_tool_execution(
                     retry_streaming_execution,
                     budget,
-                    tool_candidates,
                     provider_tool_results,
                     events,
-                )?);
+                )?;
+                completed_streaming_call_ids.extend(retry_completed_call_ids);
                 if cancellation.is_some_and(CancellationToken::is_cancelled) {
                     return Ok(ProviderRoundOutcome::Finished(
                         finalize_inbox_cancelled_turn(

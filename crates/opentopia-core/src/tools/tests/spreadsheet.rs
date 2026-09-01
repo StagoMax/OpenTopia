@@ -34,7 +34,40 @@ async fn spreadsheet_protocol_progressively_describes_and_executes_offline_workb
         .expect("create workbook through protocol");
     assert_eq!(created.metadata["success"], true);
 
-    let resource = json!({ "kind": "workspaceFile", "path": "protocol.xlsx" });
+    let create_contract = SpreadsheetDescribeTool
+        .execute(
+            ToolCall::new("spreadsheet_describe", json!({ "operations": ["write"] })),
+            ToolInvocationContext::local(workspace_root.clone(), policy.clone()),
+        )
+        .await
+        .expect("describe creation without an existing resource");
+    let create_contracts: Vec<crate::provider::ProviderToolContractLoad> = serde_json::from_value(
+        create_contract.metadata[crate::provider::PROVIDER_TOOL_CONTRACT_LOADS_METADATA_KEY]
+            .clone(),
+    )
+    .expect("creation contract load");
+    assert_eq!(
+        crate::provider::tool_input_schema_error(
+            &create_contracts[0].input_schema,
+            &json!({
+                "operation": "write",
+                "arguments": {
+                    "outputPath": "new.xlsx",
+                    "sheets": [{
+                        "name": "Summary",
+                        "cells": [{
+                            "address": { "row": 0, "column": 0 },
+                            "value": { "type": "string", "value": "created" }
+                        }]
+                    }]
+                }
+            }),
+            "arguments"
+        ),
+        None
+    );
+
+    let resource = json!({ "kind": "workspaceFile", "path": "output/protocol.xlsx" });
     let inspected = SpreadsheetInspectTool
         .execute(
             ToolCall::new("spreadsheet_inspect", json!({ "resource": resource })),
@@ -59,6 +92,40 @@ async fn spreadsheet_protocol_progressively_describes_and_executes_offline_workb
         .expect("describe selected protocol operations");
     assert!(described.output.contains("write_rows"));
     assert!(described.output.contains("argumentsSchema"));
+
+    let loaded_contracts: Vec<crate::provider::ProviderToolContractLoad> = serde_json::from_value(
+        described.metadata[crate::provider::PROVIDER_TOOL_CONTRACT_LOADS_METADATA_KEY].clone(),
+    )
+    .expect("describe must return a loadable execute contract");
+    assert_eq!(loaded_contracts.len(), 1);
+    assert_eq!(loaded_contracts[0].name, "spreadsheet_execute");
+    let loaded_execute_schema = &loaded_contracts[0].input_schema;
+    assert!(crate::provider::tool_input_schema_error(
+        loaded_execute_schema,
+        &json!({
+            "resource": resource,
+            "operation": "read_range",
+            "arguments": {}
+        }),
+        "arguments"
+    )
+    .is_some());
+    assert!(crate::provider::tool_input_schema_error(
+        loaded_execute_schema,
+        &json!({
+            "resource": null,
+            "operation": "read_range",
+            "arguments": {
+                "sheet": "Summary",
+                "range": {
+                    "start": { "row": 0, "column": 0 },
+                    "end": { "row": 1, "column": 0 }
+                }
+            }
+        }),
+        "arguments"
+    )
+    .is_some());
 
     let described_value: Value = serde_json::from_str(&described.output).unwrap();
     let operation_schema = |operation: &str| {
@@ -85,6 +152,19 @@ async fn spreadsheet_protocol_progressively_describes_and_executes_offline_workb
             "end": { "row": 1, "column": 0 }
         }
     });
+    assert_eq!(
+        crate::provider::tool_input_schema_error(
+            loaded_execute_schema,
+            &json!({
+                "resource": resource,
+                "operation": "read_range",
+                "arguments": read_arguments
+            }),
+            "arguments"
+        ),
+        None,
+        "the loaded provider contract must accept the same payload as execution"
+    );
     for (operation, arguments, binding) in [
         ("write_rows", &write_arguments, "sourcePath"),
         ("read_range", &read_arguments, "path"),
@@ -322,7 +402,11 @@ async fn spreadsheet_protocol_uses_an_immutable_attachment_as_a_mutation_input()
         .await
         .expect("create attachment fixture");
     let attachment_path = attachment_root.join("template.xlsx");
-    fs::rename(workspace_root.join("template.xlsx"), &attachment_path).unwrap();
+    fs::rename(
+        workspace_root.join("output/template.xlsx"),
+        &attachment_path,
+    )
+    .unwrap();
     let attachment_path = attachment_path.canonicalize().unwrap();
 
     let store: Arc<dyn SessionStore> =
@@ -387,7 +471,7 @@ async fn spreadsheet_protocol_uses_an_immutable_attachment_as_a_mutation_input()
                 "spreadsheet",
                 json!({
                     "action": "read_range",
-                    "path": "attachment-copy.xlsx",
+                    "path": "output/attachment-copy.xlsx",
                     "sheet": "Summary",
                     "range": {
                         "start": { "row": 0, "column": 0 },
@@ -549,7 +633,7 @@ async fn prior_two_workbook_case_runs_as_one_attachment_backed_batch() {
                 "spreadsheet",
                 json!({
                     "action": "read_range",
-                    "path": "prior-case-regression.xlsx",
+                    "path": "output/prior-case-regression.xlsx",
                     "sheet": "订单明细",
                     "range": {
                         "start": { "row": 2, "column": 0 },

@@ -340,6 +340,11 @@ pub trait Tool: Send + Sync {
     fn has_derived_input_schema(&self) -> bool {
         false
     }
+    /// Name of the trusted discovery tool that must load this tool's precise
+    /// provider-facing contract before it is exposed to the model.
+    fn provider_contract_loader(&self) -> Option<&str> {
+        None
+    }
     /// Scheduling facts, separate from the model-facing schema. AgentCore may use
     /// these to run independent observations concurrently without guessing from
     /// tool names. The default is intentionally conservative for plugins/MCP.
@@ -382,6 +387,9 @@ trait TypedTool: Send + Sync {
 
     fn name(&self) -> &str;
     fn description(&self) -> &str;
+    fn provider_contract_loader(&self) -> Option<&str> {
+        None
+    }
     fn validate_context(&self, _ctx: &ToolInvocationContext) -> anyhow::Result<()> {
         Ok(())
     }
@@ -472,6 +480,10 @@ macro_rules! impl_typed_tool {
 
             fn has_derived_input_schema(&self) -> bool {
                 true
+            }
+
+            fn provider_contract_loader(&self) -> Option<&str> {
+                <Self as TypedTool>::provider_contract_loader(self)
             }
 
             fn execution_policy(&self, call: &ToolCall) -> ToolExecutionPolicy {

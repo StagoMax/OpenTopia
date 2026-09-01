@@ -30,7 +30,7 @@ use crate::policy::BasicPolicyEngine;
 use crate::policy::{approval_required, ApprovalRequired, PermissionMode, PolicyDecision};
 use crate::provider::{
     invalid_tool_arguments_json_details, ModelConversationMessage, ProviderToolCall,
-    ProviderToolCandidate, ProviderToolResult,
+    ProviderToolCandidate, ProviderToolResult, PROVIDER_TOOL_CONTRACT_LOADS_METADATA_KEY,
 };
 use crate::sandbox::LocalSandboxConfig;
 #[cfg(test)]
@@ -456,16 +456,28 @@ impl ToolRuntimeCatalog {
     }
 
     pub fn input_error(&self, provider_call: &ProviderToolCall) -> Option<String> {
-        if let Some(tool) = self.registry.get(&provider_call.name) {
-            return tool.input_error(&provider_call.arguments);
-        }
-        let schema = self
+        let provider_candidate = self
             .provider_candidates
             .iter()
-            .find(|candidate| candidate.name == provider_call.name)?
-            .input_schema
-            .clone();
-        crate::provider::tool_input_schema_error(&schema, &provider_call.arguments, "arguments")
+            .find(|candidate| candidate.name == provider_call.name);
+        if let Some(candidate) = provider_candidate {
+            if let Some(error) = crate::provider::tool_input_schema_error(
+                &candidate.input_schema,
+                &provider_call.arguments,
+                "arguments",
+            ) {
+                return Some(error);
+            }
+        } else if self.registry.get(&provider_call.name).is_some() {
+            return Some(format!(
+                "tool `{}` was not available in the model request that produced this call",
+                provider_call.name
+            ));
+        }
+
+        self.registry
+            .get(&provider_call.name)
+            .and_then(|tool| tool.input_error(&provider_call.arguments))
     }
 
     pub fn insert_source_metadata(&self, name: &str, metadata: &mut Value) {
@@ -902,7 +914,31 @@ impl ToolRuntime for LocalToolRuntime {
             Ok(result) => {
                 let content = provider_tool_result_content(&result);
                 let is_error = tool_result_is_error(&result);
-                let metadata = provider_tool_result_metadata(&provider_call.name, &result.metadata);
+                let contract_loads = catalog
+                    .registry
+                    .is_provider_contract_loader(&provider_call.name)
+                    .then(|| {
+                        result
+                            .metadata
+                            .get(PROVIDER_TOOL_CONTRACT_LOADS_METADATA_KEY)
+                            .cloned()
+                    })
+                    .flatten();
+                let mut metadata =
+                    provider_tool_result_metadata(&provider_call.name, &result.metadata);
+                // Ordinary provider metadata is size-bounded. Preserve this
+                // trusted control-plane field only until AgentCore consumes it
+                // and installs the next round's actual tool definition.
+                if !is_error {
+                    if let (Some(metadata), Some(contract_loads)) =
+                        (metadata.as_object_mut(), contract_loads)
+                    {
+                        metadata.insert(
+                            PROVIDER_TOOL_CONTRACT_LOADS_METADATA_KEY.to_string(),
+                            contract_loads,
+                        );
+                    }
+                }
                 Ok(ProviderToolResult {
                     call_id: provider_call.id.clone(),
                     name: provider_call.name.clone(),

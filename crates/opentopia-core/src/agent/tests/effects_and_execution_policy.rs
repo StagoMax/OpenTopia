@@ -258,7 +258,7 @@ fn flow_profile_exposes_work_code_and_orchestration_tools_to_the_provider() {
     assert!(!tools.contains(TOOL_SEARCH_NAME));
     assert!(tools.contains("spreadsheet_inspect"));
     assert!(tools.contains("spreadsheet_describe"));
-    assert!(tools.contains("spreadsheet_execute"));
+    assert!(!tools.contains("spreadsheet_execute"));
 
     let before_preload_hint = agent.provider_tool_catalog();
     agent.set_attachment_preloaded_tools(["spreadsheet_execute"]);

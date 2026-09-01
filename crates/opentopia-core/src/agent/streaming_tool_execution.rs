@@ -20,6 +20,7 @@ pub(super) struct StreamingToolExecution {
     user_message_id: Uuid,
     permission_mode: PermissionMode,
     base_context: ToolInvocationContext,
+    runtime_catalog: crate::tool_runtime::ToolRuntimeCatalog,
     gate: Arc<RwLock<()>>,
     calls_by_id: HashMap<String, ProviderToolCall>,
     committed_calls: Vec<ProviderToolCall>,
@@ -106,11 +107,16 @@ impl StreamingToolExecution {
             user_message_id,
             permission_mode,
             base_context,
+            runtime_catalog: agent.tool_runtime_catalog(),
             gate: Arc::new(RwLock::new(())),
             calls_by_id: HashMap::new(),
             committed_calls: Vec::new(),
             tasks: Vec::new(),
         })
+    }
+
+    pub(super) fn bind_provider_candidates(&mut self, candidates: Vec<ProviderToolCandidate>) {
+        self.runtime_catalog = self.agent.tool_runtime_catalog_with_candidates(candidates);
     }
 
     pub(super) fn dispatch(&mut self, call: ProviderToolCall) -> anyhow::Result<()> {
@@ -125,7 +131,7 @@ impl StreamingToolExecution {
         self.calls_by_id.insert(call.id.clone(), call.clone());
         self.committed_calls.push(call.clone());
 
-        let catalog = self.agent.tool_runtime_catalog();
+        let catalog = self.runtime_catalog.clone();
         let logical_call = ToolCall::new(&call.name, call.arguments.clone());
         let tool = catalog.get(&call.name);
         let interactive = catalog.registry().class(&call.name) == Some(ToolClass::StructuredInput);
@@ -164,12 +170,24 @@ impl StreamingToolExecution {
             let result = if parallel {
                 let _guard = gate.read_owned().await;
                 agent
-                    .execute_provider_tool_call(&call, user_message_id, context, &mut events)
+                    .execute_provider_tool_call_with_catalog(
+                        &call,
+                        user_message_id,
+                        context,
+                        catalog,
+                        &mut events,
+                    )
                     .await
             } else {
                 let _guard = gate.write_owned().await;
                 agent
-                    .execute_provider_tool_call(&call, user_message_id, context, &mut events)
+                    .execute_provider_tool_call_with_catalog(
+                        &call,
+                        user_message_id,
+                        context,
+                        catalog,
+                        &mut events,
+                    )
                     .await
             };
             StreamingToolTaskResult { result, events }
@@ -207,7 +225,6 @@ impl AgentCore {
         &self,
         execution: StreamingToolExecutionResult,
         budget: &mut Option<ContextBudget>,
-        tool_candidates: &mut Vec<ProviderToolCandidate>,
         provider_tool_results: &mut Vec<ProviderToolResult>,
         events: &mut TurnEvents,
     ) -> anyhow::Result<HashSet<String>> {
@@ -230,7 +247,6 @@ impl AgentCore {
             if let Some(budget) = budget.as_mut() {
                 budget.record_tokens(ContextBudget::estimate_tokens(&result.output));
             }
-            self.reveal_tools_from_search_result(&result, tool_candidates);
             completed_call_ids.insert(result.call_id.clone());
             provider_tool_results.push(result);
         }

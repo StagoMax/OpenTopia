@@ -389,6 +389,24 @@ impl ToolRegistry {
         self.entries.get(name).map(|entry| entry.class)
     }
 
+    pub fn provider_contract_loader(&self, name: &str) -> Option<&str> {
+        self.entries
+            .get(name)
+            .and_then(|entry| entry.tool.provider_contract_loader())
+    }
+
+    pub fn is_provider_contract_loader(&self, name: &str) -> bool {
+        let Some(loader_source) = self.source(name) else {
+            return false;
+        };
+        if loader_source == ToolSource::Mcp {
+            return false;
+        }
+        self.entries.values().any(|entry| {
+            entry.source == loader_source && entry.tool.provider_contract_loader() == Some(name)
+        })
+    }
+
     pub(crate) fn is_model_visible(&self, name: &str) -> bool {
         self.entries
             .get(name)
@@ -448,6 +466,12 @@ mod tests {
         ] {
             assert!(registry.is_model_visible(name), "{name} should be visible");
         }
+        assert_eq!(
+            registry.provider_contract_loader("spreadsheet_execute"),
+            Some("spreadsheet_describe")
+        );
+        assert!(registry.is_provider_contract_loader("spreadsheet_describe"));
+        assert!(!registry.is_provider_contract_loader("filesystem"));
     }
 
     #[test]

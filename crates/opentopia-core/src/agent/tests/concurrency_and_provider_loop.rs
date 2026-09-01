@@ -189,10 +189,12 @@ async fn approved_batch_executes_disjoint_resources_concurrently_in_order() {
         vec![0, 1]
     );
 
+    let provider_candidates = agent.provider_tool_candidates();
     let mut events = TurnEvents::new(None);
     let results = agent
         .execute_scoped_approved_batch(
             calls,
+            &provider_candidates,
             &workspace,
             PermissionMode::FullAccess,
             None,

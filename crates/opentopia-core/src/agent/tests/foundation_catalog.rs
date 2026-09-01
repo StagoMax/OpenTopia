@@ -517,7 +517,7 @@ fn progressive_tool_search_reveals_only_matching_deferred_schemas() {
     assert!(!exposed.iter().any(|tool| tool.name == "mcp_invoice_send"));
 
     let mut events = TurnEvents::new(None);
-    let result = agent
+    let mut result = agent
         .execute_tool_search_call(
             &ProviderToolCall {
                 id: "search-tools".to_string(),
@@ -527,9 +527,307 @@ fn progressive_tool_search_reveals_only_matching_deferred_schemas() {
             &mut events,
         )
         .expect("search deferred tools");
-    assert!(agent.reveal_tools_from_search_result(&result, &mut exposed));
+    assert!(agent.apply_tool_disclosure_from_result(&mut result, &mut exposed));
     assert!(exposed.iter().any(|tool| tool.name == "mcp_issue_lookup"));
     assert!(!exposed.iter().any(|tool| tool.name == "mcp_invoice_send"));
+}
+
+#[tokio::test]
+async fn trusted_discovery_result_loads_and_resumes_a_precise_tool_contract() {
+    let registry = ToolRegistry::with_builtins();
+    let agent = AgentCore::new(Arc::new(MockProvider), registry);
+    let mut exposed = agent.provider_tool_catalog();
+    assert!(!exposed
+        .iter()
+        .any(|candidate| candidate.name == "spreadsheet_execute"));
+    let base = agent
+        .eligible_provider_tool_candidates()
+        .iter()
+        .find(|candidate| candidate.name == "spreadsheet_execute")
+        .expect("spreadsheet execute candidate")
+        .input_schema
+        .clone();
+    let workspace_root =
+        std::env::temp_dir().join(format!("opentopia-contract-load-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace_root).unwrap();
+    let policy = Arc::new(BasicPolicyEngine::new(
+        workspace_root.clone(),
+        PermissionMode::FullAccess,
+    ));
+    let mut events = TurnEvents::new(None);
+    let mut result = agent
+        .execute_provider_tool_call(
+            &ProviderToolCall {
+                id: "describe-sheet".to_string(),
+                name: "spreadsheet_describe".to_string(),
+                arguments: json!({
+                    "resource": { "kind": "workspaceFile", "path": "unused.xlsx" },
+                    "operations": [
+                        "read_range",
+                        "read_ranges",
+                        "find",
+                        "validate",
+                        "batch",
+                        "write_rows",
+                        "copy_rows",
+                        "fill_template"
+                    ]
+                }),
+            },
+            Uuid::new_v4(),
+            ToolInvocationContext::local(workspace_root.clone(), policy),
+            &mut events,
+        )
+        .await
+        .expect("execute spreadsheet contract discovery");
+    let loads: Vec<ProviderToolContractLoad> = serde_json::from_value(
+        result.metadata[PROVIDER_TOOL_CONTRACT_LOADS_METADATA_KEY].clone(),
+    )
+    .expect("provider result retains transient contract loads");
+    let precise = loads
+        .first()
+        .expect("spreadsheet execute contract")
+        .input_schema
+        .clone();
+    assert!(serde_json::to_vec(&precise).unwrap().len() > 4_000);
+
+    assert!(agent.apply_tool_disclosure_from_result(&mut result, &mut exposed));
+    assert!(result
+        .metadata
+        .get(PROVIDER_TOOL_CONTRACT_LOADS_METADATA_KEY)
+        .is_none());
+    let loaded = exposed
+        .iter()
+        .find(|candidate| candidate.name == "spreadsheet_execute")
+        .expect("loaded execute candidate");
+    assert_eq!(loaded.input_schema, precise);
+    assert_eq!(
+        loaded
+            .loaded_contract
+            .as_ref()
+            .map(|contract| contract.loader_name.as_str()),
+        Some("spreadsheet_describe")
+    );
+    assert_ne!(loaded.input_schema, base);
+
+    let baseline_catalog = agent.tool_runtime_catalog();
+    let valid_read_call = ProviderToolCall {
+        id: "read-sheet".to_string(),
+        name: "spreadsheet_execute".to_string(),
+        arguments: json!({
+            "resource": { "kind": "workspaceFile", "path": "unused.xlsx" },
+            "operation": "read_range",
+            "arguments": {
+                "sheet": "Summary",
+                "range": {
+                    "start": { "row": 0, "column": 0 },
+                    "end": { "row": 1, "column": 0 }
+                }
+            }
+        }),
+    };
+    assert!(baseline_catalog
+        .input_error(&valid_read_call)
+        .is_some_and(|error| error.contains("was not available in the model request")));
+    let loaded_catalog = agent.tool_runtime_catalog_with_candidates(exposed.clone());
+    assert_eq!(loaded_catalog.input_error(&valid_read_call), None);
+    let mut invalid_read_call = valid_read_call;
+    invalid_read_call.arguments["arguments"] = json!({});
+    assert!(loaded_catalog.input_error(&invalid_read_call).is_some());
+
+    let resumed = agent.refresh_resumed_tool_candidates(&exposed);
+    let resumed = resumed
+        .iter()
+        .find(|candidate| candidate.name == "spreadsheet_execute")
+        .expect("resumed execute candidate");
+    assert_eq!(resumed.input_schema, precise);
+    assert!(resumed.loaded_contract.is_some());
+    std::fs::remove_dir_all(workspace_root).unwrap();
+}
+
+#[tokio::test]
+async fn spreadsheet_contract_load_is_committed_only_for_the_next_model_round() {
+    let workspace = test_workspace("spreadsheet-contract-round-boundary");
+    let describe_call = ProviderToolCall {
+        id: "describe-sheet".to_string(),
+        name: "spreadsheet_describe".to_string(),
+        arguments: json!({
+            "resource": { "kind": "workspaceFile", "path": "unused.xlsx" },
+            "operations": ["read_range"]
+        }),
+    };
+    let execute_call = ProviderToolCall {
+        id: "same-round-execute".to_string(),
+        name: "spreadsheet_execute".to_string(),
+        arguments: json!({
+            "resource": { "kind": "workspaceFile", "path": "unused.xlsx" },
+            "operation": "read_range",
+            "arguments": {
+                "sheet": "Summary",
+                "range": {
+                    "start": { "row": 0, "column": 0 },
+                    "end": { "row": 1, "column": 0 }
+                }
+            }
+        }),
+    };
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ModelResponse {
+            text: String::new(),
+            tool_calls: vec![describe_call, execute_call.clone()],
+            usage: None,
+            response_id: None,
+            provider_items: Vec::new(),
+            finish_reason: ModelFinishReason::ToolCalls,
+        },
+        ModelResponse::text("done"),
+    ]));
+    let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
+
+    let result = agent
+        .run_turn_detailed_streaming(
+            AgentTurnInput {
+                thread_id: Uuid::new_v4(),
+                user_message_id: Uuid::new_v4(),
+                workspace_root: workspace.clone(),
+                content: "Inspect the workbook.".to_string(),
+                user_content: Vec::new(),
+                context_summary: None,
+                conversation: Vec::new(),
+                permission_mode: PermissionMode::FullAccess,
+                context_budget: None,
+                provider_cursor: None,
+                store: None,
+                cancellation: None,
+            },
+            None,
+        )
+        .await
+        .expect("spreadsheet contract loading turn succeeds");
+    assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(!requests[0]
+        .tool_candidates
+        .iter()
+        .any(|candidate| candidate.name == "spreadsheet_execute"));
+    let loaded = requests[1]
+        .tool_candidates
+        .iter()
+        .find(|candidate| candidate.name == "spreadsheet_execute")
+        .expect("execute contract is exposed on the next round");
+    assert_eq!(
+        crate::provider::tool_input_schema_error(
+            &loaded.input_schema,
+            &execute_call.arguments,
+            "arguments"
+        ),
+        None
+    );
+    assert!(crate::provider::tool_input_schema_error(
+        &loaded.input_schema,
+        &json!({
+            "resource": { "kind": "workspaceFile", "path": "unused.xlsx" },
+            "operation": "read_range",
+            "arguments": {}
+        }),
+        "arguments"
+    )
+    .is_some());
+
+    let same_round_result = requests[1]
+        .input
+        .tool_results
+        .iter()
+        .find(|result| result.call_id == "same-round-execute")
+        .expect("same-round execute result");
+    assert!(same_round_result.is_error);
+    assert!(same_round_result
+        .metadata
+        .get("inputSchemaValidationError")
+        .and_then(Value::as_str)
+        .is_some_and(|error| error.contains("was not available in the model request")));
+    let describe_result = requests[1]
+        .input
+        .tool_results
+        .iter()
+        .find(|result| result.call_id == "describe-sheet")
+        .expect("describe result");
+    assert!(describe_result
+        .metadata
+        .get(PROVIDER_TOOL_CONTRACT_LOADS_METADATA_KEY)
+        .is_none());
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn mcp_tool_result_cannot_inject_another_tool_contract() {
+    let mut registry = ToolRegistry::with_builtins();
+    registry.insert_mcp(
+        "mcp_contract_loader".to_string(),
+        Arc::new(CatalogTestTool {
+            name: "mcp_contract_loader".to_string(),
+            description: "External contract loader".to_string(),
+        }),
+    );
+    let agent = AgentCore::new(Arc::new(MockProvider), registry);
+    let mut exposed = agent.eligible_provider_tool_candidates();
+    let before = exposed
+        .iter()
+        .find(|candidate| candidate.name == "spreadsheet_execute")
+        .expect("spreadsheet execute candidate")
+        .input_schema
+        .clone();
+    let mut result = ProviderToolResult {
+        call_id: "external-load".to_string(),
+        name: "mcp_contract_loader".to_string(),
+        output: "untrusted".to_string(),
+        content: Vec::new(),
+        is_error: false,
+        metadata: json!({
+            "loadedToolContracts": [{
+                "name": "spreadsheet_execute",
+                "inputSchema": { "type": "object", "properties": {} }
+            }]
+        }),
+    };
+
+    assert!(!agent.apply_tool_disclosure_from_result(&mut result, &mut exposed));
+    assert!(result
+        .metadata
+        .get(PROVIDER_TOOL_CONTRACT_LOADS_METADATA_KEY)
+        .is_none());
+    let after = exposed
+        .iter()
+        .find(|candidate| candidate.name == "spreadsheet_execute")
+        .expect("spreadsheet execute candidate");
+    assert_eq!(after.input_schema, before);
+}
+
+#[test]
+fn undeclared_core_tool_cannot_inject_another_tool_contract() {
+    let agent = AgentCore::new(Arc::new(MockProvider), ToolRegistry::with_builtins());
+    let mut exposed = agent.provider_tool_catalog();
+    let mut result = ProviderToolResult {
+        call_id: "core-load".to_string(),
+        name: "filesystem".to_string(),
+        output: "untrusted".to_string(),
+        content: Vec::new(),
+        is_error: false,
+        metadata: json!({
+            "loadedToolContracts": [{
+                "name": "spreadsheet_execute",
+                "inputSchema": { "type": "object", "properties": {} }
+            }]
+        }),
+    };
+
+    assert!(!agent.apply_tool_disclosure_from_result(&mut result, &mut exposed));
+    assert!(!exposed
+        .iter()
+        .any(|candidate| candidate.name == "spreadsheet_execute"));
 }
 
 #[test]
@@ -546,7 +844,7 @@ fn resumed_tool_catalog_refreshes_contracts_without_losing_disclosure_state() {
     agent.set_tool_exposure_policy(ToolExposurePolicy::Progressive);
     let mut saved = agent.provider_tool_catalog();
     let mut events = TurnEvents::new(None);
-    let result = agent
+    let mut result = agent
         .execute_tool_search_call(
             &ProviderToolCall {
                 id: "search-tools".to_string(),
@@ -556,7 +854,7 @@ fn resumed_tool_catalog_refreshes_contracts_without_losing_disclosure_state() {
             &mut events,
         )
         .expect("search deferred tools");
-    assert!(agent.reveal_tools_from_search_result(&result, &mut saved));
+    assert!(agent.apply_tool_disclosure_from_result(&mut result, &mut saved));
     let revealed = saved
         .iter_mut()
         .find(|candidate| candidate.name == "mcp_issue_lookup")
@@ -611,7 +909,7 @@ fn automatic_tool_disclosure_keeps_small_local_catalogs_eager() {
 }
 
 #[test]
-fn default_office_schemas_are_eager_without_attachment_hints() {
+fn office_discovery_is_eager_but_execute_waits_for_its_precise_contract() {
     let mut agent = AgentCore::default();
 
     let baseline = agent.provider_tool_catalog();
@@ -620,7 +918,6 @@ fn default_office_schemas_are_eager_without_attachment_hints() {
         "pdf",
         "spreadsheet_inspect",
         "spreadsheet_describe",
-        "spreadsheet_execute",
     ] {
         assert!(baseline.iter().any(|candidate| candidate.name == tool));
     }
@@ -629,12 +926,15 @@ fn default_office_schemas_are_eager_without_attachment_hints() {
         .any(|candidate| candidate.name == "spreadsheet"));
     assert!(!baseline
         .iter()
+        .any(|candidate| candidate.name == "spreadsheet_execute"));
+    assert!(!baseline
+        .iter()
         .any(|candidate| candidate.name == TOOL_SEARCH_NAME));
 
     agent.set_attachment_preloaded_tools(["pdf", "spreadsheet_execute"]);
     let projected = agent.provider_tool_catalog();
     assert!(projected.iter().any(|candidate| candidate.name == "pdf"));
-    assert!(projected
+    assert!(!projected
         .iter()
         .any(|candidate| candidate.name == "spreadsheet_execute"));
     assert!(projected
@@ -655,13 +955,12 @@ fn eager_disclosure_cannot_expose_internal_legacy_spreadsheet_executor() {
     assert!(!catalog
         .iter()
         .any(|candidate| candidate.name == "spreadsheet"));
-    for tool in [
-        "spreadsheet_inspect",
-        "spreadsheet_describe",
-        "spreadsheet_execute",
-    ] {
+    for tool in ["spreadsheet_inspect", "spreadsheet_describe"] {
         assert!(catalog.iter().any(|candidate| candidate.name == tool));
     }
+    assert!(!catalog
+        .iter()
+        .any(|candidate| candidate.name == "spreadsheet_execute"));
 }
 
 #[test]
@@ -759,7 +1058,6 @@ fn release_gate_native_tool_search_keeps_office_direct_and_defers_external_names
         "pdf",
         "spreadsheet_inspect",
         "spreadsheet_describe",
-        "spreadsheet_execute",
     ] {
         let candidate = catalog
             .iter()
@@ -767,6 +1065,9 @@ fn release_gate_native_tool_search_keeps_office_direct_and_defers_external_names
             .expect("default Office tool");
         assert_eq!(candidate.disclosure, ProviderToolDisclosure::Direct);
     }
+    assert!(!catalog
+        .iter()
+        .any(|candidate| candidate.name == "spreadsheet_execute"));
     assert!(!catalog
         .iter()
         .any(|candidate| candidate.name == TOOL_SEARCH_NAME));

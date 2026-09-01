@@ -68,7 +68,7 @@ impl AgentCore {
             )
         });
         let lineage_instructions = self.lineage_instructions();
-        let mut tool_candidates = self.provider_tool_candidates();
+        let tool_candidates = self.provider_tool_candidates();
         let model_context =
             self.kernel
                 .context_assembler
@@ -207,7 +207,6 @@ impl AgentCore {
         let mut completed_streaming_call_ids = self.commit_streaming_tool_execution(
             streaming_execution,
             &mut budget,
-            &mut tool_candidates,
             &mut opening_provider_tool_results,
             &mut events,
         )?;
@@ -279,13 +278,13 @@ impl AgentCore {
                 if let Ok(response) = retry.as_ref() {
                     retry_streaming_execution.validate_terminal_calls(&response.tool_calls)?;
                 }
-                completed_streaming_call_ids.extend(self.commit_streaming_tool_execution(
+                let retry_completed_call_ids = self.commit_streaming_tool_execution(
                     retry_streaming_execution,
                     &mut budget,
-                    &mut tool_candidates,
                     &mut opening_provider_tool_results,
                     &mut events,
-                )?);
+                )?;
+                completed_streaming_call_ids.extend(retry_completed_call_ids);
                 if input
                     .cancellation
                     .as_ref()
@@ -571,6 +570,7 @@ impl AgentCore {
                             )?;
                             self.execute_scoped_approved_batch(
                                 approved_calls,
+                                &tool_candidates,
                                 &continuation.workspace_root,
                                 continuation.permission_mode,
                                 store.clone(),

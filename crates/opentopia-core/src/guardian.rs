@@ -1022,6 +1022,7 @@ fn guardian_read_only_tool_candidates() -> Vec<ProviderToolCandidate> {
             }),
             disclosure: Default::default(),
             namespace: None,
+            loaded_contract: None,
         },
         ProviderToolCandidate {
             name: "guardian_read_file".to_string(),
@@ -1034,6 +1035,7 @@ fn guardian_read_only_tool_candidates() -> Vec<ProviderToolCandidate> {
             }),
             disclosure: Default::default(),
             namespace: None,
+            loaded_contract: None,
         },
         ProviderToolCandidate {
             name: "guardian_git_context".to_string(),
@@ -1046,6 +1048,7 @@ fn guardian_read_only_tool_candidates() -> Vec<ProviderToolCandidate> {
             }),
             disclosure: Default::default(),
             namespace: None,
+            loaded_contract: None,
         },
     ]
 }

@@ -56,6 +56,7 @@ impl AgentCore {
         cancellation: Option<&CancellationToken>,
     ) -> anyhow::Result<ModelResponse> {
         let request_id = Uuid::new_v4();
+        streaming_tools.bind_provider_candidates(request.logical().tool_candidates.clone());
         let tool_input_schemas = request
             .logical()
             .tool_candidates
@@ -524,6 +525,12 @@ impl AgentCore {
 
     pub(super) fn provider_tool_candidates(&self) -> Vec<ProviderToolCandidate> {
         let mut eligible = self.eligible_provider_tool_candidates();
+        eligible.retain(|candidate| {
+            self.tool_host
+                .catalog
+                .provider_contract_loader(&candidate.name)
+                .is_none()
+        });
         if self.native_tool_search_active(&eligible) {
             for candidate in &mut eligible {
                 if self.is_default_eager_office_tool(&candidate.name) {
@@ -597,8 +604,9 @@ impl AgentCore {
     }
 
     /// Reconciles a checkpoint's disclosure state with the currently executable
-    /// catalog. Previously revealed tools remain revealed, but their contracts
-    /// are always replaced with the current definitions.
+    /// catalog. Static revealed tools receive current definitions. Dynamically
+    /// loaded contracts survive suspension only while their loader and target
+    /// remain eligible and the target's base schema has not changed.
     pub(super) fn refresh_resumed_tool_candidates(
         &self,
         saved: &[ProviderToolCandidate],
@@ -617,13 +625,18 @@ impl AgentCore {
         let mut refreshed = Vec::new();
         let mut included = HashSet::new();
 
-        for candidate in saved {
+        for saved_candidate in saved {
             let current = baseline_by_name
-                .get(&candidate.name)
-                .or_else(|| eligible_by_name.get(&candidate.name));
+                .get(&saved_candidate.name)
+                .or_else(|| eligible_by_name.get(&saved_candidate.name));
             if let Some(current) = current {
                 if included.insert(current.name.clone()) {
-                    refreshed.push(current.clone());
+                    let preserved = self.restore_loaded_tool_contract(
+                        saved_candidate,
+                        current,
+                        &eligible_by_name,
+                    );
+                    refreshed.push(preserved.unwrap_or_else(|| current.clone()));
                 }
             }
         }
@@ -654,6 +667,12 @@ impl AgentCore {
         let defer_all_external = self.progressive_tool_disclosure_active(&eligible);
         let mut matches = eligible
             .into_iter()
+            .filter(|candidate| {
+                self.tool_host
+                    .catalog
+                    .provider_contract_loader(&candidate.name)
+                    .is_none()
+            })
             .filter(|candidate| self.client_deferred_tool_candidate(candidate, defer_all_external))
             .filter_map(|candidate| {
                 let name = candidate.name.to_lowercase();
@@ -679,37 +698,40 @@ impl AgentCore {
             .collect()
     }
 
-    pub(super) fn reveal_tools_from_search_result(
+    pub(super) fn apply_tool_disclosure_from_result(
         &self,
-        result: &ProviderToolResult,
+        result: &mut ProviderToolResult,
         exposed: &mut Vec<ProviderToolCandidate>,
     ) -> bool {
-        if result.name != TOOL_SEARCH_NAME || result.is_error {
-            return false;
+        let mut changed = self.apply_loaded_tool_contracts_from_result(result, exposed);
+        if result.is_error {
+            return changed;
         }
-        let names = result
-            .metadata
-            .get("revealedTools")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .collect::<HashSet<_>>();
-        if names.is_empty() {
-            return false;
+
+        if result.name == TOOL_SEARCH_NAME {
+            let names = result
+                .metadata
+                .get("revealedTools")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<HashSet<_>>();
+            if !names.is_empty() {
+                let existing = exposed
+                    .iter()
+                    .map(|candidate| candidate.name.as_str())
+                    .collect::<HashSet<_>>();
+                let mut additions = self
+                    .eligible_provider_tool_candidates()
+                    .into_iter()
+                    .filter(|candidate| names.contains(candidate.name.as_str()))
+                    .filter(|candidate| !existing.contains(candidate.name.as_str()))
+                    .collect::<Vec<_>>();
+                changed |= !additions.is_empty();
+                exposed.append(&mut additions);
+            }
         }
-        let existing = exposed
-            .iter()
-            .map(|candidate| candidate.name.as_str())
-            .collect::<HashSet<_>>();
-        let mut additions = self
-            .eligible_provider_tool_candidates()
-            .into_iter()
-            .filter(|candidate| names.contains(candidate.name.as_str()))
-            .filter(|candidate| !existing.contains(candidate.name.as_str()))
-            .collect::<Vec<_>>();
-        let changed = !additions.is_empty();
-        exposed.append(&mut additions);
         changed
     }
 

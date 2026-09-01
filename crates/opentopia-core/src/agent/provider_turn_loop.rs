@@ -82,14 +82,6 @@ impl AgentCore {
                                 budget
                                     .record_tokens(ContextBudget::estimate_tokens(&result.output));
                             }
-                            if self.reveal_tools_from_search_result(&result, &mut tool_candidates) {
-                                compatibility_hash = provider_compatibility_hash(
-                                    &model_context,
-                                    context_summary.as_deref(),
-                                    &tool_candidates,
-                                    branch_developer_instructions.as_deref(),
-                                );
-                            }
                             provider_tool_results.push(result);
                             pending_tool_calls.remove(0);
                             continue;
@@ -121,11 +113,12 @@ impl AgentCore {
                 let turn_sandbox_config =
                     runtime_state.sandbox_config_with_path_leases(&self.tool_host.sandbox_config);
                 if parallel_outcomes.is_empty() {
-                    let batch = self.approval_candidates(
+                    let batch = self.approval_candidates_with_provider_candidates(
                         &pending_tool_calls,
                         &workspace_root,
                         permission_mode,
                         &turn_sandbox_config,
+                        &tool_candidates,
                     );
                     if !batch.is_empty() {
                         if permission_mode.approvals_reviewer() == ApprovalsReviewer::User {
@@ -398,6 +391,7 @@ impl AgentCore {
                             )?;
                             self.execute_scoped_approved_batch(
                                 batch_calls,
+                                &tool_candidates,
                                 &workspace_root,
                                 permission_mode,
                                 store.clone(),
@@ -436,11 +430,12 @@ impl AgentCore {
                 }
 
                 let parallel_indices = if parallel_outcomes.is_empty() {
-                    self.parallel_tool_call_indices_with_sandbox(
+                    self.parallel_tool_call_indices_with_candidates(
                         &pending_tool_calls,
                         &workspace_root,
                         permission_mode,
                         &turn_sandbox_config,
+                        &tool_candidates,
                     )
                 } else {
                     Vec::new()
@@ -476,7 +471,8 @@ impl AgentCore {
                         .into_iter()
                         .map(|index| pending_tool_calls[index].clone())
                         .collect::<Vec<_>>();
-                    let runtime_catalog = self.tool_runtime_catalog();
+                    let runtime_catalog =
+                        self.tool_runtime_catalog_with_candidates(tool_candidates.clone());
                     let inputs = calls
                         .into_iter()
                         .map(
@@ -539,7 +535,13 @@ impl AgentCore {
                 });
                 ctx.fork_model_context = Some(model_context.clone());
                 match self
-                    .execute_provider_tool_call(&provider_call, user_message_id, ctx, events)
+                    .execute_provider_tool_call_with_candidates(
+                        &provider_call,
+                        user_message_id,
+                        ctx,
+                        &tool_candidates,
+                        events,
+                    )
                     .await
                 {
                     Ok(result) => {
@@ -606,14 +608,6 @@ impl AgentCore {
                         }
                         if let Some(ref mut budget) = budget {
                             budget.record_tokens(ContextBudget::estimate_tokens(&result.output));
-                        }
-                        if self.reveal_tools_from_search_result(&result, &mut tool_candidates) {
-                            compatibility_hash = provider_compatibility_hash(
-                                &model_context,
-                                context_summary.as_deref(),
-                                &tool_candidates,
-                                branch_developer_instructions.as_deref(),
-                            );
                         }
                         provider_tool_results.push(result);
                         pending_tool_calls.remove(0);
@@ -883,6 +877,7 @@ impl AgentCore {
                                 )?;
                                 self.execute_scoped_approved_call(
                                     &provider_call,
+                                    &tool_candidates,
                                     &workspace_root,
                                     permission_mode,
                                     store.clone(),
@@ -972,6 +967,20 @@ impl AgentCore {
                     }
                     Err(err) => return Err(err),
                 }
+            }
+
+            let mut tool_surface_changed = false;
+            for result in &mut provider_tool_results {
+                tool_surface_changed |=
+                    self.apply_tool_disclosure_from_result(result, &mut tool_candidates);
+            }
+            if tool_surface_changed {
+                compatibility_hash = provider_compatibility_hash(
+                    &model_context,
+                    context_summary.as_deref(),
+                    &tool_candidates,
+                    branch_developer_instructions.as_deref(),
+                );
             }
 
             match self

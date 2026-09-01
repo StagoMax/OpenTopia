@@ -58,9 +58,10 @@ use crate::provider::{
     normalize_tool_argument_keys, provider_transcript_state_item, provider_wire_transcript,
     redact_model_observation, tool_input_schema_error, IncompleteReason, ModelConversationMessage,
     ModelConversationRole, ModelDecision, ModelProvider, ModelRequest, ModelResponse,
-    ModelStreamDelta, ModelUsage, PromptCacheBreakpointPolicy, ProviderRequestCheckpoint,
-    ProviderToolCall, ProviderToolCandidate, ProviderToolDisclosure, ProviderToolNamespace,
-    ProviderToolResult, ProviderTransportEvent, PROVIDER_TRANSCRIPT_CANDIDATE_TYPE,
+    ModelStreamDelta, ModelUsage, PromptCacheBreakpointPolicy, ProviderLoadedToolContract,
+    ProviderRequestCheckpoint, ProviderToolCall, ProviderToolCandidate, ProviderToolContractLoad,
+    ProviderToolDisclosure, ProviderToolNamespace, ProviderToolResult, ProviderTransportEvent,
+    PROVIDER_TOOL_CONTRACT_LOADS_METADATA_KEY, PROVIDER_TRANSCRIPT_CANDIDATE_TYPE,
     PROVIDER_TRANSCRIPT_STATE_TYPE,
 };
 #[cfg(test)]
@@ -119,6 +120,7 @@ mod provider_round;
 mod provider_turn_loop;
 mod run_config;
 mod streaming_tool_execution;
+mod tool_contract_loading;
 mod tool_disclosure;
 mod tool_scheduler;
 mod turn_control;
@@ -145,12 +147,11 @@ const TOOL_SEARCH_NAME: &str = "tool_search";
 const MAX_TOOL_SEARCH_RESULTS: usize = 8;
 const AUTOMATIC_TOOL_DISCLOSURE_COUNT_THRESHOLD: usize = 24;
 const AUTOMATIC_TOOL_DISCLOSURE_TOKEN_THRESHOLD: usize = 12_000;
-const DEFAULT_EAGER_OFFICE_TOOLS: [(&str, &str); 5] = [
+const DEFAULT_EAGER_OFFICE_TOOLS: [(&str, &str); 4] = [
     ("document", "documents"),
     ("pdf", "pdf"),
     ("spreadsheet_inspect", "spreadsheet"),
     ("spreadsheet_describe", "spreadsheet"),
-    ("spreadsheet_execute", "spreadsheet"),
 ];
 const ROLLOUT_CHECKPOINT_TOOL_NAME: &str = "runtime_rollout_checkpoint";
 const STEP_REMINDER_TOOL_NAME: &str = "runtime_step_reminder";
@@ -1137,6 +1138,7 @@ Goal mode manages durable execution state but does not broaden what the user's r
     async fn execute_scoped_approved_batch(
         &self,
         calls: Vec<ProviderToolCall>,
+        provider_candidates: &[ProviderToolCandidate],
         workspace_root: &Path,
         permission_mode: PermissionMode,
         store: Option<Arc<dyn SessionStore>>,
@@ -1181,13 +1183,17 @@ Goal mode manages durable execution state but does not broaden what the user's r
             }
 
             if parallel_outcomes.is_empty() {
-                let parallel_indices = self.approved_parallel_tool_call_indices(&pending_calls);
+                let parallel_indices = self.approved_parallel_tool_call_indices_with_candidates(
+                    &pending_calls,
+                    provider_candidates,
+                );
                 if parallel_indices.len() >= 2 {
                     let selected_calls = parallel_indices
                         .into_iter()
                         .map(|index| pending_calls[index].clone())
                         .collect::<Vec<_>>();
-                    let runtime_catalog = self.tool_runtime_catalog();
+                    let runtime_catalog =
+                        self.tool_runtime_catalog_with_candidates(provider_candidates.to_vec());
                     let mut inputs = Vec::with_capacity(selected_calls.len());
                     for call in selected_calls {
                         let context = self.scoped_approved_context(
@@ -1241,6 +1247,7 @@ Goal mode manages durable execution state but does not broaden what the user's r
             let result = self
                 .execute_scoped_approved_call(
                     &call,
+                    provider_candidates,
                     workspace_root,
                     permission_mode,
                     store.clone(),
@@ -1262,6 +1269,7 @@ Goal mode manages durable execution state but does not broaden what the user's r
     async fn execute_scoped_approved_call(
         &self,
         call: &ProviderToolCall,
+        provider_candidates: &[ProviderToolCandidate],
         workspace_root: &Path,
         permission_mode: PermissionMode,
         store: Option<Arc<dyn SessionStore>>,
@@ -1281,7 +1289,13 @@ Goal mode manages durable execution state but does not broaden what the user's r
             fallback_turn_id,
         )?;
         let result = self
-            .execute_provider_tool_call(call, fallback_turn_id, ctx, events)
+            .execute_provider_tool_call_with_candidates(
+                call,
+                fallback_turn_id,
+                ctx,
+                provider_candidates,
+                events,
+            )
             .await;
         self.decorate_scoped_approved_result(call, approval_source, result)
     }
@@ -1375,14 +1389,53 @@ Goal mode manages durable execution state but does not broaden what the user's r
         }
     }
 
+    #[cfg(test)]
     async fn execute_provider_tool_call(
         &self,
         provider_call: &ProviderToolCall,
         user_message_id: Uuid,
-        mut ctx: ToolInvocationContext,
+        ctx: ToolInvocationContext,
         events: &mut TurnEvents,
     ) -> anyhow::Result<ProviderToolResult> {
         let runtime_catalog = self.tool_runtime_catalog();
+        self.execute_provider_tool_call_with_catalog(
+            provider_call,
+            user_message_id,
+            ctx,
+            runtime_catalog,
+            events,
+        )
+        .await
+    }
+
+    async fn execute_provider_tool_call_with_candidates(
+        &self,
+        provider_call: &ProviderToolCall,
+        user_message_id: Uuid,
+        ctx: ToolInvocationContext,
+        provider_candidates: &[ProviderToolCandidate],
+        events: &mut TurnEvents,
+    ) -> anyhow::Result<ProviderToolResult> {
+        let runtime_catalog =
+            self.tool_runtime_catalog_with_candidates(provider_candidates.to_vec());
+        self.execute_provider_tool_call_with_catalog(
+            provider_call,
+            user_message_id,
+            ctx,
+            runtime_catalog,
+            events,
+        )
+        .await
+    }
+
+    async fn execute_provider_tool_call_with_catalog(
+        &self,
+        provider_call: &ProviderToolCall,
+        user_message_id: Uuid,
+        mut ctx: ToolInvocationContext,
+        runtime_catalog: crate::tool_runtime::ToolRuntimeCatalog,
+        events: &mut TurnEvents,
+    ) -> anyhow::Result<ProviderToolResult> {
         // Tool Search is a virtual catalog operation rather than a registered
         // executor. Validation remains runtime-owned before this compatibility
         // branch handles the catalog lookup.
