@@ -139,6 +139,48 @@ fn find_and_filter_return_bounded_structured_rows() {
 }
 
 #[test]
+fn filter_rows_scans_past_read_windows_and_returns_up_to_two_thousand_rows() {
+    let directory = TestDirectory::new();
+    let workbook = directory.path("large-filter.xlsx");
+    let cells = (0..1_501)
+        .flat_map(|row| {
+            [
+                update(row, 0, SpreadsheetCellInput::Integer(row as i64)),
+                update(row, 1, SpreadsheetCellInput::String("keep".to_string())),
+            ]
+        })
+        .collect();
+    write_workbook(&WriteWorkbookRequest {
+        source: None,
+        output: workbook.clone(),
+        sheets: vec![SheetWriteRequest {
+            name: "Rows".to_string(),
+            visibility: None,
+            cells,
+        }],
+    })
+    .expect("create large filter workbook");
+
+    let filtered = filter_rows(&FilterRowsRequest {
+        path: workbook,
+        sheet: "Rows".to_string(),
+        range: range((0, 0), (1_500, 1)),
+        conditions: vec![SpreadsheetFilterCondition {
+            column: 1,
+            operator: SpreadsheetFilterOperator::NotContains,
+            value: Some(SpreadsheetFilterValue::String("cancel".to_string())),
+            case_sensitive: false,
+        }],
+        match_mode: SpreadsheetFilterMatchMode::All,
+        max_results: 2_000,
+    })
+    .expect("filter beyond the ordinary read window");
+    assert_eq!(filtered.scanned_rows, 1_501);
+    assert_eq!(filtered.rows.len(), 1_501);
+    assert!(!filtered.truncated);
+}
+
+#[test]
 fn rejects_range_and_cell_limits() {
     let directory = TestDirectory::new();
     let workbook = directory.path("limits.xlsx");
@@ -194,7 +236,7 @@ fn rejects_range_and_cell_limits() {
 }
 
 #[test]
-fn rejects_oversized_files_and_return_content() {
+fn rejects_oversized_files_but_allows_results_for_the_artifact_boundary() {
     let directory = TestDirectory::new();
     let oversized = directory.path("oversized.xlsx");
     let file = OpenOptions::new()
@@ -225,13 +267,13 @@ fn rejects_oversized_files_and_return_content() {
         }],
     })
     .expect("create large-return workbook");
-    let error = read_range(&ReadRangeRequest {
+    let result = read_range(&ReadRangeRequest {
         path: workbook,
         sheet: "Sheet1".to_string(),
         range: range((0, 0), (39, 0)),
     })
-    .expect_err("large return must be rejected");
-    assert_eq!(error.code(), SpreadsheetErrorCode::ReturnTooLarge);
+    .expect("large results are handed to the tool-result artifact boundary");
+    assert_eq!(result.rows.len(), 40);
 }
 
 #[test]

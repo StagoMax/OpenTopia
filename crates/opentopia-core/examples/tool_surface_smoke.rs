@@ -281,7 +281,7 @@ impl ModelProvider for SmokeProvider {
                 11,
                 "spreadsheet_describe",
                 json!({
-                    "resource": { "kind": "workspaceFile", "path": "smoke.xlsx" },
+                    "resource": { "kind": "file", "path": "smoke.xlsx" },
                     "operations": ["write"]
                 }),
             ),
@@ -306,7 +306,7 @@ impl ModelProvider for SmokeProvider {
                 13,
                 "spreadsheet_inspect",
                 json!({
-                    "resource": { "kind": "workspaceFile", "path": "smoke.xlsx" }
+                    "resource": { "kind": "file", "path": "smoke.xlsx" }
                 }),
             ),
             14 => Self::one_call(

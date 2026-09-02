@@ -1,16 +1,16 @@
 use super::display::{date_time_display_kinds, formatted_cell_value};
 use super::{
-    add_used_positions, cell_value_from_data, collect_sheet_stats, ensure_return_size,
-    ensure_sheet_count, ensure_workbook_cell_count, open_workbook_reader, sheet_info,
-    validate_address, validate_read_range, validate_return_text, worksheet_formulas,
-    worksheet_values, CellAddress, CellRange, FilterRowsRequest, FilterRowsResult,
-    FindCellsRequest, FindCellsResult, InspectWorkbookRequest, InspectWorkbookResult,
-    ListSheetsRequest, ListSheetsResult, ReadRangeRequest, ReadRangeResult, ReadRangesRequest,
-    ReadRangesResult, SheetInspection, SheetKind, SheetStats, SpreadsheetCell,
-    SpreadsheetCellMatch, SpreadsheetCellValue, SpreadsheetError, SpreadsheetFilterCondition,
-    SpreadsheetFilterMatchMode, SpreadsheetFilterOperator, SpreadsheetFilterValue,
-    SpreadsheetTextMatchMode, MAX_FILTER_CONDITIONS, MAX_FILTER_RESULTS, MAX_FIND_RESULTS,
-    MAX_READ_CELLS, MAX_READ_COLUMNS, MAX_READ_RANGES, MAX_READ_ROWS, MAX_WORKBOOK_CELLS,
+    add_used_positions, cell_value_from_data, collect_sheet_stats, ensure_sheet_count,
+    ensure_workbook_cell_count, open_workbook_reader, sheet_info, validate_address,
+    validate_read_range, validate_return_text, worksheet_formulas, worksheet_values, CellAddress,
+    CellRange, FilterRowsRequest, FilterRowsResult, FindCellsRequest, FindCellsResult,
+    InspectWorkbookRequest, InspectWorkbookResult, ListSheetsRequest, ListSheetsResult,
+    ReadRangeRequest, ReadRangeResult, ReadRangesRequest, ReadRangesResult, SheetInspection,
+    SheetKind, SheetStats, SpreadsheetCell, SpreadsheetCellMatch, SpreadsheetCellValue,
+    SpreadsheetError, SpreadsheetFilterCondition, SpreadsheetFilterMatchMode,
+    SpreadsheetFilterOperator, SpreadsheetFilterValue, SpreadsheetTextMatchMode,
+    MAX_FILTER_CONDITIONS, MAX_FILTER_RESULTS, MAX_FIND_RESULTS, MAX_READ_CELLS, MAX_READ_COLUMNS,
+    MAX_READ_RANGES, MAX_READ_ROWS, MAX_WORKBOOK_CELLS,
 };
 use calamine::{Data, Reader};
 use serde::Serialize;
@@ -49,7 +49,6 @@ pub fn list_sheets(request: &ListSheetsRequest) -> Result<ListSheetsResult, Spre
         file_size_bytes,
         sheets,
     };
-    ensure_return_size(&result)?;
     Ok(result)
 }
 
@@ -93,7 +92,6 @@ pub fn inspect_workbook(
         sheets,
         populated_cells: workbook_cells as u64,
     };
-    ensure_return_size(&result)?;
     Ok(result)
 }
 
@@ -116,7 +114,6 @@ pub fn read_range(request: &ReadRangeRequest) -> Result<ReadRangeResult, Spreads
             })
             .collect(),
     };
-    ensure_return_size(&result)?;
     Ok(result)
 }
 
@@ -124,7 +121,6 @@ pub(crate) fn read_range_for_display(
     request: &ReadRangeRequest,
 ) -> Result<DisplayReadRangeResult, SpreadsheetError> {
     let result = load_range(request, true)?;
-    ensure_return_size(&result)?;
     Ok(result)
 }
 
@@ -256,7 +252,6 @@ pub fn read_ranges(request: &ReadRangesRequest) -> Result<ReadRangesResult, Spre
         ranges,
         total_cells,
     };
-    ensure_return_size(&result)?;
     Ok(result)
 }
 
@@ -372,12 +367,24 @@ pub fn find_cells(request: &FindCellsRequest) -> Result<FindCellsResult, Spreads
         scanned_cells: scanned_cells as u64,
         truncated,
     };
-    ensure_return_size(&result)?;
     Ok(result)
 }
 
 pub fn filter_rows(request: &FilterRowsRequest) -> Result<FilterRowsResult, SpreadsheetError> {
-    validate_read_range(request.range)?;
+    validate_address(request.range.start)?;
+    validate_address(request.range.end)?;
+    let columns = request
+        .range
+        .column_count()
+        .ok_or(SpreadsheetError::InvalidRange {
+            reason: "range end must not precede range start",
+        })?;
+    request
+        .range
+        .row_count()
+        .ok_or(SpreadsheetError::InvalidRange {
+            reason: "range end must not precede range start",
+        })?;
     if request.conditions.is_empty() {
         return Err(SpreadsheetError::InvalidFilter {
             reason: "conditions must not be empty".to_string(),
@@ -396,41 +403,73 @@ pub fn filter_rows(request: &FilterRowsRequest) -> Result<FilterRowsResult, Spre
     for condition in &request.conditions {
         validate_filter_condition(condition, request.range)?;
     }
+    let returned_cells = columns.saturating_mul(request.max_results as u64);
+    if returned_cells > MAX_WORKBOOK_CELLS as u64 {
+        return Err(SpreadsheetError::TooManyCells {
+            context: "filtered result",
+            actual: usize::try_from(returned_cells).unwrap_or(usize::MAX),
+            limit: MAX_WORKBOOK_CELLS,
+        });
+    }
 
-    let read = read_range(&ReadRangeRequest {
-        path: request.path.clone(),
-        sheet: request.sheet.clone(),
-        range: request.range,
-    })?;
+    let (mut workbook, _) = open_workbook_reader(&request.path)?;
+    let metadata = workbook.sheets_metadata().to_vec();
+    ensure_sheet_count(metadata.len())?;
+    let sheet = metadata
+        .iter()
+        .find(|sheet| sheet.name == request.sheet)
+        .ok_or_else(|| SpreadsheetError::SheetNotFound {
+            sheet: request.sheet.clone(),
+        })?;
+    let info = sheet_info(sheet);
+    if info.kind != SheetKind::Worksheet {
+        return Err(SpreadsheetError::UnsupportedSheetType {
+            sheet: info.name,
+            kind: info.kind,
+        });
+    }
+    let values = worksheet_values(&mut workbook, &request.path, &request.sheet)?;
+    let formulas = worksheet_formulas(&mut workbook, &request.path, &request.sheet)?;
+    let stats = collect_sheet_stats(&values, &formulas, &request.sheet)?;
+    ensure_workbook_cell_count(stats.populated_cells)?;
+    let sheet_end_row = stats
+        .used_range
+        .map(|range| range.end.row)
+        .unwrap_or(request.range.start.row.saturating_sub(1));
+    let scan_end_row = request.range.end.row.min(sheet_end_row);
+
     let mut rows = Vec::new();
     let mut matched_row_indices = Vec::new();
     let mut truncated = false;
     let mut scanned_rows = 0_u64;
-    for (row_offset, row) in read.rows.into_iter().enumerate() {
+    for row_index in request.range.start.row..=scan_end_row {
         scanned_rows = scanned_rows.saturating_add(1);
+        let condition_matches = request
+            .conditions
+            .iter()
+            .map(|condition| {
+                filter_cell(
+                    &values,
+                    &formulas,
+                    &request.sheet,
+                    row_index,
+                    condition.column,
+                )
+                .map(|cell| filter_condition_matches(&cell, condition))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let include = match request.match_mode {
-            SpreadsheetFilterMatchMode::All => request.conditions.iter().all(|condition| {
-                let index = (condition.column - request.range.start.column) as usize;
-                filter_condition_matches(&row[index], condition)
-            }),
-            SpreadsheetFilterMatchMode::Any => request.conditions.iter().any(|condition| {
-                let index = (condition.column - request.range.start.column) as usize;
-                filter_condition_matches(&row[index], condition)
-            }),
+            SpreadsheetFilterMatchMode::All => condition_matches.into_iter().all(|matched| matched),
+            SpreadsheetFilterMatchMode::Any => condition_matches.into_iter().any(|matched| matched),
         };
         if include {
             if rows.len() == request.max_results {
                 truncated = true;
                 break;
             }
-            let row_index = request
-                .range
-                .start
-                .row
-                .checked_add(row_offset as u32)
-                .ok_or(SpreadsheetError::InvalidRange {
-                    reason: "filtered row index overflowed",
-                })?;
+            let row = (request.range.start.column..=request.range.end.column)
+                .map(|column| filter_cell(&values, &formulas, &request.sheet, row_index, column))
+                .collect::<Result<Vec<_>, _>>()?;
             matched_row_indices.push(row_index);
             rows.push(row);
         }
@@ -445,8 +484,28 @@ pub fn filter_rows(request: &FilterRowsRequest) -> Result<FilterRowsResult, Spre
         scanned_rows,
         truncated,
     };
-    ensure_return_size(&result)?;
     Ok(result)
+}
+
+fn filter_cell(
+    values: &calamine::Range<Data>,
+    formulas: &calamine::Range<String>,
+    sheet: &str,
+    row: u32,
+    column: u32,
+) -> Result<SpreadsheetCell, SpreadsheetError> {
+    let value = values.get_value((row, column)).unwrap_or(&Data::Empty);
+    let formula = formulas
+        .get_value((row, column))
+        .filter(|formula| !formula.is_empty())
+        .cloned();
+    if let Some(formula) = &formula {
+        validate_return_text(formula, sheet, row, column)?;
+    }
+    Ok(SpreadsheetCell {
+        value: cell_value_from_data(value, sheet, row, column)?,
+        formula,
+    })
 }
 
 fn spreadsheet_cell_display_text(value: &SpreadsheetCellValue) -> String {
@@ -482,7 +541,7 @@ fn text_matches(
     }
 }
 
-fn validate_filter_condition(
+pub(super) fn validate_filter_condition(
     condition: &SpreadsheetFilterCondition,
     range: CellRange,
 ) -> Result<(), SpreadsheetError> {
@@ -536,7 +595,7 @@ fn validate_filter_condition(
     Ok(())
 }
 
-fn filter_condition_matches(
+pub(super) fn filter_condition_matches(
     cell: &SpreadsheetCell,
     condition: &SpreadsheetFilterCondition,
 ) -> bool {
@@ -557,6 +616,7 @@ fn filter_condition_matches(
             !filter_values_equal(&cell.value, value, condition.case_sensitive)
         }),
         SpreadsheetFilterOperator::Contains
+        | SpreadsheetFilterOperator::NotContains
         | SpreadsheetFilterOperator::StartsWith
         | SpreadsheetFilterOperator::EndsWith => {
             let Some(value) = condition.value.as_ref() else {
@@ -564,16 +624,22 @@ fn filter_condition_matches(
             };
             let mode = match condition.operator {
                 SpreadsheetFilterOperator::Contains => SpreadsheetTextMatchMode::Contains,
+                SpreadsheetFilterOperator::NotContains => SpreadsheetTextMatchMode::Contains,
                 SpreadsheetFilterOperator::StartsWith => SpreadsheetTextMatchMode::StartsWith,
                 SpreadsheetFilterOperator::EndsWith => SpreadsheetTextMatchMode::EndsWith,
                 _ => unreachable!(),
             };
-            text_matches(
+            let matched = text_matches(
                 &spreadsheet_cell_display_text(&cell.value),
                 &filter_value_display_text(value),
                 mode,
                 condition.case_sensitive,
-            )
+            );
+            if condition.operator == SpreadsheetFilterOperator::NotContains {
+                !matched
+            } else {
+                matched
+            }
         }
         SpreadsheetFilterOperator::GreaterThan
         | SpreadsheetFilterOperator::GreaterThanOrEqual

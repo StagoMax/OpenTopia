@@ -24,6 +24,7 @@ mod display;
 mod format;
 mod ooxml;
 mod read;
+mod row_transfer;
 mod template_patch;
 mod transfer;
 mod workbook_write;
@@ -31,6 +32,7 @@ mod workbook_write;
 pub use format::SpreadsheetFileFormat;
 pub(crate) use read::read_range_for_display;
 pub use read::{filter_rows, find_cells, inspect_workbook, list_sheets, read_range, read_ranges};
+pub use row_transfer::*;
 pub use transfer::*;
 
 use template_patch::patch_workbook_template;
@@ -50,13 +52,12 @@ pub const MAX_READ_CELLS: u64 = 10_000;
 pub const MAX_READ_RANGES: usize = 64;
 pub const MAX_WRITE_UPDATES: usize = 10_000;
 pub const MAX_WORKBOOK_CELLS: usize = 250_000;
-pub const MAX_RETURN_BYTES: usize = 1024 * 1024;
 pub const MAX_CELL_CHARACTERS: usize = 32_767;
 pub const MAX_CELL_TEXT_BYTES: usize = 128 * 1024;
 pub const MAX_FORMULA_BYTES: usize = 8_192;
 pub const MAX_FIND_RESULTS: usize = 1_000;
 pub const MAX_FILTER_CONDITIONS: usize = 32;
-pub const MAX_FILTER_RESULTS: usize = 1_000;
+pub const MAX_FILTER_RESULTS: usize = 2_000;
 
 const MAX_EXCEL_INTEGER: i64 = 999_999_999_999_999;
 const OPENPYXL_WORKER_TIMEOUT: Duration = Duration::from_secs(60);
@@ -80,6 +81,7 @@ pub enum SpreadsheetAction {
     FilterRows(FilterRowsRequest),
     ValidateWorkbook(ValidateWorkbookRequest),
     FillTemplate(FillTemplateRequest),
+    TransferRows(TransferRowsRequest),
     ExportDelimited(ExportDelimitedRequest),
     WriteWorkbook(WriteWorkbookRequest),
 }
@@ -96,6 +98,7 @@ pub enum SpreadsheetActionKind {
     FilterRows,
     ValidateWorkbook,
     FillTemplate,
+    TransferRows,
     ExportDelimited,
     WriteWorkbook,
 }
@@ -112,6 +115,7 @@ impl SpreadsheetAction {
             Self::FilterRows(_) => SpreadsheetActionKind::FilterRows,
             Self::ValidateWorkbook(_) => SpreadsheetActionKind::ValidateWorkbook,
             Self::FillTemplate(_) => SpreadsheetActionKind::FillTemplate,
+            Self::TransferRows(_) => SpreadsheetActionKind::TransferRows,
             Self::ExportDelimited(_) => SpreadsheetActionKind::ExportDelimited,
             Self::WriteWorkbook(_) => SpreadsheetActionKind::WriteWorkbook,
         }
@@ -122,7 +126,7 @@ impl SpreadsheetActionKind {
     pub fn is_mutation(self) -> bool {
         matches!(
             self,
-            Self::FillTemplate | Self::ExportDelimited | Self::WriteWorkbook
+            Self::FillTemplate | Self::TransferRows | Self::ExportDelimited | Self::WriteWorkbook
         )
     }
 }
@@ -210,6 +214,7 @@ pub enum SpreadsheetFilterOperator {
     Equals,
     NotEquals,
     Contains,
+    NotContains,
     StartsWith,
     EndsWith,
     GreaterThan,
@@ -355,6 +360,7 @@ pub enum SpreadsheetResult {
     RowsFiltered(FilterRowsResult),
     WorkbookValidated(ValidateWorkbookResult),
     TemplateFilled(FillTemplateResult),
+    RowsTransferred(TransferRowsResult),
     DelimitedExported(ExportDelimitedResult),
     WorkbookWritten(WriteWorkbookResult),
 }
@@ -371,6 +377,7 @@ impl SpreadsheetResult {
             Self::RowsFiltered(_) => SpreadsheetActionKind::FilterRows,
             Self::WorkbookValidated(_) => SpreadsheetActionKind::ValidateWorkbook,
             Self::TemplateFilled(_) => SpreadsheetActionKind::FillTemplate,
+            Self::RowsTransferred(_) => SpreadsheetActionKind::TransferRows,
             Self::DelimitedExported(_) => SpreadsheetActionKind::ExportDelimited,
             Self::WorkbookWritten(_) => SpreadsheetActionKind::WriteWorkbook,
         }
@@ -553,7 +560,6 @@ pub enum SpreadsheetErrorCode {
     CellContentTooLarge,
     NoSheets,
     NoVisibleSheet,
-    ReturnTooLarge,
     Serialization,
     BackendUnavailable,
     WorkerTimeout,
@@ -668,11 +674,6 @@ pub enum SpreadsheetError {
     NoSheets,
     #[error("a workbook must contain at least one visible worksheet")]
     NoVisibleSheet,
-    #[error("serialized result is {actual_bytes} bytes; return limit is {limit_bytes} bytes")]
-    ReturnTooLarge {
-        actual_bytes: usize,
-        limit_bytes: usize,
-    },
     #[error("failed to serialize spreadsheet result: {message}")]
     Serialization { message: String },
     #[error("spreadsheet backend is unavailable: {message}")]
@@ -711,7 +712,6 @@ impl SpreadsheetError {
             Self::CellContentTooLarge { .. } => SpreadsheetErrorCode::CellContentTooLarge,
             Self::NoSheets => SpreadsheetErrorCode::NoSheets,
             Self::NoVisibleSheet => SpreadsheetErrorCode::NoVisibleSheet,
-            Self::ReturnTooLarge { .. } => SpreadsheetErrorCode::ReturnTooLarge,
             Self::Serialization { .. } => SpreadsheetErrorCode::Serialization,
             Self::BackendUnavailable { .. } => SpreadsheetErrorCode::BackendUnavailable,
             Self::WorkerTimeout { .. } => SpreadsheetErrorCode::WorkerTimeout,
@@ -757,6 +757,9 @@ pub fn execute_spreadsheet(
         }
         SpreadsheetAction::FillTemplate(request) => {
             transfer::fill_template(&request).map(SpreadsheetResult::TemplateFilled)
+        }
+        SpreadsheetAction::TransferRows(request) => {
+            row_transfer::transfer_rows(&request).map(SpreadsheetResult::RowsTransferred)
         }
         SpreadsheetAction::ExportDelimited(request) => {
             transfer::export_delimited(&request).map(SpreadsheetResult::DelimitedExported)
@@ -936,7 +939,6 @@ pub fn write_workbook_openpyxl(
         preserved_template_parts: false,
         backend: SpreadsheetWriteBackend::Openpyxl,
     };
-    ensure_return_size(&result)?;
     Ok(result)
 }
 
@@ -1032,8 +1034,6 @@ pub fn write_workbook(
         preserved_template_parts: preserve_template_parts,
         backend: SpreadsheetWriteBackend::Native,
     };
-    ensure_return_size(&result)?;
-
     fs::write(&request.output, &bytes).map_err(|source| SpreadsheetError::Io {
         operation: "write",
         path: request.output.clone(),
@@ -1516,21 +1516,6 @@ fn cell_value_from_data(
         Data::Error(value) => SpreadsheetCellValue::Error(value.to_string()),
     };
     Ok(result)
-}
-
-fn ensure_return_size<T: Serialize>(result: &T) -> Result<(), SpreadsheetError> {
-    let actual_bytes = serde_json::to_vec(result)
-        .map_err(|error| SpreadsheetError::Serialization {
-            message: error.to_string(),
-        })?
-        .len();
-    if actual_bytes > MAX_RETURN_BYTES {
-        return Err(SpreadsheetError::ReturnTooLarge {
-            actual_bytes,
-            limit_bytes: MAX_RETURN_BYTES,
-        });
-    }
-    Ok(())
 }
 
 fn sheet_info(sheet: &calamine::Sheet) -> SheetInfo {

@@ -1,9 +1,11 @@
 //! Progressive spreadsheet tool protocol.
 //!
-//! The public surface remains small while the precise operation schema is
-//! supplied only after `spreadsheet_describe` selects an operation. Execution
-//! delegates to the established `SpreadsheetTool`, keeping one validation and
-//! staging path for both the modern protocol and legacy calls.
+//! The public surface remains small while the stable execution schema is
+//! supplied only after `spreadsheet_describe` is called. Describe can return
+//! focused guidance for selected operations without changing the contract that
+//! was already exposed. Execution delegates to the established
+//! `SpreadsheetTool`, keeping one validation and staging path for both the
+//! modern protocol and legacy calls.
 
 use super::attachment_tool::stored_attachment_read_path;
 use super::spreadsheet_protocol_contract::{
@@ -25,8 +27,6 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::path::PathBuf;
 use uuid::Uuid;
-
-const DEFAULT_SPREADSHEET_OUTPUT_DIR: &str = "output";
 
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -66,7 +66,7 @@ impl TypedTool for SpreadsheetInspectTool {
     }
 
     fn description(&self) -> &str {
-        "Stage 1 of spreadsheet work: bind and inspect one workspace file or immutable user attachment. Use it before choosing a detailed read or mutation operation."
+        "Stage 1 of spreadsheet work: bind and inspect one file path or immutable user attachment. Relative and absolute paths are governed by the active filesystem authority. Use it before choosing a detailed read or mutation operation."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
@@ -79,7 +79,7 @@ impl TypedTool for SpreadsheetInspectTool {
         _workspace_root: &std::path::Path,
     ) -> ToolExecutionIntent {
         match &input.resource {
-            OfficeResourceRef::WorkspaceFile { path } => {
+            OfficeResourceRef::File { path } => {
                 ToolExecutionIntent::observation([PathBuf::from(path)])
             }
             OfficeResourceRef::Attachment { .. } => ToolExecutionIntent::observation([]),
@@ -142,7 +142,7 @@ impl TypedTool for SpreadsheetDescribeTool {
     }
 
     fn description(&self) -> &str {
-        "Stage 2 of spreadsheet work: load exact spreadsheet_execute schemas and backend constraints for selected operations. Call after spreadsheet_inspect for existing inputs; omit resource only when selecting write to create a new workbook."
+        "Stage 2 of spreadsheet work: expose the stable spreadsheet_execute tool and return exact backend constraints for selected operations. Call after spreadsheet_inspect for existing inputs; omit resource only when selecting write to create a new workbook."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
@@ -229,7 +229,10 @@ impl TypedTool for SpreadsheetDescribeTool {
                 "rule": "Do not include action or the primary resource field in arguments; the protocol binds it from resource."
             }
         });
-        let loaded_execute_schema = spreadsheet_execute_contract_schema(&selected_operations)?;
+        // Tool disclosure is progressive, but the disclosed tool contract is
+        // stable. A later describe call may request different operation docs;
+        // it must not revoke operations that the model learned earlier.
+        let loaded_execute_schema = spreadsheet_execute_contract_schema()?;
         let mut metadata = Map::new();
         metadata.insert("success".to_string(), Value::Bool(true));
         metadata.insert(
@@ -266,13 +269,7 @@ pub(super) struct SpreadsheetExecuteInput {
 
 pub struct SpreadsheetExecuteTool;
 
-fn spreadsheet_execute_contract_schema(
-    operations: &[SpreadsheetProtocolOperation],
-) -> anyhow::Result<Value> {
-    anyhow::ensure!(
-        !operations.is_empty(),
-        "at least one spreadsheet operation must be selected"
-    );
+fn spreadsheet_execute_contract_schema() -> anyhow::Result<Value> {
     // Use the required resource type rather than SpreadsheetExecuteInput's
     // `Option` projection; read/mutation branches may make the property
     // optional, but an explicitly supplied resource is never null.
@@ -281,7 +278,7 @@ fn spreadsheet_execute_contract_schema(
         .pointer("/properties/resource")
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("spreadsheet resource schema is missing"))?;
-    let branches = operations
+    let branches = SpreadsheetProtocolOperation::ALL
         .iter()
         .copied()
         .map(|operation| -> anyhow::Result<Value> {
@@ -327,7 +324,7 @@ impl TypedTool for SpreadsheetExecuteTool {
     }
 
     fn description(&self) -> &str {
-        "Stage 3 of spreadsheet work: execute a selected operation using the exact argument contract returned by spreadsheet_describe. Mutations remain approval-governed and atomic; observations use the same resource contract."
+        "Stage 3 of spreadsheet work: execute any supported operation using the exact argument guidance returned by spreadsheet_describe. Its tool contract stays stable across repeated describe calls; mutations remain approval-governed and atomic."
     }
 
     fn provider_contract_loader(&self) -> Option<&str> {
@@ -342,7 +339,7 @@ impl TypedTool for SpreadsheetExecuteTool {
             .unwrap_or_else(|| tool_resource_key("file", "*"))];
         if input.operation.is_mutation() {
             if let Some(output) = output_path_from_arguments(&input.arguments) {
-                resource_keys.push(tool_resource_key("file", &output));
+                resource_keys.push(tool_resource_key("file", output));
             }
             resource_keys.sort();
             resource_keys.dedup();
@@ -369,7 +366,7 @@ impl TypedTool for SpreadsheetExecuteTool {
             .resource
             .as_ref()
             .and_then(|resource| match resource {
-                OfficeResourceRef::WorkspaceFile { path } => Some(vec![PathBuf::from(path)]),
+                OfficeResourceRef::File { path } => Some(vec![PathBuf::from(path)]),
                 OfficeResourceRef::Attachment { .. } => None,
             })
             .unwrap_or_default();
@@ -405,15 +402,12 @@ impl TypedTool for SpreadsheetExecuteTool {
         let Value::Object(mut arguments) = arguments_value else {
             unreachable!("spreadsheet execute arguments are constructed as an object")
         };
-        apply_default_output_directory(&mut arguments);
 
         if let Some(resource) = resource {
             let binding = operation.primary_binding();
             if operation.is_mutation() {
                 let path = match &resource {
-                    OfficeResourceRef::WorkspaceFile { .. } => {
-                        PathBuf::from(resource.offline_path()?)
-                    }
+                    OfficeResourceRef::File { .. } => PathBuf::from(resource.offline_path()?),
                     OfficeResourceRef::Attachment { attachment_id } => {
                         stored_attachment_read_path(&ctx, *attachment_id)?
                     }
@@ -440,40 +434,12 @@ impl TypedTool for SpreadsheetExecuteTool {
     }
 }
 
-fn output_path_from_arguments(arguments: &Map<String, Value>) -> Option<String> {
-    if let Some(output_path) = arguments
+fn output_path_from_arguments(arguments: &Map<String, Value>) -> Option<&str> {
+    arguments
         .get("outputPath")
+        .or_else(|| arguments.get("path"))
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-    {
-        return Some(default_output_path(output_path));
-    }
-    arguments
-        .get("path")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-fn apply_default_output_directory(arguments: &mut Map<String, Value>) {
-    let Some(output_path) = arguments.get("outputPath").and_then(Value::as_str) else {
-        return;
-    };
-    arguments.insert(
-        "outputPath".to_string(),
-        Value::String(default_output_path(output_path)),
-    );
-}
-
-fn default_output_path(output_path: &str) -> String {
-    let trimmed = output_path.trim();
-    let path = PathBuf::from(trimmed);
-    if !path.is_absolute() && path.components().count() == 1 {
-        format!("{DEFAULT_SPREADSHEET_OUTPUT_DIR}/{trimmed}")
-    } else {
-        output_path.to_string()
-    }
 }
 
 fn argument_read_paths(arguments: &Map<String, Value>) -> Vec<&str> {
@@ -498,18 +464,24 @@ fn operation_notes(operation: SpreadsheetProtocolOperation, resource: &Value) ->
     let mut notes = vec![format!("Resource backend: {backend}.")];
     if resource["kind"] == "newWorkbook" {
         notes.push(
-            "No input resource is bound; outputPath creates the new workbook in the active workspace authority."
+            "No input resource is bound; outputPath creates the new workbook under the active filesystem authority."
                 .to_string(),
         );
     } else if operation.is_mutation() {
         notes.push(
-            "The resource is a read input; outputPath is a separate destination governed by the active sandbox policy. The input is never modified unless outputPath intentionally resolves to the same writable file. Mutations are atomic."
+            "The resource is a read input; outputPath is a separate destination governed by the active filesystem authority. The input is never modified unless outputPath intentionally resolves to the same writable file. Mutations are atomic."
                 .to_string(),
         );
     }
     if matches!(operation, SpreadsheetProtocolOperation::FillTemplate) {
         notes.push(
-            "resource binds templatePath; dataPath is a separate readable CSV/TSV source governed by the active sandbox policy."
+            "resource binds templatePath; dataPath is a separate readable CSV/TSV source governed by the active filesystem authority."
+                .to_string(),
+        );
+    }
+    if matches!(operation, SpreadsheetProtocolOperation::TransferRows) {
+        notes.push(
+            "resource binds sourcePath; templatePath is a separate readable XLSX template. Filtering, projection, constants, and value transforms execute inside the spreadsheet backend and only a summary is returned."
                 .to_string(),
         );
     }
@@ -584,34 +556,5 @@ mod runtime_projection_tests {
         );
         assert!(runtime.get("root").is_none());
         assert!(runtime.get("executable").is_none());
-    }
-
-    #[test]
-    fn bare_spreadsheet_output_names_default_to_the_output_directory() {
-        assert_eq!(default_output_path("book.xlsx"), "output/book.xlsx");
-        assert_eq!(
-            default_output_path("reports/book.xlsx"),
-            "reports/book.xlsx"
-        );
-        assert_eq!(default_output_path("./book.xlsx"), "./book.xlsx");
-
-        let mut arguments = json!({ "outputPath": "book.xlsx" })
-            .as_object()
-            .expect("arguments object")
-            .clone();
-        apply_default_output_directory(&mut arguments);
-        assert_eq!(arguments["outputPath"], "output/book.xlsx");
-    }
-
-    #[test]
-    fn an_existing_path_without_output_path_is_not_redirected() {
-        let arguments = json!({ "path": "book.xlsx" })
-            .as_object()
-            .expect("arguments object")
-            .clone();
-        assert_eq!(
-            output_path_from_arguments(&arguments),
-            Some("book.xlsx".to_string())
-        );
     }
 }

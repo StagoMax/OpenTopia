@@ -17,7 +17,8 @@ use crate::spreadsheet::{
     SheetRangeRequest, SheetWriteRequest, SpreadsheetAction, SpreadsheetCell, SpreadsheetCellInput,
     SpreadsheetCellValue, SpreadsheetFileFormat, SpreadsheetFilterCondition,
     SpreadsheetFilterMatchMode, SpreadsheetRequest, SpreadsheetResult, SpreadsheetSheetValidation,
-    SpreadsheetTextMatchMode, ValidateWorkbookRequest, WriteWorkbookRequest,
+    SpreadsheetTextMatchMode, TransferColumn, TransferRowFilter, TransferRowsRequest,
+    ValidateWorkbookRequest, WriteWorkbookRequest,
     MAX_INPUT_FILE_BYTES as MAX_SPREADSHEET_INPUT_BYTES,
 };
 use anyhow::Context;
@@ -44,6 +45,7 @@ enum SpreadsheetToolAction {
     FilterRows,
     Validate,
     FillTemplate,
+    TransferRows,
     ExportDelimited,
     Write,
     WriteRows,
@@ -136,7 +138,7 @@ pub(super) enum SpreadsheetToolInput {
     },
     #[schemars(rename_all = "camelCase")]
     Inspect {
-        /// Workspace-relative workbook path (.xls/.xlsx/.xlsm/.xlsb/.xltx/.xltm/.ods). Provide exactly one of path or attachmentId.
+        /// Workbook path (.xls/.xlsx/.xlsm/.xlsb/.xltx/.xltm/.ods). Relative and absolute paths follow the active filesystem authority. Provide exactly one of path or attachmentId.
         #[serde(default)]
         path: Option<String>,
         #[serde(default)]
@@ -230,7 +232,7 @@ pub(super) enum SpreadsheetToolInput {
         #[serde(default)]
         filter_match_mode: Option<SpreadsheetFilterMatchMode>,
         #[serde(default)]
-        #[schemars(range(min = 1, max = 1000))]
+        #[schemars(range(min = 1, max = 2000))]
         max_results: Option<usize>,
     },
     #[schemars(rename_all = "camelCase")]
@@ -271,6 +273,32 @@ pub(super) enum SpreadsheetToolInput {
         rstrip_tabs: bool,
     },
     #[schemars(rename_all = "camelCase")]
+    TransferRows {
+        /// Source workbook/data path. The protocol binds this from resource.
+        source_path: String,
+        source_sheet: String,
+        /// Existing XLSX template path.
+        template_path: String,
+        /// Destination XLSX path.
+        output_path: String,
+        target_sheet: String,
+        #[serde(default)]
+        source_header_row: u32,
+        #[serde(default)]
+        source_start_row: Option<u32>,
+        #[serde(default)]
+        target_header_row: u32,
+        #[serde(default)]
+        target_start_row: Option<u32>,
+        #[serde(default)]
+        #[schemars(length(max = 32))]
+        filters: Vec<TransferRowFilter>,
+        #[serde(default)]
+        filter_match_mode: Option<SpreadsheetFilterMatchMode>,
+        #[schemars(length(min = 1, max = 256))]
+        columns: Vec<TransferColumn>,
+    },
+    #[schemars(rename_all = "camelCase")]
     ExportDelimited {
         /// Source workbook path.
         path: String,
@@ -286,7 +314,7 @@ pub(super) enum SpreadsheetToolInput {
     },
     #[schemars(rename_all = "camelCase")]
     Write {
-        /// Workspace-relative destination selected by the model from the user's request.
+        /// Destination selected by the model from the user's request. Relative and absolute paths follow the active filesystem authority.
         #[serde(default)]
         path: Option<String>,
         #[serde(default)]
@@ -401,6 +429,7 @@ impl SpreadsheetToolInput {
             Self::FilterRows { .. } => SpreadsheetToolAction::FilterRows,
             Self::Validate { .. } => SpreadsheetToolAction::Validate,
             Self::FillTemplate { .. } => SpreadsheetToolAction::FillTemplate,
+            Self::TransferRows { .. } => SpreadsheetToolAction::TransferRows,
             Self::ExportDelimited { .. } => SpreadsheetToolAction::ExportDelimited,
             Self::Write { .. } => SpreadsheetToolAction::Write,
             Self::WriteRows { .. } => SpreadsheetToolAction::WriteRows,
@@ -430,7 +459,7 @@ impl SpreadsheetToolInput {
             | Self::CopyColumns { path, .. }
             | Self::Batch { path, .. } => path.as_deref(),
             Self::ExportDelimited { path, .. } => Some(path.as_str()),
-            Self::FillTemplate { .. } => None,
+            Self::FillTemplate { .. } | Self::TransferRows { .. } => None,
         }
     }
 
@@ -447,6 +476,7 @@ impl SpreadsheetToolInput {
             | Self::FilterRows { attachment_id, .. }
             | Self::Validate { attachment_id, .. } => attachment_id.as_deref(),
             Self::FillTemplate { .. }
+            | Self::TransferRows { .. }
             | Self::ExportDelimited { .. }
             | Self::Write { .. }
             | Self::WriteRows { .. }
@@ -467,6 +497,16 @@ impl SpreadsheetToolInput {
                 ..
             } => paths.extend([
                 data_path.as_str(),
+                template_path.as_str(),
+                output_path.as_str(),
+            ]),
+            Self::TransferRows {
+                source_path,
+                template_path,
+                output_path,
+                ..
+            } => paths.extend([
+                source_path.as_str(),
                 template_path.as_str(),
                 output_path.as_str(),
             ]),
@@ -547,9 +587,9 @@ impl SpreadsheetToolInput {
 
     fn mutation_output_path(&self) -> Option<&str> {
         match self {
-            Self::FillTemplate { output_path, .. } | Self::ExportDelimited { output_path, .. } => {
-                Some(output_path.as_str())
-            }
+            Self::FillTemplate { output_path, .. }
+            | Self::TransferRows { output_path, .. }
+            | Self::ExportDelimited { output_path, .. } => Some(output_path.as_str()),
             Self::Write {
                 path, output_path, ..
             }
@@ -589,6 +629,11 @@ impl SpreadsheetToolInput {
                 template_path,
                 ..
             } => paths.extend([data_path.as_str(), template_path.as_str()]),
+            Self::TransferRows {
+                source_path,
+                template_path,
+                ..
+            } => paths.extend([source_path.as_str(), template_path.as_str()]),
             Self::ExportDelimited { path, .. } => paths.push(path.as_str()),
             Self::Write {
                 path, source_path, ..
@@ -670,6 +715,7 @@ struct SpreadsheetExecutionInput {
     columns: Vec<Vec<SpreadsheetCellInput>>,
     from: Option<String>,
     source_sheet: Option<String>,
+    source_start_row: Option<u32>,
     source_start: Option<CellAddress>,
     destination_sheet: Option<String>,
     destination_start: Option<CellAddress>,
@@ -680,6 +726,8 @@ struct SpreadsheetExecutionInput {
     template_path: Option<String>,
     target_header_row: u32,
     target_start_row: Option<u32>,
+    transfer_filters: Vec<TransferRowFilter>,
+    transfer_columns: Vec<TransferColumn>,
     mappings: Vec<DelimitedColumnMapping>,
     formula_mode: DelimitedFormulaMode,
     expected_sheets: Vec<String>,
@@ -764,6 +812,7 @@ impl SpreadsheetExecutionInput {
             | SpreadsheetToolAction::FilterRows
             | SpreadsheetToolAction::Validate
             | SpreadsheetToolAction::FillTemplate
+            | SpreadsheetToolAction::TransferRows
             | SpreadsheetToolAction::ExportDelimited
             | SpreadsheetToolAction::Write
             | SpreadsheetToolAction::Batch => None,
@@ -801,6 +850,7 @@ impl From<SpreadsheetToolInput> for SpreadsheetExecutionInput {
             columns: Vec::new(),
             from: None,
             source_sheet: None,
+            source_start_row: None,
             source_start: None,
             destination_sheet: None,
             destination_start: None,
@@ -811,6 +861,8 @@ impl From<SpreadsheetToolInput> for SpreadsheetExecutionInput {
             template_path: None,
             target_header_row: 0,
             target_start_row: None,
+            transfer_filters: Vec::new(),
+            transfer_columns: Vec::new(),
             mappings: Vec::new(),
             formula_mode: DelimitedFormulaMode::Values,
             expected_sheets: Vec::new(),
@@ -967,6 +1019,33 @@ impl From<SpreadsheetToolInput> for SpreadsheetExecutionInput {
                 execution.mappings = mappings;
                 execution.rstrip_tabs = rstrip_tabs;
             }
+            SpreadsheetToolInput::TransferRows {
+                source_path,
+                source_sheet,
+                template_path,
+                output_path,
+                target_sheet,
+                source_header_row,
+                source_start_row,
+                target_header_row,
+                target_start_row,
+                filters,
+                filter_match_mode,
+                columns,
+            } => {
+                execution.source_path = Some(source_path);
+                execution.source_sheet = Some(source_sheet);
+                execution.template_path = Some(template_path);
+                execution.output_path = Some(output_path);
+                execution.sheet = Some(target_sheet);
+                execution.header_row = source_header_row;
+                execution.source_start_row = source_start_row;
+                execution.target_header_row = target_header_row;
+                execution.target_start_row = target_start_row;
+                execution.transfer_filters = filters;
+                execution.filter_match_mode = filter_match_mode;
+                execution.transfer_columns = columns;
+            }
             SpreadsheetToolInput::ExportDelimited {
                 path,
                 output_path,
@@ -1122,6 +1201,7 @@ impl TypedTool for SpreadsheetTool {
                 )])
             }
             SpreadsheetToolAction::FillTemplate
+            | SpreadsheetToolAction::TransferRows
             | SpreadsheetToolAction::ExportDelimited
             | SpreadsheetToolAction::Write
             | SpreadsheetToolAction::WriteRows
@@ -1165,6 +1245,7 @@ impl TypedTool for SpreadsheetTool {
                 ToolExecutionIntent::observation(input.path().map(PathBuf::from))
             }
             SpreadsheetToolAction::FillTemplate
+            | SpreadsheetToolAction::TransferRows
             | SpreadsheetToolAction::ExportDelimited
             | SpreadsheetToolAction::Write
             | SpreadsheetToolAction::WriteRows
@@ -1204,6 +1285,9 @@ impl TypedTool for SpreadsheetTool {
             }
             SpreadsheetToolAction::FillTemplate => {
                 execute_spreadsheet_fill_template(call_id, input, ctx).await
+            }
+            SpreadsheetToolAction::TransferRows => {
+                execute_spreadsheet_transfer_rows(call_id, input, ctx).await
             }
             SpreadsheetToolAction::ExportDelimited => {
                 execute_spreadsheet_export_delimited(call_id, input, ctx).await
@@ -1437,6 +1521,7 @@ async fn execute_spreadsheet_read(
                 })
             }
             SpreadsheetToolAction::FillTemplate
+            | SpreadsheetToolAction::TransferRows
             | SpreadsheetToolAction::ExportDelimited
             | SpreadsheetToolAction::Write
             | SpreadsheetToolAction::WriteRows
@@ -1550,6 +1635,97 @@ async fn execute_spreadsheet_fill_template(
     if let SpreadsheetResult::TemplateFilled(filled) = &mut result {
         filled.source = resolved_data_path;
         filled.template = resolved_template_path;
+    }
+    remap_spreadsheet_paths(&mut result, None, Some(&written.path));
+    spreadsheet_success_result(call_id, result, Some(written.path))
+}
+
+async fn execute_spreadsheet_transfer_rows(
+    call_id: Uuid,
+    input: SpreadsheetExecutionInput,
+    ctx: ToolInvocationContext,
+) -> anyhow::Result<ToolResult> {
+    let source_relative = required_typed_string(input.source_path.as_deref(), "sourcePath")?;
+    let template_relative = required_typed_string(input.template_path.as_deref(), "templatePath")?;
+    let output_relative = required_typed_string(input.output_path.as_deref(), "outputPath")?;
+    let source_logical = normalize_workspace_path(&ctx.workspace_root, &source_relative)?;
+    let template_logical = normalize_workspace_path(&ctx.workspace_root, &template_relative)?;
+    let output_path = normalize_workspace_path(&ctx.workspace_root, &output_relative)?;
+    enforce_read_policy(&ctx, &source_logical)?;
+    enforce_read_policy(&ctx, &template_logical)?;
+    ensure_spreadsheet_source_path(&source_logical)?;
+    ensure_xlsx_path(&template_logical)?;
+    ensure_xlsx_path(&output_path)?;
+    enforce_policy_decision(ctx.policy.inspect_write(&output_path), &ctx)?;
+
+    let resolved_source = ctx.environment.resolve_read_path(&source_logical)?;
+    let resolved_template = ctx.environment.resolve_read_path(&template_logical)?;
+    let source = ctx
+        .environment
+        .read_file(
+            FileReadRequest::new(&resolved_source).with_max_bytes(MAX_SPREADSHEET_INPUT_BYTES),
+        )
+        .await?;
+    let template = ctx
+        .environment
+        .read_file(
+            FileReadRequest::new(&resolved_template).with_max_bytes(MAX_SPREADSHEET_INPUT_BYTES),
+        )
+        .await?;
+    let source_sheet = required_typed_string(input.source_sheet.as_deref(), "sourceSheet")?;
+    let target_sheet = required_typed_string(input.sheet.as_deref(), "targetSheet")?;
+    let request = TransferRowsRequest {
+        source: PathBuf::new(),
+        source_sheet,
+        template: PathBuf::new(),
+        output: PathBuf::new(),
+        target_sheet,
+        source_header_row: input.header_row,
+        source_start_row: input.source_start_row,
+        target_header_row: input.target_header_row,
+        target_start_row: input.target_start_row,
+        filters: input.transfer_filters,
+        filter_match_mode: input.filter_match_mode.unwrap_or_default(),
+        columns: input.transfer_columns,
+    };
+    let staged = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let staging = SpreadsheetStaging::new()?;
+        let staged_source = staging.path(&staging_file_name("source", &source.path, "xlsx"));
+        let staged_template = staging.path("template.xlsx");
+        let staged_output = staging.path("output.xlsx");
+        fs::write(&staged_source, source.bytes)
+            .with_context(|| format!("failed to stage {}", source.path.display()))?;
+        fs::write(&staged_template, template.bytes)
+            .with_context(|| format!("failed to stage {}", template.path.display()))?;
+        let mut request = request;
+        request.source = staged_source;
+        request.template = staged_template;
+        request.output = staged_output.clone();
+        let outcome = execute_spreadsheet(SpreadsheetRequest {
+            action: SpreadsheetAction::TransferRows(request),
+        });
+        match outcome {
+            Ok(result) => {
+                let bytes = fs::read(&staged_output)
+                    .with_context(|| format!("failed to read {}", staged_output.display()))?;
+                Ok(Ok((result, bytes, source.path, template.path)))
+            }
+            Err(error) => Ok(Err(error)),
+        }
+    })
+    .await
+    .context("spreadsheet transfer_rows worker task failed")??;
+    let (mut result, bytes, resolved_source_path, resolved_template_path) = match staged {
+        Ok(result) => result,
+        Err(error) => return Ok(spreadsheet_error_result(call_id, error)),
+    };
+    let written = ctx
+        .environment
+        .write_file(FileWriteRequest::new(&output_path, bytes))
+        .await?;
+    if let SpreadsheetResult::RowsTransferred(transferred) = &mut result {
+        transferred.source = resolved_source_path;
+        transferred.template = resolved_template_path;
     }
     remap_spreadsheet_paths(&mut result, None, Some(&written.path));
     spreadsheet_success_result(call_id, result, Some(written.path))
@@ -2198,6 +2374,14 @@ fn remap_spreadsheet_paths(
             }
         }
         SpreadsheetResult::TemplateFilled(result) => {
+            if let Some(source) = source {
+                result.source = source.to_path_buf();
+            }
+            if let Some(output) = output {
+                result.output = output.to_path_buf();
+            }
+        }
+        SpreadsheetResult::RowsTransferred(result) => {
             if let Some(source) = source {
                 result.source = source.to_path_buf();
             }

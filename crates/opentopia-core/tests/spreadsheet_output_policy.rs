@@ -46,7 +46,7 @@ async fn mutation_contract_does_not_override_the_model_selected_output() {
             ToolCall::new(
                 "spreadsheet_describe",
                 json!({
-                    "resource": { "kind": "workspaceFile", "path": "source.xls" },
+                    "resource": { "kind": "file", "path": "source.xls" },
                     "operations": ["write_rows"]
                 }),
             ),
@@ -56,9 +56,7 @@ async fn mutation_contract_does_not_override_the_model_selected_output() {
         .expect("describe spreadsheet mutation contract");
 
     assert_eq!(described.metadata["success"], true);
-    assert!(described
-        .output
-        .contains("workspace-relative destination path"));
+    assert!(described.output.contains("active filesystem authority"));
     assert!(!described.output.contains("read-only sources"));
     assert!(!described.output.contains("write changed workbooks to XLSX"));
 }

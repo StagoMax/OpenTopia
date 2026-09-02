@@ -241,6 +241,7 @@ fn action_driven_tools_expose_only_action_specific_fields() {
             "filter_rows",
             "validate",
             "fill_template",
+            "transfer_rows",
             "export_delimited",
             "write",
             "write_rows",
@@ -289,6 +290,12 @@ fn action_driven_tools_expose_only_action_specific_fields() {
     assert!(fill_template.get("templatePath").is_some());
     assert!(fill_template.get("mappings").is_some());
     assert!(fill_template.get("rows").is_none());
+    let transfer_rows = &action_schema_branch(&spreadsheet, "transfer_rows")["properties"];
+    assert!(transfer_rows.get("sourcePath").is_some());
+    assert!(transfer_rows.get("templatePath").is_some());
+    assert!(transfer_rows.get("filters").is_some());
+    assert!(transfer_rows.get("columns").is_some());
+    assert!(transfer_rows.get("rows").is_none());
     let export_delimited = &action_schema_branch(&spreadsheet, "export_delimited")["properties"];
     assert!(export_delimited.get("outputPath").is_some());
     assert!(export_delimited.get("format").is_some());

@@ -561,16 +561,16 @@ async fn trusted_discovery_result_loads_and_resumes_a_precise_tool_contract() {
                 id: "describe-sheet".to_string(),
                 name: "spreadsheet_describe".to_string(),
                 arguments: json!({
-                    "resource": { "kind": "workspaceFile", "path": "unused.xlsx" },
+                    "resource": { "kind": "file", "path": "unused.xlsx" },
                     "operations": [
                         "read_range",
-                        "read_ranges",
                         "find",
                         "validate",
                         "batch",
                         "write_rows",
                         "copy_rows",
-                        "fill_template"
+                        "fill_template",
+                        "transfer_rows"
                     ]
                 }),
             },
@@ -615,7 +615,7 @@ async fn trusted_discovery_result_loads_and_resumes_a_precise_tool_contract() {
         id: "read-sheet".to_string(),
         name: "spreadsheet_execute".to_string(),
         arguments: json!({
-            "resource": { "kind": "workspaceFile", "path": "unused.xlsx" },
+            "resource": { "kind": "file", "path": "unused.xlsx" },
             "operation": "read_range",
             "arguments": {
                 "sheet": "Summary",
@@ -652,7 +652,7 @@ async fn spreadsheet_contract_load_is_committed_only_for_the_next_model_round() 
         id: "describe-sheet".to_string(),
         name: "spreadsheet_describe".to_string(),
         arguments: json!({
-            "resource": { "kind": "workspaceFile", "path": "unused.xlsx" },
+            "resource": { "kind": "file", "path": "unused.xlsx" },
             "operations": ["read_range"]
         }),
     };
@@ -660,7 +660,7 @@ async fn spreadsheet_contract_load_is_committed_only_for_the_next_model_round() 
         id: "same-round-execute".to_string(),
         name: "spreadsheet_execute".to_string(),
         arguments: json!({
-            "resource": { "kind": "workspaceFile", "path": "unused.xlsx" },
+            "resource": { "kind": "file", "path": "unused.xlsx" },
             "operation": "read_range",
             "arguments": {
                 "sheet": "Summary",
@@ -728,7 +728,7 @@ async fn spreadsheet_contract_load_is_committed_only_for_the_next_model_round() 
     assert!(crate::provider::tool_input_schema_error(
         &loaded.input_schema,
         &json!({
-            "resource": { "kind": "workspaceFile", "path": "unused.xlsx" },
+            "resource": { "kind": "file", "path": "unused.xlsx" },
             "operation": "read_range",
             "arguments": {}
         }),

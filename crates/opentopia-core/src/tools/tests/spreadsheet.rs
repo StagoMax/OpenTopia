@@ -67,7 +67,7 @@ async fn spreadsheet_protocol_progressively_describes_and_executes_offline_workb
         None
     );
 
-    let resource = json!({ "kind": "workspaceFile", "path": "output/protocol.xlsx" });
+    let resource = json!({ "kind": "file", "path": "protocol.xlsx" });
     let inspected = SpreadsheetInspectTool
         .execute(
             ToolCall::new("spreadsheet_inspect", json!({ "resource": resource })),
@@ -100,6 +100,29 @@ async fn spreadsheet_protocol_progressively_describes_and_executes_offline_workb
     assert_eq!(loaded_contracts.len(), 1);
     assert_eq!(loaded_contracts[0].name, "spreadsheet_execute");
     let loaded_execute_schema = &loaded_contracts[0].input_schema;
+    assert_eq!(
+        loaded_execute_schema, &create_contracts[0].input_schema,
+        "describe selections must not replace the exposed execute contract"
+    );
+    assert_eq!(
+        crate::provider::tool_input_schema_error(
+            loaded_execute_schema,
+            &json!({
+                "resource": resource,
+                "operation": "read_columns",
+                "arguments": {
+                    "sheet": "Summary",
+                    "startRow": 0,
+                    "rowCount": 2,
+                    "startColumn": 0,
+                    "columnCount": 1
+                }
+            }),
+            "arguments"
+        ),
+        None,
+        "a later describe selection must retain the read_columns contract"
+    );
     assert!(crate::provider::tool_input_schema_error(
         loaded_execute_schema,
         &json!({
@@ -264,7 +287,8 @@ async fn spreadsheet_protocol_progressively_describes_and_executes_offline_workb
 
     let inspect_schema = SpreadsheetInspectTool.schema();
     let inspect_schema_text = serde_json::to_string(&inspect_schema).unwrap();
-    assert!(inspect_schema_text.contains("workspaceFile"));
+    assert!(inspect_schema_text.contains("\"file\""));
+    assert!(!inspect_schema_text.contains("workspaceFile"));
     assert!(inspect_schema_text.contains("attachment"));
     assert!(inspect_schema_text.contains("attachmentId"));
     assert!(!inspect_schema_text.contains("attachment_id"));
@@ -402,11 +426,7 @@ async fn spreadsheet_protocol_uses_an_immutable_attachment_as_a_mutation_input()
         .await
         .expect("create attachment fixture");
     let attachment_path = attachment_root.join("template.xlsx");
-    fs::rename(
-        workspace_root.join("output/template.xlsx"),
-        &attachment_path,
-    )
-    .unwrap();
+    fs::rename(workspace_root.join("template.xlsx"), &attachment_path).unwrap();
     let attachment_path = attachment_path.canonicalize().unwrap();
 
     let store: Arc<dyn SessionStore> =
@@ -471,7 +491,7 @@ async fn spreadsheet_protocol_uses_an_immutable_attachment_as_a_mutation_input()
                 "spreadsheet",
                 json!({
                     "action": "read_range",
-                    "path": "output/attachment-copy.xlsx",
+                    "path": "attachment-copy.xlsx",
                     "sheet": "Summary",
                     "range": {
                         "start": { "row": 0, "column": 0 },
@@ -514,12 +534,292 @@ async fn spreadsheet_protocol_uses_an_immutable_attachment_as_a_mutation_input()
     fs::remove_dir_all(case_root).unwrap();
 }
 
+#[tokio::test]
+async fn transfer_rows_handles_full_scale_filter_mapping_constants_and_conversions() {
+    use crate::spreadsheet::{
+        execute_spreadsheet, write_workbook, CellAddress, CellUpdate, FillTemplateRequest,
+        SheetWriteRequest, SpreadsheetAction, SpreadsheetCellInput, SpreadsheetRequest,
+        WriteWorkbookRequest,
+    };
+
+    let workspace_root =
+        std::env::temp_dir().join(format!("opentopia-transfer-workspace-{}", Uuid::new_v4()));
+    let case_root =
+        std::env::temp_dir().join(format!("opentopia-transfer-external-{}", Uuid::new_v4()));
+    fs::create_dir_all(&workspace_root).unwrap();
+    fs::create_dir_all(&case_root).unwrap();
+    let source_template = case_root.join("source-template.xlsx");
+    let source_csv = case_root.join("source.csv");
+    let source = case_root.join("source.xlsx");
+    let template = case_root.join("template.xlsx");
+    let output = case_root.join("output.xlsx");
+
+    let mut source_headers = vec![
+        "Order ID".to_string(),
+        "Order Status".to_string(),
+        "Created Time".to_string(),
+        "Order Amount".to_string(),
+        "Product Name".to_string(),
+        "Quantity".to_string(),
+        "SKU Unit Original Price".to_string(),
+        "Tracking ID".to_string(),
+    ];
+    source_headers.extend((source_headers.len()..59).map(|index| format!("Extra {index}")));
+    write_workbook(&WriteWorkbookRequest {
+        source: None,
+        output: source_template.clone(),
+        sheets: vec![SheetWriteRequest {
+            name: "OrderSKUList".to_string(),
+            visibility: None,
+            cells: source_headers
+                .iter()
+                .enumerate()
+                .map(|(column, header)| CellUpdate {
+                    address: CellAddress {
+                        row: 0,
+                        column: column as u32,
+                    },
+                    value: SpreadsheetCellInput::String(header.clone()),
+                })
+                .collect(),
+        }],
+    })
+    .expect("create source template");
+
+    let mut csv = String::new();
+    csv.push_str(&source_headers.join(","));
+    csv.push('\n');
+    let mut description = vec![String::new(); 59];
+    description[0] = "Platform unique order ID.".to_string();
+    description[1] = "Order status.".to_string();
+    description[2] = "Order created time.".to_string();
+    csv.push_str(&description.join(","));
+    csv.push('\n');
+    for index in 0..1_500 {
+        let mut row = vec![String::new(); 59];
+        row[0] = (index + 1).to_string();
+        row[1] = if index < 330 {
+            "Cancelled by seller".to_string()
+        } else if index < 334 {
+            "Unpaid".to_string()
+        } else {
+            "Paid".to_string()
+        };
+        row[2] = "08/19/2026 02:37:00 AM".to_string();
+        row[3] = "USD 1234.50".to_string();
+        row[4] = format!("Product {}", index + 1);
+        row[5] = "2".to_string();
+        row[6] = "USD 10.25".to_string();
+        row[7] = format!("TRACK-{}", index + 1);
+        csv.push_str(&row.join(","));
+        csv.push('\n');
+    }
+    fs::write(&source_csv, csv).unwrap();
+    execute_spreadsheet(SpreadsheetRequest {
+        action: SpreadsheetAction::FillTemplate(FillTemplateRequest {
+            source: source_csv,
+            source_format: None,
+            template: source_template,
+            output: source.clone(),
+            target_sheet: "OrderSKUList".to_string(),
+            source_header_row: 0,
+            target_header_row: 0,
+            target_start_row: Some(1),
+            mappings: Vec::new(),
+            rstrip_tabs: false,
+        }),
+    })
+    .expect("materialize full-scale source workbook");
+
+    let target_headers = [
+        "Order ID",
+        "Created Date",
+        "Currency",
+        "Amount",
+        "Product",
+        "Quantity",
+        "Unit Price",
+        "Website",
+        "Tracking",
+        "Logistics",
+        "Platform",
+    ];
+    let mut target_cells = vec![CellUpdate {
+        address: CellAddress { row: 0, column: 0 },
+        value: SpreadsheetCellInput::String("template-version".to_string()),
+    }];
+    target_cells.extend(
+        target_headers
+            .iter()
+            .enumerate()
+            .map(|(column, header)| CellUpdate {
+                address: CellAddress {
+                    row: 1,
+                    column: column as u32,
+                },
+                value: SpreadsheetCellInput::String((*header).to_string()),
+            }),
+    );
+    write_workbook(&WriteWorkbookRequest {
+        source: None,
+        output: template.clone(),
+        sheets: vec![SheetWriteRequest {
+            name: "订单明细".to_string(),
+            visibility: None,
+            cells: target_cells,
+        }],
+    })
+    .expect("create target template");
+    let source_before = fs::read(&source).unwrap();
+    let template_before = fs::read(&template).unwrap();
+
+    let policy = Arc::new(BasicPolicyEngine::new(
+        workspace_root.clone(),
+        PermissionMode::FullAccess,
+    ));
+    let sandbox = crate::sandbox::LocalSandboxConfig::danger_full_access();
+    let transferred = SpreadsheetExecuteTool
+        .execute(
+            ToolCall::new(
+                "spreadsheet_execute",
+                json!({
+                    "resource": { "kind": "file", "path": source.to_string_lossy() },
+                    "operation": "transfer_rows",
+                    "arguments": {
+                        "sourceSheet": "OrderSKUList",
+                        "templatePath": template.to_string_lossy(),
+                        "outputPath": output.to_string_lossy(),
+                        "targetSheet": "订单明细",
+                        "sourceHeaderRow": 0,
+                        "sourceStartRow": 1,
+                        "targetHeaderRow": 1,
+                        "targetStartRow": 2,
+                        "filters": [
+                            {
+                                "source": { "by": "header", "name": "Order ID" },
+                                "operator": "not_equals",
+                                "value": { "type": "string", "value": "Platform unique order ID." }
+                            },
+                            {
+                                "source": { "by": "header", "name": "Order Status" },
+                                "operator": "not_contains",
+                                "value": { "type": "string", "value": "cancel" }
+                            },
+                            {
+                                "source": { "by": "header", "name": "Order Status" },
+                                "operator": "not_equals",
+                                "value": { "type": "string", "value": "unpaid" }
+                            }
+                        ],
+                        "columns": [
+                            transfer_source_column("Order ID", "Order ID", json!([{ "type": "as_string" }])),
+                            transfer_source_column("Created Time", "Created Date", json!([{
+                                "type": "parse_date_time",
+                                "format": "%m/%d/%Y %I:%M:%S %p"
+                            }])),
+                            transfer_source_column("Order Amount", "Currency", json!([{
+                                "type": "extract_currency_code"
+                            }])),
+                            transfer_source_column("Order Amount", "Amount", json!([{
+                                "type": "parse_number",
+                                "extract": true
+                            }])),
+                            transfer_source_column("Product Name", "Product", json!([])),
+                            transfer_source_column("Quantity", "Quantity", json!([{
+                                "type": "parse_number",
+                                "extract": false
+                            }])),
+                            transfer_source_column("SKU Unit Original Price", "Unit Price", json!([{
+                                "type": "parse_number",
+                                "extract": true
+                            }])),
+                            transfer_constant_column("Website", "www.tiktokshop.com"),
+                            transfer_source_column("Tracking ID", "Tracking", json!([])),
+                            transfer_constant_column("Logistics", "J&T"),
+                            transfer_constant_column("Platform", "tiktokshop")
+                        ]
+                    }
+                }),
+            ),
+            ToolInvocationContext::local_with_sandbox_config(
+                workspace_root.clone(),
+                policy.clone(),
+                sandbox.clone(),
+            ),
+        )
+        .await
+        .expect("execute full-scale row transfer");
+    assert_eq!(
+        transferred.metadata["success"], true,
+        "{}",
+        transferred.output
+    );
+    assert!(transferred.output.contains("\"rowsWritten\": 1166"));
+    assert!(transferred.output.contains("\"cellsWritten\": 12826"));
+    assert!(output.is_file());
+    assert_eq!(fs::read(&source).unwrap(), source_before);
+    assert_eq!(fs::read(&template).unwrap(), template_before);
+
+    for (row, expected_id) in [(2, "335"), (1167, "1500")] {
+        let read = SpreadsheetTool
+            .execute(
+                ToolCall::new(
+                    "spreadsheet",
+                    json!({
+                        "action": "read_range",
+                        "path": output.to_string_lossy(),
+                        "sheet": "订单明细",
+                        "range": {
+                            "start": { "row": row, "column": 0 },
+                            "end": { "row": row, "column": 10 }
+                        }
+                    }),
+                ),
+                ToolInvocationContext::local_with_sandbox_config(
+                    workspace_root.clone(),
+                    policy.clone(),
+                    sandbox.clone(),
+                ),
+            )
+            .await
+            .expect("read transferred row");
+        assert!(read.output.contains(expected_id));
+        assert!(read.output.contains("J&T"));
+        assert!(read.output.contains("www.tiktokshop.com"));
+        assert!(read.output.contains("1234.5"));
+    }
+
+    fs::remove_dir_all(workspace_root).unwrap();
+    fs::remove_dir_all(case_root).unwrap();
+}
+
+fn transfer_source_column(source: &str, target: &str, transforms: Value) -> Value {
+    json!({
+        "target": { "by": "header", "name": target },
+        "value": {
+            "kind": "source",
+            "source": { "by": "header", "name": source },
+            "transforms": transforms
+        }
+    })
+}
+
+fn transfer_constant_column(target: &str, value: &str) -> Value {
+    json!({
+        "target": { "by": "header", "name": target },
+        "value": {
+            "kind": "constant",
+            "value": { "type": "string", "value": value }
+        }
+    })
+}
+
 /// Manual regression for the two external workbooks from the original failure.
 /// The paths stay outside source control and are supplied only when this ignored
 /// test is explicitly requested.
 #[tokio::test]
 #[ignore = "requires OPENTOPIA_PRIOR_CASE_SOURCE and OPENTOPIA_PRIOR_CASE_TEMPLATE"]
-async fn prior_two_workbook_case_runs_as_one_attachment_backed_batch() {
+async fn prior_two_workbook_case_runs_as_one_native_transfer() {
     let source_path = PathBuf::from(
         std::env::var("OPENTOPIA_PRIOR_CASE_SOURCE").expect("source workbook environment variable"),
     )
@@ -593,30 +893,61 @@ async fn prior_two_workbook_case_runs_as_one_attachment_backed_batch() {
                 json!({
                     "resource": {
                         "kind": "attachment",
-                        "attachmentId": template_id
+                        "attachmentId": source_id
                     },
-                    "operation": "batch",
+                    "operation": "transfer_rows",
                     "arguments": {
+                        "sourceSheet": "OrderSKUList",
+                        "templatePath": template_path.to_string_lossy(),
                         "outputPath": "prior-case-regression.xlsx",
-                        "atomic": true,
-                        "operations": [
+                        "targetSheet": "订单明细",
+                        "sourceHeaderRow": 0,
+                        "sourceStartRow": 1,
+                        "targetHeaderRow": 1,
+                        "targetStartRow": 2,
+                        "filters": [
                             {
-                                "type": "copy_rows",
-                                "sourcePath": source_path.to_string_lossy(),
-                                "sourceSheet": "OrderSKUList",
-                                "sourceStart": { "row": 2, "column": 0 },
-                                "rowCount": 1,
-                                "columnCount": 1,
-                                "destinationSheet": "订单明细",
-                                "destinationStart": { "row": 2, "column": 0 },
-                                "contentMode": "values"
+                                "source": { "by": "header", "name": "Order ID" },
+                                "operator": "not_equals",
+                                "value": { "type": "string", "value": "Platform unique order ID." }
                             },
                             {
-                                "type": "write_rows",
-                                "sheet": "订单明细",
-                                "start": { "row": 2, "column": 9 },
-                                "rows": [[{ "type": "string", "value": "J&T" }]]
+                                "source": { "by": "header", "name": "Order Status" },
+                                "operator": "not_contains",
+                                "value": { "type": "string", "value": "cancel" }
+                            },
+                            {
+                                "source": { "by": "header", "name": "Order Status" },
+                                "operator": "not_equals",
+                                "value": { "type": "string", "value": "no pagado" }
                             }
+                        ],
+                        "columns": [
+                            transfer_source_column("Order ID", "订单号", json!([{ "type": "as_string" }])),
+                            transfer_source_column("Created Time", "订单日期", json!([{
+                                "type": "parse_date_time",
+                                "format": "%m/%d/%Y %I:%M:%S %p"
+                            }])),
+                            transfer_source_column("Order Amount", "币种", json!([{
+                                "type": "extract_currency_code"
+                            }])),
+                            transfer_source_column("Order Amount", "订单金额", json!([{
+                                "type": "parse_number",
+                                "extract": true
+                            }])),
+                            transfer_source_column("Product Name", "商品名称", json!([])),
+                            transfer_source_column("Quantity", "商品数量", json!([{
+                                "type": "parse_number",
+                                "extract": false
+                            }])),
+                            transfer_source_column("SKU Unit Original Price", "商品单价", json!([{
+                                "type": "parse_number",
+                                "extract": true
+                            }])),
+                            transfer_constant_column("网站", "www.tiktokshop.com"),
+                            transfer_source_column("Tracking ID", "物流单号", json!([])),
+                            transfer_constant_column("物流企业", "J&T"),
+                            transfer_constant_column("电商平台", "tiktokshop")
                         ]
                     }
                 }),
@@ -624,8 +955,9 @@ async fn prior_two_workbook_case_runs_as_one_attachment_backed_batch() {
             context,
         )
         .await
-        .expect("execute the prior two-workbook case as one batch");
+        .expect("execute the prior two-workbook case as one native transfer");
     assert_eq!(result.metadata["success"], true);
+    assert!(result.output.contains("\"rowsWritten\": 1166"));
 
     let output = SpreadsheetTool
         .execute(
@@ -633,7 +965,7 @@ async fn prior_two_workbook_case_runs_as_one_attachment_backed_batch() {
                 "spreadsheet",
                 json!({
                     "action": "read_range",
-                    "path": "output/prior-case-regression.xlsx",
+                    "path": "prior-case-regression.xlsx",
                     "sheet": "订单明细",
                     "range": {
                         "start": { "row": 2, "column": 0 },

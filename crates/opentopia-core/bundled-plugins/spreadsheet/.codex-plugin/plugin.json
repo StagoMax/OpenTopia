@@ -11,7 +11,7 @@
     "longDescription": "Give the model bounded spreadsheet inspection, validation, creation, update, template filling, and delimited-data capabilities. The model interprets the requested deliverable, selects the destination, requests only the needed operation contract, and executes it.",
     "developerName": "OpenTopia",
     "category": "Productivity",
-    "defaultPrompt": "For existing spreadsheet files or attachments, use spreadsheet_inspect, request only the needed operation contracts with spreadsheet_describe, then call spreadsheet_execute. Describe returns the exact operation schema, so do not guess optional fields or request unrelated operations. Interpret the user's requested deliverable yourself and choose the destination accordingly. Attachments are immutable inputs; mutations require a workspaceFile resource and write to a workspace-relative destination. For template tasks, choose fill_template; the tool handles delimited parsing, writing, and reopen validation server-side. Use validate for workbook verification; do not use PDF or manually unpack workbook packages unless the spreadsheet protocol reports an unsupported feature.",
+    "defaultPrompt": "For existing spreadsheet files or attachments, use spreadsheet_inspect, request only the needed operation contracts with spreadsheet_describe, then call spreadsheet_execute. Describe returns the exact operation schema, so do not guess optional fields or request unrelated operations. Interpret the user's requested deliverable yourself and choose the destination accordingly. File resources may use relative or absolute paths allowed by the active filesystem authority; attachments are immutable inputs. For row selection, column mapping, constants, and date or amount conversion, use transfer_rows so data stays inside the native spreadsheet pipeline. For template tasks backed by delimited data, choose fill_template. Use validate for workbook verification; do not use PDF or manually unpack workbook packages unless the spreadsheet protocol reports an unsupported feature.",
     "capabilities": [
       "XLS, XLSX, XLSM, XLSB, Excel template, and ODS inspection",
       "Workbook structural validation",
@@ -20,6 +20,7 @@
       "CSV and TSV export",
       "Bounded range reading",
       "Cell finding and conditional row filtering",
+      "Native row filtering, column mapping, constants, and value conversion",
       "Workbook creation and update"
     ]
   },

@@ -512,7 +512,6 @@ pub(super) fn write_delimited_workbook(
         preserved_template_parts: false,
         backend: SpreadsheetWriteBackend::Delimited,
     };
-    super::ensure_return_size(&result)?;
     Ok(result)
 }
 

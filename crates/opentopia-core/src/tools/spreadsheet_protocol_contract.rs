@@ -25,6 +25,7 @@ pub(super) enum SpreadsheetProtocolOperation {
     FilterRows,
     Validate,
     FillTemplate,
+    TransferRows,
     ExportDelimited,
     Write,
     WriteRows,
@@ -35,8 +36,7 @@ pub(super) enum SpreadsheetProtocolOperation {
 }
 
 impl SpreadsheetProtocolOperation {
-    #[cfg(test)]
-    const ALL: [Self; 16] = [
+    pub(super) const ALL: [Self; 17] = [
         Self::ListSheets,
         Self::ReadRange,
         Self::ReadRanges,
@@ -46,6 +46,7 @@ impl SpreadsheetProtocolOperation {
         Self::FilterRows,
         Self::Validate,
         Self::FillTemplate,
+        Self::TransferRows,
         Self::ExportDelimited,
         Self::Write,
         Self::WriteRows,
@@ -66,6 +67,7 @@ impl SpreadsheetProtocolOperation {
             Self::FilterRows => "filter_rows",
             Self::Validate => "validate",
             Self::FillTemplate => "fill_template",
+            Self::TransferRows => "transfer_rows",
             Self::ExportDelimited => "export_delimited",
             Self::Write => "write",
             Self::WriteRows => "write_rows",
@@ -102,6 +104,7 @@ impl SpreadsheetProtocolOperation {
             | Self::Validate
             | Self::ExportDelimited => "path",
             Self::FillTemplate => "templatePath",
+            Self::TransferRows => "sourcePath",
             Self::Write | Self::WriteRows | Self::WriteColumns | Self::Batch => "sourcePath",
             Self::CopyRows | Self::CopyColumns => "from",
         }

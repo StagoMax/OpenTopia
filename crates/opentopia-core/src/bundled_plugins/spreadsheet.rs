@@ -117,6 +117,7 @@ mod tests {
                 "filter_rows",
                 "validate",
                 "fill_template",
+                "transfer_rows",
                 "export_delimited",
                 "write",
                 "write_rows",

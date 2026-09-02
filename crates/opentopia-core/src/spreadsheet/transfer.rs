@@ -1,9 +1,9 @@
 use super::{
-    apply_sheet_updates, ensure_return_size, ensure_workbook_cell_count, inspect_workbook,
-    load_workbook, patch_workbook_template, validate_address, validate_write_text, CellAddress,
-    CellRange, InspectWorkbookRequest, SheetWriteRequest, SpreadsheetCellInput,
-    SpreadsheetCellValue, SpreadsheetError, StoredCell, EXCEL_MAX_COLUMNS, EXCEL_MAX_ROWS,
-    MAX_INPUT_FILE_BYTES, MAX_OUTPUT_FILE_BYTES, MAX_WORKBOOK_CELLS,
+    apply_sheet_updates, ensure_workbook_cell_count, inspect_workbook, load_workbook,
+    patch_workbook_template, validate_address, validate_write_text, CellAddress, CellRange,
+    InspectWorkbookRequest, SheetWriteRequest, SpreadsheetCellInput, SpreadsheetCellValue,
+    SpreadsheetError, StoredCell, EXCEL_MAX_COLUMNS, EXCEL_MAX_ROWS, MAX_INPUT_FILE_BYTES,
+    MAX_OUTPUT_FILE_BYTES, MAX_WORKBOOK_CELLS,
 };
 use crate::delimited;
 use schemars::JsonSchema;
@@ -82,7 +82,7 @@ impl DelimitedFormat {
     rename_all_fields = "camelCase",
     deny_unknown_fields
 )]
-pub enum DelimitedColumnSelector {
+pub enum SpreadsheetColumnSelector {
     /// Zero-based physical column index.
     Index { index: u32 },
     /// Header name plus a one-based occurrence for duplicate headers.
@@ -101,8 +101,8 @@ fn default_occurrence() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DelimitedColumnMapping {
-    pub source: DelimitedColumnSelector,
-    pub target: DelimitedColumnSelector,
+    pub source: SpreadsheetColumnSelector,
+    pub target: SpreadsheetColumnSelector,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -332,7 +332,6 @@ pub(super) fn inspect_delimited(
         ragged_row_count: scan.ragged_row_count,
         sample_rows: scan.samples,
     };
-    ensure_return_size(&result)?;
     Ok(result)
 }
 
@@ -500,7 +499,6 @@ pub(super) fn fill_template(
             target_range,
         },
     };
-    ensure_return_size(&result)?;
     Ok(result)
 }
 
@@ -584,7 +582,6 @@ pub(super) fn validate_workbook(
         populated_cells: inspected.populated_cells,
         checks,
     };
-    ensure_return_size(&result)?;
     Ok(result)
 }
 
@@ -675,7 +672,6 @@ pub(super) fn export_delimited(
         bytes_written,
         validation_reopened: true,
     };
-    ensure_return_size(&result)?;
     Ok(result)
 }
 
@@ -823,7 +819,7 @@ fn duplicate_headers(headers: &[DelimitedHeader]) -> Vec<DuplicateDelimitedHeade
         .collect()
 }
 
-fn headers_from_sheet(sheet: &super::LoadedSheet, row: u32) -> Vec<DelimitedHeader> {
+pub(super) fn headers_from_sheet(sheet: &super::LoadedSheet, row: u32) -> Vec<DelimitedHeader> {
     let values = sheet
         .cells
         .iter()
@@ -902,14 +898,14 @@ fn resolve_mappings(
     Ok(resolved)
 }
 
-fn resolve_selector(
-    selector: &DelimitedColumnSelector,
+pub(super) fn resolve_selector(
+    selector: &SpreadsheetColumnSelector,
     headers: &[DelimitedHeader],
     column_limit: u32,
     side: &str,
 ) -> Result<DelimitedHeader, SpreadsheetError> {
     match selector {
-        DelimitedColumnSelector::Index { index } => {
+        SpreadsheetColumnSelector::Index { index } => {
             if *index >= column_limit {
                 return Err(SpreadsheetError::InvalidMapping {
                     message: format!(
@@ -928,7 +924,7 @@ fn resolve_selector(
                     occurrence: 1,
                 }))
         }
-        DelimitedColumnSelector::Header { name, occurrence } => {
+        SpreadsheetColumnSelector::Header { name, occurrence } => {
             if name.trim().is_empty() || *occurrence == 0 {
                 return Err(SpreadsheetError::InvalidMapping {
                     message: format!("{side} header name must be non-empty and occurrence >= 1"),
@@ -1066,7 +1062,7 @@ fn export_cell(cell: &StoredCell, formula_mode: DelimitedFormulaMode) -> String 
     stored_cell_value(cell)
 }
 
-fn stored_cell_value(cell: &StoredCell) -> String {
+pub(super) fn stored_cell_value(cell: &StoredCell) -> String {
     match &cell.value {
         SpreadsheetCellValue::Empty => cell.formula_result.clone().unwrap_or_default(),
         SpreadsheetCellValue::String(value)
