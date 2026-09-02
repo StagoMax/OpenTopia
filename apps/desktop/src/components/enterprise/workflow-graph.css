@@ -69,7 +69,7 @@
 .workflow-graph--select
   .react-flow__node.draggable
   .workflow-node__trigger:not(button) {
-  cursor: grab;
+  cursor: move;
 }
 
 .workflow-graph--select .react-flow__node.dragging .workflow-node,
@@ -78,7 +78,7 @@
 .workflow-graph--select
   .react-flow__node.dragging
   .workflow-node__trigger:not(button) {
-  cursor: grabbing;
+  cursor: move;
 }
 
 .workflow-graph--pan .react-flow__pane,
