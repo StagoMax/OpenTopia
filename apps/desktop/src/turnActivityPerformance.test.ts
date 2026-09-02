@@ -133,8 +133,13 @@ test("keeps completed activity groups behind progressive disclosure", () => {
     activityGroupsSource,
     /<FileActivityGroup[\s\S]{0,160}defaultExpanded/,
   );
-  assert.match(activityGroupsSource, /useState\(!commandBatch && running\)/);
-  assert.match(activityGroupsSource, /useState\(false\)/);
+  assert.doesNotMatch(activityGroupsSource, /commandBatch/);
+  assert.match(activityGroupsSource, /buildToolGroupPresentation/);
+  assert.match(activityGroupsSource, /executions\.length === 1 && !isActive/);
+  assert.match(
+    activityGroupsSource,
+    /const \[expanded, setExpanded\] = useState\(false\)/,
+  );
 });
 
 test("does not force a synchronous scroll layout for every event batch", () => {

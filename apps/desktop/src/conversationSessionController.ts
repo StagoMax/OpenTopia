@@ -457,6 +457,13 @@ export class ConversationSessionController {
     this.activityStore.applyEvent(event);
     this.eventListeners.forEach((listener) => listener(event));
     this.pendingEvents.push(event);
+    // A tool can start and finish inside the normal 32 ms event window. Flush
+    // its start edge immediately so React can publish the running state before
+    // a later result is folded into the next batch. Other high-volume events
+    // keep the existing batching path.
+    if (event.payload.type === "tool_call_started") {
+      this.flushPendingEvents();
+    }
     if (!this.eventBatchTimer) {
       this.eventBatchTimer = setTimeout(() => this.flushPendingEvents(), 32);
     }

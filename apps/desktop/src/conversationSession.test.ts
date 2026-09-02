@@ -326,6 +326,77 @@ test("registry forwards detailed events while the conversation view is active", 
   registry.dispose();
 });
 
+test("publishes a tool start before its fast result joins the next event batch", async () => {
+  let onStreamEvent: ((event: AgentEvent) => void) | undefined;
+  const client = {
+    listMessages: () => Promise.resolve([message("user")]),
+    listConversationEvents: () =>
+      Promise.resolve([
+        event("started", 1, {
+          type: "turn_started",
+          user_message_id: "user",
+        }),
+      ]),
+    getTurnStatus: () => Promise.resolve(null),
+    listPendingApprovals: () => Promise.resolve([]),
+    listPendingUserInput: () => Promise.resolve([]),
+    openEventStream: (
+      _threadId: string,
+      _since: number | undefined,
+      onEvent: (event: AgentEvent) => void,
+    ) => {
+      onStreamEvent = onEvent;
+      return { close() {} };
+    },
+  } as unknown as ApiClient;
+  const controller = new ConversationSessionController(client, "thread-1");
+  const release = controller.retain();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  const snapshots: string[][] = [];
+  const unsubscribe = controller.subscribe(() => {
+    snapshots.push(
+      controller.getSnapshot().events.map((item) => item.payload.type),
+    );
+  });
+  onStreamEvent?.(
+    event("tool-started", 2, {
+      type: "tool_call_started",
+      call: { id: "call-1", name: "github__list_issues", input: {} },
+    }),
+  );
+  onStreamEvent?.(
+    event("tool-finished", 3, {
+      type: "tool_call_finished",
+      result: {
+        callId: "call-1",
+        output: "ok",
+        metadata: { success: true },
+      },
+    }),
+  );
+
+  assert.ok(
+    snapshots.some(
+      (types) =>
+        types.includes("tool_call_started") &&
+        !types.includes("tool_call_finished"),
+    ),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.deepEqual(
+    controller
+      .getSnapshot()
+      .events.slice(-2)
+      .map((item) => item.payload.type),
+    ["tool_call_started", "tool_call_finished"],
+  );
+
+  unsubscribe();
+  release();
+  controller.dispose();
+});
+
 test("registry tracks background activity without retaining detailed streams", async () => {
   let detailedCloseCalls = 0;
   let activityCloseCalls = 0;

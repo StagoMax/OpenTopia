@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   AlertCircle,
   ChevronDown,
@@ -11,7 +11,6 @@ import {
 import {
   toolActivityGroupStatus,
   type ToolActivityGroup as ToolGroupKey,
-  type ToolActivityIconKind,
 } from "../../toolActivity";
 import { toolExecutionDurationMs } from "../../toolExecutionTiming";
 import type { ToolResult } from "../../types";
@@ -39,6 +38,7 @@ import {
   formatToolSandbox,
 } from "./timing";
 import { useTimelineClock } from "./hooks";
+import { buildToolGroupPresentation } from "./toolGroupPresentation";
 
 export function ActivityEntryView({
   entry,
@@ -62,6 +62,7 @@ export function ActivityEntryView({
       <ToolActivityGroup
         group={entry.group}
         executions={entry.executions}
+        isActive={isActive}
         onLoadToolResultDetail={onLoadToolResultDetail}
       />
     );
@@ -176,10 +177,12 @@ export function ActivityEntryView({
 function ToolActivityGroup({
   group,
   executions,
+  isActive,
   onLoadToolResultDetail,
 }: {
   group: ToolGroupKey;
   executions: ToolExecution[];
+  isActive: boolean;
   onLoadToolResultDetail?(eventId: string): Promise<ToolResult>;
 }) {
   const state = toolActivityGroupStatus(
@@ -187,39 +190,33 @@ function ToolActivityGroup({
   );
   const running = state === "running";
   const now = useTimelineClock(running);
-  const commandBatch = group === "shell" && executions.length > 1;
-  const runningCommand = [...executions]
-    .reverse()
-    .find((execution) => !execution.result);
   const timing = formatExecutionGroupTiming(executions, running, now);
-  const [expanded, setExpanded] = useState(!commandBatch && running);
-  const wasRunning = useRef(running);
+  const [presentationRevision, setPresentationRevision] = useState(0);
+  const presentation = useMemo(
+    () => buildToolGroupPresentation(group, executions, Date.now()),
+    [executions, group, presentationRevision],
+  );
+  const [expanded, setExpanded] = useState(false);
 
   useEffect(() => {
-    if (commandBatch) {
-      if (!running && wasRunning.current) setExpanded(false);
-      wasRunning.current = running;
+    if (!presentation.settleUntil) return;
+    const remaining = presentation.settleUntil - Date.now();
+    if (remaining <= 0) {
+      setPresentationRevision((current) => current + 1);
       return;
     }
-    if (running) setExpanded(true);
-  }, [commandBatch, running]);
+    const timer = window.setTimeout(
+      () => setPresentationRevision((current) => current + 1),
+      remaining,
+    );
+    return () => window.clearTimeout(timer);
+  }, [presentation.settleUntil]);
 
-  if (executions.length === 1) {
+  if (executions.length === 1 && !isActive) {
     return (
       <ToolExecutionItem
         execution={executions[0]}
         now={now}
-        onLoadToolResultDetail={onLoadToolResultDetail}
-      />
-    );
-  }
-
-  if (commandBatch && running && runningCommand) {
-    return (
-      <ToolExecutionItem
-        execution={runningCommand}
-        now={now}
-        currentCommand
         onLoadToolResultDetail={onLoadToolResultDetail}
       />
     );
@@ -234,10 +231,10 @@ function ToolActivityGroup({
         onClick={() => setExpanded((current) => !current)}
       >
         <span className="activity-group-icon" aria-hidden="true">
-          {toolActivityIcon(toolGroupIconKind(group, executions), 13)}
+          {toolActivityIcon(presentation.iconKind, 13)}
         </span>
-        <span>
-          {toolGroupTitle(group, executions)}
+        <span className="activity-group-title" title={presentation.label}>
+          <span aria-live="polite">{presentation.label}</span>
           {timing ? ` · ${timing}` : ""}
         </span>
         <ActivityResultIcon running={running} />
@@ -303,12 +300,10 @@ function TimedContextCompactionActivity({
 function ToolExecutionItem({
   execution,
   now,
-  currentCommand = false,
   onLoadToolResultDetail,
 }: {
   execution: ToolExecution;
   now: number;
-  currentCommand?: boolean;
   onLoadToolResultDetail?(eventId: string): Promise<ToolResult>;
 }) {
   const running = !execution.result;
@@ -326,7 +321,6 @@ function ToolExecutionItem({
       result={execution.result}
       timing={timing}
       sandbox={formatToolSandbox(execution.result)}
-      streaming={currentCommand}
       onLoadResultDetail={onLoadToolResultDetail}
     />
   );
@@ -414,44 +408,4 @@ function FileChangeStatsView({ change }: { change: FileChangeSummary }) {
       )}
     </span>
   );
-}
-
-function toolGroupTitle(group: ToolGroupKey, executions: ToolExecution[]) {
-  const count = executions.length;
-  if (group === "explore") return `探索了 ${count} 处`;
-  if (group === "shell") return `运行了 ${count} 个命令`;
-  if (group === "edit") return `修改了 ${count} 次文件`;
-  if (group === "browser") return `进行了 ${count} 个浏览器操作`;
-  if (group === "computer") return `进行了 ${count} 个计算机操作`;
-  if (group === "spreadsheet") return `进行了 ${count} 个表格操作`;
-  if (group === "agent") return `进行了 ${count} 个子智能体操作`;
-  if (group === "plan") return `更新了 ${count} 次执行计划`;
-  if (group === "skill") return `进行了 ${count} 次 Skill 操作`;
-  if (group === "attachment") {
-    if (executions.every(({ call }) => call.name === "view_attachment")) {
-      return `查看了 ${count} 张图片`;
-    }
-    if (executions.every(({ call }) => call.name === "read_attachment")) {
-      return `读取了 ${count} 个附件`;
-    }
-    return `处理了 ${count} 个附件`;
-  }
-  if (group === "mcp") return `调用了 ${count} 个 MCP 工具`;
-  return `调用了 ${count} 个工具`;
-}
-
-function toolGroupIconKind(
-  group: ToolGroupKey,
-  executions: ToolExecution[],
-): ToolActivityIconKind {
-  if (group === "explore") return "search";
-  if (group === "shell") return "shell";
-  if (group === "edit") return "edit";
-  if (
-    group === "attachment" &&
-    executions.every(({ call }) => call.name === "view_attachment")
-  ) {
-    return "image";
-  }
-  return group;
 }

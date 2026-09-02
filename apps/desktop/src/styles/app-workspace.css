@@ -1289,6 +1289,13 @@
   color: var(--text-muted);
 }
 
+.activity-group-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .activity-group-header > .activity-result-icon {
   margin-left: auto;
 }
