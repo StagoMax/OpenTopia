@@ -114,20 +114,26 @@ export type PluginView = {
   plugin: PluginDescriptor;
   skillIds: string[];
   mcpServers: McpServerView[];
-  threadEnabled: boolean;
+  effectiveEnabled: boolean;
   compatible: boolean;
 };
 
 export type PluginControlScopeType = "global" | "workspace" | "thread";
+export type PluginActivationScopeType = "global" | "workspace";
 
 export type PluginControlScope = {
   scopeType: PluginControlScopeType;
   scopeId?: string;
 };
 
+export type PluginActivationScope = {
+  scopeType: PluginActivationScopeType;
+  scopeId?: string;
+};
+
 export type PluginActivationRecord = {
   pluginId: string;
-  scope: PluginControlScope;
+  scope: PluginActivationScope;
   enabled: boolean;
   updatedAt: string;
 };
@@ -166,13 +172,17 @@ export type PluginPermissionRequest = {
   permission: string;
 };
 
-export type PluginContributionRecord = {
+export type PluginContribution = {
+  id: string;
   pluginId: string;
-  contributionId: string;
-  kind: string;
   localId: string;
-  descriptor: unknown;
-  updatedAt: string;
+  kind: PluginContributionKind;
+  origin: "codex_compatible" | "open_topia";
+  apiVersion: string;
+  requiredHostCapabilities: string[];
+  permissions: PluginCapabilityPermission[];
+  configurationSchema?: string | null;
+  declaration: unknown;
 };
 
 export type PluginRuntimeHealthStatus =
@@ -194,7 +204,7 @@ export type PluginControlManifest = {
   configurationSchema?: unknown;
   secretSettingKeys: string[];
   requiredSecretSettingKeys: string[];
-  contributions: PluginContributionRecord[];
+  contributions: PluginContribution[];
 };
 
 export type PluginDetail = {
@@ -202,7 +212,7 @@ export type PluginDetail = {
   manifest: PluginControlManifest;
   activations: PluginActivationRecord[];
   effectiveEnabled: boolean;
-  contributions: PluginContributionRecord[];
+  contributions: PluginContribution[];
   health: PluginRuntimeHealthRecord[];
 };
 
@@ -237,24 +247,11 @@ export type PluginCapabilityPermission = {
   value: string;
 };
 
-export type PluginCapabilityContribution = {
-  id: string;
-  pluginId: string;
-  localId: string;
-  kind: PluginContributionKind;
-  origin: "codex_compatible" | "open_topia";
-  apiVersion: string;
-  requiredHostCapabilities: string[];
-  permissions: PluginCapabilityPermission[];
-  configurationSchema?: string | null;
-  declaration: unknown;
-};
-
 export type ActivatedPluginContribution = {
   pluginName: string;
   source: PluginDescriptor["source"];
   trust: PluginDescriptor["trust"];
-  contribution: PluginCapabilityContribution;
+  contribution: PluginContribution;
 };
 
 export type CapabilityUnavailableReason =
@@ -284,7 +281,7 @@ export type ThreadPluginCapabilities = {
   pluginId: string;
   pluginName: string;
   enabled: boolean;
-  contributions: PluginContributionRecord[];
+  contributions: PluginContribution[];
   grantedPermissions: string[];
 };
 

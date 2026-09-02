@@ -22,6 +22,7 @@ rusqlite.workspace = true
 reqwest.workspace = true
 rust_xlsxwriter = "0.96"
 schemars.workspace = true
+semver = "1"
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

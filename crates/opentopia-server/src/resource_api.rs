@@ -5,7 +5,7 @@ use crate::{
     ResourceLease, ResourceLocator, SessionStore, SqliteSessionStore, MAX_PREVIEW_CONTENT_BYTES,
 };
 #[cfg(test)]
-use crate::{discover_plugins, plugins_api, ContributionKind, PreviewTarget};
+use crate::{plugin_runtime, ContributionKind, PreviewTarget};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -305,17 +305,18 @@ pub(super) fn bundled_plugin_enabled_for_thread(
     let thread = store
         .get_thread(thread_id)?
         .ok_or_else(|| ApiError::not_found(format!("thread not found: {thread_id}")))?;
-    let Some(plugin) = discover_plugins(Some(&thread.workspace_root))
-        .into_iter()
+    let outcome = plugin_runtime::load_plugin_outcome_for_thread(store, &thread)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let Some(plugin) = outcome
+        .descriptors()
         .find(|plugin| plugin.name == plugin_name && !plugin.native_capabilities.is_empty())
     else {
         return Ok(false);
     };
-    let contributions = plugins_api::active_contributions_for_thread(store, &thread)
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    Ok(contributions.iter().any(|contribution| {
+    let has_native_tool = outcome.active_contributions().any(|contribution| {
         contribution.plugin_id == plugin.id && contribution.kind == ContributionKind::NativeTool
-    }))
+    });
+    Ok(has_native_tool)
 }
 
 pub(crate) fn resolve_preview_id_for_thread(

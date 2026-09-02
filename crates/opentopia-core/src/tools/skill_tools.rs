@@ -4,6 +4,7 @@ use super::{
 };
 use crate::execution_authorization::ToolExecutionIntent;
 use crate::model::{ModelContentPart, ToolCall, ToolResult};
+use crate::plugins::discover_plugins;
 use crate::policy::PolicyDecision;
 use crate::skill_authoring::{
     create_skill_from_draft, preview_skill_draft, skill_target_path, SkillDraft, SkillResourceDraft,
@@ -13,6 +14,7 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::path::Path;
 use uuid::Uuid;
 
@@ -44,14 +46,15 @@ impl TypedTool for ListSkillsTool {
         _input: Self::Input,
         ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
+        let active_plugins = active_skill_plugins(&ctx)?;
         let skills = discover_skills(Some(&ctx.workspace_root))
             .into_iter()
             .filter(|skill| {
                 ctx.capability_projection.allows_skill(&skill.id)
-                    && skill
-                        .plugin_id
-                        .as_ref()
-                        .is_none_or(|plugin_id| ctx.capability_projection.allows_plugin(plugin_id))
+                    && skill.plugin_id.as_ref().is_none_or(|plugin_id| {
+                        ctx.capability_projection.allows_plugin(plugin_id)
+                            && active_plugins.contains(plugin_id)
+                    })
             })
             .collect::<Vec<_>>();
         let value = serde_json::to_value(&skills)?;
@@ -122,6 +125,10 @@ impl TypedTool for ReadSkillTool {
                 ctx.capability_projection.allows_plugin(plugin_id),
                 "Skill plugin is outside the active ExecutionContext projection: {plugin_id}"
             );
+            anyhow::ensure!(
+                active_skill_plugins(&ctx)?.contains(plugin_id),
+                "Skill plugin is disabled in the current project: {plugin_id}"
+            );
         }
         let output = slice.render_for_model();
         Ok(ToolResult {
@@ -141,6 +148,27 @@ impl TypedTool for ReadSkillTool {
 }
 
 impl_typed_tool!(ReadSkillTool);
+
+fn active_skill_plugins(ctx: &ToolInvocationContext) -> anyhow::Result<BTreeSet<String>> {
+    let Some(state) = ctx.state.as_ref() else {
+        return Ok(BTreeSet::new());
+    };
+    discover_plugins(Some(&ctx.workspace_root))
+        .into_iter()
+        .filter(|plugin| plugin.skill_root.is_some())
+        .filter_map(|plugin| {
+            match state.plugin_effectively_enabled(
+                &plugin.id,
+                plugin.default_enabled,
+                &ctx.workspace_root,
+            ) {
+                Ok(true) => Some(Ok(plugin.id)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect()
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

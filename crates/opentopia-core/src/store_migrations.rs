@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 pub(crate) const LEGACY_DATABASE_SCHEMA_VERSION: i64 = 19;
-pub(crate) const CURRENT_DATABASE_SCHEMA_VERSION: i64 = 31;
+pub(crate) const CURRENT_DATABASE_SCHEMA_VERSION: i64 = 32;
 
 const LEGACY_BASELINE_NAME: &str = "legacy_baseline_v19";
 const MIGRATION_LEDGER_SQL: &str = include_str!("migrations/0019_legacy_baseline.sql");
@@ -139,6 +139,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "flow_product_model",
         sql: include_str!("migrations/0031_flow_product_model.sql"),
         verify: verify_v31,
+    },
+    Migration {
+        version: 32,
+        name: "codex_plugin_runtime",
+        sql: include_str!("migrations/0032_codex_plugin_runtime.sql"),
+        verify: verify_v32,
     },
 ];
 
@@ -735,6 +741,25 @@ fn verify_v31(conn: &Connection) -> anyhow::Result<()> {
     ] {
         anyhow::ensure!(index_exists(conn, index)?, "{index} index is missing");
     }
+    Ok(())
+}
+
+fn verify_v32(conn: &Connection) -> anyhow::Result<()> {
+    verify_v31(conn)?;
+    for removed in ["thread_plugin_activations", "plugin_contributions"] {
+        anyhow::ensure!(!table_exists(conn, removed)?, "{removed} must be removed");
+    }
+    let activation_sql = table_sql(conn, "plugin_activations")?
+        .context("plugin_activations table is missing")?
+        .to_ascii_lowercase();
+    anyhow::ensure!(
+        !activation_sql.contains("'thread'"),
+        "plugin_activations must not accept task-scoped records"
+    );
+    anyhow::ensure!(
+        index_exists(conn, "idx_plugin_activations_scope")?,
+        "idx_plugin_activations_scope index is missing"
+    );
     Ok(())
 }
 

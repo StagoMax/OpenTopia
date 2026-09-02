@@ -93,8 +93,8 @@ type WorkbenchPanelProps = {
   onDeleteMcpServer(serverId: string): Promise<void>;
   onInstallPlugin(): Promise<void>;
   onUninstallPlugin(pluginId: string): Promise<void>;
-  onToggleThreadPlugin(pluginId: string, enabled: boolean): Promise<void>;
-  onUsePluginSkills(pluginId: string, enabled: boolean): void;
+  onTogglePlugin(pluginId: string, enabled: boolean): Promise<void>;
+  onUsePluginSkills(pluginId: string, enabled: boolean): Promise<void>;
   onOpenPath(targetPath: string): void;
   onEnsureTerminalSession(threadId: string): Promise<TerminalSession>;
   onWriteTerminalSession(
@@ -173,7 +173,7 @@ export function WorkbenchPanel({
   onDeleteMcpServer,
   onInstallPlugin,
   onUninstallPlugin,
-  onToggleThreadPlugin,
+  onTogglePlugin,
   onUsePluginSkills,
   onOpenPath,
   onEnsureTerminalSession,
@@ -268,7 +268,7 @@ export function WorkbenchPanel({
           onDeleteMcpServer={onDeleteMcpServer}
           onInstallPlugin={onInstallPlugin}
           onUninstallPlugin={onUninstallPlugin}
-          onToggleThreadPlugin={onToggleThreadPlugin}
+          onTogglePlugin={onTogglePlugin}
           onUsePluginSkills={onUsePluginSkills}
           onOpenPath={onOpenPath}
         />

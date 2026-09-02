@@ -1,4 +1,4 @@
-use crate::capabilities::{ContributionKind, PluginPermissionKind};
+use crate::capabilities::{PluginContribution, PluginPermissionKind};
 use crate::plugins::PluginDescriptor;
 use crate::store::{normalize_workspace_key, SqliteSessionStore};
 use anyhow::{bail, Context};
@@ -125,11 +125,91 @@ impl PluginControlScope {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginActivationScopeType {
+    Global,
+    Workspace,
+}
+
+impl PluginActivationScopeType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Workspace => "workspace",
+        }
+    }
+
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "global" => Ok(Self::Global),
+            "workspace" => Ok(Self::Workspace),
+            other => bail!("unknown plugin activation scope type: {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginActivationScope {
+    pub scope_type: PluginActivationScopeType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_id: Option<String>,
+}
+
+impl PluginActivationScope {
+    pub fn global() -> Self {
+        Self {
+            scope_type: PluginActivationScopeType::Global,
+            scope_id: None,
+        }
+    }
+
+    pub fn workspace(path: &Path) -> anyhow::Result<Self> {
+        let scope_id = normalize_workspace_key(path);
+        if scope_id.is_empty() {
+            bail!("workspace plugin activation scope cannot be empty");
+        }
+        Ok(Self {
+            scope_type: PluginActivationScopeType::Workspace,
+            scope_id: Some(scope_id),
+        })
+    }
+
+    pub fn normalized(&self) -> anyhow::Result<Self> {
+        match self.scope_type {
+            PluginActivationScopeType::Global => {
+                if self
+                    .scope_id
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                {
+                    bail!("global plugin activation scope must not have a scopeId");
+                }
+                Ok(Self::global())
+            }
+            PluginActivationScopeType::Workspace => {
+                let value = self
+                    .scope_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .context("workspace plugin activation scope requires scopeId")?;
+                Self::workspace(Path::new(value))
+            }
+        }
+    }
+
+    fn database_id(&self) -> anyhow::Result<String> {
+        Ok(self.normalized()?.scope_id.unwrap_or_default())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginActivationRecord {
     pub plugin_id: String,
-    pub scope: PluginControlScope,
+    pub scope: PluginActivationScope,
     pub enabled: bool,
     pub updated_at: DateTime<Utc>,
 }
@@ -190,18 +270,6 @@ pub struct PluginPermissionGrantRecord {
     pub status: PluginPermissionGrantStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub granted_at: Option<DateTime<Utc>>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct PluginContributionRecord {
-    pub plugin_id: String,
-    pub contribution_id: String,
-    pub kind: String,
-    pub local_id: String,
-    #[serde(default)]
-    pub descriptor: Value,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -274,7 +342,7 @@ pub struct PluginControlManifest {
     #[serde(default)]
     pub required_secret_setting_keys: Vec<String>,
     #[serde(default)]
-    pub contributions: Vec<PluginContributionRecord>,
+    pub contributions: Vec<PluginContribution>,
 }
 
 pub(crate) fn migrate_plugin_control(conn: &mut Connection) -> anyhow::Result<()> {
@@ -350,7 +418,7 @@ impl SqliteSessionStore {
     pub fn set_plugin_activation(
         &self,
         plugin_id: &str,
-        scope: &PluginControlScope,
+        scope: &PluginActivationScope,
         enabled: bool,
     ) -> anyhow::Result<PluginActivationRecord> {
         let scope = scope.normalized()?;
@@ -399,7 +467,7 @@ impl SqliteSessionStore {
                 let (scope_type, scope_id, enabled, updated_at) = row?;
                 Ok(PluginActivationRecord {
                     plugin_id: plugin_id.to_string(),
-                    scope: scope_from_database(&scope_type, &scope_id)?,
+                    scope: activation_scope_from_database(&scope_type, &scope_id)?,
                     enabled,
                     updated_at: parse_datetime(&updated_at)?,
                 })
@@ -413,26 +481,104 @@ impl SqliteSessionStore {
         plugin_id: &str,
         default_enabled: bool,
         workspace_root: Option<&Path>,
-        _thread_id: Option<Uuid>,
     ) -> anyhow::Result<bool> {
-        // Ordinary plugin enablement follows the Codex model: the effective
-        // user/project configuration is inherited by every thread. Keep the
-        // thread argument in this compatibility-facing API because callers also
-        // use it to select the workspace context, but never consult a
-        // thread-scoped activation row here.
         let records = self.list_plugin_activations(plugin_id)?;
-        let global = PluginControlScope::global();
+        let global = PluginActivationScope::global();
         let workspace = workspace_root
-            .map(PluginControlScope::workspace)
+            .map(PluginActivationScope::workspace)
             .transpose()?;
-        let value_for = |target: &PluginControlScope| {
+        let value_for = |target: &PluginActivationScope| {
             records
                 .iter()
                 .find(|record| record.scope == *target)
                 .map(|record| record.enabled)
         };
-        Ok(value_for(&global).unwrap_or(default_enabled)
-            && workspace.as_ref().and_then(value_for).unwrap_or(true))
+        Ok(workspace
+            .as_ref()
+            .and_then(value_for)
+            .or_else(|| value_for(&global))
+            .unwrap_or(default_enabled))
+    }
+
+    /// Removes user-owned control-plane state after a plugin package is
+    /// uninstalled. Package updates use the same stable identity and do not
+    /// call this method, so configuration survives upgrades but not removal.
+    pub fn delete_plugin_configuration(&self, plugin_id: &str) -> anyhow::Result<()> {
+        self.with_connection(|conn| {
+            let transaction = conn.transaction()?;
+            for table in [
+                "plugin_activations",
+                "plugin_settings",
+                "plugin_secret_bindings",
+                "plugin_permission_grants",
+                "plugin_runtime_health",
+            ] {
+                transaction.execute(
+                    &format!("DELETE FROM {table} WHERE plugin_id = ?1"),
+                    params![plugin_id],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Moves configuration written by the retired path-based identity scheme
+    /// to the stable logical plugin key. Manifest-derived catalogs and runtime
+    /// health are rebuilt instead of migrated.
+    pub fn migrate_plugin_identity(
+        &self,
+        plugin_id: &str,
+        legacy_ids: &[String],
+    ) -> anyhow::Result<()> {
+        self.with_connection(|conn| {
+            let transaction = conn.transaction()?;
+            for legacy_id in legacy_ids.iter().filter(|legacy_id| legacy_id.as_str() != plugin_id) {
+                for (table, columns) in [
+                    (
+                        "plugin_activations",
+                        "scope_type, scope_id, enabled, updated_at",
+                    ),
+                    (
+                        "plugin_settings",
+                        "scope_type, scope_id, settings_json, updated_at",
+                    ),
+                    (
+                        "plugin_secret_bindings",
+                        "scope_type, scope_id, setting_key, binding_id, metadata_json, updated_at",
+                    ),
+                    (
+                        "plugin_permission_grants",
+                        "scope_type, scope_id, permission, constraint_json, status, granted_at, updated_at",
+                    ),
+                ] {
+                    transaction.execute(
+                        &format!(
+                            "INSERT OR IGNORE INTO {table} (plugin_id, {columns}) SELECT ?1, {columns} FROM {table} WHERE plugin_id = ?2"
+                        ),
+                        params![plugin_id, legacy_id],
+                    )?;
+                    transaction.execute(
+                        &format!("DELETE FROM {table} WHERE plugin_id = ?1"),
+                        params![legacy_id],
+                    )?;
+                }
+                transaction.execute(
+                    "UPDATE OR IGNORE mcp_servers SET plugin_id = ?1 WHERE plugin_id = ?2",
+                    params![plugin_id, legacy_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM mcp_servers WHERE plugin_id = ?1",
+                    params![legacy_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM plugin_runtime_health WHERE plugin_id = ?1",
+                    params![legacy_id],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(())
+        })
     }
 
     pub fn get_plugin_settings(
@@ -461,8 +607,9 @@ impl SqliteSessionStore {
         })
     }
 
-    /// Resolves plugin configuration using the same global -> workspace -> thread precedence as
-    /// activation. Object keys in a narrower scope replace the corresponding broader value.
+    /// Resolves plugin configuration with global -> workspace -> thread precedence.
+    /// Configuration and permission constraints may be task-specific even though ordinary
+    /// plugin enablement intentionally stops at the project boundary.
     pub fn effective_plugin_settings(
         &self,
         plugin_id: &str,
@@ -682,61 +829,6 @@ impl SqliteSessionStore {
         })
     }
 
-    pub fn replace_plugin_contributions(
-        &self,
-        plugin_id: &str,
-        contributions: &[PluginContributionRecord],
-    ) -> anyhow::Result<()> {
-        self.with_connection(|conn| {
-            let transaction = conn.transaction()?;
-            transaction.execute("DELETE FROM plugin_contributions WHERE plugin_id = ?1", params![plugin_id])?;
-            for contribution in contributions {
-                if contribution.plugin_id != plugin_id {
-                    bail!("plugin contribution belongs to a different plugin");
-                }
-                transaction.execute(
-                    "INSERT INTO plugin_contributions (plugin_id, contribution_id, kind, local_id, descriptor_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![plugin_id, contribution.contribution_id, contribution.kind, contribution.local_id, serde_json::to_string(&contribution.descriptor)?, contribution.updated_at.to_rfc3339()],
-                )?;
-                transaction.execute(
-                    "INSERT OR IGNORE INTO plugin_runtime_health (contribution_id, plugin_id, status, last_checked_at, restart_count) VALUES (?1, ?2, 'unknown', ?3, 0)",
-                    params![contribution.contribution_id, plugin_id, contribution.updated_at.to_rfc3339()],
-                )?;
-            }
-            transaction.execute(
-                "DELETE FROM plugin_runtime_health WHERE plugin_id = ?1 AND contribution_id NOT IN (SELECT contribution_id FROM plugin_contributions WHERE plugin_id = ?1)",
-                params![plugin_id],
-            )?;
-            transaction.commit()?;
-            Ok(())
-        })
-    }
-
-    pub fn list_plugin_contributions(
-        &self,
-        plugin_id: &str,
-    ) -> anyhow::Result<Vec<PluginContributionRecord>> {
-        self.with_connection(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT contribution_id, kind, local_id, descriptor_json, updated_at FROM plugin_contributions WHERE plugin_id = ?1 ORDER BY kind, contribution_id",
-            )?;
-            let rows = stmt.query_map(params![plugin_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?))
-            })?;
-            rows.map(|row| {
-                let (contribution_id, kind, local_id, descriptor, updated_at) = row?;
-                Ok(PluginContributionRecord {
-                    plugin_id: plugin_id.to_string(),
-                    contribution_id,
-                    kind,
-                    local_id,
-                    descriptor: serde_json::from_str(&descriptor)?,
-                    updated_at: parse_datetime(&updated_at)?,
-                })
-            }).collect()
-        })
-    }
-
     pub fn put_plugin_runtime_health(
         &self,
         record: &PluginRuntimeHealthRecord,
@@ -822,19 +914,7 @@ pub fn inspect_plugin_control_manifest(
         .as_ref()
         .map(required_secret_setting_keys)
         .unwrap_or_default();
-    let now = Utc::now();
-    let contributions = capability_manifest
-        .contributions
-        .iter()
-        .map(|contribution| PluginContributionRecord {
-            plugin_id: plugin.id.clone(),
-            contribution_id: contribution.id.clone(),
-            kind: contribution_kind_name(contribution.kind).to_string(),
-            local_id: contribution.local_id.clone(),
-            descriptor: serde_json::to_value(contribution).unwrap_or_else(|_| Value::Null),
-            updated_at: now,
-        })
-        .collect();
+    let contributions = capability_manifest.contributions.clone();
     Ok(PluginControlManifest {
         api_version,
         host_capabilities,
@@ -1058,19 +1138,6 @@ fn validate_schema_value(schema: &Value, value: &Value, path: &str) -> anyhow::R
     Ok(())
 }
 
-fn contribution_kind_name(kind: ContributionKind) -> &'static str {
-    match kind {
-        ContributionKind::Skill => "skills",
-        ContributionKind::McpServer => "mcp_servers",
-        ContributionKind::NativeTool => "native_tools",
-        ContributionKind::Previewer => "previewers",
-        ContributionKind::ContextLoader => "context_loaders",
-        ContributionKind::AgentProfile => "agent_profiles",
-        ContributionKind::ScmConnector => "scm_connectors",
-        ContributionKind::App => "apps",
-    }
-}
-
 fn value_matches_type(value: &Value, kind: &str) -> bool {
     match kind {
         "null" => value.is_null(),
@@ -1093,6 +1160,18 @@ fn scope_from_database(scope_type: &str, scope_id: &str) -> anyhow::Result<Plugi
     .normalized()
 }
 
+fn activation_scope_from_database(
+    scope_type: &str,
+    scope_id: &str,
+) -> anyhow::Result<PluginActivationScope> {
+    let scope_type = PluginActivationScopeType::parse(scope_type)?;
+    PluginActivationScope {
+        scope_type,
+        scope_id: (scope_type != PluginActivationScopeType::Global).then(|| scope_id.to_string()),
+    }
+    .normalized()
+}
+
 fn parse_datetime(value: &str) -> anyhow::Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(value)?.with_timezone(&Utc))
 }
@@ -1110,44 +1189,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn activation_scopes_are_persistent_and_monotonic() {
+    fn project_activation_overrides_the_global_configuration_layer() {
         let store = SqliteSessionStore::open(":memory:").unwrap();
         let workspace = Path::new("C:/work/demo");
-        let thread_id = Uuid::new_v4();
         store
-            .set_plugin_activation("plugin", &PluginControlScope::global(), false)
+            .set_plugin_activation("plugin", &PluginActivationScope::global(), true)
             .unwrap();
         store
             .set_plugin_activation(
                 "plugin",
-                &PluginControlScope::workspace(workspace).unwrap(),
+                &PluginActivationScope::workspace(workspace).unwrap(),
+                false,
+            )
+            .unwrap();
+        assert!(!store
+            .plugin_effectively_enabled("plugin", true, Some(workspace))
+            .unwrap());
+        assert_eq!(store.list_plugin_activations("plugin").unwrap().len(), 2);
+
+        store
+            .set_plugin_activation("plugin", &PluginActivationScope::global(), false)
+            .unwrap();
+        store
+            .set_plugin_activation(
+                "plugin",
+                &PluginActivationScope::workspace(workspace).unwrap(),
                 true,
             )
             .unwrap();
-        store
-            .set_plugin_activation("plugin", &PluginControlScope::thread(thread_id), true)
-            .unwrap();
-        assert!(!store
-            .plugin_effectively_enabled("plugin", true, Some(workspace), Some(thread_id))
-            .unwrap());
-        assert_eq!(store.list_plugin_activations("plugin").unwrap().len(), 3);
-    }
-
-    #[test]
-    fn legacy_thread_activation_does_not_override_global_or_workspace_configuration() {
-        let store = SqliteSessionStore::open(":memory:").unwrap();
-        let workspace = Path::new("C:/work/demo");
-        let thread_id = Uuid::new_v4();
-
-        store
-            .set_plugin_activation("plugin", &PluginControlScope::global(), true)
-            .unwrap();
-        store
-            .set_plugin_activation("plugin", &PluginControlScope::thread(thread_id), false)
-            .unwrap();
-
         assert!(store
-            .plugin_effectively_enabled("plugin", false, Some(workspace), Some(thread_id))
+            .plugin_effectively_enabled("plugin", true, Some(workspace))
             .unwrap());
     }
 
@@ -1155,11 +1226,123 @@ mod tests {
     fn explicit_global_activation_can_enable_a_default_disabled_plugin() {
         let store = SqliteSessionStore::open(":memory:").unwrap();
         store
-            .set_plugin_activation("plugin", &PluginControlScope::global(), true)
+            .set_plugin_activation("plugin", &PluginActivationScope::global(), true)
             .unwrap();
         assert!(store
-            .plugin_effectively_enabled("plugin", false, None, None)
+            .plugin_effectively_enabled("plugin", false, None)
             .unwrap());
+    }
+
+    #[test]
+    fn uninstall_cleanup_removes_plugin_control_plane_state() {
+        let store = SqliteSessionStore::open(":memory:").unwrap();
+        let plugin_id = "example@user";
+        let scope = PluginControlScope::global();
+        store
+            .set_plugin_activation(plugin_id, &PluginActivationScope::global(), true)
+            .unwrap();
+        store
+            .put_plugin_settings(plugin_id, &scope, &serde_json::json!({ "mode": "safe" }))
+            .unwrap();
+        store
+            .set_plugin_permission_grant(
+                plugin_id,
+                &scope,
+                "network:api.example.com",
+                &Value::Null,
+                PluginPermissionGrantStatus::Granted,
+            )
+            .unwrap();
+        store
+            .put_plugin_runtime_health(&PluginRuntimeHealthRecord {
+                plugin_id: plugin_id.to_string(),
+                contribution_id: format!("{plugin_id}/tool"),
+                status: PluginRuntimeHealthStatus::Ready,
+                last_error: None,
+                last_checked_at: Utc::now(),
+                restart_count: 0,
+            })
+            .unwrap();
+
+        store.delete_plugin_configuration(plugin_id).unwrap();
+
+        assert!(store.list_plugin_activations(plugin_id).unwrap().is_empty());
+        assert!(store
+            .get_plugin_settings(plugin_id, &scope)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .list_plugin_permission_grants(plugin_id)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .list_plugin_runtime_health(plugin_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn stable_identity_migration_preserves_user_configuration() {
+        let store = SqliteSessionStore::open(":memory:").unwrap();
+        let legacy_id = "codex:C:/cache/example/1.0.0";
+        let stable_id = "example@openai-primary-runtime";
+        store
+            .set_plugin_activation(legacy_id, &PluginActivationScope::global(), false)
+            .unwrap();
+        store
+            .put_plugin_settings(
+                legacy_id,
+                &PluginControlScope::global(),
+                &serde_json::json!({ "mode": "safe" }),
+            )
+            .unwrap();
+        store
+            .set_plugin_permission_grant(
+                legacy_id,
+                &PluginControlScope::global(),
+                "network:api.example.com",
+                &Value::Null,
+                PluginPermissionGrantStatus::Granted,
+            )
+            .unwrap();
+        store
+            .put_plugin_runtime_health(&PluginRuntimeHealthRecord {
+                plugin_id: legacy_id.to_string(),
+                contribution_id: format!("{legacy_id}/tool"),
+                status: PluginRuntimeHealthStatus::Ready,
+                last_error: None,
+                last_checked_at: Utc::now(),
+                restart_count: 1,
+            })
+            .unwrap();
+
+        store
+            .migrate_plugin_identity(stable_id, &[legacy_id.to_string()])
+            .unwrap();
+
+        assert!(store.list_plugin_activations(legacy_id).unwrap().is_empty());
+        assert!(!store
+            .plugin_effectively_enabled(stable_id, true, None)
+            .unwrap());
+        assert_eq!(
+            store
+                .get_plugin_settings(stable_id, &PluginControlScope::global())
+                .unwrap()
+                .unwrap()
+                .settings,
+            serde_json::json!({ "mode": "safe" })
+        );
+        assert_eq!(
+            store
+                .list_plugin_permission_grants(stable_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store
+            .list_plugin_runtime_health(stable_id)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1252,24 +1435,14 @@ mod tests {
             1
         );
 
-        let contribution = PluginContributionRecord {
+        let health = PluginRuntimeHealthRecord {
             plugin_id: "plugin".to_string(),
             contribution_id: "plugin/tool".to_string(),
-            kind: "nativeTools".to_string(),
-            local_id: "tool".to_string(),
-            descriptor: serde_json::json!({ "id": "tool" }),
-            updated_at: Utc::now(),
+            status: PluginRuntimeHealthStatus::Ready,
+            last_error: None,
+            last_checked_at: Utc::now(),
+            restart_count: 2,
         };
-        store
-            .replace_plugin_contributions("plugin", &[contribution])
-            .unwrap();
-        let mut health = store
-            .list_plugin_runtime_health("plugin")
-            .unwrap()
-            .remove(0);
-        assert_eq!(health.status, PluginRuntimeHealthStatus::Unknown);
-        health.status = PluginRuntimeHealthStatus::Ready;
-        health.restart_count = 2;
         store.put_plugin_runtime_health(&health).unwrap();
         assert_eq!(
             store.list_plugin_runtime_health("plugin").unwrap()[0].restart_count,

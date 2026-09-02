@@ -1,27 +1,34 @@
-use super::{ensure_thread, load_bound_agent_context, ApiError, AppState};
+use super::mcp_api::McpServerView;
+use super::plugin_runtime::{
+    load_plugin_outcome, load_plugin_outcome_for_thread, sync_plugin_mcp_configs, LoadedPlugin,
+};
+use super::{ensure_thread, load_bound_agent_context, ApiError, AppState, DeleteResponse};
 use axum::extract::{Path, Query, State};
-use axum::routing::{get, put};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use opentopia_core::{
-    discover_plugins, inspect_plugin_control_manifest, permission_requested,
-    validate_plugin_settings, CapabilityActivationRequest, CapabilityActivationScope,
-    CapabilityActivationSnapshot, CapabilityProjection, CapabilityRegistry, ExperienceMode,
-    ExperienceSurfaceProfile, PluginActivation, PluginActivationRecord, PluginContribution,
-    PluginContributionRecord, PluginControlManifest, PluginControlScope, PluginControlScopeType,
-    PluginDescriptor, PluginPermission, PluginPermissionGrantRecord, PluginPermissionGrantStatus,
-    PluginRuntimeHealthRecord, PluginSecretBindingRecord, PluginSettingsRecord, PluginSource,
-    SessionStore, SqliteSessionStore, Thread,
+    discover_plugins, discover_skills, inspect_plugin_control_manifest, install_plugin,
+    permission_requested, uninstall_plugin, validate_plugin_settings, CapabilityActivationSnapshot,
+    CapabilityProjection, ExperienceMode, ExperienceSurfaceProfile, PluginActivationRecord,
+    PluginActivationScope, PluginActivationScopeType, PluginContribution, PluginControlManifest,
+    PluginControlScope, PluginControlScopeType, PluginDescriptor, PluginError,
+    PluginPermissionGrantRecord, PluginPermissionGrantStatus, PluginRuntimeHealthRecord,
+    PluginSecretBindingRecord, PluginSettingsRecord, PluginSource, SessionStore, SkillDescriptor,
+    SqliteSessionStore,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path as FsPath, PathBuf};
+use std::path::PathBuf;
 use uuid::Uuid;
 
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
+        .route("/api/plugins", get(list_plugins))
+        .route("/api/plugins/install", post(install_local_plugin))
+        .route("/api/plugins/uninstall", post(uninstall_local_plugin))
         .route("/api/plugins/:plugin_id", get(get_plugin_detail))
         .route(
             "/api/plugins/:plugin_id/activation",
@@ -46,24 +53,193 @@ pub(crate) fn router() -> Router<AppState> {
         )
 }
 
+async fn list_plugins(
+    State(state): State<AppState>,
+    Query(query): Query<PluginsQuery>,
+) -> Result<Json<Vec<PluginView>>, ApiError> {
+    let (workspace_root, thread_id) = resolve_plugin_context(&state, query)?;
+    let outcome = load_plugin_outcome(&state.store, workspace_root.as_deref(), thread_id)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let skills = discover_skills(workspace_root.as_deref());
+    let mut views = Vec::with_capacity(outcome.plugins().len());
+    for plugin in outcome.plugins() {
+        sync_plugin_mcp_configs(&state.store, &state.mcp_host, &plugin.descriptor)
+            .await
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        views.push(plugin_view(&state, plugin, &skills).await?);
+    }
+    Ok(Json(views))
+}
+
+async fn install_local_plugin(
+    State(state): State<AppState>,
+    Json(request): Json<InstallPluginRequest>,
+) -> Result<Json<PluginView>, ApiError> {
+    let source = request.path;
+    let plugin = tokio::task::spawn_blocking(move || install_plugin(&source))
+        .await
+        .map_err(|error| ApiError::internal(format!("plugin installation failed: {error}")))?
+        .map_err(plugin_bad_request)?;
+    state
+        .store
+        .migrate_plugin_identity(&plugin.id, &plugin.legacy_ids)?;
+    state
+        .store
+        .set_plugin_activation(&plugin.id, &PluginActivationScope::global(), true)?;
+    sync_plugin_mcp_configs(&state.store, &state.mcp_host, &plugin)
+        .await
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let outcome = load_plugin_outcome(&state.store, None, None)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let loaded = outcome
+        .plugin(&plugin.id)
+        .ok_or_else(|| ApiError::internal("installed plugin was not discoverable"))?;
+    let skills = discover_skills(None);
+    Ok(Json(plugin_view(&state, loaded, &skills).await?))
+}
+
+async fn uninstall_local_plugin(
+    State(state): State<AppState>,
+    Json(request): Json<UninstallPluginRequest>,
+) -> Result<Json<DeleteResponse>, ApiError> {
+    let workspace_root = validate_plugin_workspace(&state, request.workspace_root)?;
+    let plugin_id = request.plugin_id;
+    let plugin_servers = state.store.list_plugin_mcp_servers(&plugin_id)?;
+    let uninstall_id = plugin_id.clone();
+    let uninstall_root = workspace_root.clone();
+    tokio::task::spawn_blocking(move || uninstall_plugin(&uninstall_id, uninstall_root.as_deref()))
+        .await
+        .map_err(|error| ApiError::internal(format!("plugin removal failed: {error}")))?
+        .map_err(plugin_bad_request)?;
+    for server in plugin_servers {
+        state.mcp_host.stop_server(server.server_id).await.ok();
+        state.store.delete_mcp_server(server.server_id)?;
+    }
+    state.store.delete_plugin_configuration(&plugin_id)?;
+    Ok(Json(DeleteResponse { deleted: true }))
+}
+
+async fn plugin_view(
+    state: &AppState,
+    loaded: &LoadedPlugin,
+    skills: &[SkillDescriptor],
+) -> Result<PluginView, ApiError> {
+    let plugin = &loaded.descriptor;
+    let skill_ids = skills
+        .iter()
+        .filter(|skill| skill.plugin_id.as_deref() == Some(plugin.id.as_str()))
+        .map(|skill| skill.id.clone())
+        .collect::<Vec<_>>();
+    let servers = state.store.list_plugin_mcp_servers(&plugin.id)?;
+    let mut mcp_servers = Vec::with_capacity(servers.len());
+    for server in servers {
+        let status = state.mcp_host.status_for_config(&server).await;
+        mcp_servers.push(McpServerView { server, status });
+    }
+    Ok(PluginView {
+        compatible: plugin.is_compatible(),
+        plugin: plugin.clone(),
+        skill_ids,
+        mcp_servers,
+        effective_enabled: loaded.enabled,
+    })
+}
+
+fn resolve_plugin_context(
+    state: &AppState,
+    query: PluginsQuery,
+) -> Result<(Option<PathBuf>, Option<Uuid>), ApiError> {
+    if let Some(thread_id) = query.thread_id {
+        let thread = ensure_thread(state, thread_id)?;
+        if query
+            .workspace_root
+            .as_ref()
+            .is_some_and(|root| root != &thread.workspace_root)
+        {
+            return Err(ApiError::bad_request(
+                "plugin workspace does not match the selected thread",
+            ));
+        }
+        return Ok((Some(thread.workspace_root), Some(thread_id)));
+    }
+    Ok((
+        validate_plugin_workspace(state, query.workspace_root)?,
+        None,
+    ))
+}
+
+fn validate_plugin_workspace(
+    state: &AppState,
+    workspace_root: Option<PathBuf>,
+) -> Result<Option<PathBuf>, ApiError> {
+    if let Some(workspace_root) = workspace_root {
+        if state
+            .store
+            .find_project_by_workspace(&workspace_root)?
+            .is_none()
+        {
+            return Err(ApiError::bad_request(
+                "workspace is not registered as a project",
+            ));
+        }
+        Ok(Some(workspace_root))
+    } else {
+        Ok(None)
+    }
+}
+
+fn plugin_bad_request(error: PluginError) -> ApiError {
+    ApiError::bad_request(error.to_string())
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginsQuery {
+    workspace_root: Option<PathBuf>,
+    thread_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallPluginRequest {
+    path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UninstallPluginRequest {
+    plugin_id: String,
+    workspace_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct PluginView {
+    plugin: PluginDescriptor,
+    skill_ids: Vec<String>,
+    mcp_servers: Vec<McpServerView>,
+    effective_enabled: bool,
+    compatible: bool,
+}
+
 async fn get_plugin_detail(
     State(state): State<AppState>,
     Path(plugin_id): Path<String>,
     Query(query): Query<PluginContextQuery>,
 ) -> Result<Json<PluginDetailResponse>, ApiError> {
     let (plugin, manifest) = prepare_plugin(&state, &plugin_id, &query)?;
+    let workspace_root = resolve_context(&state, &query)?;
     let effective_enabled = state.store.plugin_effectively_enabled(
         &plugin.id,
         plugin.default_enabled,
-        query.workspace_root.as_deref(),
-        query.thread_id,
+        workspace_root.as_deref(),
     )?;
     Ok(Json(PluginDetailResponse {
         plugin: plugin.clone(),
+        contributions: manifest.contributions.clone(),
         manifest,
         activations: state.store.list_plugin_activations(&plugin.id)?,
         effective_enabled,
-        contributions: state.store.list_plugin_contributions(&plugin.id)?,
         health: state.store.list_plugin_runtime_health(&plugin.id)?,
     }))
 }
@@ -73,13 +249,8 @@ async fn put_plugin_activation(
     Path(plugin_id): Path<String>,
     Json(request): Json<PluginActivationRequest>,
 ) -> Result<Json<PluginActivationResponse>, ApiError> {
-    let scope = validate_scope(&state, &request.scope)?;
-    if scope.scope_type == PluginControlScopeType::Thread {
-        return Err(ApiError::bad_request(
-            "ordinary plugin activation is inherited from global or project configuration; thread scope is not supported",
-        ));
-    }
-    let query = context_for_scope(&state, &scope)?;
+    let scope = validate_activation_scope(&state, &request.scope)?;
+    let query = context_for_activation_scope(&state, &scope)?;
     let (plugin, _) = prepare_plugin(&state, &plugin_id, &query)?;
     let activation = state
         .store
@@ -88,7 +259,6 @@ async fn put_plugin_activation(
         &plugin.id,
         plugin.default_enabled,
         query.workspace_root.as_deref(),
-        query.thread_id,
     )?;
     Ok(Json(PluginActivationResponse {
         activation,
@@ -278,9 +448,13 @@ async fn get_plugin_contributions(
     State(state): State<AppState>,
     Path(plugin_id): Path<String>,
     Query(query): Query<PluginContextQuery>,
-) -> Result<Json<Vec<PluginContributionRecord>>, ApiError> {
-    let (plugin, _) = prepare_plugin(&state, &plugin_id, &query)?;
-    Ok(Json(state.store.list_plugin_contributions(&plugin.id)?))
+) -> Result<Json<Vec<PluginContribution>>, ApiError> {
+    let (plugin, manifest) = prepare_plugin(&state, &plugin_id, &query)?;
+    debug_assert!(manifest
+        .contributions
+        .iter()
+        .all(|contribution| contribution.plugin_id == plugin.id));
+    Ok(Json(manifest.contributions))
 }
 
 async fn get_plugin_health(
@@ -303,39 +477,32 @@ async fn get_thread_capabilities(
         effective_capabilities =
             effective_capabilities.intersect(&instance.execution_context.capabilities);
     }
+    let outcome = load_plugin_outcome_for_thread(&state.store, &thread)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let mut plugins = Vec::new();
-    for plugin in discover_plugins(Some(&thread.workspace_root)) {
-        let manifest = inspect_plugin_control_manifest(&plugin)
-            .map_err(|error| ApiError::bad_request(error.to_string()))?;
-        state
-            .store
-            .replace_plugin_contributions(&plugin.id, &manifest.contributions)?;
-        let configured_enabled = state.store.plugin_effectively_enabled(
-            &plugin.id,
-            plugin.default_enabled,
-            Some(&thread.workspace_root),
-            Some(thread_id),
-        )?;
-        let enabled = configured_enabled
+    for loaded in outcome.plugins() {
+        let plugin = &loaded.descriptor;
+        let enabled = loaded.enabled
             && (effective_capabilities.allows_plugin(&plugin.id)
                 || effective_capabilities.allows_plugin(&plugin.name));
-        let grants = state.store.list_plugin_permission_grants(&plugin.id)?;
-        let granted_permissions =
-            effective_granted_permissions(&grants, &thread.workspace_root, thread_id);
         plugins.push(ThreadPluginCapabilities {
             plugin_id: plugin.id.clone(),
-            plugin_name: plugin.name,
+            plugin_name: plugin.name.clone(),
             enabled,
             contributions: enabled
-                .then(|| state.store.list_plugin_contributions(&plugin.id))
-                .transpose()?
+                .then(|| {
+                    outcome
+                        .active_contributions()
+                        .filter(|contribution| contribution.plugin_id == plugin.id)
+                        .cloned()
+                        .collect()
+                })
                 .unwrap_or_default(),
-            granted_permissions,
+            granted_permissions: loaded.granted_permissions.clone(),
         });
     }
     plugins.sort_by(|left, right| left.plugin_name.cmp(&right.plugin_name));
-    let snapshot = capability_snapshot_for_thread(&state.store, &thread)
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let snapshot = outcome.capability_snapshot().clone();
     Ok(Json(ThreadCapabilitiesResponse {
         thread_id,
         experience_mode: thread.experience_mode,
@@ -348,49 +515,6 @@ async fn get_thread_capabilities(
     }))
 }
 
-pub(crate) fn capability_snapshot_for_thread(
-    store: &SqliteSessionStore,
-    thread: &Thread,
-) -> anyhow::Result<CapabilityActivationSnapshot> {
-    let mut registry = CapabilityRegistry::new();
-    let mut activations = Vec::new();
-    for plugin in discover_plugins(Some(&thread.workspace_root)) {
-        let grants = store.list_plugin_permission_grants(&plugin.id)?;
-        let granted_permissions =
-            effective_granted_permissions(&grants, &thread.workspace_root, thread.id);
-        let activation_records = store.list_plugin_activations(&plugin.id)?;
-        activations.push(capability_activation(
-            &plugin,
-            &activation_records,
-            &granted_permissions,
-            &thread.workspace_root,
-            thread.id,
-        ));
-        registry.register_plugin(plugin.capability_registration())?;
-    }
-    Ok(registry.activation_snapshot(CapabilityActivationRequest {
-        scope: CapabilityActivationScope {
-            workspace_id: Some(opentopia_core::normalize_workspace_key(
-                &thread.workspace_root,
-            )),
-            thread_id: Some(thread.id.to_string()),
-        },
-        host_capabilities: host_capabilities(),
-        plugins: activations,
-    }))
-}
-
-pub(crate) fn active_contributions_for_thread(
-    store: &SqliteSessionStore,
-    thread: &Thread,
-) -> anyhow::Result<Vec<PluginContribution>> {
-    Ok(capability_snapshot_for_thread(store, thread)?
-        .active
-        .into_iter()
-        .map(|active| active.contribution)
-        .collect())
-}
-
 pub(crate) fn ensure_default_bundled_plugin_permissions(
     store: &SqliteSessionStore,
 ) -> anyhow::Result<()> {
@@ -398,6 +522,7 @@ pub(crate) fn ensure_default_bundled_plugin_permissions(
         .into_iter()
         .filter(|plugin| plugin.source == PluginSource::Bundled && plugin.default_enabled)
     {
+        store.migrate_plugin_identity(&plugin.id, &plugin.legacy_ids)?;
         // Bootstrap each official default exactly once. Any existing grant or
         // revocation is an explicit user decision and remains authoritative.
         if !store.list_plugin_permission_grants(&plugin.id)?.is_empty() {
@@ -419,97 +544,20 @@ pub(crate) fn ensure_default_bundled_plugin_permissions(
     Ok(())
 }
 
-fn capability_activation(
-    plugin: &PluginDescriptor,
-    records: &[PluginActivationRecord],
-    granted_permissions: &[String],
-    workspace_root: &FsPath,
-    _thread_id: Uuid,
-) -> PluginActivation {
-    let workspace_id = opentopia_core::normalize_workspace_key(workspace_root);
-    let enabled_at = |scope_type, scope_id: Option<&str>| {
-        records
-            .iter()
-            .find(|record| {
-                record.scope.scope_type == scope_type
-                    && record.scope.scope_id.as_deref() == scope_id
-            })
-            .map(|record| record.enabled)
-    };
-    let granted = granted_permissions.iter().collect::<BTreeSet<_>>();
-    let permission_objects = plugin
-        .capability_manifest
-        .permissions
-        .requirements()
-        .into_iter()
-        .filter(|permission| granted.contains(&permission_key(permission)))
-        .collect();
-    PluginActivation {
-        plugin_id: plugin.id.clone(),
-        global_enabled: enabled_at(PluginControlScopeType::Global, None),
-        workspace_enabled: enabled_at(
-            PluginControlScopeType::Workspace,
-            Some(workspace_id.as_str()),
-        ),
-        // Kept empty for backwards-compatible snapshot decoding. Ordinary
-        // plugin activation is inherited by all threads in the workspace.
-        thread_enabled: None,
-        granted_permissions: permission_objects,
-    }
-}
-
-fn permission_key(permission: &PluginPermission) -> String {
-    let category = match permission.kind {
-        opentopia_core::PluginPermissionKind::Filesystem => "filesystem",
-        opentopia_core::PluginPermissionKind::Network => "network",
-        opentopia_core::PluginPermissionKind::Secret => "secrets",
-        opentopia_core::PluginPermissionKind::Desktop => "desktop",
-    };
-    format!("{category}:{}", permission.value)
-}
-
-fn host_capabilities() -> Vec<String> {
-    [
-        "workspace.files.v1",
-        "artifact.runtime.v1",
-        "artifact.preview.v1",
-        "nativeTool.pdf.v1",
-        "nativeTool.document.v1",
-        "nativeTool.spreadsheet.v1",
-        "browser.runtime.v1",
-        "policy.network.v1",
-        "nativeTool.browser.v1",
-        "computer.driver.v1",
-        "policy.approval.v1",
-        "nativeTool.computer.v1",
-        "localGit.read.v1",
-        "localGit.mutate.v1",
-        "previewer.v1",
-        "contextLoader.v1",
-        "agentProfile.v1",
-        "appView.v1",
-        "scmConnector.v1",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
-}
-
 fn prepare_plugin(
     state: &AppState,
     plugin_id: &str,
     query: &PluginContextQuery,
 ) -> Result<(PluginDescriptor, PluginControlManifest), ApiError> {
     let workspace_root = resolve_context(state, query)?;
-    let plugin = discover_plugins(workspace_root.as_deref())
-        .into_iter()
-        .find(|plugin| plugin.id == plugin_id)
+    let outcome = load_plugin_outcome(&state.store, workspace_root.as_deref(), query.thread_id)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let plugin = outcome
+        .plugin(plugin_id)
+        .map(|plugin| plugin.descriptor.clone())
         .ok_or_else(|| ApiError::not_found("plugin is not available in this context"))?;
     let manifest = inspect_plugin_control_manifest(&plugin)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    state
-        .store
-        .replace_plugin_contributions(&plugin.id, &manifest.contributions)?;
     Ok((plugin, manifest))
 }
 
@@ -577,6 +625,53 @@ fn validate_scope(
     Ok(scope)
 }
 
+fn validate_activation_scope(
+    state: &AppState,
+    scope: &PluginActivationScope,
+) -> Result<PluginActivationScope, ApiError> {
+    let scope = scope
+        .normalized()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    if scope.scope_type == PluginActivationScopeType::Workspace {
+        let scope_id = scope.scope_id.as_deref().unwrap_or_default();
+        let registered = state.store.list_projects()?.into_iter().any(|project| {
+            project
+                .workspace_root
+                .as_deref()
+                .is_some_and(|root| opentopia_core::normalize_workspace_key(root) == scope_id)
+        });
+        if !registered {
+            return Err(ApiError::bad_request(
+                "workspace scope is not registered as a project",
+            ));
+        }
+    }
+    Ok(scope)
+}
+
+fn context_for_activation_scope(
+    state: &AppState,
+    scope: &PluginActivationScope,
+) -> Result<PluginContextQuery, ApiError> {
+    match scope.scope_type {
+        PluginActivationScopeType::Global => Ok(PluginContextQuery::default()),
+        PluginActivationScopeType::Workspace => {
+            let scope_id = scope.scope_id.as_deref().unwrap_or_default();
+            let workspace_root = state
+                .store
+                .list_projects()?
+                .into_iter()
+                .filter_map(|project| project.workspace_root)
+                .find(|root| opentopia_core::normalize_workspace_key(root) == scope_id)
+                .ok_or_else(|| ApiError::bad_request("workspace scope is not registered"))?;
+            Ok(PluginContextQuery {
+                workspace_root: Some(workspace_root),
+                thread_id: None,
+            })
+        }
+    }
+}
+
 fn context_for_scope(
     state: &AppState,
     scope: &PluginControlScope,
@@ -622,43 +717,6 @@ fn scope_from_query(
     )
 }
 
-fn effective_granted_permissions(
-    records: &[PluginPermissionGrantRecord],
-    workspace_root: &FsPath,
-    thread_id: Uuid,
-) -> Vec<String> {
-    let workspace_id = opentopia_core::normalize_workspace_key(workspace_root);
-    let thread_id = thread_id.to_string();
-    let relevant = |record: &&PluginPermissionGrantRecord| match record.scope.scope_type {
-        PluginControlScopeType::Global => true,
-        PluginControlScopeType::Workspace => {
-            record.scope.scope_id.as_deref() == Some(&workspace_id)
-        }
-        PluginControlScopeType::Thread => record.scope.scope_id.as_deref() == Some(&thread_id),
-    };
-    let permissions = records
-        .iter()
-        .filter(relevant)
-        .map(|record| record.permission.clone())
-        .collect::<BTreeSet<_>>();
-    permissions
-        .into_iter()
-        .filter(|permission| {
-            let matching = records
-                .iter()
-                .filter(relevant)
-                .filter(|record| record.permission == *permission)
-                .collect::<Vec<_>>();
-            matching
-                .iter()
-                .any(|record| record.status == PluginPermissionGrantStatus::Granted)
-                && !matching
-                    .iter()
-                    .any(|record| record.status == PluginPermissionGrantStatus::Revoked)
-        })
-        .collect()
-}
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PluginContextQuery {
@@ -676,7 +734,7 @@ struct PluginScopedQuery {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PluginActivationRequest {
-    scope: PluginControlScope,
+    scope: PluginActivationScope,
     enabled: bool,
 }
 
@@ -694,7 +752,7 @@ pub(super) struct PluginDetailResponse {
     manifest: PluginControlManifest,
     activations: Vec<PluginActivationRecord>,
     effective_enabled: bool,
-    contributions: Vec<PluginContributionRecord>,
+    contributions: Vec<PluginContribution>,
     health: Vec<PluginRuntimeHealthRecord>,
 }
 
@@ -756,13 +814,14 @@ struct ThreadPluginCapabilities {
     plugin_id: String,
     plugin_name: String,
     enabled: bool,
-    contributions: Vec<PluginContributionRecord>,
+    contributions: Vec<PluginContribution>,
     granted_permissions: Vec<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin_runtime::effective_granted_permissions;
     use opentopia_core::{CapabilityUnavailableReason, ContributionKind};
     use serde_json::json;
     use std::fs;
@@ -898,7 +957,9 @@ mod tests {
                 PluginPermissionGrantStatus::Revoked,
             ),
         ];
-        assert!(effective_granted_permissions(&records, &workspace, thread_id).is_empty());
+        assert!(
+            effective_granted_permissions(&records, Some(&workspace), Some(thread_id)).is_empty()
+        );
     }
 
     #[test]
@@ -914,7 +975,9 @@ mod tests {
             granted_at: Some(Utc::now()),
             updated_at: Utc::now(),
         }];
-        assert!(effective_granted_permissions(&records, &workspace, thread_id).is_empty());
+        assert!(
+            effective_granted_permissions(&records, Some(&workspace), Some(thread_id)).is_empty()
+        );
     }
 
     #[test]
@@ -954,8 +1017,8 @@ mod tests {
         assert!(!browser.default_enabled);
         assert!(!computer.default_enabled);
 
-        let snapshot =
-            capability_snapshot_for_thread(&store, &thread).expect("capability snapshot");
+        let outcome = load_plugin_outcome_for_thread(&store, &thread).expect("plugin load outcome");
+        let snapshot = outcome.capability_snapshot();
         for plugin in [spreadsheet, pdf, documents] {
             assert!(snapshot.unavailable.iter().any(|item| {
                 item.contribution.contribution.plugin_id == plugin.id
@@ -978,8 +1041,9 @@ mod tests {
 
         ensure_default_bundled_plugin_permissions(&store)
             .expect("bootstrap default bundled plugin permissions");
-        let snapshot = capability_snapshot_for_thread(&store, &thread)
-            .expect("authorized capability snapshot");
+        let outcome =
+            load_plugin_outcome_for_thread(&store, &thread).expect("authorized plugin outcome");
+        let snapshot = outcome.capability_snapshot();
         let spreadsheet_kinds = snapshot
             .active
             .iter()
@@ -1025,8 +1089,9 @@ mod tests {
         set_all_permissions(&store, &spreadsheet, PluginPermissionGrantStatus::Revoked);
         ensure_default_bundled_plugin_permissions(&store).expect("preserve spreadsheet revocation");
 
-        let snapshot =
-            capability_snapshot_for_thread(&store, &thread).expect("revoked capability snapshot");
+        let outcome =
+            load_plugin_outcome_for_thread(&store, &thread).expect("revoked plugin outcome");
+        let snapshot = outcome.capability_snapshot();
         assert!(!snapshot
             .active
             .iter()
@@ -1054,12 +1119,13 @@ mod tests {
             .find(|plugin| plugin.name == "projection-pack")
             .expect("projection plugin");
         store
-            .set_plugin_activation(&plugin.id, &PluginControlScope::global(), true)
+            .set_plugin_activation(&plugin.id, &PluginActivationScope::global(), true)
             .expect("activate plugin");
         set_all_permissions(&store, &plugin, PluginPermissionGrantStatus::Granted);
 
-        let active =
-            active_contributions_for_thread(&store, &thread).expect("project active contributions");
+        let outcome =
+            load_plugin_outcome_for_thread(&store, &thread).expect("project plugin outcome");
+        let active = outcome.active_contributions().cloned().collect::<Vec<_>>();
         let projected_kinds = active
             .iter()
             .filter(|contribution| contribution.plugin_id == plugin.id)
@@ -1085,16 +1151,16 @@ mod tests {
 
         set_all_permissions(&store, &plugin, PluginPermissionGrantStatus::Revoked);
 
-        let active = active_contributions_for_thread(&store, &thread)
-            .expect("project revoked contributions");
+        let outcome =
+            load_plugin_outcome_for_thread(&store, &thread).expect("project revoked outcome");
+        let active = outcome.active_contributions().cloned().collect::<Vec<_>>();
         assert!(!active
             .iter()
             .any(|contribution| contribution.plugin_id == plugin.id));
         let profiles =
             crate::load_agent_profiles_for_thread(&store, &thread).expect("reload plugin profiles");
         assert!(profiles.get(&profile_id).is_none());
-        let snapshot =
-            capability_snapshot_for_thread(&store, &thread).expect("revoked capability snapshot");
+        let snapshot = outcome.capability_snapshot();
         let unavailable_kinds = snapshot
             .unavailable
             .iter()

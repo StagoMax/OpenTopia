@@ -1,5 +1,5 @@
 use super::*;
-use axum::routing::{get, post, put};
+use axum::routing::{get, post};
 use axum::Router;
 use tower_http::trace::TraceLayer;
 
@@ -38,10 +38,6 @@ fn platform_routes() -> Router<AppState> {
         .merge(scm_api::router())
         .route("/health", get(health))
         .route("/api/skills", get(list_skills))
-        .route("/api/plugins", get(list_plugins))
-        .route("/api/plugins/install", post(install_local_plugin))
-        .route("/api/plugins/uninstall", post(uninstall_local_plugin))
-        .route("/api/threads/:thread_id/plugins", put(set_thread_plugin))
 }
 
 fn conversation_routes() -> Router<AppState> {

@@ -56,8 +56,59 @@ fn restore_pre_v28_effect_journal(conn: &Connection) {
     .expect("restore the pre-v28 effect journal constraint");
 }
 
+/// Tests that advertise a schema before v32 must restore the plugin tables
+/// removed or narrowed by that migration. Merely rewinding the ledger would
+/// create a schema/version mismatch and correctly trip drift detection.
+fn restore_pre_v32_plugin_runtime(conn: &Connection) {
+    conn.execute_batch(
+        r#"
+        PRAGMA foreign_keys = OFF;
+        DROP INDEX IF EXISTS idx_plugin_activations_scope;
+        ALTER TABLE plugin_activations RENAME TO plugin_activations_v32_source;
+        CREATE TABLE plugin_activations (
+            plugin_id TEXT NOT NULL,
+            scope_type TEXT NOT NULL CHECK(scope_type IN ('global', 'workspace', 'thread')),
+            scope_id TEXT NOT NULL DEFAULT '',
+            enabled INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(plugin_id, scope_type, scope_id)
+        );
+        INSERT INTO plugin_activations
+        SELECT * FROM plugin_activations_v32_source;
+        DROP TABLE plugin_activations_v32_source;
+        CREATE INDEX idx_plugin_activations_scope
+            ON plugin_activations(scope_type, scope_id, plugin_id);
+
+        CREATE TABLE thread_plugin_activations (
+            thread_id TEXT NOT NULL,
+            plugin_name TEXT NOT NULL,
+            enabled INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(thread_id, plugin_name),
+            FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_thread_plugin_activations_thread
+            ON thread_plugin_activations(thread_id, updated_at);
+
+        CREATE TABLE plugin_contributions (
+            plugin_id TEXT NOT NULL,
+            contribution_id TEXT NOT NULL PRIMARY KEY,
+            kind TEXT NOT NULL,
+            local_id TEXT NOT NULL,
+            descriptor_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_plugin_contributions_plugin
+            ON plugin_contributions(plugin_id, kind, contribution_id);
+        PRAGMA foreign_keys = ON;
+        "#,
+    )
+    .expect("restore the pre-v32 plugin runtime schema");
+}
+
 fn remove_post_legacy_agent_runtime_tables(conn: &Connection) {
     restore_pre_v28_effect_journal(conn);
+    restore_pre_v32_plugin_runtime(conn);
     conn.execute_batch(
         r#"
         DROP TABLE IF EXISTS workflow_evaluations;
@@ -383,41 +434,6 @@ fn tool_fixture(server_id: Uuid, tool_name: &str) -> McpToolDescriptor {
         }),
         permission_labels: vec!["read".to_string()],
     }
-}
-
-#[test]
-fn thread_plugin_activation_defaults_to_absent_and_round_trips() {
-    let store = SqliteSessionStore::open(":memory:").expect("open memory store");
-    let thread = store
-        .create_thread(Some("bundled plugins".to_string()), std::env::temp_dir())
-        .expect("create thread");
-
-    assert!(store
-        .list_thread_plugin_activations(thread.id)
-        .expect("list default activations")
-        .is_empty());
-
-    store
-        .set_thread_plugin_activation(thread.id, "browser-automation", false)
-        .expect("disable bundled plugin");
-    assert_eq!(
-        store
-            .list_thread_plugin_activations(thread.id)
-            .expect("list disabled activation")
-            .get("browser-automation"),
-        Some(&false)
-    );
-
-    store
-        .set_thread_plugin_activation(thread.id, "browser-automation", true)
-        .expect("enable bundled plugin");
-    assert_eq!(
-        store
-            .list_thread_plugin_activations(thread.id)
-            .expect("list enabled activation")
-            .get("browser-automation"),
-        Some(&true)
-    );
 }
 
 #[test]

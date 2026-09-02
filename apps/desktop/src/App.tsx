@@ -2557,15 +2557,16 @@ export function App() {
     await refreshPluginState();
   }
 
-  async function toggleThreadPlugin(pluginId: string, enabled: boolean) {
-    if (!client || !activeThread) {
-      throw new Error("Open a task before enabling plugin tools.");
-    }
-    await client.setThreadPlugin(activeThread.id, pluginId, enabled);
+  async function togglePlugin(pluginId: string, enabled: boolean) {
+    if (!client) throw new Error("OpenTopia API is unavailable.");
+    const scope = currentWorkspaceRoot
+      ? { scopeType: "workspace" as const, scopeId: currentWorkspaceRoot }
+      : { scopeType: "global" as const };
+    await client.setPluginActivation(pluginId, scope, enabled);
     await refreshPluginState();
   }
 
-  function usePluginSkills(pluginId: string, enabled: boolean) {
+  async function usePluginSkills(pluginId: string, enabled: boolean) {
     const plugin = plugins.find((item) => item.plugin.id === pluginId);
     if (!plugin) return;
     if (!enabled) {
@@ -2573,6 +2574,9 @@ export function App() {
         current.filter((id) => !plugin.skillIds.includes(id)),
       );
       return;
+    }
+    if (!plugin.effectiveEnabled) {
+      await togglePlugin(pluginId, true);
     }
     const next = [...selectedSkillIds];
     for (const skillId of plugin.skillIds) {
@@ -4392,7 +4396,7 @@ export function App() {
               onDeleteMcpServer={deleteMcpServer}
               onInstallPlugin={installLocalPlugin}
               onUninstallPlugin={uninstallLocalPlugin}
-              onToggleThreadPlugin={toggleThreadPlugin}
+              onTogglePlugin={togglePlugin}
               onUsePluginSkills={usePluginSkills}
               onOpenWorkspace={(workspaceRoot) =>
                 void openWorkspaceRoot(workspaceRoot)

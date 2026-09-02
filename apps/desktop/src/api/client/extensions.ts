@@ -26,7 +26,8 @@ import type {
   MediaHandlerOperation,
   MediaHandlerSelection,
   PluginActivationResponse,
-  PluginContributionRecord,
+  PluginContribution,
+  PluginActivationScope,
   PluginControlScope,
   PluginDetail,
   PluginPermissionGrantRecord,
@@ -74,17 +75,6 @@ export class ExtensionsApi extends ConfigurationApi {
     });
   }
 
-  async setThreadPlugin(
-    threadId: string,
-    pluginId: string,
-    enabled: boolean,
-  ): Promise<PluginView> {
-    return this.put("setThreadPlugin", `/api/threads/${threadId}/plugins`, {
-      pluginId,
-      enabled,
-    });
-  }
-
   async getPluginDetail(
     pluginId: string,
     input?: { workspaceRoot?: string | null; threadId?: string | null },
@@ -100,7 +90,7 @@ export class ExtensionsApi extends ConfigurationApi {
 
   async setPluginActivation(
     pluginId: string,
-    scope: PluginControlScope,
+    scope: PluginActivationScope,
     enabled: boolean,
   ): Promise<PluginActivationResponse> {
     return this.put(
@@ -175,7 +165,7 @@ export class ExtensionsApi extends ConfigurationApi {
   async getPluginContributions(
     pluginId: string,
     input?: { workspaceRoot?: string | null; threadId?: string | null },
-  ): Promise<PluginContributionRecord[]> {
+  ): Promise<PluginContribution[]> {
     return this.get(
       "getPluginContributions",
       `/api/plugins/${encodeURIComponent(pluginId)}/contributions${queryString({

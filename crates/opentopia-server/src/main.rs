@@ -19,26 +19,23 @@ use opentopia_core::collaboration::{
 };
 use opentopia_core::mcp_host::McpExtensionHost;
 use opentopia_core::AgentResumeSignal;
-#[cfg(test)]
-use opentopia_core::PreviewTarget;
 use opentopia_core::{
     agent_model_context_with_runtime, browser_handoff_for_node, configured_provider_from_settings,
     content_fingerprint, current_office_runtime_status, current_shell_runtime_status,
-    discover_plugins, discover_skills, execute_git_workflow, experience_mode_module,
-    install_plugin, load_plugin_mcp_servers, negotiate_provider_settings, permission_policy_module,
-    redact_model_observation, remove_windows_sandbox, resolve_instruction_documents,
-    setup_windows_sandbox, tool_result_is_error, uninstall_plugin, windows_sandbox_setup_status,
-    world_state_catalog_item, AgentContextBudget, AgentContinuation, AgentContinuationState,
-    AgentCore, AgentEvent, AgentEventPayload, AgentInstanceStatusV1, AgentInstanceV1,
-    AgentRunConfig, AgentRunIdentity, AgentRuntimeSettings, AgentTemplateVersionV1, AgentTurnInput,
-    AgentTurnOutcome, AppSettings, Approval, ApprovalStatus, Artifact, ArtifactMetadata,
-    BasicPolicyEngine, BrowserAction, BrowserActionReceipt, BrowserContent, BrowserDownloadRequest,
-    BrowserNavigateRequest, BrowserNodeRef, BrowserObservation, BrowserObservationId,
-    BrowserObserveOptions, BrowserOutput, BrowserRuntimeRoute, BrowserSelector, BrowserSessionId,
-    BrowserSessionSpec, BrowserTargetRef, BrowserWaitCondition, BrowserWaitRequest,
-    CapabilityProjection, CodexAccountStatus, CodexLoginStart, CollaborationMode,
-    CompiledModelContext, ComputerSessionId, ContextCacheScope, ContextCheckpoint,
-    ContextCheckpointCoverage, ContextCheckpointMode, ContextCompactionDetails,
+    discover_skills, execute_git_workflow, experience_mode_module, negotiate_provider_settings,
+    permission_policy_module, redact_model_observation, remove_windows_sandbox,
+    resolve_instruction_documents, setup_windows_sandbox, tool_result_is_error,
+    windows_sandbox_setup_status, world_state_catalog_item, AgentContextBudget, AgentContinuation,
+    AgentContinuationState, AgentCore, AgentEvent, AgentEventPayload, AgentInstanceStatusV1,
+    AgentInstanceV1, AgentRunConfig, AgentRunIdentity, AgentRuntimeSettings,
+    AgentTemplateVersionV1, AgentTurnInput, AgentTurnOutcome, AppSettings, Approval,
+    ApprovalStatus, Artifact, ArtifactMetadata, BasicPolicyEngine, BrowserAction,
+    BrowserActionReceipt, BrowserContent, BrowserDownloadRequest, BrowserNavigateRequest,
+    BrowserNodeRef, BrowserObservation, BrowserObservationId, BrowserObserveOptions, BrowserOutput,
+    BrowserRuntimeRoute, BrowserSelector, BrowserSessionId, BrowserSessionSpec, BrowserTargetRef,
+    BrowserWaitCondition, BrowserWaitRequest, CapabilityProjection, CodexAccountStatus,
+    CodexLoginStart, CollaborationMode, CompiledModelContext, ComputerSessionId, ContextCacheScope,
+    ContextCheckpoint, ContextCheckpointCoverage, ContextCheckpointMode, ContextCompactionDetails,
     ContextCompactionMetrics, ContextItemKind, ContextProjection, ContextRole, ContextSensitivity,
     ContextSummary, ContributionKind, ExecutionAuthority, ExecutionContext, ExperienceMode,
     ExperienceSurfaceProfile, GitWorkflowAction, GitWorkflowRequest, GoalRecord, GoalStatus,
@@ -46,26 +43,32 @@ use opentopia_core::{
     McpToolDescriptor, MediaHandlerSelection, Message, MessagePart, MessageRole, ModelCallPurpose,
     ModelContentPart, ModelContextItem, ModelConversationMessage, ModelConversationRole,
     ModelGateway, ModelStreamDelta, ObserveOptions, OfficeRuntimeStatus, PermissionMode,
-    PluginControlScope, PluginDescriptor, PluginError, PolicyDecision, PolicyEngine,
-    PreviewDescriptor, PreviewError, PreviewKind, PreviewRange, PreviewRangeRequest,
-    PreviewWorkbook, ProviderAdapterKind, ProviderAuthKind, ProviderConversationCursor,
-    ProviderConversationState, ProviderDriverDescriptor, ProviderDriverRegistry, ProviderHealth,
-    ProviderHealthCheck, ProviderKind, ProviderModelGateway, ProviderSettings, ProviderToolCall,
-    ProviderToolResult, ProviderTransportEvent, ProviderTransportKind, ResolvedPreview,
-    ResourceLimit, RuntimeSurface, SandboxDescriptor, SandboxSettings, SessionStore,
-    ShellRuntimeStatus, SkillDescriptor, SqliteSessionStore, StoreError, ThreadContextSnapshot,
-    ThreadMcpServer, ThreadModelSelection, ToolCall, ToolPermissionDescriptor, ToolResult,
-    TurnChangeSet, TurnChangeSetStatus, TurnContextSnapshot, TurnInboxItem, TurnRecord, TurnStatus,
-    UserInputResponse, UserInputStatus, WindowsSandboxSetupStatus, WorkspaceDiff, WorldStateSkill,
-    WorldStateSnapshot, CONTEXT_CHECKPOINT_SCHEMA_VERSION, MAX_PREVIEW_CONTENT_BYTES,
+    PolicyDecision, PolicyEngine, PreviewDescriptor, PreviewError, PreviewKind, PreviewRange,
+    PreviewRangeRequest, PreviewWorkbook, ProviderAdapterKind, ProviderAuthKind,
+    ProviderConversationCursor, ProviderConversationState, ProviderDriverDescriptor,
+    ProviderDriverRegistry, ProviderHealth, ProviderHealthCheck, ProviderKind,
+    ProviderModelGateway, ProviderSettings, ProviderToolCall, ProviderToolResult,
+    ProviderTransportEvent, ProviderTransportKind, ResolvedPreview, ResourceLimit, RuntimeSurface,
+    SandboxDescriptor, SandboxSettings, SessionStore, ShellRuntimeStatus, SkillDescriptor,
+    SqliteSessionStore, StoreError, ThreadContextSnapshot, ThreadMcpServer, ThreadModelSelection,
+    ToolCall, ToolPermissionDescriptor, ToolResult, TurnChangeSet, TurnChangeSetStatus,
+    TurnContextSnapshot, TurnInboxItem, TurnRecord, TurnStatus, UserInputResponse, UserInputStatus,
+    WindowsSandboxSetupStatus, WorkspaceDiff, WorldStateSkill, WorldStateSnapshot,
+    CONTEXT_CHECKPOINT_SCHEMA_VERSION, MAX_PREVIEW_CONTENT_BYTES,
     MIN_PROVIDER_CONTEXT_WINDOW_TOKENS,
 };
 #[cfg(test)]
-use opentopia_core::{ContextSourceRef, UserInputRequest};
+use opentopia_core::{discover_plugins, PreviewTarget};
+#[cfg(test)]
+use opentopia_core::{
+    ContextSourceRef, PluginActivationScope, PluginControlScope, PluginDescriptor, UserInputRequest,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::HashSet;
+#[cfg(test)]
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
@@ -102,6 +105,7 @@ mod interaction_api;
 mod library_api;
 mod mcp_api;
 mod message_api;
+mod plugin_runtime;
 mod plugins_api;
 mod provider_api;
 mod provider_runtime_health;
@@ -155,13 +159,16 @@ use interaction_api::validate_user_input_response;
 use interaction_api::{
     ApprovalDecisionResponse, ExternalActionResumeResponse, UserInputResponseAccepted,
 };
-use mcp_api::{ensure_mcp_server_status, McpServerView, ThreadMcpServerView};
+use mcp_api::ThreadMcpServerView;
 use message_api::{launch_next_queued_turn, message_library_provider};
 #[cfg(test)]
 use message_api::{
     legacy_direct_tool_command, resolve_inline_message_parts, validate_inline_image_attachments,
     InlineImageAttachmentRequest, InlineMessageContentPartRequest,
 };
+#[cfg(test)]
+use plugin_runtime::short_plugin_identity;
+use plugins_api::PluginView;
 use provider_api::{current_settings, ProviderModelSyncResult};
 #[cfg(test)]
 use provider_api::{
@@ -330,12 +337,9 @@ async fn list_skills(
     skills.retain(|skill| effective_capabilities.allows_skill(&skill.id));
     if let Some(thread) = &thread {
         let active_skill_plugins =
-            plugins_api::active_contributions_for_thread(&state.store, thread)
+            plugin_runtime::load_plugin_outcome_for_thread(&state.store, thread)
                 .map_err(|error| ApiError::bad_request(error.to_string()))?
-                .into_iter()
-                .filter(|contribution| contribution.kind == ContributionKind::Skill)
-                .map(|contribution| contribution.plugin_id)
-                .collect::<BTreeSet<_>>();
+                .active_plugin_ids(ContributionKind::Skill);
         skills.retain(|skill| {
             let Some(plugin_id) = skill.plugin_id.as_ref() else {
                 return true;
@@ -345,261 +349,6 @@ async fn list_skills(
         });
     }
     Ok(Json(skills))
-}
-
-async fn list_plugins(
-    State(state): State<AppState>,
-    Query(query): Query<PluginsQuery>,
-) -> Result<Json<Vec<PluginView>>, ApiError> {
-    let (workspace_root, thread_id) = resolve_plugin_context(&state, query)?;
-    let discovery_root = workspace_root.clone();
-    let plugins = tokio::task::spawn_blocking(move || discover_plugins(discovery_root.as_deref()))
-        .await
-        .map_err(|error| ApiError::internal(format!("plugin discovery failed: {error}")))?;
-    let skills = discover_skills(workspace_root.as_deref());
-    let bindings = match thread_id {
-        Some(thread_id) => state.store.list_thread_mcp_servers(thread_id)?,
-        None => Vec::new(),
-    };
-    let bindings = bindings
-        .into_iter()
-        .map(|binding| (binding.server_id, binding.enabled))
-        .collect::<HashMap<_, _>>();
-    let activations = match thread_id {
-        Some(thread_id) => Some(state.store.list_thread_plugin_activations(thread_id)?),
-        None => None,
-    };
-    let mut views = Vec::with_capacity(plugins.len());
-    for plugin in plugins {
-        views.push(plugin_view(&state, plugin, &skills, &bindings, activations.as_ref()).await?);
-    }
-    Ok(Json(views))
-}
-
-async fn install_local_plugin(
-    State(state): State<AppState>,
-    Json(request): Json<InstallPluginRequest>,
-) -> Result<Json<PluginView>, ApiError> {
-    let source = request.path;
-    let plugin = tokio::task::spawn_blocking(move || install_plugin(&source))
-        .await
-        .map_err(|error| ApiError::internal(format!("plugin installation failed: {error}")))?
-        .map_err(plugin_bad_request)?;
-    sync_plugin_mcp_configs(&state, &plugin).await?;
-    let skills = discover_skills(None);
-    let view = plugin_view(&state, plugin, &skills, &HashMap::new(), None).await?;
-    Ok(Json(view))
-}
-
-async fn uninstall_local_plugin(
-    State(state): State<AppState>,
-    Json(request): Json<UninstallPluginRequest>,
-) -> Result<Json<DeleteResponse>, ApiError> {
-    let workspace_root = validate_plugin_workspace(&state, request.workspace_root)?;
-    let plugin_id = request.plugin_id;
-    let plugin_servers = state.store.list_plugin_mcp_servers(&plugin_id)?;
-    let uninstall_id = plugin_id.clone();
-    let uninstall_root = workspace_root.clone();
-    tokio::task::spawn_blocking(move || uninstall_plugin(&uninstall_id, uninstall_root.as_deref()))
-        .await
-        .map_err(|error| ApiError::internal(format!("plugin removal failed: {error}")))?
-        .map_err(plugin_bad_request)?;
-    for server in plugin_servers {
-        state.mcp_host.stop_server(server.server_id).await.ok();
-        state.store.delete_mcp_server(server.server_id)?;
-    }
-    Ok(Json(DeleteResponse { deleted: true }))
-}
-
-async fn set_thread_plugin(
-    State(state): State<AppState>,
-    Path(thread_id): Path<Uuid>,
-    Json(request): Json<ThreadPluginRequest>,
-) -> Result<Json<PluginView>, ApiError> {
-    let thread = ensure_thread(&state, thread_id)?;
-    let plugins = discover_plugins(Some(&thread.workspace_root));
-    let plugin = plugins
-        .into_iter()
-        .find(|plugin| plugin.id == request.plugin_id)
-        .ok_or_else(|| ApiError::not_found("plugin is not available in this workspace"))?;
-    let servers = sync_plugin_mcp_configs(&state, &plugin).await?;
-    state.store.set_plugin_activation(
-        &plugin.id,
-        &PluginControlScope::thread(thread_id),
-        request.enabled,
-    )?;
-    if !plugin.native_capabilities.is_empty() {
-        state
-            .store
-            .set_thread_plugin_activation(thread_id, &plugin.name, request.enabled)?;
-    }
-    for server in &servers {
-        state
-            .store
-            .set_thread_mcp_server(thread_id, server.server_id, request.enabled)?;
-        if request.enabled && server.enabled {
-            let _ = ensure_mcp_server_status(&state.mcp_host, server).await;
-        }
-    }
-    let bindings = state
-        .store
-        .list_thread_mcp_servers(thread_id)?
-        .into_iter()
-        .map(|binding| (binding.server_id, binding.enabled))
-        .collect::<HashMap<_, _>>();
-    let activations = state.store.list_thread_plugin_activations(thread_id)?;
-    let skills = discover_skills(Some(&thread.workspace_root));
-    Ok(Json(
-        plugin_view(&state, plugin, &skills, &bindings, Some(&activations)).await?,
-    ))
-}
-
-async fn plugin_view(
-    state: &AppState,
-    plugin: PluginDescriptor,
-    skills: &[SkillDescriptor],
-    bindings: &HashMap<Uuid, bool>,
-    activations: Option<&HashMap<String, bool>>,
-) -> Result<PluginView, ApiError> {
-    let skill_ids = skills
-        .iter()
-        .filter(|skill| skill.plugin_id.as_deref() == Some(plugin.id.as_str()))
-        .map(|skill| skill.id.clone())
-        .collect::<Vec<_>>();
-    let servers = state.store.list_plugin_mcp_servers(&plugin.id)?;
-    let has_native_tools = !plugin.native_capabilities.is_empty();
-    let native_tools_enabled = activations.is_some_and(|activations| {
-        activations
-            .get(&plugin.name)
-            .copied()
-            .unwrap_or(plugin.default_enabled)
-    });
-    let has_mcp_tools = !servers.is_empty();
-    let mcp_tools_enabled = servers
-        .iter()
-        .all(|server| bindings.get(&server.server_id).copied().unwrap_or(false));
-    let thread_enabled = activations.is_some()
-        && (has_native_tools || has_mcp_tools)
-        && (!has_native_tools || native_tools_enabled)
-        && (!has_mcp_tools || mcp_tools_enabled);
-    let mut mcp_servers = Vec::with_capacity(servers.len());
-    for server in servers {
-        let status = state.mcp_host.status_for_config(&server).await;
-        mcp_servers.push(McpServerView { server, status });
-    }
-    Ok(PluginView {
-        compatible: plugin.is_compatible(),
-        plugin,
-        skill_ids,
-        mcp_servers,
-        thread_enabled,
-    })
-}
-
-async fn sync_plugin_mcp_configs(
-    state: &AppState,
-    plugin: &PluginDescriptor,
-) -> Result<Vec<McpServerConfig>, ApiError> {
-    let definitions = load_plugin_mcp_servers(plugin).map_err(plugin_bad_request)?;
-    let mut existing = state
-        .store
-        .list_plugin_mcp_servers(&plugin.id)?
-        .into_iter()
-        .filter_map(|server| server.plugin_server_name.clone().map(|name| (name, server)))
-        .collect::<HashMap<_, _>>();
-    let mut synchronized = Vec::with_capacity(definitions.len());
-    for definition in definitions {
-        let display_name = format!(
-            "{}/{} [{}]",
-            plugin.name,
-            definition.name,
-            short_plugin_identity(&plugin.id)
-        );
-        let mut server = existing.remove(&definition.name).unwrap_or_else(|| {
-            McpServerConfig::new(display_name.clone(), definition.command.clone())
-        });
-        server.name = display_name;
-        server.command = definition.command;
-        server.args = definition.args;
-        server.cwd = Some(definition.cwd);
-        server.env_keys = definition.env_keys;
-        server.timeout_ms = definition.timeout_ms;
-        server.enabled = true;
-        server.plugin_id = Some(plugin.id.clone());
-        server.plugin_server_name = Some(definition.name);
-        server.refresh_updated_at();
-        let server = if state.store.get_mcp_server(server.server_id)?.is_some() {
-            state
-                .store
-                .update_mcp_server(server)?
-                .ok_or_else(|| ApiError::internal("plugin MCP server disappeared during sync"))?
-        } else {
-            state.store.insert_mcp_server(server)?
-        };
-        synchronized.push(server);
-    }
-    for stale in existing.into_values() {
-        state.mcp_host.stop_server(stale.server_id).await.ok();
-        state.store.delete_mcp_server(stale.server_id)?;
-    }
-    Ok(synchronized)
-}
-
-fn resolve_plugin_context(
-    state: &AppState,
-    query: PluginsQuery,
-) -> Result<(Option<PathBuf>, Option<Uuid>), ApiError> {
-    if let Some(thread_id) = query.thread_id {
-        let thread = ensure_thread(state, thread_id)?;
-        if query
-            .workspace_root
-            .as_ref()
-            .is_some_and(|root| root != &thread.workspace_root)
-        {
-            return Err(ApiError::bad_request(
-                "plugin workspace does not match the selected thread",
-            ));
-        }
-        return Ok((Some(thread.workspace_root), Some(thread_id)));
-    }
-    Ok((
-        validate_plugin_workspace(state, query.workspace_root)?,
-        None,
-    ))
-}
-
-fn validate_plugin_workspace(
-    state: &AppState,
-    workspace_root: Option<PathBuf>,
-) -> Result<Option<PathBuf>, ApiError> {
-    if let Some(workspace_root) = workspace_root {
-        if state
-            .store
-            .find_project_by_workspace(&workspace_root)?
-            .is_none()
-        {
-            return Err(ApiError::bad_request(
-                "workspace is not registered as a project",
-            ));
-        }
-        Ok(Some(workspace_root))
-    } else {
-        Ok(None)
-    }
-}
-
-fn plugin_bad_request(error: PluginError) -> ApiError {
-    ApiError::bad_request(error.to_string())
-}
-
-fn short_plugin_identity(plugin_id: &str) -> String {
-    let hash = plugin_id
-        .as_bytes()
-        .iter()
-        .fold(0xcbf29ce484222325_u64, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-        });
-    format!("{hash:08x}").chars().take(8).collect()
 }
 
 async fn get_turn_status(
@@ -3348,33 +3097,6 @@ struct SkillsQuery {
     experience_mode: Option<ExperienceMode>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PluginsQuery {
-    workspace_root: Option<PathBuf>,
-    thread_id: Option<Uuid>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct InstallPluginRequest {
-    path: PathBuf,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UninstallPluginRequest {
-    plugin_id: String,
-    workspace_root: Option<PathBuf>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ThreadPluginRequest {
-    plugin_id: String,
-    enabled: bool,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CancelAgentTurnRequest {
@@ -3392,16 +3114,6 @@ struct TurnFileDiffPreviewQuery {
 struct TurnUndoRequest {
     #[serde(default)]
     confirm: bool,
-}
-
-#[derive(Debug, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-struct PluginView {
-    plugin: PluginDescriptor,
-    skill_ids: Vec<String>,
-    mcp_servers: Vec<McpServerView>,
-    thread_enabled: bool,
-    compatible: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]

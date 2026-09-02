@@ -1,4 +1,5 @@
 use super::*;
+use crate::mcp_api::McpServerView;
 use schemars::{schema::RootSchema, schema_for, JsonSchema};
 use serde_json::Value;
 use std::fs;
@@ -28,7 +29,6 @@ struct DesktopHttpResponsesV1 {
     list_plugins: Vec<PluginView>,
     install_plugin: PluginView,
     uninstall_plugin: DeleteResponse,
-    set_thread_plugin: PluginView,
     list_provider_drivers: Vec<ProviderDriverDescriptor>,
     get_provider_health: Vec<ProviderHealth>,
     test_provider_connection: ProviderHealthCheck,
@@ -43,7 +43,7 @@ struct DesktopHttpResponsesV1 {
     update_plugin_settings: plugins_api::PluginSettingsResponse,
     get_plugin_permissions: plugins_api::PluginPermissionsResponse,
     set_plugin_permission: opentopia_core::PluginPermissionGrantRecord,
-    get_plugin_contributions: Vec<opentopia_core::PluginContributionRecord>,
+    get_plugin_contributions: Vec<opentopia_core::PluginContribution>,
     get_plugin_health: Vec<opentopia_core::PluginRuntimeHealthRecord>,
     get_thread_capabilities: plugins_api::ThreadCapabilitiesResponse,
     list_agent_templates: Vec<agent_templates_api::AgentTemplateVersionView>,

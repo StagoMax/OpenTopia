@@ -1,4 +1,4 @@
-use super::{current_settings, load_bound_agent_context, plugins_api, AppState};
+use super::{current_settings, load_bound_agent_context, plugin_runtime, AppState};
 use crate::connection_operation_runtime::StoreConnectionOperationInvocationGate;
 use anyhow::Context;
 use opentopia_core::collaboration::{
@@ -9,10 +9,10 @@ use opentopia_core::collaboration::{
 };
 use opentopia_core::mcp_host::McpExtensionHost;
 use opentopia_core::{
-    discover_plugins, AgentCore, AgentProfileRegistry, ConnectionOperationInvocationGate,
-    ContributionKind, ExecutionConnectionOperationV1, ExperienceMode, ExperienceSurfaceProfile,
-    LoadedSkill, Message, MessagePart, ProviderSettings, SessionStore, SpreadsheetFileFormat,
-    SqliteSessionStore, TurnInboxItem, GIT_NONINTERACTIVE_ENVIRONMENT,
+    AgentCore, AgentProfileRegistry, ConnectionOperationInvocationGate, ContributionKind,
+    ExecutionConnectionOperationV1, ExperienceMode, ExperienceSurfaceProfile, LoadedSkill, Message,
+    MessagePart, ProviderSettings, SessionStore, SpreadsheetFileFormat, SqliteSessionStore,
+    TurnInboxItem, GIT_NONINTERACTIVE_ENVIRONMENT,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
@@ -36,17 +36,24 @@ pub(super) async fn sync_thread_mcp_tools(
             return;
         }
     };
-    let active_mcp_plugins = match plugins_api::active_contributions_for_thread(store, &thread) {
-        Ok(contributions) => contributions
-            .into_iter()
-            .filter(|contribution| contribution.kind == ContributionKind::McpServer)
-            .map(|contribution| contribution.plugin_id)
-            .collect::<BTreeSet<_>>(),
+    let plugin_outcome = match plugin_runtime::load_plugin_outcome_for_thread(store, &thread) {
+        Ok(outcome) => outcome,
         Err(err) => {
             error!(?err, %thread_id, "failed to resolve MCP capability snapshot");
-            BTreeSet::new()
+            return;
         }
     };
+    for plugin in plugin_outcome
+        .plugins()
+        .filter(|plugin| plugin.descriptor.mcp_server_count > 0)
+    {
+        if let Err(err) =
+            plugin_runtime::sync_plugin_mcp_configs(store, host, &plugin.descriptor).await
+        {
+            warn!(?err, %thread_id, plugin_id = %plugin.descriptor.id, "failed to synchronize plugin MCP manifest");
+        }
+    }
+    let active_mcp_plugins = plugin_outcome.active_plugin_ids(ContributionKind::McpServer);
     let enabled_servers = match store.list_mcp_servers() {
         Ok(servers) => servers
             .into_iter()
@@ -102,10 +109,10 @@ pub(super) async fn sync_thread_mcp_tools(
 
 /// Synchronizes the structured Connection surface frozen into a bound Agent.
 ///
-/// This is intentionally independent from `thread_mcp_servers` and plugin
-/// activation. Those are legacy/user-thread catalog switches; applying them a
-/// second time would make an approved Agent operation disappear or, worse,
-/// broaden a server-level grant back to every provider tool on that server.
+/// This is intentionally independent from standalone `thread_mcp_servers` and
+/// the plugin runtime snapshot. Applying either a second time would make an
+/// approved Agent operation disappear or, worse, broaden a server-level grant
+/// back to every provider tool on that server.
 pub(super) async fn sync_connection_operation_tools(
     store: &Arc<SqliteSessionStore>,
     host: &McpExtensionHost,
@@ -178,20 +185,17 @@ pub(super) fn sync_thread_bundled_plugin_activations(
             return;
         }
     };
-    let active_native_plugins = match plugins_api::active_contributions_for_thread(store, &thread) {
-        Ok(contributions) => contributions
-            .into_iter()
-            .filter(|contribution| contribution.kind == ContributionKind::NativeTool)
-            .map(|contribution| contribution.plugin_id)
-            .collect::<BTreeSet<_>>(),
+    let outcome = match plugin_runtime::load_plugin_outcome_for_thread(store, &thread) {
+        Ok(outcome) => outcome,
         Err(err) => {
             error!(?err, %thread_id, "failed to resolve bundled capability snapshot");
-            BTreeSet::new()
+            agent.disable_all_bundled_plugins();
+            return;
         }
     };
-    let plugins = discover_plugins(Some(&thread.workspace_root));
-    let activations = plugins
-        .iter()
+    let active_native_plugins = outcome.active_plugin_ids(ContributionKind::NativeTool);
+    let activations = outcome
+        .descriptors()
         .filter(|plugin| !plugin.native_capabilities.is_empty())
         .map(|plugin| {
             let enabled = active_native_plugins.contains(&plugin.id);
@@ -200,8 +204,8 @@ pub(super) fn sync_thread_bundled_plugin_activations(
         .collect::<HashMap<_, _>>();
     agent.set_bundled_plugin_activations(&activations);
 
-    let allowed_applications = plugins
-        .iter()
+    let allowed_applications = outcome
+        .descriptors()
         .find(|plugin| plugin.name == "computer-use")
         .filter(|plugin| active_native_plugins.contains(&plugin.id))
         .map(|plugin| {
@@ -306,11 +310,8 @@ pub(super) fn ensure_plugin_skills_enabled(
     thread: &opentopia_core::Thread,
     skills: &[LoadedSkill],
 ) -> anyhow::Result<()> {
-    let active_skill_plugins = plugins_api::active_contributions_for_thread(store, thread)?
-        .into_iter()
-        .filter(|contribution| contribution.kind == ContributionKind::Skill)
-        .map(|contribution| contribution.plugin_id)
-        .collect::<BTreeSet<_>>();
+    let active_skill_plugins = plugin_runtime::load_plugin_outcome_for_thread(store, thread)?
+        .active_plugin_ids(ContributionKind::Skill);
     for skill in skills {
         let Some(plugin_id) = skill.descriptor.plugin_id.as_deref() else {
             continue;
@@ -387,12 +388,9 @@ pub(super) fn load_agent_profiles_for_thread(
     store: &SqliteSessionStore,
     thread: &opentopia_core::Thread,
 ) -> anyhow::Result<AgentProfileRegistry> {
-    let plugins = discover_plugins(Some(&thread.workspace_root));
-    let enabled_plugin_ids = plugins_api::active_contributions_for_thread(store, thread)?
-        .into_iter()
-        .filter(|contribution| contribution.kind == ContributionKind::AgentProfile)
-        .map(|contribution| contribution.plugin_id)
-        .collect::<BTreeSet<_>>();
+    let outcome = plugin_runtime::load_plugin_outcome_for_thread(store, thread)?;
+    let plugins = outcome.descriptors().cloned().collect::<Vec<_>>();
+    let enabled_plugin_ids = outcome.active_plugin_ids(ContributionKind::AgentProfile);
     Ok(AgentProfileRegistry::load_with_plugin_profiles(
         &thread.workspace_root,
         &plugins,
@@ -496,7 +494,11 @@ pub(super) async fn freeze_root_runtime_snapshot_with_connection_authority(
         .iter()
         .map(|tool| tool.name.clone())
         .collect::<Vec<_>>();
-    let plugin_contributions = plugins_api::active_contributions_for_thread(&state.store, thread)?;
+    let plugin_contributions: Vec<_> =
+        plugin_runtime::load_plugin_outcome_for_thread(&state.store, thread)?
+            .active_contributions()
+            .cloned()
+            .collect();
     let attachment_references = state
         .store
         .list_messages(thread.id)?

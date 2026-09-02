@@ -22,6 +22,8 @@ import {
 import type {
   AppViewDescriptor,
   AppViewSessionResponse,
+  PluginActivationScope,
+  PluginActivationScopeType,
   PluginControlScope,
   PluginControlScopeType,
   PluginDetail,
@@ -212,7 +214,7 @@ export function PluginControlPanel({
   );
 
   async function updateActivation(
-    target: PluginControlScope,
+    target: PluginActivationScope,
     enabled: boolean,
   ) {
     if (!client) return;
@@ -300,6 +302,18 @@ export function PluginControlPanel({
     { value: "workspace", label: "Project", disabled: !workspaceRoot },
     { value: "thread", label: "Task", disabled: !threadId },
   ] as const;
+  const activationOptions: ReadonlyArray<{
+    value: PluginActivationScopeType;
+    label: string;
+    disabled: boolean;
+  }> = [
+    { value: "global", label: "Global", disabled: false },
+    { value: "workspace", label: "Project", disabled: !workspaceRoot },
+  ] as const;
+  const inheritedGlobalEnabled =
+    (detail
+      ? activationForScope(detail.activations, { scopeType: "global" })?.enabled
+      : undefined) ?? plugin.defaultEnabled;
 
   return (
     <div className="plugin-control-surface">
@@ -336,29 +350,31 @@ export function PluginControlPanel({
         <div className="plugin-control-section-heading">
           <div>
             <h3 id="plugin-activation-heading">Activation</h3>
-            <p>Each narrower scope can disable the plugin for that context.</p>
+            <p>
+              Project configuration overrides the global value for this project.
+            </p>
           </div>
         </div>
         <div className="plugin-activation-list">
-          {scopeOptions.map((option) => {
-            const target = scopeForType(option.value, threadId, workspaceRoot);
+          {activationOptions.map((option) => {
+            const target = activationScopeForType(option.value, workspaceRoot);
             const activation = detail
               ? activationForScope(detail.activations, target)
               : undefined;
             const fallback =
-              option.value === "global" ? plugin.defaultEnabled : true;
+              option.value === "global"
+                ? plugin.defaultEnabled
+                : inheritedGlobalEnabled;
             return (
               <div className="plugin-activation-row" key={option.value}>
                 <div>
                   <strong>{option.label}</strong>
                   <span>
                     {option.disabled
-                      ? option.value === "thread"
-                        ? "Open a task to configure this scope."
-                        : "Select a project to configure this scope."
+                      ? "Select a project to configure this scope."
                       : activation
                         ? `Explicitly ${activation.enabled ? "enabled" : "disabled"}`
-                        : `Inherited default: ${fallback ? "enabled" : "disabled"}`}
+                        : `Inherited: ${fallback ? "enabled" : "disabled"}`}
                   </span>
                 </div>
                 <Switch
@@ -525,17 +541,13 @@ export function PluginControlPanel({
           <div className="plugin-contribution-list">
             {detail.contributions.map((contribution) => {
               const runtime = health.find(
-                (record) =>
-                  record.contributionId === contribution.contributionId,
+                (record) => record.contributionId === contribution.id,
               );
               return (
-                <div
-                  className="plugin-contribution-row"
-                  key={contribution.contributionId}
-                >
+                <div className="plugin-contribution-row" key={contribution.id}>
                   <div>
                     <strong>{contribution.localId}</strong>
-                    <code>{contribution.contributionId}</code>
+                    <code>{contribution.id}</code>
                   </div>
                   <div className="plugin-contribution-status">
                     <Badge>{contribution.kind}</Badge>
@@ -952,6 +964,16 @@ function scopeForType(
   if (scopeType === "thread") {
     return { scopeType, scopeId: threadId ?? undefined };
   }
+  if (scopeType === "workspace") {
+    return { scopeType, scopeId: workspaceRoot ?? undefined };
+  }
+  return { scopeType };
+}
+
+function activationScopeForType(
+  scopeType: PluginActivationScopeType,
+  workspaceRoot: string | null,
+): PluginActivationScope {
   if (scopeType === "workspace") {
     return { scopeType, scopeId: workspaceRoot ?? undefined };
   }

@@ -1,5 +1,5 @@
 use super::{
-    current_settings, ensure_thread, plugins_api, publish_payload, ApiError, AppState,
+    current_settings, ensure_thread, plugin_runtime, publish_payload, ApiError, AppState,
     GIT_OUTPUT_BYTES_LIMIT,
 };
 use axum::extract::{Path, State};
@@ -190,13 +190,13 @@ fn active_connectors(
     thread: &opentopia_core::Thread,
 ) -> Result<Vec<ScmConnectorDescriptor>, ApiError> {
     let mut connectors = Vec::new();
-    for contribution in plugins_api::active_contributions_for_thread(&state.store, thread)
+    for contribution in plugin_runtime::load_plugin_outcome_for_thread(&state.store, thread)
         .map_err(|error| ApiError::bad_request(error.to_string()))?
-        .into_iter()
+        .active_contributions()
         .filter(|contribution| contribution.kind == ContributionKind::ScmConnector)
     {
         connectors.push(
-            ScmConnectorDescriptor::from_contribution(&contribution)
+            ScmConnectorDescriptor::from_contribution(contribution)
                 .map_err(|error| ApiError::bad_request(error.to_string()))?,
         );
     }

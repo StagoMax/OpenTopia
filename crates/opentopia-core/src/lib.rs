@@ -324,14 +324,14 @@ pub use pdf::{
 };
 pub use plugin_control::{
     inspect_plugin_control_manifest, permission_requested, validate_plugin_settings,
-    PluginActivationRecord, PluginContributionRecord, PluginControlManifest, PluginControlScope,
-    PluginControlScopeType, PluginPermissionGrantRecord, PluginPermissionGrantStatus,
-    PluginPermissionRequest, PluginRuntimeHealthRecord, PluginRuntimeHealthStatus,
-    PluginSecretBindingRecord, PluginSettingsRecord,
+    PluginActivationRecord, PluginActivationScope, PluginActivationScopeType,
+    PluginControlManifest, PluginControlScope, PluginControlScopeType, PluginPermissionGrantRecord,
+    PluginPermissionGrantStatus, PluginPermissionRequest, PluginRuntimeHealthRecord,
+    PluginRuntimeHealthStatus, PluginSecretBindingRecord, PluginSettingsRecord,
 };
 pub use plugins::{
     bundled_plugins_path, discover_plugins, inspect_plugin, install_plugin,
-    load_plugin_mcp_servers, uninstall_plugin, PluginDescriptor, PluginError,
+    load_plugin_mcp_servers, uninstall_plugin, PluginDescriptor, PluginError, PluginId,
     PluginMcpServerDefinition, PluginScope, PluginSource,
 };
 pub use policy::{

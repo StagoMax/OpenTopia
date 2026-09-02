@@ -39,7 +39,7 @@ export function ExtensionsView({
   onDeleteMcpServer,
   onInstallPlugin,
   onUninstallPlugin,
-  onToggleThreadPlugin,
+  onTogglePlugin,
   onUsePluginSkills,
   onOpenPath,
 }: {
@@ -58,8 +58,8 @@ export function ExtensionsView({
   onDeleteMcpServer(serverId: string): Promise<void>;
   onInstallPlugin(): Promise<void>;
   onUninstallPlugin(pluginId: string): Promise<void>;
-  onToggleThreadPlugin(pluginId: string, enabled: boolean): Promise<void>;
-  onUsePluginSkills(pluginId: string, enabled: boolean): void;
+  onTogglePlugin(pluginId: string, enabled: boolean): Promise<void>;
+  onUsePluginSkills(pluginId: string, enabled: boolean): Promise<void>;
   onOpenPath(targetPath: string): void;
 }) {
   const [view, setView] = useState<"plugins" | "mcp">("plugins");
@@ -83,9 +83,7 @@ export function ExtensionsView({
     [normalizedQuery, plugins, source],
   );
   const activeCount = plugins.filter(
-    (plugin) =>
-      plugin.threadEnabled ||
-      plugin.skillIds.some((id) => selectedSkillIds.includes(id)),
+    (plugin) => plugin.effectiveEnabled,
   ).length;
   const selectedPlugin = plugins.find(
     (item) => item.plugin.id === selectedPluginId,
@@ -214,7 +212,7 @@ export function ExtensionsView({
           </div>
           <div className="plugin-summary">
             <span>{plugins.length} installed</span>
-            <span>{activeCount} in this turn</span>
+            <span>{activeCount} enabled</span>
             <span>{filteredPlugins.length} shown</span>
           </div>
           {error && (
@@ -310,8 +308,11 @@ export function ExtensionsView({
                             className={`secondary-button compact ${skillsSelected ? "is-selected" : ""}`}
                             type="button"
                             aria-pressed={skillsSelected}
+                            disabled={busy}
                             onClick={() =>
-                              onUsePluginSkills(plugin.id, !skillsSelected)
+                              void run(`skills:${plugin.id}`, () =>
+                                onUsePluginSkills(plugin.id, !skillsSelected),
+                              )
                             }
                           >
                             {skillsSelected ? (
@@ -322,32 +323,26 @@ export function ExtensionsView({
                             {skillsSelected ? "Skills added" : "Use Skills"}
                           </button>
                         )}
-                        {(plugin.supportedMcpServerCount > 0 ||
-                          plugin.nativeCapabilities.length > 0) && (
-                          <label
-                            className="plugin-task-toggle"
-                            title={
-                              hasThread
-                                ? "Enable this plugin's tools for this task"
-                                : "Open a task to enable plugin tools"
+                        <label
+                          className="plugin-task-toggle"
+                          title={
+                            workspaceRoot
+                              ? "Enable this plugin for the current project"
+                              : "Enable this plugin globally"
+                          }
+                        >
+                          <input
+                            type="checkbox"
+                            checked={item.effectiveEnabled}
+                            disabled={!item.compatible || busy}
+                            onChange={(event) =>
+                              void run(`toggle:${plugin.id}`, () =>
+                                onTogglePlugin(plugin.id, event.target.checked),
+                              )
                             }
-                          >
-                            <input
-                              type="checkbox"
-                              checked={item.threadEnabled}
-                              disabled={!hasThread || busy}
-                              onChange={(event) =>
-                                void run(`toggle:${plugin.id}`, () =>
-                                  onToggleThreadPlugin(
-                                    plugin.id,
-                                    event.target.checked,
-                                  ),
-                                )
-                              }
-                            />
-                            <span>Task tools</span>
-                          </label>
-                        )}
+                          />
+                          <span>Enabled</span>
+                        </label>
                       </div>
                       <div className="plugin-secondary-actions">
                         <button

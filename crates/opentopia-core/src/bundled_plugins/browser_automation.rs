@@ -4,6 +4,11 @@ const MANIFEST: &[u8] =
     include_bytes!("../../bundled-plugins/browser-automation/.codex-plugin/plugin.json");
 const CONFIGURATION_SCHEMA: &[u8] =
     include_bytes!("../../bundled-plugins/browser-automation/configuration.schema.json");
+const BROWSER_SKILL: &[u8] =
+    include_bytes!("../../bundled-plugins/browser-automation/skills/control-browser/SKILL.md");
+const BROWSER_SKILL_INTERFACE: &[u8] = include_bytes!(
+    "../../bundled-plugins/browser-automation/skills/control-browser/agents/openai.yaml"
+);
 
 const FILES: &[BundledPluginFile] = &[
     BundledPluginFile {
@@ -14,12 +19,20 @@ const FILES: &[BundledPluginFile] = &[
         relative_path: "configuration.schema.json",
         contents: CONFIGURATION_SCHEMA,
     },
+    BundledPluginFile {
+        relative_path: "skills/control-browser/SKILL.md",
+        contents: BROWSER_SKILL,
+    },
+    BundledPluginFile {
+        relative_path: "skills/control-browser/agents/openai.yaml",
+        contents: BROWSER_SKILL_INTERFACE,
+    },
 ];
 
 pub(super) const PACKAGE: BundledPluginPackage = BundledPluginPackage {
     metadata: BundledPluginMetadata {
         name: "browser-automation",
-        version: "1.0.0",
+        version: "1.0.1",
         trust: BundledPluginTrust::Privileged,
         default_enabled: false,
         native_capabilities: &["browser"],
@@ -41,6 +54,7 @@ mod tests {
         assert_eq!(PACKAGE.metadata.trust, BundledPluginTrust::Privileged);
         assert!(!PACKAGE.metadata.default_enabled);
         assert_eq!(PACKAGE.metadata.native_capabilities, &["browser"]);
+        assert_eq!(manifest["skills"], "./skills/");
         assert!(manifest.get("trust").is_none());
         assert!(manifest.get("official").is_none());
         assert!(manifest["opentopia"].get("trust").is_none());
@@ -69,6 +83,9 @@ mod tests {
             opentopia["configuration"]["schema"],
             "./configuration.schema.json"
         );
+        assert!(std::str::from_utf8(BROWSER_SKILL)
+            .expect("UTF-8 browser Skill")
+            .contains("OpenTopia's `browser` tool"));
 
         let schema: Value =
             serde_json::from_slice(CONFIGURATION_SCHEMA).expect("valid configuration schema");

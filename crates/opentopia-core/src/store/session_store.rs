@@ -74,6 +74,12 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         workspace_root: &Path,
         thread_id: Uuid,
     ) -> anyhow::Result<Value>;
+    fn plugin_effectively_enabled(
+        &self,
+        plugin_id: &str,
+        default_enabled: bool,
+        workspace_root: Option<&Path>,
+    ) -> anyhow::Result<bool>;
     fn list_threads(&self) -> anyhow::Result<Vec<Thread>>;
     fn list_threads_including_archived(
         &self,

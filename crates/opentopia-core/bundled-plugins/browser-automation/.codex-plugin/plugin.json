@@ -1,10 +1,11 @@
 {
   "name": "browser-automation",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Observe and automate a bounded OpenTopia browser session.",
   "author": {
     "name": "OpenTopia Contributors"
   },
+  "skills": "./skills/",
   "interface": {
     "displayName": "Browser Automation",
     "shortDescription": "Navigate, inspect, and interact with web pages.",

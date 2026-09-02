@@ -627,3 +627,89 @@ async fn skill_discovery_and_reads_honor_execution_context_projection() {
         .to_string()
         .contains("outside the active ExecutionContext projection"));
 }
+
+#[tokio::test]
+async fn plugin_skills_follow_the_effective_project_activation() {
+    let workspace =
+        std::env::temp_dir().join(format!("opentopia-plugin-skill-tool-{}", Uuid::new_v4()));
+    let plugin_root = workspace.join(".opentopia/plugins/review-kit");
+    std::fs::create_dir_all(plugin_root.join(".codex-plugin")).unwrap();
+    std::fs::create_dir_all(plugin_root.join("skills/review")).unwrap();
+    std::fs::write(
+        plugin_root.join(".codex-plugin/plugin.json"),
+        r#"{"name":"review-kit","version":"1.0.0","skills":"./skills"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        plugin_root.join("skills/review/SKILL.md"),
+        "---\nname: review\ndescription: Review a change\n---\n\n# Review\n",
+    )
+    .unwrap();
+
+    let plugin_skill = crate::discover_skills(Some(&workspace))
+        .into_iter()
+        .find(|skill| skill.plugin_id.as_deref() == Some("review-kit@workspace"))
+        .unwrap();
+    let store = Arc::new(SqliteSessionStore::open(":memory:").unwrap());
+    let policy = Arc::new(BasicPolicyEngine::new(
+        workspace.clone(),
+        PermissionMode::FullAccess,
+    ));
+    let mut context = ToolInvocationContext::local(workspace.clone(), policy);
+    context.capability_projection = CapabilityProjection::unrestricted();
+    context.state = Some(ToolStateStore::new(store.clone()));
+
+    let disabled_catalog = ListSkillsTool
+        .execute_typed(Uuid::new_v4(), EmptyToolInput {}, context.clone())
+        .await
+        .unwrap();
+    let disabled_catalog: Vec<crate::SkillDescriptor> =
+        serde_json::from_str(&disabled_catalog.output).unwrap();
+    assert!(!disabled_catalog
+        .iter()
+        .any(|skill| skill.id == plugin_skill.id));
+    let disabled_read = ReadSkillTool
+        .execute_typed(
+            Uuid::new_v4(),
+            ReadSkillInput {
+                id: plugin_skill.id.clone(),
+                offset: 0,
+                limit: None,
+            },
+            context.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert!(disabled_read.to_string().contains("plugin is disabled"));
+
+    store
+        .set_plugin_activation(
+            "review-kit@workspace",
+            &crate::PluginActivationScope::workspace(&workspace).unwrap(),
+            true,
+        )
+        .unwrap();
+    let enabled_catalog = ListSkillsTool
+        .execute_typed(Uuid::new_v4(), EmptyToolInput {}, context.clone())
+        .await
+        .unwrap();
+    let enabled_catalog: Vec<crate::SkillDescriptor> =
+        serde_json::from_str(&enabled_catalog.output).unwrap();
+    assert!(enabled_catalog
+        .iter()
+        .any(|skill| skill.id == plugin_skill.id));
+    ReadSkillTool
+        .execute_typed(
+            Uuid::new_v4(),
+            ReadSkillInput {
+                id: plugin_skill.id,
+                offset: 0,
+                limit: None,
+            },
+            context,
+        )
+        .await
+        .unwrap();
+
+    std::fs::remove_dir_all(workspace).unwrap();
+}

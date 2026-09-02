@@ -133,7 +133,7 @@ export function RightPanel({
   onDeleteMcpServer,
   onInstallPlugin,
   onUninstallPlugin,
-  onToggleThreadPlugin,
+  onTogglePlugin,
   onUsePluginSkills,
   onOpenWorkspace,
   onEnsureTerminalSession,
@@ -223,8 +223,8 @@ export function RightPanel({
   onDeleteMcpServer(serverId: string): Promise<void>;
   onInstallPlugin(): Promise<void>;
   onUninstallPlugin(pluginId: string): Promise<void>;
-  onToggleThreadPlugin(pluginId: string, enabled: boolean): Promise<void>;
-  onUsePluginSkills(pluginId: string, enabled: boolean): void;
+  onTogglePlugin(pluginId: string, enabled: boolean): Promise<void>;
+  onUsePluginSkills(pluginId: string, enabled: boolean): Promise<void>;
   onOpenWorkspace(workspaceRoot: string): void;
   onEnsureTerminalSession(threadId: string): Promise<TerminalSession>;
   onWriteTerminalSession(
@@ -335,7 +335,7 @@ export function RightPanel({
       onDeleteMcpServer={onDeleteMcpServer}
       onInstallPlugin={onInstallPlugin}
       onUninstallPlugin={onUninstallPlugin}
-      onToggleThreadPlugin={onToggleThreadPlugin}
+      onTogglePlugin={onTogglePlugin}
       onUsePluginSkills={onUsePluginSkills}
       onOpenPath={onOpenWorkspace}
       onEnsureTerminalSession={onEnsureTerminalSession}

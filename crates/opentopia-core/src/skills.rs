@@ -543,10 +543,7 @@ mod tests {
             .iter()
             .find(|skill| skill.name == "review-kit:Review")
             .expect("plugin Skill should be discovered");
-        assert!(skill
-            .plugin_id
-            .as_deref()
-            .is_some_and(|id| id.starts_with("workspace:")));
+        assert_eq!(skill.plugin_id.as_deref(), Some("review-kit@workspace"));
         assert_eq!(skill.scope, SkillScope::Workspace);
     }
 

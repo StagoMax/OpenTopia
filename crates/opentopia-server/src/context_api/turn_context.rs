@@ -7,15 +7,15 @@ use super::{
 #[cfg(test)]
 use crate::ensure_experience_mode_enabled;
 use crate::{
-    agent_model_context_with_runtime, content_fingerprint, discover_plugins, discover_skills,
-    experience_mode_module, permission_policy_module, plugins_api, resolve_instruction_documents,
-    run_git, world_state_catalog_item, AgentContextBudget, AgentCore, AgentEvent,
-    AgentEventPayload, AgentInstanceV1, AgentTemplateVersionV1, ApiError, AppSettings, AppState,
-    CompiledModelContext, ContextCacheScope, ContextItemKind, ContextProjection, ContextRole,
-    ContextSensitivity, ContributionKind, ExperienceMode, ExperienceSurfaceProfile, FsPath,
-    LoadedSkill, ModelCallPurpose, ModelContentPart, ModelContextItem, ModelConversationMessage,
-    PermissionMode, ProviderSettings, RuntimeSurface, SessionStore, ThreadContextSnapshot,
-    TurnContextSnapshot, WorldStateSkill, WorldStateSnapshot,
+    agent_model_context_with_runtime, content_fingerprint, discover_skills, experience_mode_module,
+    permission_policy_module, plugin_runtime, resolve_instruction_documents, run_git,
+    world_state_catalog_item, AgentContextBudget, AgentCore, AgentEvent, AgentEventPayload,
+    AgentInstanceV1, AgentTemplateVersionV1, ApiError, AppSettings, AppState, CompiledModelContext,
+    ContextCacheScope, ContextItemKind, ContextProjection, ContextRole, ContextSensitivity,
+    ContributionKind, ExperienceMode, ExperienceSurfaceProfile, FsPath, LoadedSkill,
+    ModelCallPurpose, ModelContentPart, ModelContextItem, ModelConversationMessage, PermissionMode,
+    ProviderSettings, RuntimeSurface, SessionStore, ThreadContextSnapshot, TurnContextSnapshot,
+    WorldStateSkill, WorldStateSnapshot,
 };
 #[cfg(test)]
 use axum::http::StatusCode;
@@ -276,22 +276,26 @@ pub(crate) async fn build_turn_model_context(
             .unwrap_or_default()
             .as_slice(),
     );
-    let active_contributions = match state.store.get_thread(thread_id) {
+    let plugin_outcome = match state.store.get_thread(thread_id) {
         Ok(Some(thread)) => {
-            match plugins_api::active_contributions_for_thread(&state.store, &thread) {
-                Ok(contributions) => contributions,
+            match plugin_runtime::load_plugin_outcome_for_thread(&state.store, &thread) {
+                Ok(outcome) => Some(outcome),
                 Err(error) => {
                     warn!(?error, %thread_id, "failed to project plugin capabilities into model context");
-                    Vec::new()
+                    None
                 }
             }
         }
-        Ok(None) => Vec::new(),
+        Ok(None) => None,
         Err(error) => {
             warn!(?error, %thread_id, "failed to load thread plugin capabilities");
-            Vec::new()
+            None
         }
     };
+    let active_contributions = plugin_outcome
+        .as_ref()
+        .map(|outcome| outcome.active_contributions().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
     let active_plugin_ids = active_contributions
         .iter()
         .map(|contribution| contribution.plugin_id.clone())
@@ -330,8 +334,9 @@ pub(crate) async fn build_turn_model_context(
             },
         })
         .collect::<Vec<_>>();
-    let plugin_catalog = discover_plugins(Some(&cwd))
-        .into_iter()
+    let plugin_catalog = plugin_outcome
+        .iter()
+        .flat_map(|outcome| outcome.descriptors())
         .filter(|plugin| {
             active_plugin_ids.contains(&plugin.id)
                 && (effective_capabilities.allows_plugin(&plugin.id)

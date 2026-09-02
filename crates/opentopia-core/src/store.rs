@@ -195,6 +195,20 @@ pub struct SqliteSessionStore {
 }
 
 impl SessionStore for SqliteSessionStore {
+    fn plugin_effectively_enabled(
+        &self,
+        plugin_id: &str,
+        default_enabled: bool,
+        workspace_root: Option<&Path>,
+    ) -> anyhow::Result<bool> {
+        SqliteSessionStore::plugin_effectively_enabled(
+            self,
+            plugin_id,
+            default_enabled,
+            workspace_root,
+        )
+    }
+
     fn effective_plugin_settings(
         &self,
         plugin_id: &str,

@@ -6,8 +6,10 @@ use crate::capabilities::{
     RegisteredPluginCapabilities,
 };
 use schemars::JsonSchema;
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -36,6 +38,34 @@ pub enum PluginSource {
     User,
     Codex,
     Bundled,
+}
+
+/// Stable logical plugin identity. Installation paths and versions are never
+/// part of the key, so configuration survives upgrades and cache relocation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PluginId {
+    pub plugin_name: String,
+    pub marketplace_name: String,
+}
+
+impl PluginId {
+    pub fn new(
+        plugin_name: impl Into<String>,
+        marketplace_name: impl Into<String>,
+    ) -> Result<Self, PluginError> {
+        let plugin_name = plugin_name.into();
+        let marketplace_name = marketplace_name.into();
+        validate_plugin_name(&plugin_name)?;
+        validate_marketplace_name(&marketplace_name)?;
+        Ok(Self {
+            plugin_name,
+            marketplace_name,
+        })
+    }
+
+    pub fn as_key(&self) -> String {
+        format!("{}@{}", self.plugin_name, self.marketplace_name)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -67,6 +97,11 @@ pub struct PluginDescriptor {
     pub brand_color: Option<String>,
     pub website_url: Option<String>,
     pub issues: Vec<String>,
+    /// Previous path-derived identities accepted only for one-time state
+    /// migration. They are intentionally absent from the API contract.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub legacy_ids: Vec<String>,
 }
 
 impl PluginDescriptor {
@@ -199,6 +234,24 @@ struct PluginMcpFile {
     mcp_servers: HashMap<String, Value>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct CodexPluginConfigFile {
+    #[serde(default)]
+    plugins: HashMap<String, CodexPluginConfigEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexPluginConfigEntry {
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexRemotePluginInstallMetadata {
+    schema_version: u8,
+    remote_plugin_id: String,
+}
+
 pub fn discover_plugins(workspace_root: Option<&Path>) -> Vec<PluginDescriptor> {
     let mut roots = Vec::new();
     if let Some(workspace_root) = workspace_root {
@@ -222,13 +275,16 @@ pub fn discover_plugins(workspace_root: Option<&Path>) -> Vec<PluginDescriptor> 
     let bundled_root = bundled_plugin_root();
     let _ = ensure_bundled_plugins_installed(&bundled_root);
     roots.push((bundled_root, PluginScope::User, PluginSource::Bundled));
-    if let Some(codex_home) = codex_home() {
+    let codex_plugin_config = if let Some(codex_home) = codex_home() {
         roots.push((
             codex_home.join("plugins/cache"),
             PluginScope::Codex,
             PluginSource::Codex,
         ));
-    }
+        configured_codex_plugins(&codex_home, workspace_root)
+    } else {
+        HashMap::new()
+    };
 
     let managed_root = user_plugin_root().canonicalize().ok();
     let mut manifests = Vec::new();
@@ -237,16 +293,48 @@ pub fn discover_plugins(workspace_root: Option<&Path>) -> Vec<PluginDescriptor> 
     }
 
     let mut seen = HashSet::new();
-    let mut plugins = manifests
+    let discovered = manifests
         .into_iter()
         .filter_map(|(manifest_path, scope, source)| {
             let canonical = manifest_path.canonicalize().ok()?;
             if !seen.insert(canonical.clone()) {
                 return None;
             }
-            descriptor_from_manifest(&canonical, scope, source, managed_root.as_deref()).ok()
+            let mut descriptor =
+                descriptor_from_manifest(&canonical, scope, source, managed_root.as_deref())
+                    .ok()?;
+            if source == PluginSource::Codex {
+                descriptor.default_enabled = codex_plugin_config
+                    .get(&descriptor.id)
+                    .copied()
+                    .or_else(|| codex_remote_install_marker(&canonical).then_some(true))?;
+            }
+            Some(descriptor)
         })
         .collect::<Vec<_>>();
+    let mut selected = HashMap::<String, PluginDescriptor>::new();
+    for mut plugin in discovered {
+        match selected.entry(plugin.id.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(plugin);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if compare_plugin_versions(&entry.get().version, &plugin.version).is_lt() {
+                    plugin
+                        .legacy_ids
+                        .extend(entry.get().legacy_ids.iter().cloned());
+                    plugin.legacy_ids.sort();
+                    plugin.legacy_ids.dedup();
+                    entry.insert(plugin);
+                } else {
+                    entry.get_mut().legacy_ids.extend(plugin.legacy_ids);
+                    entry.get_mut().legacy_ids.sort();
+                    entry.get_mut().legacy_ids.dedup();
+                }
+            }
+        }
+    }
+    let mut plugins = selected.into_values().collect::<Vec<_>>();
     plugins.sort_by(|left, right| {
         source_rank(left.source)
             .cmp(&source_rank(right.source))
@@ -286,14 +374,13 @@ pub fn install_plugin(source: &Path) -> Result<PluginDescriptor, PluginError> {
     fs::create_dir_all(&destination_root).map_err(io_error)?;
     let destination_root = destination_root.canonicalize().map_err(io_error)?;
     let destination = destination_root.join(safe_directory_name(&source_descriptor.name)?);
-    if destination.exists() {
-        return Err(PluginError::AlreadyInstalled(
-            source_descriptor.display_name,
-        ));
-    }
-
     let staging = destination_root.join(format!(
         ".installing-{}-{}",
+        safe_directory_name(&source_descriptor.name)?,
+        Uuid::new_v4()
+    ));
+    let backup = destination_root.join(format!(
+        ".updating-backup-{}-{}",
         safe_directory_name(&source_descriptor.name)?,
         Uuid::new_v4()
     ));
@@ -308,16 +395,56 @@ pub fn install_plugin(source: &Path) -> Result<PluginDescriptor, PluginError> {
             PluginSource::User,
             Some(&destination_root),
         )?;
-        fs::rename(&staging, &destination).map_err(io_error)?;
-        descriptor_from_manifest(
+        if !destination.exists() {
+            fs::rename(&staging, &destination).map_err(io_error)?;
+            return descriptor_from_manifest(
+                &destination.join(MANIFEST_RELATIVE_PATH),
+                PluginScope::User,
+                PluginSource::User,
+                Some(&destination_root),
+            );
+        }
+
+        let installed = descriptor_from_manifest(
             &destination.join(MANIFEST_RELATIVE_PATH),
             PluginScope::User,
             PluginSource::User,
             Some(&destination_root),
         )
+        .map_err(|_| PluginError::AlreadyInstalled(source_descriptor.display_name.clone()))?;
+        if installed.id != source_descriptor.id {
+            return Err(PluginError::AlreadyInstalled(
+                source_descriptor.display_name.clone(),
+            ));
+        }
+
+        fs::rename(&destination, &backup).map_err(io_error)?;
+        if let Err(error) = fs::rename(&staging, &destination) {
+            let _ = fs::rename(&backup, &destination);
+            return Err(io_error(error));
+        }
+        match descriptor_from_manifest(
+            &destination.join(MANIFEST_RELATIVE_PATH),
+            PluginScope::User,
+            PluginSource::User,
+            Some(&destination_root),
+        ) {
+            Ok(plugin) => {
+                let _ = fs::remove_dir_all(&backup);
+                Ok(plugin)
+            }
+            Err(error) => {
+                let _ = fs::remove_dir_all(&destination);
+                let _ = fs::rename(&backup, &destination);
+                Err(error)
+            }
+        }
     })();
     if install_result.is_err() && staging.exists() {
         let _ = fs::remove_dir_all(&staging);
+    }
+    if install_result.is_err() && backup.exists() && !destination.exists() {
+        let _ = fs::rename(&backup, &destination);
     }
     install_result
 }
@@ -403,8 +530,23 @@ fn descriptor_from_manifest(
     } else {
         None
     };
+    let id = plugin_id(source, &manifest_path, &manifest.name)?;
+    let legacy_ids = vec![legacy_plugin_id(source, &manifest_path, &manifest.name)]
+        .into_iter()
+        .filter(|legacy_id| legacy_id != &id)
+        .collect();
     let mut issues = Vec::new();
-    let skill_root = match manifest.skills.as_deref() {
+    let host_skill_replacement = codex_host_skill_replacement(&id);
+    if let Some(replacement) = host_skill_replacement {
+        issues.push(format!(
+            "The declared Skills require a Codex Desktop host runtime that OpenTopia cannot load from this package. Use the bundled {replacement} plugin instead."
+        ));
+    }
+    let skill_root = match manifest
+        .skills
+        .as_deref()
+        .filter(|_| host_skill_replacement.is_none())
+    {
         Some(path) => match resolve_declared_path(&plugin_root, path, true) {
             Ok(path) => Some(path),
             Err(error) => {
@@ -418,7 +560,7 @@ fn descriptor_from_manifest(
         .as_deref()
         .map(|root| count_named_files(root, "SKILL.md", 0))
         .unwrap_or_default();
-    if manifest.skills.is_some() && skill_count == 0 {
+    if host_skill_replacement.is_none() && manifest.skills.is_some() && skill_count == 0 {
         issues.push("The declared Skills directory contains no SKILL.md files.".to_string());
     }
 
@@ -426,7 +568,8 @@ fn descriptor_from_manifest(
         inspect_mcp_capability(&plugin_root, manifest.mcp_servers.as_deref());
     issues.extend(mcp_issues);
     let has_apps = manifest.apps.is_some();
-    if skill_count == 0
+    if host_skill_replacement.is_none()
+        && skill_count == 0
         && mcp_server_count == 0
         && !has_apps
         && bundled.is_none_or(|metadata| metadata.native_capabilities.is_empty())
@@ -434,12 +577,14 @@ fn descriptor_from_manifest(
         issues.push("The plugin does not declare Skills, MCP servers, or apps.".to_string());
     }
 
-    let id = plugin_id(source, &manifest_path, &manifest.name);
     let capability_manifest = PluginCapabilityManifest::from_manifests(
         &id,
         manifest.opentopia.clone(),
         CodexCompatibleContributions {
-            skills: manifest.skills.as_deref(),
+            skills: manifest
+                .skills
+                .as_deref()
+                .filter(|_| host_skill_replacement.is_none()),
             mcp_servers: manifest.mcp_servers.as_deref(),
             apps: manifest.apps.as_ref(),
         },
@@ -506,6 +651,7 @@ fn descriptor_from_manifest(
             .filter(|color| valid_brand_color(color)),
         website_url,
         issues,
+        legacy_ids,
     })
 }
 
@@ -754,16 +900,19 @@ fn collect_manifests(
             output.push((path, scope, source));
             continue;
         }
-        if file_type.is_dir() && !ignored_directory(&entry.file_name().to_string_lossy()) {
+        if file_type.is_dir() && !ignored_directory(&entry.file_name().to_string_lossy(), source) {
             collect_manifests(&path, scope, source, depth + 1, output);
         }
     }
 }
 
-fn ignored_directory(name: &str) -> bool {
+fn ignored_directory(name: &str, source: PluginSource) -> bool {
     matches!(name, ".git" | "node_modules" | "target" | "dist" | "build")
         || name.starts_with(".bundled-installing-")
         || name.starts_with(".bundled-backup-")
+        || name.starts_with(".installing-")
+        || name.starts_with(".updating-backup-")
+        || (source == PluginSource::Codex && name.starts_with("plugin-install-"))
 }
 
 fn resolve_declared_path(
@@ -876,6 +1025,19 @@ fn validate_plugin_name(name: &str) -> Result<(), PluginError> {
     Ok(())
 }
 
+fn validate_marketplace_name(name: &str) -> Result<(), PluginError> {
+    if name.is_empty()
+        || !name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '_'
+        })
+    {
+        return Err(PluginError::InvalidManifest(
+            "plugin marketplace name must use ASCII letters, digits, '-' or '_'".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn valid_brand_color(value: &str) -> bool {
     value.len() == 7
         && value.starts_with('#')
@@ -892,11 +1054,48 @@ fn non_empty(value: String, fallback: &str) -> String {
     }
 }
 
-fn plugin_id(source: PluginSource, manifest_path: &Path, plugin_name: &str) -> String {
+fn plugin_id(
+    source: PluginSource,
+    manifest_path: &Path,
+    plugin_name: &str,
+) -> Result<String, PluginError> {
+    let marketplace_name = match source {
+        PluginSource::Workspace => "workspace".to_string(),
+        PluginSource::User => "user".to_string(),
+        PluginSource::Bundled => "opentopia".to_string(),
+        PluginSource::Codex => codex_marketplace_name(manifest_path, plugin_name)
+            .unwrap_or_else(|| "codex".to_string()),
+    };
+    Ok(PluginId::new(plugin_name, marketplace_name)?.as_key())
+}
+
+fn codex_marketplace_name(manifest_path: &Path, plugin_name: &str) -> Option<String> {
+    let plugin_directory = manifest_path.parent()?.parent()?.parent()?;
+    if plugin_directory.file_name()?.to_str()? != plugin_name {
+        return None;
+    }
+    plugin_directory
+        .parent()?
+        .file_name()?
+        .to_str()
+        .map(str::to_string)
+}
+
+/// Some first-party Codex packages intentionally contain only instructions;
+/// their executable surface is injected by Codex Desktop and is not part of
+/// the plugin package. Projecting those Skills in another host advertises
+/// operations that cannot be called. Keep the package visible for diagnostics,
+/// but route users to the equivalent host-owned OpenTopia plugin.
+fn codex_host_skill_replacement(plugin_id: &str) -> Option<&'static str> {
+    match plugin_id {
+        "browser@openai-bundled" | "chrome@openai-bundled" => Some("Browser Automation"),
+        "computer-use@openai-bundled" => Some("Computer Use"),
+        _ => None,
+    }
+}
+
+fn legacy_plugin_id(source: PluginSource, manifest_path: &Path, plugin_name: &str) -> String {
     if source == PluginSource::Bundled {
-        // Bundled package identity is host-owned and verified against the catalog.
-        // Keeping it independent of the application install path preserves scoped
-        // activation, permission and settings records across upgrades or moves.
         return format!("bundled:{plugin_name}");
     }
     format!(
@@ -909,6 +1108,13 @@ fn plugin_id(source: PluginSource, manifest_path: &Path, plugin_name: &str) -> S
         },
         manifest_path.to_string_lossy().replace('\\', "/")
     )
+}
+
+fn compare_plugin_versions(left: &str, right: &str) -> Ordering {
+    match (Version::parse(left), Version::parse(right)) {
+        (Ok(left), Ok(right)) => left.cmp(&right),
+        _ => left.cmp(right),
+    }
 }
 
 fn source_rank(source: PluginSource) -> u8 {
@@ -946,6 +1152,79 @@ fn codex_home() -> Option<PathBuf> {
     std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| home_dir().map(|home| home.join(".codex")))
+}
+
+/// Resolve the effective Codex plugin selection. The cache is only package
+/// storage; a cached package is installed for a runtime when its stable key is
+/// present in the layered Codex configuration.
+fn configured_codex_plugins(
+    codex_home: &Path,
+    workspace_root: Option<&Path>,
+) -> HashMap<String, bool> {
+    let mut layers = Vec::new();
+    if let Some(system_config) = codex_system_config_path() {
+        layers.push(system_config);
+    }
+    layers.push(codex_home.join("config.toml"));
+    if let Some(workspace_root) = workspace_root {
+        layers.push(workspace_root.join(".codex/config.toml"));
+    }
+    configured_codex_plugins_from_layers(layers.iter().map(PathBuf::as_path))
+}
+
+fn configured_codex_plugins_from_layers<'a>(
+    layers: impl IntoIterator<Item = &'a Path>,
+) -> HashMap<String, bool> {
+    let mut configured = HashMap::new();
+    for path in layers {
+        let Ok(contents) = fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(layer) = toml::from_str::<CodexPluginConfigFile>(&contents) else {
+            continue;
+        };
+        for (plugin_id, config) in layer.plugins {
+            match (configured.get_mut(&plugin_id), config.enabled) {
+                (Some(enabled), Some(override_enabled)) => *enabled = override_enabled,
+                (Some(_), None) => {}
+                (None, enabled) => {
+                    configured.insert(plugin_id, enabled.unwrap_or(true));
+                }
+            }
+        }
+    }
+    configured
+}
+
+fn codex_remote_install_marker(manifest_path: &Path) -> bool {
+    let Some(metadata_path) = manifest_path
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .map(|plugin_base| plugin_base.join(".codex-remote-plugin-install.json"))
+    else {
+        return false;
+    };
+    fs::read_to_string(metadata_path)
+        .ok()
+        .and_then(|contents| {
+            serde_json::from_str::<CodexRemotePluginInstallMetadata>(&contents).ok()
+        })
+        .is_some_and(|metadata| {
+            metadata.schema_version == 1 && !metadata.remote_plugin_id.trim().is_empty()
+        })
+}
+
+#[cfg(windows)]
+fn codex_system_config_path() -> Option<PathBuf> {
+    std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .map(|root| root.join("OpenAI/Codex/config.toml"))
+}
+
+#[cfg(not(windows))]
+fn codex_system_config_path() -> Option<PathBuf> {
+    Some(PathBuf::from("/etc/codex/config.toml"))
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -1149,20 +1428,162 @@ mod tests {
                 .iter()
                 .any(|contribution| contribution.kind
                     == crate::capabilities::ContributionKind::NativeTool));
+            if metadata.name == "browser-automation" {
+                assert_eq!(descriptor.skill_count, 1);
+                assert!(descriptor
+                    .capability_manifest
+                    .contributions
+                    .iter()
+                    .any(|contribution| contribution.kind
+                        == crate::capabilities::ContributionKind::Skill));
+            }
             assert!(!descriptor.managed);
             assert!(descriptor.is_compatible());
-            assert_eq!(descriptor.id, format!("bundled:{}", metadata.name));
+            assert_eq!(descriptor.id, format!("{}@opentopia", metadata.name));
             assert!(descriptor
                 .capability_manifest
                 .contributions
                 .iter()
                 .all(|contribution| contribution
                     .id
-                    .starts_with(&format!("bundled:{}/", metadata.name))));
+                    .starts_with(&format!("{}@opentopia/", metadata.name))));
             assert!(!descriptor
                 .issues
                 .iter()
                 .any(|issue| issue.contains("does not declare")));
         }
+    }
+
+    #[test]
+    fn plugin_identity_is_stable_across_installation_versions() {
+        let first = Path::new(
+            "C:/Users/example/.codex/plugins/cache/openai-primary-runtime/spreadsheets/1.0.0/.codex-plugin/plugin.json",
+        );
+        let second = Path::new(
+            "C:/Users/example/.codex/plugins/cache/openai-primary-runtime/spreadsheets/2.0.0/.codex-plugin/plugin.json",
+        );
+
+        assert_eq!(
+            plugin_id(PluginSource::Codex, first, "spreadsheets").unwrap(),
+            "spreadsheets@openai-primary-runtime"
+        );
+        assert_eq!(
+            plugin_id(PluginSource::Codex, second, "spreadsheets").unwrap(),
+            "spreadsheets@openai-primary-runtime"
+        );
+    }
+
+    #[test]
+    fn codex_host_only_browser_skill_is_not_projected_as_portable_capability() {
+        let dir = TestDir::new();
+        let plugin_root = dir.0.join("openai-bundled/browser/1.0.0");
+        let manifest = plugin_root.join(MANIFEST_RELATIVE_PATH);
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        fs::create_dir_all(plugin_root.join("skills/control-browser")).unwrap();
+        fs::write(
+            &manifest,
+            r#"{"name":"browser","version":"1.0.0","skills":"./skills/"}"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin_root.join("skills/control-browser/SKILL.md"),
+            "---\nname: control-browser\ndescription: Browser\n---\n",
+        )
+        .unwrap();
+
+        let descriptor =
+            descriptor_from_manifest(&manifest, PluginScope::Codex, PluginSource::Codex, None)
+                .unwrap();
+
+        assert_eq!(descriptor.id, "browser@openai-bundled");
+        assert_eq!(descriptor.skill_count, 0);
+        assert!(descriptor.skill_root.is_none());
+        assert!(!descriptor.is_compatible());
+        assert!(descriptor.capability_manifest.contributions.is_empty());
+        assert!(descriptor
+            .issues
+            .iter()
+            .any(|issue| issue.contains("bundled Browser Automation plugin")));
+    }
+
+    #[test]
+    fn semantic_versions_choose_the_newer_installation() {
+        assert!(compare_plugin_versions("1.10.0", "1.9.0").is_gt());
+        assert!(compare_plugin_versions("26.826.12354", "26.826.12353").is_gt());
+    }
+
+    #[test]
+    fn codex_plugin_configuration_selects_cache_entries_and_layers_enablement() {
+        let dir = TestDir::new();
+        let system = dir.0.join("system.toml");
+        let user = dir.0.join("config.toml");
+        let project = dir.0.join("project/.codex/config.toml");
+        fs::create_dir_all(project.parent().unwrap()).unwrap();
+        fs::write(
+            &system,
+            r#"
+                [plugins."base@market"]
+                [plugins."overridden@market"]
+                enabled = false
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            &user,
+            r#"
+                [plugins."user@market"]
+                enabled = true
+                [plugins."overridden@market"]
+                enabled = true
+                [plugins."mcp-only-overlay@market"]
+                enabled = false
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            &project,
+            r#"
+                [plugins."overridden@market"]
+                enabled = false
+                [plugins."mcp-only-overlay@market".mcp_servers.example]
+                enabled = false
+            "#,
+        )
+        .unwrap();
+
+        let configured = configured_codex_plugins_from_layers([
+            system.as_path(),
+            user.as_path(),
+            project.as_path(),
+        ]);
+
+        assert_eq!(configured.get("base@market"), Some(&true));
+        assert_eq!(configured.get("user@market"), Some(&true));
+        assert_eq!(configured.get("overridden@market"), Some(&false));
+        assert_eq!(configured.get("mcp-only-overlay@market"), Some(&false));
+        assert!(!configured.contains_key("cached-only@market"));
+    }
+
+    #[test]
+    fn codex_remote_install_marker_promotes_cache_entry_to_installed() {
+        let dir = TestDir::new();
+        let plugin_base = dir.0.join("cache/openai-curated-remote/research");
+        let manifest = plugin_base.join("1.0.0/.codex-plugin/plugin.json");
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        fs::write(&manifest, r#"{"name":"research","version":"1.0.0"}"#).unwrap();
+
+        assert!(!codex_remote_install_marker(&manifest));
+        fs::write(
+            plugin_base.join(".codex-remote-plugin-install.json"),
+            r#"{"schema_version":2,"remote_plugin_id":""}"#,
+        )
+        .unwrap();
+        assert!(!codex_remote_install_marker(&manifest));
+        fs::write(
+            plugin_base.join(".codex-remote-plugin-install.json"),
+            r#"{"schema_version":1,"remote_plugin_id":"plugin_example"}"#,
+        )
+        .unwrap();
+        assert!(codex_remote_install_marker(&manifest));
     }
 }

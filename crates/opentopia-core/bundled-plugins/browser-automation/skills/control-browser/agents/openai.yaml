@@ -1,0 +1,4 @@
+interface:
+  display_name: "Browser Automation"
+  short_description: "Navigate, inspect, and interact with web pages"
+  default_prompt: "Use $control-browser to open a page, inspect it, and complete the requested browser interaction."

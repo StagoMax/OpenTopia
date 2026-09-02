@@ -9,7 +9,6 @@ import type {
 import type {
   CapabilityActivationSnapshot,
   CapabilityProjection,
-  PluginContributionRecord,
   ThreadPluginCapabilities,
 } from "./plugins";
 

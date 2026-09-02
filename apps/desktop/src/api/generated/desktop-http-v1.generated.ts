@@ -267,13 +267,14 @@ export type WorkScope =
     };
 export type WorkFormStatus = "active" | "completed" | "blocked" | "paused" | "cancelled";
 export type LibraryProviderStatus = SagConnectionView | GraphRagConnectionView;
-export type PluginControlScopeType = "global" | "workspace" | "thread";
-export type PluginRuntimeHealthStatus = "unknown" | "ready" | "degraded" | "error" | "stopped";
 export type ContributionOrigin = "codex_compatible" | "open_topia";
 export type PluginPermissionKind = "filesystem" | "network" | "secret" | "desktop";
+export type PluginActivationScopeType = "global" | "workspace";
+export type PluginRuntimeHealthStatus = "unknown" | "ready" | "degraded" | "error" | "stopped";
 export type PluginScope = "workspace" | "user" | "codex";
 export type PluginSource = "workspace" | "user" | "codex" | "bundled";
 export type BundledPluginTrust = "standard" | "official" | "privileged" | "trusted_driver";
+export type PluginControlScopeType = "global" | "workspace" | "thread";
 export type PluginPermissionGrantStatus = "granted" | "revoked";
 /**
  * Wire protocol selected for one concrete endpoint/model pair. Connections are credentials and routing; adapters are protocol codecs, so one relay may legitimately select different adapters for different models.
@@ -1066,7 +1067,7 @@ export interface DesktopHttpResponsesV1 {
   getHumanTask: HumanTaskV1;
   getIntegrationDefinition: IntegrationDefinitionV1;
   getLibraryProviderStatus: LibraryProviderStatus;
-  getPluginContributions: PluginContributionRecord[];
+  getPluginContributions: PluginContribution[];
   getPluginDetail: PluginDetailResponse;
   getPluginHealth: PluginRuntimeHealthRecord[];
   getPluginPermissions: PluginPermissionsResponse;
@@ -1161,7 +1162,6 @@ export interface DesktopHttpResponsesV1 {
   setScmRemoteConnector: ScmRemoteConnectorResponse;
   setThreadMcpServer: ThreadMcpServer;
   setThreadModel: Thread;
-  setThreadPlugin: PluginView;
   setupWindowsSandbox: WindowsSandboxSetupStatus;
   simulateFlowDraft: FlowTrialV1;
   startCodexLogin: CodexLoginStart;
@@ -2531,20 +2531,27 @@ export interface GraphRagStatus {
   vector_backend?: string | null;
   [k: string]: unknown;
 }
-export interface PluginContributionRecord {
-  contributionId: string;
-  descriptor?: {
-    [k: string]: unknown;
-  };
-  kind: string;
+export interface PluginContribution {
+  apiVersion: string;
+  configurationSchema?: string | null;
+  declaration: unknown;
+  id: string;
+  kind: ContributionKind;
   localId: string;
+  origin: ContributionOrigin;
+  permissions: PluginPermission[];
   pluginId: string;
-  updatedAt: string;
+  requiredHostCapabilities: string[];
+  [k: string]: unknown;
+}
+export interface PluginPermission {
+  kind: PluginPermissionKind;
+  value: string;
   [k: string]: unknown;
 }
 export interface PluginDetailResponse {
   activations: PluginActivationRecord[];
-  contributions: PluginContributionRecord[];
+  contributions: PluginContribution[];
   effectiveEnabled: boolean;
   health: PluginRuntimeHealthRecord[];
   manifest: PluginControlManifest;
@@ -2554,13 +2561,13 @@ export interface PluginDetailResponse {
 export interface PluginActivationRecord {
   enabled: boolean;
   pluginId: string;
-  scope: PluginControlScope;
+  scope: PluginActivationScope;
   updatedAt: string;
   [k: string]: unknown;
 }
-export interface PluginControlScope {
+export interface PluginActivationScope {
   scopeId?: string | null;
-  scopeType: PluginControlScopeType;
+  scopeType: PluginActivationScopeType;
   [k: string]: unknown;
 }
 export interface PluginRuntimeHealthRecord {
@@ -2575,7 +2582,7 @@ export interface PluginRuntimeHealthRecord {
 export interface PluginControlManifest {
   apiVersion?: string | null;
   configurationSchema?: unknown;
-  contributions?: PluginContributionRecord[];
+  contributions?: PluginContribution[];
   hostCapabilities?: string[];
   permissionRequests?: PluginPermissionRequest[];
   requiredSecretSettingKeys?: string[];
@@ -2625,24 +2632,6 @@ export interface PluginCapabilityManifest {
   requiredHostCapabilities: string[];
   [k: string]: unknown;
 }
-export interface PluginContribution {
-  apiVersion: string;
-  configurationSchema?: string | null;
-  declaration: unknown;
-  id: string;
-  kind: ContributionKind;
-  localId: string;
-  origin: ContributionOrigin;
-  permissions: PluginPermission[];
-  pluginId: string;
-  requiredHostCapabilities: string[];
-  [k: string]: unknown;
-}
-export interface PluginPermission {
-  kind: PluginPermissionKind;
-  value: string;
-  [k: string]: unknown;
-}
 export interface PluginPermissions {
   desktop?: string[];
   filesystem?: string[];
@@ -2665,6 +2654,11 @@ export interface PluginPermissionGrantRecord {
   scope: PluginControlScope;
   status: PluginPermissionGrantStatus;
   updatedAt: string;
+  [k: string]: unknown;
+}
+export interface PluginControlScope {
+  scopeId?: string | null;
+  scopeType: PluginControlScopeType;
   [k: string]: unknown;
 }
 export interface PluginSettingsResponse {
@@ -3135,7 +3129,7 @@ export interface ThreadCapabilitiesResponse {
   [k: string]: unknown;
 }
 export interface ThreadPluginCapabilities {
-  contributions: PluginContributionRecord[];
+  contributions: PluginContribution[];
   enabled: boolean;
   grantedPermissions: string[];
   pluginId: string;
@@ -3305,10 +3299,10 @@ export interface LibraryIngestionResponseView {
 }
 export interface PluginView {
   compatible: boolean;
+  effectiveEnabled: boolean;
   mcpServers: McpServerView[];
   plugin: PluginDescriptor;
   skillIds: string[];
-  threadEnabled: boolean;
   [k: string]: unknown;
 }
 export interface MediaHandlerInvocationResponse {

@@ -1,5 +1,6 @@
 import type {
   PluginActivationRecord,
+  PluginActivationScope,
   PluginControlScope,
   PluginPermissionGrantRecord,
 } from "./types";
@@ -66,8 +67,8 @@ export function pluginSettingFields(
 }
 
 export function scopeMatches(
-  left: PluginControlScope,
-  right: PluginControlScope,
+  left: PluginControlScope | PluginActivationScope,
+  right: PluginControlScope | PluginActivationScope,
 ): boolean {
   return (
     left.scopeType === right.scopeType &&
@@ -77,7 +78,7 @@ export function scopeMatches(
 
 export function activationForScope(
   activations: readonly PluginActivationRecord[],
-  scope: PluginControlScope,
+  scope: PluginActivationScope,
 ): PluginActivationRecord | undefined {
   return activations.find((activation) =>
     scopeMatches(activation.scope, scope),

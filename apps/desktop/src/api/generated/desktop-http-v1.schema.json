@@ -9435,7 +9435,7 @@
           "type": "string"
         },
         "scope": {
-          "$ref": "#/definitions/PluginControlScope"
+          "$ref": "#/definitions/PluginActivationScope"
         },
         "updatedAt": {
           "format": "date-time",
@@ -9464,6 +9464,30 @@
         "effectiveEnabled"
       ],
       "type": "object"
+    },
+    "PluginActivationScope": {
+      "properties": {
+        "scopeId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scopeType": {
+          "$ref": "#/definitions/PluginActivationScopeType"
+        }
+      },
+      "required": [
+        "scopeType"
+      ],
+      "type": "object"
+    },
+    "PluginActivationScopeType": {
+      "enum": [
+        "global",
+        "workspace"
+      ],
+      "type": "string"
     },
     "PluginCapabilityManifest": {
       "properties": {
@@ -9555,37 +9579,6 @@
       ],
       "type": "object"
     },
-    "PluginContributionRecord": {
-      "properties": {
-        "contributionId": {
-          "type": "string"
-        },
-        "descriptor": {
-          "default": null
-        },
-        "kind": {
-          "type": "string"
-        },
-        "localId": {
-          "type": "string"
-        },
-        "pluginId": {
-          "type": "string"
-        },
-        "updatedAt": {
-          "format": "date-time",
-          "type": "string"
-        }
-      },
-      "required": [
-        "contributionId",
-        "kind",
-        "localId",
-        "pluginId",
-        "updatedAt"
-      ],
-      "type": "object"
-    },
     "PluginControlManifest": {
       "properties": {
         "apiVersion": {
@@ -9598,7 +9591,7 @@
         "contributions": {
           "default": [],
           "items": {
-            "$ref": "#/definitions/PluginContributionRecord"
+            "$ref": "#/definitions/PluginContribution"
           },
           "type": "array"
         },
@@ -9800,7 +9793,7 @@
         },
         "contributions": {
           "items": {
-            "$ref": "#/definitions/PluginContributionRecord"
+            "$ref": "#/definitions/PluginContribution"
           },
           "type": "array"
         },
@@ -10112,6 +10105,9 @@
         "compatible": {
           "type": "boolean"
         },
+        "effectiveEnabled": {
+          "type": "boolean"
+        },
         "mcpServers": {
           "items": {
             "$ref": "#/definitions/McpServerView"
@@ -10126,17 +10122,14 @@
             "type": "string"
           },
           "type": "array"
-        },
-        "threadEnabled": {
-          "type": "boolean"
         }
       },
       "required": [
         "compatible",
+        "effectiveEnabled",
         "mcpServers",
         "plugin",
-        "skillIds",
-        "threadEnabled"
+        "skillIds"
       ],
       "type": "object"
     },
@@ -12895,7 +12888,7 @@
       "properties": {
         "contributions": {
           "items": {
-            "$ref": "#/definitions/PluginContributionRecord"
+            "$ref": "#/definitions/PluginContribution"
           },
           "type": "array"
         },
@@ -15401,7 +15394,7 @@
     },
     "getPluginContributions": {
       "items": {
-        "$ref": "#/definitions/PluginContributionRecord"
+        "$ref": "#/definitions/PluginContribution"
       },
       "type": "array"
     },
@@ -15813,9 +15806,6 @@
     "setThreadModel": {
       "$ref": "#/definitions/Thread"
     },
-    "setThreadPlugin": {
-      "$ref": "#/definitions/PluginView"
-    },
     "setupWindowsSandbox": {
       "$ref": "#/definitions/WindowsSandboxSetupStatus"
     },
@@ -16043,7 +16033,6 @@
     "setScmRemoteConnector",
     "setThreadMcpServer",
     "setThreadModel",
-    "setThreadPlugin",
     "setupWindowsSandbox",
     "simulateFlowDraft",
     "startCodexLogin",

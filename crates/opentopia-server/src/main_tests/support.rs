@@ -333,7 +333,7 @@ fn default_office_plugins_project_uploaded_pdf_and_document_tools() {
 }
 
 #[test]
-fn model_plugin_requires_permission_grants_and_honors_thread_disable() {
+fn model_plugin_requires_permission_grants_and_honors_project_disable() {
     let store = SqliteSessionStore::open(":memory:").expect("open store");
     let workspace = std::env::current_dir().expect("cwd");
     let thread = store
@@ -354,12 +354,60 @@ fn model_plugin_requires_permission_grants_and_honors_thread_disable() {
             .expect("granted activation")
     );
     store
-        .set_plugin_activation(&plugin.id, &PluginControlScope::thread(thread.id), false)
+        .set_plugin_activation(
+            &plugin.id,
+            &PluginActivationScope::workspace(&workspace).expect("workspace scope"),
+            false,
+        )
         .expect("disable spreadsheet");
     assert!(
         !bundled_plugin_enabled_for_thread(&store, thread.id, "spreadsheet")
             .expect("persisted activation")
     );
+}
+
+#[test]
+fn browser_plugin_projects_its_skill_and_tool_under_one_activation_boundary() {
+    let store = SqliteSessionStore::open(":memory:").expect("open store");
+    let workspace = std::env::current_dir().expect("cwd");
+    let thread = store
+        .create_thread(None, workspace.clone())
+        .expect("create thread");
+    let plugin = discover_plugins(Some(&workspace))
+        .into_iter()
+        .find(|plugin| plugin.id == "browser-automation@opentopia")
+        .expect("Browser Automation bundled plugin");
+
+    assert_eq!(plugin.skill_count, 1);
+    let inactive = plugin_runtime::load_plugin_outcome_for_thread(&store, &thread)
+        .expect("inactive plugin outcome");
+    assert!(!inactive
+        .active_contributions()
+        .any(|contribution| contribution.plugin_id == plugin.id));
+
+    store
+        .set_plugin_activation(&plugin.id, &PluginActivationScope::global(), true)
+        .expect("enable Browser Automation");
+    grant_all_plugin_permissions(&store, &plugin);
+
+    let active = plugin_runtime::load_plugin_outcome_for_thread(&store, &thread)
+        .expect("active plugin outcome");
+    let kinds = active
+        .active_contributions()
+        .filter(|contribution| contribution.plugin_id == plugin.id)
+        .map(|contribution| contribution.kind)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        kinds,
+        BTreeSet::from([ContributionKind::Skill, ContributionKind::NativeTool])
+    );
+
+    let mut agent = AgentCore::default();
+    sync_thread_bundled_plugin_activations(&store, thread.id, &mut agent);
+    assert!(agent
+        .provider_tool_catalog()
+        .iter()
+        .any(|candidate| candidate.name == "browser"));
 }
 
 #[test]
@@ -382,45 +430,6 @@ fn computer_application_allowlist_parsing_is_strict() {
     assert!(computer_allowed_applications(&json!({}))
         .unwrap()
         .is_empty());
-}
-
-#[test]
-fn scoped_plugin_activation_overrides_legacy_thread_state_monotonically() {
-    let store = SqliteSessionStore::open(":memory:").expect("open store");
-    let workspace = std::env::current_dir().expect("cwd");
-    let thread = store
-        .create_thread(None, workspace.clone())
-        .expect("create thread");
-    let plugin = discover_plugins(Some(&workspace))
-        .into_iter()
-        .find(|plugin| plugin.name == "spreadsheet")
-        .expect("spreadsheet bundled plugin");
-    grant_all_plugin_permissions(&store, &plugin);
-
-    store
-        .set_thread_plugin_activation(thread.id, "spreadsheet", true)
-        .expect("legacy enable");
-    store
-        .set_plugin_activation(&plugin.id, &PluginControlScope::global(), false)
-        .expect("global disable");
-    store
-        .set_plugin_activation(&plugin.id, &PluginControlScope::thread(thread.id), true)
-        .expect("thread enable request");
-    assert!(
-        !bundled_plugin_enabled_for_thread(&store, thread.id, "spreadsheet")
-            .expect("global constraint wins")
-    );
-
-    store
-        .set_plugin_activation(&plugin.id, &PluginControlScope::global(), true)
-        .expect("global enable");
-    store
-        .set_plugin_activation(&plugin.id, &PluginControlScope::thread(thread.id), false)
-        .expect("thread disable");
-    assert!(
-        !bundled_plugin_enabled_for_thread(&store, thread.id, "spreadsheet")
-            .expect("thread disable wins")
-    );
 }
 
 fn grant_all_plugin_permissions(store: &SqliteSessionStore, plugin: &PluginDescriptor) {
@@ -490,8 +499,12 @@ fn preserves_interleaved_attachment_references_in_persisted_message_parts() {
     let second_path = std::env::temp_dir().join(format!("opentopia-inline-{second_id}.xlsx"));
     std::fs::write(&first_path, b"first").expect("write first inline source");
     std::fs::write(&second_path, b"second").expect("write second inline source");
-    let first_path = first_path.canonicalize().expect("canonicalize first source");
-    let second_path = second_path.canonicalize().expect("canonicalize second source");
+    let first_path = first_path
+        .canonicalize()
+        .expect("canonicalize first source");
+    let second_path = second_path
+        .canonicalize()
+        .expect("canonicalize second source");
     let sources = vec![
         ContextSourceRef {
             id: first_id,
@@ -702,7 +715,9 @@ fn rejects_inline_attachment_references_outside_selected_sources() {
     let selected_path = selected_path
         .canonicalize()
         .expect("canonicalize selected source");
-    let other_path = other_path.canonicalize().expect("canonicalize other source");
+    let other_path = other_path
+        .canonicalize()
+        .expect("canonicalize other source");
     let sources = vec![ContextSourceRef {
         id: selected_id,
         path: selected_path.clone(),

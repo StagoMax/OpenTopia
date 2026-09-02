@@ -1,7 +1,7 @@
 use super::resource_api::{preview_api_error, resolve_preview_id_for_thread};
 use super::{
-    current_settings, ensure_thread, load_agent_profiles_for_thread, plugins_api, publish_payload,
-    sync_plugin_mcp_configs, ApiError, AppState,
+    current_settings, ensure_thread, load_agent_profiles_for_thread, plugin_runtime,
+    publish_payload, ApiError, AppState,
 };
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -9,13 +9,15 @@ use axum::http::{header, HeaderValue, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
+#[cfg(test)]
+use opentopia_core::discover_plugins;
 use opentopia_core::{
-    discover_plugins, load_plugin_mcp_servers, mcp_operation_fingerprint, AgentEventPayload,
-    AppViewDescriptor, AppViewMessage, AppViewSession, BasicPolicyEngine,
-    ContributionHandlerRegistry, ContributionKind, McpServerConfig, McpToolDescriptor,
-    MediaHandlerDescriptor, MediaHandlerInvocationV1, MediaHandlerOperation,
-    MediaHandlerResultEnvelopeV1, MediaHandlerRuntime, MediaHandlerSelection, ModelContentPart,
-    PluginContribution, PluginMcpServerDefinition, PluginPermissionKind, PluginRuntimeHealthRecord,
+    load_plugin_mcp_servers, mcp_operation_fingerprint, AgentEventPayload, AppViewDescriptor,
+    AppViewMessage, AppViewSession, BasicPolicyEngine, ContributionHandlerRegistry,
+    ContributionKind, McpServerConfig, McpToolDescriptor, MediaHandlerDescriptor,
+    MediaHandlerInvocationV1, MediaHandlerOperation, MediaHandlerResultEnvelopeV1,
+    MediaHandlerRuntime, MediaHandlerSelection, ModelContentPart, PluginContribution,
+    PluginMcpServerDefinition, PluginPermissionKind, PluginRuntimeHealthRecord,
     PluginRuntimeHealthStatus, PolicyDecision, PolicyEngine, ToolCall, ToolPermissionDescriptor,
     ToolResult, MAX_MEDIA_HANDLER_INPUT_BYTES, MAX_MEDIA_HANDLER_OUTPUT_BYTES,
 };
@@ -202,9 +204,12 @@ async fn invoke_active_media_handler(
         ));
     }
 
-    let plugin = discover_plugins(Some(workspace_root))
-        .into_iter()
-        .find(|plugin| plugin.id == contribution.plugin_id)
+    let outcome =
+        plugin_runtime::load_plugin_outcome(&state.store, Some(workspace_root), Some(thread_id))
+            .map_err(|error| HandlerInvocationError::bad_request(error.to_string()))?;
+    let plugin = outcome
+        .plugin(&contribution.plugin_id)
+        .map(|plugin| &plugin.descriptor)
         .ok_or_else(|| {
             HandlerInvocationError::not_found("handler plugin is no longer available")
         })?;
@@ -484,9 +489,11 @@ async fn read_app_content(
         ));
     }
     let thread = ensure_thread(&state, thread_id)?;
-    let plugin = discover_plugins(Some(&thread.workspace_root))
-        .into_iter()
-        .find(|plugin| plugin.id == session.descriptor.plugin_id)
+    let outcome = plugin_runtime::load_plugin_outcome_for_thread(&state.store, &thread)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let plugin = outcome
+        .plugin(&session.descriptor.plugin_id)
+        .map(|plugin| &plugin.descriptor)
         .ok_or_else(|| ApiError::not_found("app plugin is no longer available"))?;
     let root = plugin
         .path
@@ -525,7 +532,8 @@ fn active_contributions(
     state: &AppState,
     thread: &opentopia_core::Thread,
 ) -> Result<Vec<PluginContribution>, ApiError> {
-    plugins_api::active_contributions_for_thread(&state.store, thread)
+    plugin_runtime::load_plugin_outcome_for_thread(&state.store, thread)
+        .map(|outcome| outcome.active_contributions().cloned().collect())
         .map_err(|error| ApiError::bad_request(error.to_string()))
 }
 
@@ -751,9 +759,9 @@ async fn resolve_plugin_mcp_server(
     }) {
         return Ok(server);
     }
-    sync_plugin_mcp_configs(state, plugin)
+    plugin_runtime::sync_plugin_mcp_configs(&state.store, &state.mcp_host, plugin)
         .await
-        .map_err(HandlerInvocationError::from_api)?
+        .map_err(HandlerInvocationError::internal)?
         .into_iter()
         .find(|server| server.plugin_server_name.as_deref() == Some(server_name))
         .ok_or_else(|| {
@@ -1006,9 +1014,9 @@ mod tests {
     use opentopia_core::{
         AppSettings, AppViewSessionStatus, BackgroundProcessRegistry, BrowserRuntimeConfig,
         CodexAccountManager, ComputerRuntime, ComputerRuntimeConfig, ContributionOrigin,
-        LocalBrowserRuntime, LocalComputerRuntime, PermissionMode, PluginControlScope,
-        PluginDescriptor, PluginPermission, PluginPermissionGrantStatus, SessionStore,
-        SqliteSessionStore, MEDIA_HANDLER_RESULT_API_VERSION,
+        LocalBrowserRuntime, LocalComputerRuntime, PermissionMode, PluginActivationScope,
+        PluginControlScope, PluginDescriptor, PluginPermission, PluginPermissionGrantStatus,
+        SessionStore, SqliteSessionStore, MEDIA_HANDLER_RESULT_API_VERSION,
     };
     use serde_json::json;
     use std::fs;
@@ -1508,7 +1516,7 @@ mod tests {
             .expect("create thread");
         let plugin = fixture.plugin();
         store
-            .set_plugin_activation(&plugin.id, &PluginControlScope::global(), true)
+            .set_plugin_activation(&plugin.id, &PluginActivationScope::global(), true)
             .expect("activate media plugin");
         set_app_permissions(&store, &plugin, PluginPermissionGrantStatus::Granted);
         let host = McpExtensionHost::with_spawner(Arc::new(MediaHandlerMcpSpawner));
@@ -1554,7 +1562,7 @@ mod tests {
             .expect("create thread");
         let plugin = fixture.plugin();
         store
-            .set_plugin_activation(&plugin.id, &PluginControlScope::global(), true)
+            .set_plugin_activation(&plugin.id, &PluginActivationScope::global(), true)
             .expect("activate app plugin");
         let state = test_state(store.clone());
         let contribution_id = format!("{}/dashboard", plugin.id);

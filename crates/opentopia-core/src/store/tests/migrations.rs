@@ -184,7 +184,7 @@ fn migration_ledger_records_verified_baseline_and_current_version() {
     )
     .expect("read migration ledger");
 
-    assert_eq!(records.len(), 13);
+    assert_eq!(records.len(), 14);
     assert_eq!(records[0].0, LEGACY_DATABASE_SCHEMA_VERSION);
     assert_eq!(records[0].1, "legacy_baseline_v19");
     assert_eq!(records[1].0, 20);
@@ -209,8 +209,9 @@ fn migration_ledger_records_verified_baseline_and_current_version() {
     assert_eq!(records[10].1, "workflow_automation");
     assert_eq!(records[11].0, 30);
     assert_eq!(records[11].1, "workflow_invocation_superseded");
-    assert_eq!(records[12].0, CURRENT_DATABASE_SCHEMA_VERSION);
     assert_eq!(records[12].1, "flow_product_model");
+    assert_eq!(records[13].0, CURRENT_DATABASE_SCHEMA_VERSION);
+    assert_eq!(records[13].1, "codex_plugin_runtime");
     assert!(records.iter().all(|record| record.2.starts_with("sha256:")));
     assert!(records.iter().all(|record| !record.3.is_empty()));
     assert!(records
@@ -229,6 +230,7 @@ fn migration_upgrades_pre_checkpoint_v22_database() {
         let store = SqliteSessionStore::open(&path).expect("create current database");
         let conn = store.conn.lock().expect("lock current database");
         restore_pre_v28_effect_journal(&conn);
+        restore_pre_v32_plugin_runtime(&conn);
         conn.execute_batch(
             r#"
             DROP TABLE flow_evaluations;
@@ -250,6 +252,7 @@ fn migration_upgrades_pre_checkpoint_v22_database() {
             DROP INDEX idx_agent_events_reasoning_tail;
             DROP INDEX idx_agent_events_tool_results;
             DROP INDEX idx_agent_events_model_round;
+            DELETE FROM schema_migrations WHERE version = 32;
             DELETE FROM schema_migrations WHERE version = 31;
             DELETE FROM schema_migrations WHERE version = 30;
             DELETE FROM schema_migrations WHERE version = 29;
@@ -298,6 +301,7 @@ fn v26_migrates_legacy_mcp_server_into_definition_and_connection() {
             .expect("insert legacy MCP server");
         let conn = store.conn.lock().expect("lock current database");
         restore_pre_v28_effect_journal(&conn);
+        restore_pre_v32_plugin_runtime(&conn);
         restore_v25_human_tasks(&conn);
         conn.execute_batch(
             r#"
@@ -313,6 +317,7 @@ fn v26_migrates_legacy_mcp_server_into_definition_and_connection() {
             DROP TABLE connection_capability_revisions;
             DROP TABLE connections;
             DROP TABLE integration_definitions;
+            DELETE FROM schema_migrations WHERE version = 32;
             DELETE FROM schema_migrations WHERE version = 31;
             DELETE FROM schema_migrations WHERE version = 30;
             DELETE FROM schema_migrations WHERE version = 29;
@@ -409,6 +414,97 @@ fn migration_ledger_is_idempotent_across_reopen() {
 
     assert_eq!(before, after);
     let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn codex_plugin_runtime_migration_removes_task_activation_and_manifest_cache() {
+    let conn = Connection::open_in_memory().expect("open migration fixture");
+    conn.execute_batch(
+        r#"
+        CREATE TABLE plugin_activations (
+            plugin_id TEXT NOT NULL,
+            scope_type TEXT NOT NULL CHECK(scope_type IN ('global', 'workspace', 'thread')),
+            scope_id TEXT NOT NULL DEFAULT '',
+            enabled INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(plugin_id, scope_type, scope_id)
+        );
+        CREATE INDEX idx_plugin_activations_scope
+            ON plugin_activations(scope_type, scope_id, plugin_id);
+        CREATE TABLE thread_plugin_activations (
+            thread_id TEXT NOT NULL,
+            plugin_id TEXT NOT NULL,
+            enabled INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(thread_id, plugin_id)
+        );
+        CREATE INDEX idx_thread_plugin_activations_thread
+            ON thread_plugin_activations(thread_id, updated_at);
+        CREATE TABLE plugin_contributions (
+            plugin_id TEXT NOT NULL,
+            contribution_id TEXT NOT NULL PRIMARY KEY,
+            kind TEXT NOT NULL,
+            local_id TEXT NOT NULL,
+            descriptor_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_plugin_contributions_plugin
+            ON plugin_contributions(plugin_id, kind, contribution_id);
+        CREATE TABLE plugin_runtime_health (
+            contribution_id TEXT NOT NULL PRIMARY KEY,
+            plugin_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            last_error TEXT,
+            last_checked_at TEXT NOT NULL,
+            restart_count INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO plugin_activations VALUES
+            ('example@user', 'global', '', 1, '2026-01-01T00:00:00Z'),
+            ('example@user', 'workspace', 'j:/project', 0, '2026-01-01T00:00:00Z'),
+            ('example@user', 'thread', 'task-id', 1, '2026-01-01T00:00:00Z');
+        INSERT INTO thread_plugin_activations VALUES
+            ('task-id', 'example@user', 1, '2026-01-01T00:00:00Z');
+        INSERT INTO plugin_contributions VALUES
+            ('example@user', 'example@user/tool', 'native_tool', 'tool', '{}', '2026-01-01T00:00:00Z');
+        INSERT INTO plugin_runtime_health VALUES
+            ('example@user/tool', 'example@user', 'ready', NULL, '2026-01-01T00:00:00Z', 0);
+        "#,
+    )
+    .expect("create pre-v32 plugin schema");
+
+    conn.execute_batch(include_str!(
+        "../../migrations/0032_codex_plugin_runtime.sql"
+    ))
+    .expect("apply Codex plugin runtime migration");
+
+    let activations: i64 = conn
+        .query_row("SELECT COUNT(*) FROM plugin_activations", [], |row| {
+            row.get(0)
+        })
+        .expect("count retained activations");
+    assert_eq!(activations, 2);
+    assert!(conn
+        .execute(
+            "INSERT INTO plugin_activations VALUES ('example@user', 'thread', 'task', 1, 'now')",
+            [],
+        )
+        .is_err());
+    for removed in ["thread_plugin_activations", "plugin_contributions"] {
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+                params![removed],
+                |row| row.get(0),
+            )
+            .expect("inspect removed table");
+        assert!(!exists, "{removed} should be removed");
+    }
+    let health: i64 = conn
+        .query_row("SELECT COUNT(*) FROM plugin_runtime_health", [], |row| {
+            row.get(0)
+        })
+        .expect("count reset runtime health");
+    assert_eq!(health, 0);
 }
 
 #[test]

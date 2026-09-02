@@ -33,6 +33,16 @@ impl ToolStateStore {
             .effective_plugin_settings(plugin_id, workspace_root, thread_id)
     }
 
+    pub fn plugin_effectively_enabled(
+        &self,
+        plugin_id: &str,
+        default_enabled: bool,
+        workspace_root: &Path,
+    ) -> anyhow::Result<bool> {
+        self.inner
+            .plugin_effectively_enabled(plugin_id, default_enabled, Some(workspace_root))
+    }
+
     pub fn list_messages(&self, thread_id: Uuid) -> anyhow::Result<Vec<Message>> {
         self.inner.list_messages(thread_id)
     }

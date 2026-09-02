@@ -7,7 +7,6 @@ use crate::settings::AppSettings;
 use anyhow::Context;
 use chrono::Utc;
 use rusqlite::{params, OptionalExtension};
-use std::collections::HashMap;
 use uuid::Uuid;
 
 impl SqliteSessionStore {
@@ -257,57 +256,6 @@ impl SqliteSessionStore {
             ],
         )?;
         Ok(binding)
-    }
-
-    pub fn list_thread_plugin_activations(
-        &self,
-        thread_id: Uuid,
-    ) -> anyhow::Result<HashMap<String, bool>> {
-        let conn = self.conn.lock().expect("sqlite mutex poisoned");
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT plugin_name, enabled
-            FROM thread_plugin_activations
-            WHERE thread_id = ?1
-            ORDER BY plugin_name ASC
-            "#,
-        )?;
-        let rows = stmt.query_map(params![thread_id.to_string()], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0))
-        })?;
-        let mut activations = HashMap::new();
-        for row in rows {
-            let (plugin_name, enabled) = row?;
-            activations.insert(plugin_name, enabled);
-        }
-        Ok(activations)
-    }
-
-    pub fn set_thread_plugin_activation(
-        &self,
-        thread_id: Uuid,
-        plugin_name: &str,
-        enabled: bool,
-    ) -> anyhow::Result<()> {
-        let plugin_name = plugin_name.trim();
-        anyhow::ensure!(!plugin_name.is_empty(), "plugin name cannot be empty");
-        let conn = self.conn.lock().expect("sqlite mutex poisoned");
-        conn.execute(
-            r#"
-            INSERT INTO thread_plugin_activations (thread_id, plugin_name, enabled, updated_at)
-            VALUES (?1, ?2, ?3, ?4)
-            ON CONFLICT(thread_id, plugin_name) DO UPDATE SET
-                enabled = excluded.enabled,
-                updated_at = excluded.updated_at
-            "#,
-            params![
-                thread_id.to_string(),
-                plugin_name,
-                enabled as i64,
-                Utc::now().to_rfc3339(),
-            ],
-        )?;
-        Ok(())
     }
 
     /// Replaces the persisted tool catalog for one MCP server.
