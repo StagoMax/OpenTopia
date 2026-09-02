@@ -8,6 +8,8 @@ param(
   [string]$WorkRoot = "",
   [string]$SelectionFile = "",
   [string]$StatusFile = "pilot-status.json",
+  [string]$ReuseBeforeStatus = "",
+  [string]$ReuseBeforeProvenance = "",
   [string]$SummaryFile = "pilot-summary.json",
   [string]$ReportFile = "第一阶段试点报告.md",
   [string]$TaskIds = "",
@@ -188,7 +190,7 @@ $beforeArtifact = Join-Path $PlanRoot "artifacts\opentopia-server-before-6d52-sc
 $afterArtifact = if ($AfterArtifactPath) {
   (Resolve-Path -LiteralPath $AfterArtifactPath).Path
 } else {
-  Join-Path $PlanRoot "artifacts\opentopia-server-after-e135adbd-worktree-20260831-musl"
+  Join-Path $PlanRoot "artifacts\opentopia-server-after-949f978d-worktree-20260901-musl"
 }
 $afterProvenance = "$afterArtifact.provenance.json"
 foreach ($path in @($selectionPath, $dockerfile, $beforeArtifact, $afterArtifact, $afterProvenance)) {
@@ -288,6 +290,12 @@ try {
   )
   if ($TaskIds) {
     $pythonArguments += @("--task-ids", $TaskIds)
+  }
+  if ($ReuseBeforeStatus) {
+    $pythonArguments += @("--reuse-before-status", (Resolve-Path -LiteralPath $ReuseBeforeStatus).Path)
+  }
+  if ($ReuseBeforeProvenance) {
+    $pythonArguments += @("--reuse-before-provenance", (Resolve-Path -LiteralPath $ReuseBeforeProvenance).Path)
   }
   & python @pythonArguments
   $runnerExitCode = $LASTEXITCODE

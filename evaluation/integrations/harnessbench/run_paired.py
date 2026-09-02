@@ -25,6 +25,8 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--work-root", type=Path, required=True)
     parser.add_argument("--selection", type=Path, required=True)
     parser.add_argument("--status-file", default="pilot-status.json")
+    parser.add_argument("--reuse-before-status", type=Path)
+    parser.add_argument("--reuse-before-provenance", type=Path)
     parser.add_argument("--summary-file", default="pilot-summary.json")
     parser.add_argument("--report-file", default="第一阶段试点报告.md")
     parser.add_argument("--task-ids", default="")
@@ -331,7 +333,7 @@ def _write_report(path: Path, payload: dict[str, Any]) -> None:
         "",
         "## 试点结论",
         "",
-        f"- After 的总体缓存命中率提升 {cache_delta * 100:.2f} 个百分点；缓存破坏事件数量同为 {before['cache_broken_transitions']} 次，但 After 的有效转移更多，破坏率相对下降 {-break_rate_delta * 100:.2f}%，破坏或退化率相对下降 {-disruption_delta * 100:.2f}%。",
+        f"- After 的总体缓存命中率提升 {cache_delta * 100:.2f} 个百分点；缓存破坏事件由 {before['cache_broken_transitions']} 次降至 {after['cache_broken_transitions']} 次，且 After 的有效转移更多，破坏率相对下降 {-break_rate_delta * 100:.2f}%，破坏或退化率相对下降 {-disruption_delta * 100:.2f}%。",
         f"- After 平均轮数增加 {round_delta * 100:.2f}%，总 Token 增加 {token_delta * 100:.2f}%。因此本试点支持“缓存稳定性改善”，不支持“总成本下降”。",
         f"- Oracle 平均结果分变化 {oracle_delta * 100:+.2f} 个百分点，完全成功率变化 {full_success_delta * 100:+.2f} 个百分点，方向不一致；需在全量 106 对与复测后才能形成质量结论。",
         f"- 工具失败率从 {_percent(before['tool_failure_rate'])} 变为 {_percent(after['tool_failure_rate'])}。该项需结合具体失败类型和最终 Oracle 逐题审查，不能直接解释为工具能力下降。",
@@ -440,6 +442,34 @@ def main() -> int:
         except json.JSONDecodeError:
             attempts = []
             final_rows = {}
+
+    if args.reuse_before_status:
+        reuse_status_path = args.reuse_before_status.resolve()
+        reuse_status = json.loads(reuse_status_path.read_text(encoding="utf-8"))
+        reuse_artifacts = reuse_status.get("artifact_sha256") or {}
+        recorded_before_sha = str(reuse_artifacts.get("before") or "").upper()
+        if not recorded_before_sha and args.reuse_before_provenance:
+            provenance = json.loads(
+                args.reuse_before_provenance.resolve().read_text(encoding="utf-8")
+            )
+            recorded_before_sha = str(provenance.get("binarySha256") or "").upper()
+        if recorded_before_sha != artifact_sha256["before"]:
+            raise SystemExit(
+                "reused Before status belongs to a different Before artifact"
+            )
+        for item in reuse_status.get("attempts", []):
+            if not isinstance(item, dict):
+                continue
+            task_id = str(item.get("task_id") or "")
+            key = ("before", task_id)
+            if (
+                item.get("snapshot") == "before"
+                and item.get("valid") is True
+                and task_id in selected_tasks
+                and key not in final_rows
+            ):
+                attempts.append(item)
+                final_rows[key] = item
 
     variants = {
         "before": {
