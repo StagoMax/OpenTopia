@@ -227,10 +227,17 @@ export function FlowNodeConfiguration({
         <AgentCapabilitySummary template={selectedTemplate} />
       ) : null}
 
-      <WorkflowStateWritesEditor
-        onChange={(stateWrites) => onChange({ ...node, stateWrites })}
-        writes={node.stateWrites ?? []}
-      />
+      <details className="flow-editor-inspector__advanced">
+        <summary>
+          <Settings2 aria-hidden="true" size={14} /> 共享状态（高级）
+        </summary>
+        <div className="flow-editor-inspector__advanced-body">
+          <WorkflowStateWritesEditor
+            onChange={(stateWrites) => onChange({ ...node, stateWrites })}
+            writes={node.stateWrites ?? []}
+          />
+        </div>
+      </details>
 
       <section className="flow-editor-inspector__section">
         <header>

@@ -9,6 +9,7 @@ import {
 } from "./FlowEditorInspector";
 import { FlowEditorToolbar } from "./FlowEditorToolbar";
 import { FlowCreateDialog, type FlowCreateValues } from "./FlowCreateDialog";
+import { FlowTestRunDialog } from "./FlowTestRunDialog";
 import { FlowInspectorPanel, FlowInspectorSection } from "./FlowInspectorPanel";
 import {
   DEFAULT_GUIDED_FLOW_BUDGET,
@@ -87,6 +88,8 @@ export function WorkflowTemplatesPage({
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [selectedConnection, setSelectedConnection] =
     useState<WorkflowConnection | null>(null);
+  const [testInputText, setTestInputText] = useState("{}");
+  const [testRunDialogOpen, setTestRunDialogOpen] = useState(false);
   const [editorLayoutId, setEditorLayoutId] = useState(
     () => `draft:${crypto.randomUUID()}`,
   );
@@ -95,6 +98,7 @@ export function WorkflowTemplatesPage({
     nodeId: string;
   } | null>(null);
   const handledCreateRequest = useRef(selection?.createFlowRequest ?? 0);
+  const handledFailedTestRun = useRef<string | null>(null);
 
   const selectedFlowId = selection?.creatingFlow
     ? undefined
@@ -120,6 +124,8 @@ export function WorkflowTemplatesPage({
       setSelectedConnection(null);
       setEditorLayoutId(`draft:${crypto.randomUUID()}`);
       setDetailPage(null);
+      setTestInputText("{}");
+      setTestRunDialogOpen(false);
     }
   }, [selection?.createFlowRequest]);
 
@@ -128,6 +134,9 @@ export function WorkflowTemplatesPage({
       setCreating(false);
       setCreateDialogOpen(false);
       setDetailPage(null);
+      setSelectedNodeId(null);
+      setSelectedConnection(null);
+      setTestRunDialogOpen(false);
     }
   }, [selection?.selectedFlowId]);
 
@@ -178,24 +187,26 @@ export function WorkflowTemplatesPage({
   const graphReady =
     nodes.some((node) => node.kind !== "output") &&
     nodes.every(nodeConfigurationReady);
-  const passedDryRun = Boolean(
-    draft?.trials.some(
-      (trial) =>
-        trial.draftRevision === draft.draft.revision &&
-        trial.status === "passed",
-    ),
-  );
-  const successfulTestRun = Boolean(
-    draft?.testRuns.some(
+  const currentTestRuns =
+    draft?.testRuns.filter(
       (run) =>
         run.testDraftRevision === draft.draft.revision &&
-        run.definitionContentHash === draft.draft.contentHash &&
-        run.status === "succeeded",
-    ),
+        run.definitionContentHash === draft.draft.contentHash,
+    ) ?? [];
+  const successfulTestRun = Boolean(
+    currentTestRuns.some((run) => run.status === "succeeded"),
   );
-  const activeTestRun = draft?.testRuns.find(
-    (run) =>
-      run.testDraftRevision === draft.draft.revision && !isTerminal(run.status),
+  const activeTestRun = currentTestRuns.find((run) => !isTerminal(run.status));
+  const currentTestRun = activeTestRun ?? currentTestRuns[0] ?? null;
+  const testExecutionSteps = useMemo(
+    () =>
+      nodes
+        .filter((node) => node.kind === "agent" || node.kind === "tool")
+        .map(
+          (node) =>
+            `${node.kind === "agent" ? "Agent" : "Action"}：${workflowNodeLabel(node, publishedTemplates)}`,
+        ),
+    [nodes, publishedTemplates],
   );
 
   useEffect(() => {
@@ -223,6 +234,24 @@ export function WorkflowTemplatesPage({
     return () => window.clearInterval(timer);
   }, [activeTestRun, client]);
 
+  useEffect(() => {
+    if (
+      !currentTestRun ||
+      currentTestRun.status !== "failed" ||
+      handledFailedTestRun.current === currentTestRun.id
+    )
+      return;
+    handledFailedTestRun.current = currentTestRun.id;
+    const failedNode = [...currentTestRun.nodeRuns]
+      .reverse()
+      .find((nodeRun) => nodeRun.status === "failed");
+    if (!failedNode) return;
+    setDetailPage(null);
+    setSelectedConnection(null);
+    setSelectedNodeId(failedNode.nodeId);
+    setNotice("Test Run 失败，已定位到出错节点。右侧可查看输入、输出和错误。");
+  }, [currentTestRun]);
+
   async function execute(name: string, action: () => Promise<void>) {
     if (busy) return;
     setBusy(name);
@@ -235,6 +264,18 @@ export function WorkflowTemplatesPage({
     } finally {
       setBusy(null);
     }
+  }
+
+  function selectNode(nodeId: string | null) {
+    setDetailPage(null);
+    if (nodeId) setSelectedConnection(null);
+    setSelectedNodeId(nodeId);
+  }
+
+  function selectConnection(connection: WorkflowConnection | null) {
+    setDetailPage(null);
+    if (connection) setSelectedNodeId(null);
+    setSelectedConnection(connection);
   }
 
   function confirmCreateFlow() {
@@ -252,6 +293,8 @@ export function WorkflowTemplatesPage({
     setSelectedConnection(null);
     setEditorLayoutId(`draft:${crypto.randomUUID()}`);
     setDetailPage(null);
+    setTestInputText("{}");
+    setTestRunDialogOpen(false);
     setCreateDialogOpen(false);
     selection?.beginFlowDraft();
     setCreating(true);
@@ -289,8 +332,17 @@ export function WorkflowTemplatesPage({
 
   function changeNodes(next: WorkflowNodeSelection[]) {
     const hadDraft = Boolean(draft);
+    const addedOutput =
+      !nodes.some((node) => node.kind === "output") &&
+      next.some((node) => node.kind === "output");
+    const addedBusinessNode = next.some(
+      (node) =>
+        node.kind !== "output" &&
+        !nodes.some((current) => current.id === node.id),
+    );
     setNodes(next);
     setDraft(null);
+    setTestRunDialogOpen(false);
     setSelectedNodeId((current) =>
       current && next.some((node) => node.id === current) ? current : null,
     );
@@ -305,6 +357,8 @@ export function WorkflowTemplatesPage({
         : null,
     );
     if (hadDraft) setNotice("节点配置已修改，请重新创建草稿并验证。");
+    else if (addedOutput && addedBusinessNode)
+      setNotice("已添加第一个步骤，并自动创建 Flow 的固定 Output 终点。");
   }
 
   function changeFlowConfiguration(
@@ -359,29 +413,16 @@ export function WorkflowTemplatesPage({
     if (!draft) return;
     void execute("validate", async () => {
       setDraft(await client.validateFlowDraft(draft.draft.id));
-      setNotice("静态验证完成，可以进行执行计划 Dry Run。 ");
+      setNotice("验证完成。下一步使用一份测试输入执行 Test Run。 ");
     });
   }
 
-  function dryRunDraft() {
-    if (!draft || !threadId) return;
-    void execute("simulate", async () => {
-      await client.simulateFlowDraft(draft.draft.id, {});
-      setDraft(
-        (await client.listFlowDrafts(threadId)).find(
-          (item) => item.draft.id === draft.draft.id,
-        ) ?? draft,
-      );
-      setNotice("Dry Run 已通过；下一步执行真实 Test Run。 ");
-    });
-  }
-
-  function startTestRun() {
+  function startTestRun(input: unknown) {
     if (!draft) return;
     void execute("test-run", async () => {
       const run = await client.startFlowTestRun(
         draft.draft.id,
-        {},
+        input,
         owner.trim(),
       );
       setDraft((current) =>
@@ -389,8 +430,9 @@ export function WorkflowTemplatesPage({
           ? { ...current, testRuns: [run, ...current.testRuns] }
           : current,
       );
+      setTestRunDialogOpen(false);
       setNotice(
-        "真实 Test Run 已启动；Agent、工具和 Connection 会按冻结权限执行。 ",
+        "Test Run 已启动；可在画布查看实际执行路径，并点击节点检查输入和输出。 ",
       );
     });
   }
@@ -450,6 +492,8 @@ export function WorkflowTemplatesPage({
       setSelectedNodeId(null);
       setSelectedConnection(null);
       setEditorLayoutId(`draft:${crypto.randomUUID()}`);
+      setTestInputText("{}");
+      setTestRunDialogOpen(false);
       setCreateDialogOpen(false);
       selection?.beginFlowDraft();
       setCreating(true);
@@ -466,6 +510,19 @@ export function WorkflowTemplatesPage({
       onSubmit={confirmCreateFlow}
       open={createDialogOpen}
       values={createValues}
+    />
+  );
+  const testRunDialog = (
+    <FlowTestRunDialog
+      busy={busy === "test-run"}
+      executionSteps={testExecutionSteps}
+      externalError={testRunDialogOpen ? error : null}
+      inputSchema={draft?.draft.spec.inputSchema}
+      inputText={testInputText}
+      onCancel={() => setTestRunDialogOpen(false)}
+      onChangeInput={setTestInputText}
+      onSubmit={startTestRun}
+      open={testRunDialogOpen}
     />
   );
 
@@ -490,6 +547,7 @@ export function WorkflowTemplatesPage({
         {createDialog}
         <FlowInspectorPortal>
           <FlowInspectorPanel
+            key={selectedActiveNode?.id ?? selectedFlow.flowId}
             actions={
               <>
                 <Button
@@ -557,10 +615,6 @@ export function WorkflowTemplatesPage({
                     <dd>{selectedActiveNode.label}</dd>
                   </div>
                   <div>
-                    <dt>Node ID</dt>
-                    <dd>{selectedActiveNode.id}</dd>
-                  </div>
-                  <div>
                     <dt>Kind</dt>
                     <dd>{selectedActiveNode.kind}</dd>
                   </div>
@@ -574,6 +628,15 @@ export function WorkflowTemplatesPage({
                     </dd>
                   </div>
                 </dl>
+                <details className="flow-editor-inspector__advanced">
+                  <summary>节点高级信息</summary>
+                  <dl className="enterprise-facts flow-inspector-facts">
+                    <div>
+                      <dt>Node ID</dt>
+                      <dd>{selectedActiveNode.id}</dd>
+                    </div>
+                  </dl>
+                </details>
               </FlowInspectorSection>
             ) : (
               <FlowInspectorSection title="Revision">
@@ -614,7 +677,7 @@ export function WorkflowTemplatesPage({
               <WorkflowGraphEditor
                 compiledGraph={activeGraph}
                 layoutId={`active-compiled-v2:${selectedFlow.flowId}@${selectedFlow.activeRevision.compiledWorkflow.flowVersion}`}
-                onSelectNode={setSelectedNodeId}
+                onSelectNode={selectNode}
                 readOnly
                 selectedNodeId={selectedNodeId}
                 templates={publishedTemplates}
@@ -629,6 +692,7 @@ export function WorkflowTemplatesPage({
   return (
     <>
       {createDialog}
+      {testRunDialog}
       <FlowInspectorPortal>
         <section
           className="flow-workspace-inspector workflow-editor-inspector-shell"
@@ -638,28 +702,24 @@ export function WorkflowTemplatesPage({
             activeTestRun={Boolean(activeTestRun)}
             busy={busy}
             canActivate={Boolean(
-              draft?.draft.lastValidation?.valid &&
-              passedDryRun &&
-              successfulTestRun,
+              draft?.draft.lastValidation?.valid && successfulTestRun,
             )}
             canCreateDraft={Boolean(
               threadId && graphReady && allAgentsAvailable && outcome.trim(),
             )}
-            canDryRun={Boolean(draft?.draft.lastValidation?.valid)}
-            canTestRun={Boolean(
-              draft?.draft.lastValidation?.valid && passedDryRun,
-            )}
+            canTestRun={Boolean(draft?.draft.lastValidation?.valid)}
             draftExists={Boolean(draft)}
             flowId={flowId}
             name={name}
-            nodeCount={nodes.length}
+            nodeCount={nodes.filter((node) => node.kind !== "output").length}
             onActivate={activateDraft}
             onCreateDraft={createDraft}
-            onDryRun={dryRunDraft}
             onRefresh={refreshTestRun}
-            onTestRun={startTestRun}
+            onTestRun={() => {
+              setError(null);
+              setTestRunDialogOpen(true);
+            }}
             onValidate={validateDraft}
-            passedDryRun={passedDryRun}
             successfulTestRun={successfulTestRun}
             threadReady={Boolean(threadId)}
             validated={Boolean(draft?.draft.lastValidation?.valid)}
@@ -693,15 +753,15 @@ export function WorkflowTemplatesPage({
               onEditTrigger={(nodeId) =>
                 setDetailPage({ kind: "trigger", nodeId })
               }
-              onSelectNode={setSelectedNodeId}
-              onSelectConnection={setSelectedConnection}
+              onSelectNode={selectNode}
+              onSelectConnection={selectConnection}
               outcome={outcome}
               owner={owner}
-              passedDryRun={passedDryRun}
               runtimeConfiguration={runtimeConfiguration}
               selectedNodeId={selectedNodeId}
               selectedConnection={selectedConnection}
               successfulTestRun={successfulTestRun}
+              testRun={currentTestRun}
               templates={publishedTemplates}
             />
           )}
@@ -720,11 +780,12 @@ export function WorkflowTemplatesPage({
               onEditTrigger={(nodeId) =>
                 setDetailPage({ kind: "trigger", nodeId })
               }
-              onSelectNode={setSelectedNodeId}
-              onSelectConnection={setSelectedConnection}
+              onSelectNode={selectNode}
+              onSelectConnection={selectConnection}
               selections={nodes}
               selectedConnection={selectedConnection}
               selectedNodeId={selectedNodeId}
+              testRun={currentTestRun}
               templates={publishedTemplates}
             />
           </div>

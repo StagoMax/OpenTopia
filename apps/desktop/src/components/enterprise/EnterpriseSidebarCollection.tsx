@@ -50,7 +50,7 @@ export function EnterpriseSidebarCollection({
           title: enterpriseSidebarTitle({
             id: template.templateId,
             label: template.name,
-            qualifier: `${template.owner} · v${template.version}`,
+            qualifier: `v${template.version} · ${template.owner}`,
           }),
           detail: `${template.templateId}@${template.version}`,
           status: template.status,
@@ -86,7 +86,7 @@ export function EnterpriseSidebarCollection({
               title: enterpriseSidebarTitle({
                 id: flow.flowId,
                 label: flow.name,
-                qualifier: `${workflowTriggerLabel(flow.activeRevision.trigger)} · v${flow.activeRevision.compiledWorkflow.flowVersion}`,
+                qualifier: `v${flow.activeRevision.compiledWorkflow.flowVersion} · ${workflowTriggerLabel(flow.activeRevision.trigger)}`,
               }),
               detail: `${flow.flowId}@${flow.activeRevision.compiledWorkflow.flowVersion}`,
               status: flow.status,

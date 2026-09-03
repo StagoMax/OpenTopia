@@ -80,7 +80,7 @@ export function TrustPage({
         <section className="enterprise-core-detail__payload enterprise-trust-findings">
           <header>
             <span>
-              <strong>Affected Connections / 受影响的连接</strong>
+              <h3>受影响的连接</h3>
               <small>点击条目可直达对应 Connection 的问题详情。</small>
             </span>
           </header>
@@ -144,7 +144,7 @@ export function TrustPage({
               {snapshot.error}
             </p>
           ) : null}
-          <FlowInspectorSection title="Current signal / 当前信号">
+          <FlowInspectorSection title="当前信号">
             <p>{signal?.detail ?? "当前没有信任信号。"}</p>
           </FlowInspectorSection>
           <FlowInspectorSection title="更新时间">

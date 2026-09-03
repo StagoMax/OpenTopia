@@ -120,6 +120,26 @@
   outline-offset: calc(var(--space-1) * -1);
 }
 
+.workflow-node.is-run-running,
+.workflow-node.is-run-resuming,
+.workflow-node.is-run-ready {
+  border-color: var(--accent);
+}
+
+.workflow-node.is-run-succeeded {
+  border-color: var(--success);
+}
+
+.workflow-node.is-run-failed,
+.workflow-node.is-run-cancelled {
+  border-color: var(--danger);
+}
+
+.workflow-node.is-run-waiting_approval,
+.workflow-node.is-run-waiting_human {
+  border-color: var(--warning);
+}
+
 .workflow-node button:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: -2px;
@@ -196,6 +216,29 @@
   font-size: var(--font-size-xs);
 }
 
+.workflow-node__run-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--accent);
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+}
+
+.workflow-node.is-run-succeeded .workflow-node__run-status {
+  color: var(--success);
+}
+
+.workflow-node.is-run-failed .workflow-node__run-status,
+.workflow-node.is-run-cancelled .workflow-node__run-status {
+  color: var(--danger);
+}
+
+.workflow-node.is-run-waiting_approval .workflow-node__run-status,
+.workflow-node.is-run-waiting_human .workflow-node__run-status {
+  color: var(--warning);
+}
+
 .workflow-node__final {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
@@ -242,6 +285,10 @@
 .workflow-canvas__edge .react-flow__edge-path {
   stroke: var(--border-strong);
   stroke-width: 2;
+}
+
+.workflow-canvas__edge.is-tested .react-flow__edge-path {
+  stroke: var(--accent);
 }
 
 .workflow-canvas__edge + .react-flow__edge-textwrapper text {

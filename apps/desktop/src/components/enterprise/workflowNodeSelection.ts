@@ -232,7 +232,7 @@ export function workflowNodeLabel(
   if (selection.kind !== "agent") return selection.label;
   return (
     templates.find((item) => templateKey(item) === selection.templateKey)
-      ?.template.name ?? "选择 Agent"
+      ?.template.name ?? "未配置 Agent"
   );
 }
 

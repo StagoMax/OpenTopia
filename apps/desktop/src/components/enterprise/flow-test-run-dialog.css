@@ -1,0 +1,152 @@
+.flow-test-dialog__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  display: grid;
+  place-items: center;
+  background: var(--overlay-scrim);
+  padding: var(--space-12);
+}
+
+.flow-test-dialog {
+  display: grid;
+  gap: var(--space-6);
+  inline-size: min(
+    calc(var(--popover-width-compact) * 2),
+    calc(100vw - var(--space-12) * 2)
+  );
+  max-block-size: calc(100vh - var(--space-12) * 2);
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-overlay);
+  padding: var(--space-6);
+}
+
+.flow-test-dialog > header,
+.flow-test-dialog > footer,
+.flow-test-dialog > footer > span,
+.flow-test-dialog__heading,
+.flow-test-dialog__warning {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+}
+
+.flow-test-dialog > header,
+.flow-test-dialog > footer {
+  justify-content: space-between;
+}
+
+.flow-test-dialog__heading > span:last-child,
+.flow-test-dialog__warning > span,
+.flow-test-dialog__input,
+.flow-test-dialog__input > span {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.flow-test-dialog__heading small,
+.flow-test-dialog__warning small,
+.flow-test-dialog__input small {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  line-height: var(--line-height-relaxed);
+}
+
+.flow-test-dialog__icon {
+  display: grid;
+  place-items: center;
+  inline-size: var(--control-height-lg);
+  block-size: var(--control-height-lg);
+  border-radius: var(--radius-md);
+  background: var(--accent-subtle);
+  color: var(--accent);
+}
+
+.flow-test-dialog__input {
+  gap: var(--space-3);
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.flow-test-dialog__input textarea {
+  inline-size: 100%;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-subtle);
+  padding: var(--space-4);
+  color: var(--text);
+  font: var(--font-size-sm) / var(--line-height-relaxed) var(--font-mono);
+}
+
+.flow-test-dialog__input textarea:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.flow-test-dialog__input textarea[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+.flow-test-dialog__error {
+  color: var(--danger) !important;
+}
+
+.flow-test-dialog__warning {
+  align-items: flex-start;
+  border: 1px solid var(--warning);
+  border-radius: var(--radius-sm);
+  background: var(--warning-subtle);
+  padding: var(--space-4);
+  color: var(--warning);
+}
+
+.flow-test-dialog__steps {
+  border-top: 1px solid var(--border-subtle);
+  padding-top: var(--space-4);
+}
+
+.flow-test-dialog__steps summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.flow-test-dialog__steps ul {
+  display: grid;
+  gap: var(--space-2);
+  margin: var(--space-3) 0 0;
+  padding-inline-start: var(--space-10);
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.flow-test-dialog > footer {
+  border-top: 1px solid var(--border-subtle);
+  padding-top: var(--space-5);
+}
+
+@media (max-width: 48rem) {
+  .flow-test-dialog__backdrop {
+    padding: var(--space-6);
+  }
+
+  .flow-test-dialog {
+    inline-size: calc(100vw - var(--space-6) * 2);
+  }
+
+  .flow-test-dialog > footer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .flow-test-dialog > footer > span {
+    justify-content: flex-end;
+  }
+}

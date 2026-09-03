@@ -19,6 +19,7 @@ import {
 import type {
   AgentTemplateVersionView,
   FlowDraftView,
+  FlowRun,
   FlowSpec,
 } from "../../types";
 import { Badge, Button, SelectField, TextField } from "../ui";
@@ -30,6 +31,7 @@ import { FlowConnectionConfiguration } from "./FlowConnectionConfiguration";
 import type { WorkflowConnection } from "./workflowGraphOperations";
 import type { WorkflowEdgeConfiguration } from "./workflowNodeSelection";
 import { FlowNodeConfiguration } from "./FlowNodeConfiguration";
+import { FlowNodeTestRunDetails } from "./FlowNodeTestRunDetails";
 
 export function FlowEditorInspector({
   draft,
@@ -47,11 +49,11 @@ export function FlowEditorInspector({
   onSelectNode,
   outcome,
   owner,
-  passedDryRun,
   runtimeConfiguration,
   selectedNodeId,
   selectedConnection,
   successfulTestRun,
+  testRun,
   templates,
 }: {
   draft: FlowDraftView | null;
@@ -72,11 +74,11 @@ export function FlowEditorInspector({
   onSelectNode(nodeId: string | null): void;
   outcome: string;
   owner: string;
-  passedDryRun: boolean;
   runtimeConfiguration: FlowRuntimeConfiguration;
   selectedNodeId: string | null;
   selectedConnection: WorkflowConnection | null;
   successfulTestRun: boolean;
+  testRun: FlowRun | null;
   templates: AgentTemplateVersionView[];
 }) {
   const selectedNode = nodes.find((node) => node.id === selectedNodeId) ?? null;
@@ -105,7 +107,7 @@ export function FlowEditorInspector({
                 ? `${selectedConnection.sourceId} → ${selectedConnection.targetId}`
                 : selectedNode
                   ? workflowNodeLabel(selectedNode, templates)
-                  : `${nodes.length} 个节点 · ${draft ? "草稿已保存" : "尚未保存"}`}
+                  : `${nodes.filter((node) => node.kind !== "output").length} 个步骤 · ${draft ? "草稿已保存" : "尚未保存"}`}
             </small>
           </span>
         </span>
@@ -134,13 +136,17 @@ export function FlowEditorInspector({
             templates={templates}
           />
         ) : selectedNode ? (
-          <FlowNodeConfiguration
-            node={selectedNode}
-            nodes={nodes}
-            onChange={onChangeNode}
-            onEditTrigger={onEditTrigger}
-            templates={templates}
-          />
+          <>
+            <FlowNodeConfiguration
+              key={selectedNode.id}
+              node={selectedNode}
+              nodes={nodes}
+              onChange={onChangeNode}
+              onEditTrigger={onEditTrigger}
+              templates={templates}
+            />
+            <FlowNodeTestRunDetails nodeId={selectedNode.id} run={testRun} />
+          </>
         ) : (
           <>
             <section className="flow-editor-inspector__section">
@@ -176,7 +182,6 @@ export function FlowEditorInspector({
               </header>
               <WorkflowProgress
                 draft={draft}
-                passedDryRun={passedDryRun}
                 successfulTestRun={successfulTestRun}
               />
             </section>
@@ -365,18 +370,15 @@ function positiveInteger(value: string, fallback: number) {
 
 function WorkflowProgress({
   draft,
-  passedDryRun,
   successfulTestRun,
 }: {
   draft: FlowDraftView | null;
-  passedDryRun: boolean;
   successfulTestRun: boolean;
 }) {
   const steps = [
     ["保存草稿", Boolean(draft)],
     ["通过校验", Boolean(draft?.draft.lastValidation?.valid)],
-    ["完成模拟运行", passedDryRun],
-    ["通过真实测试", successfulTestRun],
+    ["完成 Test Run", successfulTestRun],
     ["激活 Flow", draft?.draft.status === "published"],
   ] as const;
   return (

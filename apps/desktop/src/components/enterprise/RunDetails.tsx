@@ -98,7 +98,7 @@ export function RunDetails({
       <section className="enterprise-core-detail__payload run-detail__result">
         <header>
           <span>
-            <strong>运行结果</strong>
+            <h3>运行结果</h3>
             <small>流程最终返回给调用方的数据</small>
           </span>
         </header>
@@ -112,7 +112,7 @@ export function RunDetails({
       <section className="enterprise-core-detail__payload run-detail__path">
         <header>
           <span>
-            <strong>执行路径</strong>
+            <h3>执行路径</h3>
             <small>按实际发生顺序展示节点、重试与工具调用</small>
           </span>
           <Badge variant="neutral">{run.nodeRuns.length} 条记录</Badge>
@@ -146,7 +146,7 @@ export function RunDetails({
         <div className="run-diagnostics__body">
           <section>
             <header>
-              <strong>本次输入</strong>
+              <h3>本次输入</h3>
             </header>
             <StructuredPayload
               emptyLabel="本次运行没有输入数据。"
@@ -156,7 +156,7 @@ export function RunDetails({
           </section>
           <section>
             <header>
-              <strong>恢复检查点</strong>
+              <h3>恢复检查点</h3>
             </header>
             <ol className="run-checkpoints">
               {run.checkpointHistory.map((checkpoint) => (

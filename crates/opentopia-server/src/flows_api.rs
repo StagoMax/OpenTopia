@@ -902,7 +902,6 @@ pub(crate) fn flow_error(error: anyhow::Error) -> ApiError {
             FlowStoreError::RevisionConflict(_)
             | FlowStoreError::RunRevisionConflict(_)
             | FlowStoreError::ValidationRequired
-            | FlowStoreError::PassedTrialRequired
             | FlowStoreError::SuccessfulTestRunRequired
             | FlowStoreError::IndependentApproverRequired => ApiError::conflict(error.to_string()),
         };

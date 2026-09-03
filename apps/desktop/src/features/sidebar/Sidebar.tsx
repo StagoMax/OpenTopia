@@ -504,9 +504,13 @@ export function Sidebar({
                         onMouseEnter={(event) => {
                           const bounds =
                             event.currentTarget.getBoundingClientRect();
+                          const sidebarRight =
+                            event.currentTarget
+                              .closest("#workspace-sidebar")
+                              ?.getBoundingClientRect().right ?? bounds.right;
                           const cardWidth = 320;
                           const left = Math.min(
-                            bounds.right + 8,
+                            sidebarRight + 8,
                             window.innerWidth - cardWidth - 8,
                           );
                           setHoveredProject({

@@ -165,7 +165,7 @@ export function AgentsPage({
             {usedByFlows.length > 0 ? (
               <section className="enterprise-core-detail__payload enterprise-agent-overview__usage">
                 <header>
-                  <strong>用于这些 Flow</strong>
+                  <h3>用于这些 Flow</h3>
                 </header>
                 <ul>
                   {usedByFlows.slice(0, 5).map((flow) => (

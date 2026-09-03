@@ -14,7 +14,7 @@ import {
 import "@xyflow/react/dist/base.css";
 import { Bot } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { AgentTemplateVersionView, FlowSpec } from "../../types";
+import type { AgentTemplateVersionView, FlowRun, FlowSpec } from "../../types";
 import { Button } from "../ui";
 import { createFinalActivation } from "./flowActivation";
 import {
@@ -43,6 +43,7 @@ import {
 } from "./WorkflowCanvasControls";
 import {
   WorkflowCanvasNode,
+  type WorkflowCanvasRunStatus,
   type WorkflowCanvasNodeType,
 } from "./WorkflowCanvasNode";
 import {
@@ -84,6 +85,7 @@ export function WorkflowGraphEditor({
   selections = EMPTY_SELECTIONS,
   selectedNodeId,
   selectedConnection,
+  testRun = null,
   templates,
 }: {
   compiledGraph?: FlowSpec["graph"];
@@ -97,6 +99,7 @@ export function WorkflowGraphEditor({
   selections?: WorkflowNodeSelection[];
   selectedNodeId: string | null;
   selectedConnection?: WorkflowConnection | null;
+  testRun?: FlowRun | null;
   templates: AgentTemplateVersionView[];
 }) {
   const canvasReadOnly = readOnly || Boolean(compiledGraph);
@@ -134,6 +137,11 @@ export function WorkflowGraphEditor({
   const [tool, setTool] = useState<CanvasTool>("select");
   const [spacePanning, setSpacePanning] = useState(false);
   const activeTool: CanvasTool = spacePanning ? "pan" : tool;
+  const runStatuses = useMemo(() => workflowRunStatuses(testRun), [testRun]);
+  const executedNodeIds = useMemo(
+    () => new Set(testRun?.nodeRuns.map((nodeRun) => nodeRun.nodeId) ?? []),
+    [testRun],
+  );
 
   useEffect(() => {
     if (!selectedConnection) return;
@@ -217,6 +225,7 @@ export function WorkflowGraphEditor({
           onSelectNode(nodeId);
         },
         readOnly: canvasReadOnly,
+        runStatus: runStatuses.get(node.id),
         subtitle: node.subtitle,
       },
     };
@@ -233,27 +242,32 @@ export function WorkflowGraphEditor({
     syncedPositionsRef.current = layout.positions;
   }, [flowNodes, layout.positions]);
 
-  const edges: Edge[] = canvasModel.connections.map((edge) => ({
-    id: edge.id ?? edgeId(edge.sourceId, edge.targetId),
-    source: edge.sourceId,
-    sourceHandle: "final",
-    target: edge.targetId,
-    targetHandle: "input",
-    type: "smoothstep",
-    className: "workflow-canvas__edge",
-    label: edge.loopPolicy
-      ? edge.condition.trim()
-        ? `Loop · ${edge.condition.trim()}`
-        : "Loop"
-      : edge.condition.trim() || undefined,
-    labelBgStyle: { fill: "var(--surface)" },
-    labelStyle: { fill: "var(--text-secondary)" },
-    selected:
-      selectedEdgeId === (edge.id ?? edgeId(edge.sourceId, edge.targetId)),
-    selectable: true,
-    deletable: !canvasReadOnly && !disabled,
-    reconnectable: !canvasReadOnly && !disabled,
-  }));
+  const edges: Edge[] = canvasModel.connections.map((edge) => {
+    const tested = Boolean(
+      executedNodeIds.has(edge.sourceId) && executedNodeIds.has(edge.targetId),
+    );
+    return {
+      id: edge.id ?? edgeId(edge.sourceId, edge.targetId),
+      source: edge.sourceId,
+      sourceHandle: "final",
+      target: edge.targetId,
+      targetHandle: "input",
+      type: "smoothstep",
+      className: `workflow-canvas__edge${tested ? " is-tested" : ""}`,
+      label: edge.loopPolicy
+        ? edge.condition.trim()
+          ? `Loop · ${edge.condition.trim()}`
+          : "Loop"
+        : edge.condition.trim() || undefined,
+      labelBgStyle: { fill: "var(--surface)" },
+      labelStyle: { fill: "var(--text-secondary)" },
+      selected:
+        selectedEdgeId === (edge.id ?? edgeId(edge.sourceId, edge.targetId)),
+      selectable: true,
+      deletable: !canvasReadOnly && !disabled,
+      reconnectable: !canvasReadOnly && !disabled,
+    };
+  });
 
   function snapshot(
     snapshotLayout: WorkflowCanvasLayout = layout,
@@ -776,4 +790,19 @@ function cssNumber(
 ) {
   const value = Number.parseFloat(styles.getPropertyValue(name));
   return Number.isFinite(value) ? value : fallback;
+}
+
+function workflowRunStatuses(testRun: FlowRun | null) {
+  const statuses = new Map<string, WorkflowCanvasRunStatus>();
+  const attempts = new Map<string, number>();
+  if (!testRun) return statuses;
+  for (const nodeRun of testRun.nodeRuns) {
+    if ((attempts.get(nodeRun.nodeId) ?? -1) > nodeRun.attempt) continue;
+    attempts.set(nodeRun.nodeId, nodeRun.attempt);
+    statuses.set(nodeRun.nodeId, nodeRun.status);
+  }
+  for (const nodeId of testRun.readyNodes) {
+    if (!statuses.has(nodeId)) statuses.set(nodeId, "ready");
+  }
+  return statuses;
 }

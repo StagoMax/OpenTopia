@@ -1,19 +1,12 @@
-import {
-  FlaskConical,
-  Play,
-  Plus,
-  RefreshCw,
-  Send,
-  ShieldCheck,
-} from "lucide-react";
+import { FlaskConical, Plus, RefreshCw, Send, ShieldCheck } from "lucide-react";
 import { Badge, Button } from "../ui";
+import { nextFlowEditorStage } from "./flowEditorProgress";
 
 export function FlowEditorToolbar({
   activeTestRun,
   busy,
   canActivate,
   canCreateDraft,
-  canDryRun,
   canTestRun,
   draftExists,
   flowId,
@@ -21,11 +14,9 @@ export function FlowEditorToolbar({
   nodeCount,
   onActivate,
   onCreateDraft,
-  onDryRun,
   onRefresh,
   onTestRun,
   onValidate,
-  passedDryRun,
   successfulTestRun,
   threadReady,
   validated,
@@ -34,7 +25,6 @@ export function FlowEditorToolbar({
   busy: string | null;
   canActivate: boolean;
   canCreateDraft: boolean;
-  canDryRun: boolean;
   canTestRun: boolean;
   draftExists: boolean;
   flowId: string;
@@ -42,37 +32,34 @@ export function FlowEditorToolbar({
   nodeCount: number;
   onActivate(): void;
   onCreateDraft(): void;
-  onDryRun(): void;
   onRefresh(): void;
   onTestRun(): void;
   onValidate(): void;
-  passedDryRun: boolean;
   successfulTestRun: boolean;
   threadReady: boolean;
   validated: boolean;
 }) {
-  const nextAction = !draftExists
-    ? {
-        disabled: !canCreateDraft,
-        icon: Plus,
-        label: busy === "create" ? "创建中…" : "保存草稿",
-        onClick: onCreateDraft,
-      }
-    : !validated
+  const stage = nextFlowEditorStage({
+    draftExists,
+    successfulTestRun,
+    validated,
+  });
+  const nextAction =
+    stage === "save"
       ? {
-          disabled: false,
-          icon: ShieldCheck,
-          label: busy === "validate" ? "验证中…" : "验证",
-          onClick: onValidate,
+          disabled: !canCreateDraft,
+          icon: Plus,
+          label: busy === "create" ? "创建中…" : "保存草稿",
+          onClick: onCreateDraft,
         }
-      : !passedDryRun
+      : stage === "validate"
         ? {
-            disabled: !canDryRun,
-            icon: Play,
-            label: busy === "simulate" ? "Dry Run…" : "Dry Run",
-            onClick: onDryRun,
+            disabled: false,
+            icon: ShieldCheck,
+            label: busy === "validate" ? "验证中…" : "验证",
+            onClick: onValidate,
           }
-        : !successfulTestRun
+        : stage === "test"
           ? {
               disabled: !canTestRun || activeTestRun,
               icon: FlaskConical,
@@ -105,7 +92,7 @@ export function FlowEditorToolbar({
           <strong>{name || "Untitled Flow"}</strong>
           <small>
             {threadReady
-              ? `${nodeCount} 个节点 · ${flowId}`
+              ? `${nodeCount} 个步骤 · ${flowId}`
               : "请先新建或选择一个 Flow 任务以保存草稿"}
           </small>
         </span>

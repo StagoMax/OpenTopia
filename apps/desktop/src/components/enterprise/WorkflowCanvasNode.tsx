@@ -4,19 +4,25 @@ import {
   BadgeCheck,
   Bot,
   Braces,
+  CheckCircle2,
   CircleDot,
   GitBranch,
   Inbox,
+  LoaderCircle,
   Merge,
+  PauseCircle,
   RadioTower,
   Repeat2,
   Sparkles,
   ShieldCheck,
   Trash2,
   Wrench,
+  XCircle,
 } from "lucide-react";
 import { IconButton } from "../ui";
-import type { FlowNodeKind } from "../../types";
+import type { FlowNodeKind, FlowNodeRun } from "../../types";
+
+export type WorkflowCanvasRunStatus = FlowNodeRun["status"] | "ready";
 
 export type WorkflowCanvasNodeData = Record<string, unknown> & {
   activationText: string;
@@ -27,6 +33,7 @@ export type WorkflowCanvasNodeData = Record<string, unknown> & {
   onRemove(nodeId: string): void;
   onSelect(nodeId: string): void;
   readOnly: boolean;
+  runStatus?: WorkflowCanvasRunStatus;
   subtitle: string;
 };
 
@@ -49,6 +56,7 @@ export const WorkflowCanvasNode = memo(function WorkflowCanvasNode({
     onRemove,
     onSelect,
     readOnly,
+    runStatus,
     subtitle,
   } = data;
   const NodeIcon = nodeIcon(kind);
@@ -59,7 +67,7 @@ export const WorkflowCanvasNode = memo(function WorkflowCanvasNode({
       aria-label={`${label}，${kind} node`}
       className={`workflow-node workflow-node--${kind}${
         selected ? " is-selected" : ""
-      }`}
+      }${runStatus ? ` is-run-${runStatus}` : ""}`}
     >
       <Handle
         aria-label={`连接到 ${label}`}
@@ -102,7 +110,11 @@ export const WorkflowCanvasNode = memo(function WorkflowCanvasNode({
           <strong title={label}>{label}</strong>
           <small title={subtitle}>{subtitle}</small>
         </span>
-        {kind === "agent" ? <Braces aria-hidden="true" size={14} /> : null}
+        {runStatus ? (
+          <NodeRunStatus status={runStatus} />
+        ) : kind === "agent" ? (
+          <Braces aria-hidden="true" size={14} />
+        ) : null}
       </button>
       <footer className="workflow-node__final">
         <CircleDot aria-hidden="true" size={12} />
@@ -138,6 +150,35 @@ export const WorkflowCanvasNode = memo(function WorkflowCanvasNode({
     </article>
   );
 }, workflowCanvasNodePropsEqual);
+
+function NodeRunStatus({ status }: { status: WorkflowCanvasRunStatus }) {
+  const Icon =
+    status === "succeeded"
+      ? CheckCircle2
+      : status === "failed" || status === "cancelled"
+        ? XCircle
+        : status === "waiting_approval" || status === "waiting_human"
+          ? PauseCircle
+          : LoaderCircle;
+  const label = runStatusLabel(status);
+  return (
+    <span className="workflow-node__run-status" title={label}>
+      <Icon aria-hidden="true" size={14} />
+      <span>{label}</span>
+    </span>
+  );
+}
+
+function runStatusLabel(status: WorkflowCanvasRunStatus) {
+  if (status === "ready") return "就绪";
+  if (status === "succeeded") return "成功";
+  if (status === "failed") return "失败";
+  if (status === "cancelled") return "取消";
+  if (status === "waiting_approval" || status === "waiting_human")
+    return "等待人工";
+  if (status === "resuming") return "恢复中";
+  return "运行中";
+}
 
 function workflowCanvasNodePropsEqual(
   previous: NodeProps<WorkflowCanvasNodeType>,

@@ -11,21 +11,21 @@ const panelSource = readFileSync(
   "utf8",
 );
 
-test("Flow Agent inspector header keeps actions inset on one row", () => {
+test("Flow Agent inspector header keeps actions inset and can wrap", () => {
   assert.match(
     styles,
-    /\.agent-template-panel--rail > \.ot-panel > \.ot-panel__header \{[^}]*min-block-size: calc\(var\(--control-height-lg\) \+ var\(--space-4\)\);[^}]*padding: var\(--space-3\) var\(--space-4\);[^}]*\}/s,
+    /\.agent-template-panel--rail > \.ot-panel > \.ot-panel__header \{[^}]*flex-wrap: wrap;[^}]*min-block-size: calc\(var\(--control-height-lg\) \+ var\(--space-4\)\);[^}]*padding: var\(--space-3\) var\(--space-4\);[^}]*\}/s,
   );
   assert.match(
     styles,
-    /\.agent-template-panel--rail \.agent-template-panel__header-actions \{[^}]*flex: 0 0 auto;[^}]*flex-wrap: nowrap;[^}]*gap: var\(--space-2\);[^}]*\}/s,
+    /\.agent-template-panel--rail \.agent-template-panel__header-actions \{[^}]*flex: 0 0 auto;[^}]*max-inline-size: 100%;[^}]*margin-inline-start: auto;[^}]*flex-wrap: wrap;[^}]*gap: var\(--space-2\);[^}]*\}/s,
   );
 });
 
-test("Flow Agent inspector title yields space to its actions", () => {
+test("Flow Agent inspector title reserves a useful width before wrapping", () => {
   assert.match(
     styles,
-    /\.agent-template-panel--rail > \.ot-panel > \.ot-panel__header > \.ot-panel__title \{[^}]*flex: 1 1 auto;[^}]*min-inline-size: 0;[^}]*text-overflow: ellipsis;[^}]*white-space: nowrap;[^}]*\}/s,
+    /\.agent-template-panel--rail > \.ot-panel > \.ot-panel__header > \.ot-panel__title \{[^}]*flex: 1 1 calc\(var\(--space-16\) \* 4\);[^}]*min-inline-size: 0;[^}]*text-overflow: ellipsis;[^}]*white-space: nowrap;[^}]*\}/s,
   );
 });
 

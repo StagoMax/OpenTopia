@@ -18,6 +18,7 @@
 
 .flow-workspace-inspector__header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: var(--space-3);
@@ -29,21 +30,24 @@
 
 .flow-workspace-inspector__heading {
   display: grid;
+  flex: 1 1 calc(var(--space-16) * 4);
   min-inline-size: 0;
   gap: var(--space-1);
 }
 
-.flow-workspace-inspector__heading strong,
+.flow-workspace-inspector__heading h2,
 .flow-workspace-inspector__heading small {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.flow-workspace-inspector__heading strong {
+.flow-workspace-inspector__heading h2 {
+  margin: 0;
   color: var(--text);
-  font-size: var(--font-size-sm);
+  font-size: var(--font-size-base);
   font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-body);
 }
 
 .flow-workspace-inspector__heading small {
@@ -57,7 +61,8 @@
   align-items: center;
   justify-content: flex-end;
   gap: var(--space-2);
-  max-inline-size: 72%;
+  max-inline-size: 100%;
+  margin-inline-start: auto;
   flex-wrap: wrap;
 }
 
@@ -83,8 +88,16 @@
 }
 
 .flow-workspace-inspector__section > header {
-  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-subtle);
+  padding-bottom: var(--space-3);
+}
+
+.flow-workspace-inspector__section > header h3 {
+  margin: 0;
+  color: var(--text);
   font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-body);
 }
 
 .flow-workspace-inspector__section > p {
@@ -94,21 +107,52 @@
   line-height: var(--line-height-relaxed);
 }
 
-.flow-inspector-facts {
+.flow-workspace-inspector .flow-inspector-facts {
+  display: grid;
   grid-template-columns: minmax(0, 1fr);
-  gap: var(--space-2);
+  gap: var(--space-0);
   margin: 0;
 }
 
-.flow-inspector-facts > div {
-  grid-template-columns: minmax(0, 0.42fr) minmax(0, 1fr);
-  align-items: start;
-  gap: var(--space-3);
-  padding-block: var(--space-2);
+.flow-workspace-inspector .flow-inspector-facts > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-1);
+  min-inline-size: 0;
+  border-bottom: 1px solid var(--border-subtle);
+  padding-block: var(--space-4);
 }
 
-.flow-inspector-facts dd {
-  text-align: end;
+.flow-workspace-inspector .flow-inspector-facts > div:first-child {
+  padding-top: 0;
+}
+
+.flow-workspace-inspector .flow-inspector-facts > div:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.flow-workspace-inspector .flow-inspector-facts dt {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+  line-height: var(--line-height-body);
+}
+
+.flow-workspace-inspector .flow-inspector-facts dd {
+  min-inline-size: 0;
+  margin: 0;
+  color: var(--text);
+  font-size: var(--font-size-base);
+  line-height: var(--line-height-relaxed);
+  overflow-wrap: anywhere;
+  text-align: start;
+  font-variant-numeric: tabular-nums;
+}
+
+.flow-workspace-inspector .flow-inspector-facts code {
+  color: var(--text-secondary);
+  font: var(--font-size-xs) / var(--line-height-relaxed) var(--font-mono);
 }
 
 .flow-workspace-inspector__textarea {
@@ -231,9 +275,12 @@
   gap: var(--space-3);
 }
 
-.enterprise-core-detail__payload > header strong {
-  color: var(--text-secondary);
+.enterprise-core-detail__payload > header h3 {
+  margin: var(--space-0);
+  color: var(--text);
   font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-body);
 }
 
 .enterprise-core-detail__payload > pre {
@@ -260,6 +307,20 @@
   cursor: pointer;
   color: var(--text-secondary);
   font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  line-height: var(--control-height-sm);
+}
+
+.flow-inspector-panel summary:hover,
+.enterprise-agent-instructions > summary:hover {
+  color: var(--text);
+}
+
+.flow-inspector-panel summary:focus-visible,
+.enterprise-agent-instructions > summary:focus-visible {
+  border-radius: var(--radius-sm);
+  outline: 2px solid var(--focus-ring);
+  outline-offset: var(--space-1);
 }
 
 .enterprise-technical-details[open] > summary {

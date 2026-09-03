@@ -58,7 +58,9 @@ export function editableWorkflowCanvasModel(
               ? "未关联 Agent"
               : selection.kind === "tool"
                 ? "deterministic action"
-                : `${selection.kind} node`,
+                : selection.kind === "output"
+                  ? "系统管理的固定终点"
+                  : `${selection.kind} node`,
       };
     }),
   };
@@ -117,5 +119,6 @@ function compiledNodeSubtitle(node: FlowGraphNode): string {
     return typeof version === "number" ? `${reference}@${version}` : reference;
   }
   if (node.kind === "tool") return "deterministic action";
+  if (node.kind === "output") return "系统管理的固定终点";
   return `${node.kind} node`;
 }

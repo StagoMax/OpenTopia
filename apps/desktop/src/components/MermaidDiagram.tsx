@@ -1,6 +1,8 @@
-import { Check, Copy } from "lucide-react";
+import { Check, Copy, Maximize2, X } from "lucide-react";
+import { createPortal } from "react-dom";
 import { useEffect, useId, useRef, useState } from "react";
 import { Button } from "./ui/Button";
+import { IconButton } from "./ui/IconButton";
 
 type RenderState =
   | { source: string; status: "loading"; svg: null }
@@ -27,7 +29,10 @@ export function MermaidDiagram({ source }: { source: string }) {
     svg: null,
   });
   const [copyStatus, setCopyStatus] = useState<CopyStatus>("idle");
+  const [isExpanded, setIsExpanded] = useState(false);
   const copyResetTimerRef = useRef<number | null>(null);
+  const expandButtonRef = useRef<HTMLButtonElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     let disposed = false;
@@ -90,6 +95,24 @@ export function MermaidDiagram({ source }: { source: string }) {
     [],
   );
 
+  useEffect(() => {
+    if (!isExpanded) return;
+
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setIsExpanded(false);
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    window.requestAnimationFrame(() => closeButtonRef.current?.focus());
+
+    return () => {
+      document.removeEventListener("keydown", closeOnEscape);
+      document.body.style.overflow = previousOverflow;
+      window.requestAnimationFrame(() => expandButtonRef.current?.focus());
+    };
+  }, [isExpanded]);
+
   const activeState: RenderState =
     renderState.source === source
       ? renderState
@@ -104,6 +127,17 @@ export function MermaidDiagram({ source }: { source: string }) {
   return (
     <figure className="mermaid-diagram">
       <div className="mermaid-diagram__toolbar">
+        <IconButton
+          ref={expandButtonRef}
+          aria-label="放大查看流程图"
+          className="mermaid-diagram__expand"
+          disabled={activeState.status !== "ready"}
+          size="compact"
+          title="放大查看"
+          onClick={() => setIsExpanded(true)}
+        >
+          <Maximize2 size={14} aria-hidden="true" />
+        </IconButton>
         <Button
           className="mermaid-diagram__copy"
           data-state={copyStatus}
@@ -134,12 +168,14 @@ export function MermaidDiagram({ source }: { source: string }) {
       </div>
 
       {activeState.status === "ready" ? (
-        <div
-          aria-label="Mermaid 图表"
-          className="mermaid-diagram__canvas"
-          role="img"
-          dangerouslySetInnerHTML={{ __html: activeState.svg }}
-        />
+        isExpanded ? null : (
+          <div
+            aria-label="Mermaid 图表"
+            className="mermaid-diagram__canvas"
+            role="img"
+            dangerouslySetInnerHTML={{ __html: activeState.svg }}
+          />
+        )
       ) : activeState.status === "error" ? (
         <div className="mermaid-diagram__fallback" role="alert">
           <p>图表无法显示，以下是 Mermaid 源码。</p>
@@ -160,6 +196,43 @@ export function MermaidDiagram({ source }: { source: string }) {
             ? "Mermaid 源码复制失败"
             : ""}
       </span>
+      {isExpanded && activeState.status === "ready"
+        ? createPortal(
+            <div
+              aria-label="流程图放大查看"
+              aria-modal="true"
+              className="mermaid-diagram__lightbox"
+              role="dialog"
+              onPointerDown={(event) => {
+                if (event.target === event.currentTarget) {
+                  setIsExpanded(false);
+                }
+              }}
+            >
+              <div className="mermaid-diagram__lightbox-dialog">
+                <header className="mermaid-diagram__lightbox-header">
+                  <strong>流程图</strong>
+                  <IconButton
+                    ref={closeButtonRef}
+                    aria-label="关闭流程图放大查看"
+                    size="compact"
+                    title="关闭"
+                    onClick={() => setIsExpanded(false)}
+                  >
+                    <X size={18} aria-hidden="true" />
+                  </IconButton>
+                </header>
+                <div
+                  aria-label="Mermaid 图表放大视图"
+                  className="mermaid-diagram__lightbox-canvas"
+                  dangerouslySetInnerHTML={{ __html: activeState.svg }}
+                  role="img"
+                />
+              </div>
+            </div>,
+            document.body,
+          )
+        : null}
     </figure>
   );
 }

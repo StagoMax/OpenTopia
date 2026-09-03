@@ -3027,6 +3027,48 @@ export function App() {
     }
   }
 
+  async function submitEditedMessage(
+    _message: Message,
+    input: string,
+  ): Promise<boolean> {
+    if (
+      !activeThread ||
+      !activeConversationController ||
+      isSending ||
+      activeApproval ||
+      activeUserInput
+    ) {
+      return false;
+    }
+    const messageText = input.trim();
+    if (!messageText) return false;
+    setActionError(null);
+    activeConversationController.clearCommandError();
+    try {
+      const result = await activeConversationController.send({
+        content: messageText,
+        replaceMessageId: _message.id,
+        collaborationMode,
+        goalId: reusableGoalId(collaborationMode, goalSnapshot),
+        libraryProvider:
+          activeThread.experienceMode === "flow"
+            ? (flowLibraryBindings[activeThread.id] ?? undefined)
+            : undefined,
+      });
+      if (!result) {
+        setActionError(
+          activeConversationController.getSnapshot().commandError ??
+            "消息发送失败。",
+        );
+        return false;
+      }
+      return activeThreadIdRef.current === activeThread.id;
+    } catch (error) {
+      setActionError(errorMessage(error));
+      return false;
+    }
+  }
+
   async function cancelTurn() {
     if (!activeConversationController || !conversationTurnCanBeCancelled)
       return;
@@ -4136,6 +4178,7 @@ export function App() {
                         )
                       }
                       onOpenMarkdownLink={openMarkdownLink}
+                      onEditMessage={submitEditedMessage}
                       onImplementProposedPlan={() => {
                         setCollaborationMode("default");
                         void submitMessage(

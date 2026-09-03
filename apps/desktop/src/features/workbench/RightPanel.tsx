@@ -359,7 +359,7 @@ export function RightPanel({
       <aside
         className="right-panel flow-inspector-panel"
         id="workspace-right-panel"
-        aria-label="Flow 配置"
+        aria-label="Flow 详情与配置"
       >
         <FlowInspectorHost />
       </aside>

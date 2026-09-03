@@ -38,6 +38,7 @@ import type {
   ContextSourceFile,
   InlineImageAttachment,
   InlineMessageContentPart,
+  Message,
   PreviewTarget,
   Project,
   SkillDescriptor,
@@ -209,6 +210,7 @@ export function SideTaskConversation({
     imageAttachments: InlineImageAttachment[],
     contentParts: InlineMessageContentPart[],
     collaborationModeOverride?: CollaborationMode,
+    replaceMessageId?: string,
   ): Promise<boolean> {
     const messageText = input.trim();
     if (
@@ -237,6 +239,7 @@ export function SideTaskConversation({
       collaborationMode: collaborationModeOverride ?? collaborationMode,
       imageAttachments,
       contentParts,
+      replaceMessageId,
     });
     if (!result) return false;
     setContextSources((current) =>
@@ -371,6 +374,9 @@ export function SideTaskConversation({
             )
           }
           onOpenMarkdownLink={onOpenMarkdownLink}
+          onEditMessage={async (message: Message, content: string) =>
+            submitSideTaskMessage(content, [], [], undefined, message.id)
+          }
           onImplementProposedPlan={() => {
             setCollaborationMode("default");
             void submitSideTaskMessage(

@@ -208,7 +208,7 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
       </section>
       <section className="enterprise-core-detail__payload">
         <header>
-          <strong>需要确认的信息</strong>
+          <h3>需要确认的信息</h3>
           <Badge variant="neutral">
             {selected.kind === "task"
               ? humanTaskSourceLabel(selected.task.sourceKind)
@@ -275,7 +275,7 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
               {snapshot.error ?? error}
             </p>
           ) : null}
-          <FlowInspectorSection title="Assignment / 处理人">
+          <FlowInspectorSection title="处理信息">
             {selected.kind === "task" ? (
               <>
                 <dl className="flow-inspector-facts">
@@ -333,7 +333,7 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
             )}
           </FlowInspectorSection>
           {selected.kind === "task" ? (
-            <FlowInspectorSection title="Resolution / 处理说明">
+            <FlowInspectorSection title="处理说明">
               {inputRequest ? (
                 <PlanChoiceCard
                   error={null}
@@ -382,23 +382,29 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
               ) : null}
             </FlowInspectorSection>
           ) : null}
-          <FlowInspectorSection title="Technical details / 技术信息">
+          <FlowInspectorSection title="技术信息">
             <details className="enterprise-technical-details">
               <summary>查看技术标识</summary>
               <dl className="flow-inspector-facts">
                 <div>
                   <dt>事项 ID</dt>
-                  <dd>{selected.id.replace(/^(task|case):/, "")}</dd>
+                  <dd>
+                    <code>{selected.id.replace(/^(task|case):/, "")}</code>
+                  </dd>
                 </div>
                 {selected.kind === "case" ? (
                   <>
                     <div>
-                      <dt>Flow revision</dt>
-                      <dd>{selected.flowCase.flowRevisionId}</dd>
+                      <dt>Flow Revision ID</dt>
+                      <dd>
+                        <code>{selected.flowCase.flowRevisionId}</code>
+                      </dd>
                     </div>
                     <div>
-                      <dt>Trigger</dt>
-                      <dd>{selected.flowCase.triggerId}</dd>
+                      <dt>触发器 ID</dt>
+                      <dd>
+                        <code>{selected.flowCase.triggerId}</code>
+                      </dd>
                     </div>
                   </>
                 ) : null}

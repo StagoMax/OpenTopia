@@ -362,6 +362,55 @@
   line-height: var(--line-height-relaxed);
 }
 
+.flow-node-test-result__timing {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.flow-node-test-result__timing span + span {
+  border-inline-start: 1px solid var(--border);
+  padding-inline-start: var(--space-3);
+}
+
+.flow-node-test-result__json {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface-subtle);
+}
+
+.flow-node-test-result__json summary {
+  cursor: pointer;
+  padding: var(--space-3);
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+}
+
+.flow-node-test-result__json pre {
+  overflow: auto;
+  max-block-size: calc(var(--control-height-lg) * 6);
+  margin: 0;
+  border-top: 1px solid var(--border-subtle);
+  padding: var(--space-3);
+  color: var(--text-secondary);
+  font: var(--font-size-xs) / var(--line-height-relaxed) var(--font-mono);
+  white-space: pre-wrap;
+}
+
+.flow-node-test-result__error {
+  margin: 0;
+  border: 1px solid var(--danger);
+  border-radius: var(--radius-sm);
+  background: var(--danger-subtle);
+  padding: var(--space-3);
+  color: var(--danger);
+  font-size: var(--font-size-xs);
+  line-height: var(--line-height-relaxed);
+}
+
 .flow-editor-progress {
   display: grid;
   gap: var(--space-3);

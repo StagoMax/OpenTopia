@@ -18,6 +18,7 @@ import {
   CircleAlert,
   Copy,
   Loader2,
+  Pencil,
 } from "lucide-react";
 import {
   PendingTurnStatus,
@@ -91,6 +92,7 @@ export type MessageListProps = {
   onLoadToolResultDetail?(eventId: string): Promise<ToolResult>;
   onLoadOlderMessages?(): Promise<void>;
   onRetrySync?(): void;
+  onEditMessage?(message: Message, content: string): Promise<boolean>;
 };
 
 export function MessageList({
@@ -119,6 +121,7 @@ export function MessageList({
   onLoadToolResultDetail,
   onLoadOlderMessages,
   onRetrySync,
+  onEditMessage,
 }: MessageListProps) {
   // Tool events originate in an external store, whose updates React must
   // process synchronously. Keep the previous timeline during that urgent pass
@@ -417,6 +420,7 @@ export function MessageList({
                         : undefined
                     }
                     isProposedPlanActionDisabled={isProposedPlanActionDisabled}
+                    onEditMessage={onEditMessage}
                   />
                   {turnIds.map((turnId) => (
                     <Fragment key={turnId}>
@@ -536,6 +540,7 @@ const MessageBubble = memo(function MessageBubble({
   onOpenMarkdownLink,
   onImplementProposedPlan,
   isProposedPlanActionDisabled,
+  onEditMessage,
 }: {
   attachmentSources: ContextSourceRef[];
   message: Message;
@@ -547,10 +552,14 @@ const MessageBubble = memo(function MessageBubble({
   onOpenMarkdownLink(href: string): void;
   onImplementProposedPlan?(): void;
   isProposedPlanActionDisabled: boolean;
+  onEditMessage?(message: Message, content: string): Promise<boolean>;
 }) {
   const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "error">(
     "idle",
   );
+  const [isEditing, setIsEditing] = useState(false);
+  const [editValue, setEditValue] = useState("");
+  const [isSubmittingEdit, setIsSubmittingEdit] = useState(false);
   const displayParts = useMemo(
     () => conversationDisplayParts(message),
     [message],
@@ -635,101 +644,183 @@ const MessageBubble = memo(function MessageBubble({
 
   if (renderedParts.length === 0) return null;
 
+  const canEdit =
+    message.role === "user" &&
+    Boolean(onEditMessage) &&
+    displayParts.every(
+      (part) => part.type === "text" || part.type === "turn_context",
+    );
+  const beginEditing = () => {
+    setEditValue(copyText);
+    setIsEditing(true);
+  };
+  const cancelEditing = () => {
+    if (isSubmittingEdit) return;
+    setIsEditing(false);
+  };
+  const submitEdit = async () => {
+    const nextValue = editValue.trim();
+    if (!nextValue || !onEditMessage || isSubmittingEdit) return;
+    setIsSubmittingEdit(true);
+    try {
+      const accepted = await onEditMessage(message, nextValue);
+      if (accepted) setIsEditing(false);
+    } finally {
+      setIsSubmittingEdit(false);
+    }
+  };
+
   return (
     <article className={`message ${message.role}`}>
       <div className="message-content">
-        <div className="message-body">
-          {renderedParts.map(
-            ({ part, referencedImage, previewImage, previewIndex }, index) => (
-              <MessagePartView
-                attachmentSources={attachmentSources}
-                key={index}
-                messageId={message.id}
-                part={part}
-                referencedImage={referencedImage}
-                imagePreviewUrl={
-                  previewIndex === null
-                    ? undefined
-                    : imagePreviews[previewIndex]?.previewUrl
+        {isEditing ? (
+          <div className="message-edit-box">
+            <textarea
+              value={editValue}
+              autoFocus
+              aria-label="编辑消息"
+              rows={Math.min(8, Math.max(2, editValue.split("\n").length))}
+              onChange={(event) => setEditValue(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Escape") cancelEditing();
+                if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+                  event.preventDefault();
+                  void submitEdit();
                 }
-                onPreviewImage={
-                  previewIndex === null || !previewImage
-                    ? undefined
-                    : () =>
-                        onOpenImagePreview(
-                          `${message.id}:${previewIndex}`,
-                          previewImage,
-                        )
-                }
-                role={message.role}
-                threadId={threadId}
-                artifacts={artifacts}
-                onOpenArtifact={onOpenArtifact}
-                onOpenAttachmentPreview={onOpenAttachmentPreview}
-                onOpenMarkdownLink={onOpenMarkdownLink}
-                onImplementProposedPlan={onImplementProposedPlan}
-                isProposedPlanActionDisabled={isProposedPlanActionDisabled}
-              />
-            ),
-          )}
-        </div>
-        <div className="message-actions">
-          {timestamp ? (
-            <time dateTime={message.createdAt} title={timestamp.title}>
-              {timestamp.label}
-            </time>
-          ) : null}
-          {copyText ? (
-            <IconButton
-              className="message-copy-button"
-              size="compact"
-              variant="quiet"
-              aria-label={
-                copyStatus === "copied"
-                  ? "消息已复制"
-                  : copyStatus === "error"
-                    ? "复制失败，重试"
-                    : "复制消息"
-              }
-              title={
-                copyStatus === "copied"
-                  ? "已复制"
-                  : copyStatus === "error"
-                    ? "复制失败，点击重试"
-                    : "复制消息"
-              }
-              data-state={copyStatus}
-              onClick={() => {
-                void (async () => {
-                  try {
-                    if (!navigator.clipboard?.writeText) {
-                      throw new Error("Clipboard API unavailable");
-                    }
-                    await navigator.clipboard.writeText(copyText);
-                    setCopyStatus("copied");
-                  } catch {
-                    setCopyStatus("error");
-                  }
-                })();
               }}
-            >
-              {copyStatus === "copied" ? (
-                <Check size={14} aria-hidden="true" />
-              ) : copyStatus === "error" ? (
-                <CircleAlert size={14} aria-hidden="true" />
-              ) : (
-                <Copy size={14} aria-hidden="true" />
-              )}
-            </IconButton>
-          ) : null}
-          <span className="ot-sr-only" aria-live="polite">
-            {copyStatus === "copied"
-              ? "消息已复制到剪贴板"
-              : copyStatus === "error"
-                ? "消息复制失败"
-                : ""}
-          </span>
-        </div>
+            />
+            <div className="message-edit-actions">
+              <Button
+                size="compact"
+                variant="secondary"
+                onClick={cancelEditing}
+              >
+                取消
+              </Button>
+              <Button
+                size="compact"
+                variant="primary"
+                disabled={!editValue.trim() || isSubmittingEdit}
+                onClick={() => void submitEdit()}
+              >
+                {isSubmittingEdit ? (
+                  <Loader2 size={14} className="spin" aria-hidden="true" />
+                ) : null}
+                发送
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <div className="message-body">
+            {renderedParts.map(
+              (
+                { part, referencedImage, previewImage, previewIndex },
+                index,
+              ) => (
+                <MessagePartView
+                  attachmentSources={attachmentSources}
+                  key={index}
+                  messageId={message.id}
+                  part={part}
+                  referencedImage={referencedImage}
+                  imagePreviewUrl={
+                    previewIndex === null
+                      ? undefined
+                      : imagePreviews[previewIndex]?.previewUrl
+                  }
+                  onPreviewImage={
+                    previewIndex === null || !previewImage
+                      ? undefined
+                      : () =>
+                          onOpenImagePreview(
+                            `${message.id}:${previewIndex}`,
+                            previewImage,
+                          )
+                  }
+                  role={message.role}
+                  threadId={threadId}
+                  artifacts={artifacts}
+                  onOpenArtifact={onOpenArtifact}
+                  onOpenAttachmentPreview={onOpenAttachmentPreview}
+                  onOpenMarkdownLink={onOpenMarkdownLink}
+                  onImplementProposedPlan={onImplementProposedPlan}
+                  isProposedPlanActionDisabled={isProposedPlanActionDisabled}
+                />
+              ),
+            )}
+          </div>
+        )}
+        {!isEditing ? (
+          <div className="message-actions">
+            {timestamp ? (
+              <time dateTime={message.createdAt} title={timestamp.title}>
+                {timestamp.label}
+              </time>
+            ) : null}
+            {copyText ? (
+              <IconButton
+                className="message-copy-button"
+                size="compact"
+                variant="quiet"
+                aria-label={
+                  copyStatus === "copied"
+                    ? "消息已复制"
+                    : copyStatus === "error"
+                      ? "复制失败，重试"
+                      : "复制消息"
+                }
+                title={
+                  copyStatus === "copied"
+                    ? "已复制"
+                    : copyStatus === "error"
+                      ? "复制失败，点击重试"
+                      : "复制消息"
+                }
+                data-state={copyStatus}
+                onClick={() => {
+                  void (async () => {
+                    try {
+                      if (!navigator.clipboard?.writeText) {
+                        throw new Error("Clipboard API unavailable");
+                      }
+                      await navigator.clipboard.writeText(copyText);
+                      setCopyStatus("copied");
+                    } catch {
+                      setCopyStatus("error");
+                    }
+                  })();
+                }}
+              >
+                {copyStatus === "copied" ? (
+                  <Check size={14} aria-hidden="true" />
+                ) : copyStatus === "error" ? (
+                  <CircleAlert size={14} aria-hidden="true" />
+                ) : (
+                  <Copy size={14} aria-hidden="true" />
+                )}
+              </IconButton>
+            ) : null}
+            {canEdit && !isEditing ? (
+              <IconButton
+                className="message-edit-button"
+                size="compact"
+                variant="quiet"
+                aria-label="编辑消息"
+                title="编辑消息"
+                onClick={beginEditing}
+              >
+                <Pencil size={14} aria-hidden="true" />
+              </IconButton>
+            ) : null}
+            <span className="ot-sr-only" aria-live="polite">
+              {copyStatus === "copied"
+                ? "消息已复制到剪贴板"
+                : copyStatus === "error"
+                  ? "消息复制失败"
+                  : ""}
+            </span>
+          </div>
+        ) : null}
       </div>
     </article>
   );
