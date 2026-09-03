@@ -20,6 +20,8 @@
   <p>
     <a href="#quick-start"><strong>Quick start</strong></a>
     &nbsp;&middot;&nbsp;
+    <a href="#demo-video">Demo video</a>
+    &nbsp;&middot;&nbsp;
     <a href="#highlights">Highlights</a>
     &nbsp;&middot;&nbsp;
     <a href="#architecture">Architecture</a>
@@ -46,6 +48,13 @@ history live in one desktop application.
 > OpenTopia is an active **developer preview**, not a stable end-user release.
 > It is currently Windows-first, has no official signed binaries, and may change
 > configuration or storage formats between revisions.
+
+## Demo video
+
+Watch a local OpenTopia agent process **1,166 order records** in a real Excel
+workflow:
+
+**[▶ Watch the OpenTopia project demo on Bilibili](https://www.bilibili.com/video/BV1r3tn6YEwk/)**
 
 ## Highlights
 

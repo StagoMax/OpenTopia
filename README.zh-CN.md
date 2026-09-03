@@ -20,6 +20,8 @@
   <p>
     <a href="#快速开始"><strong>快速开始</strong></a>
     &nbsp;&middot;&nbsp;
+    <a href="#演示视频">演示视频</a>
+    &nbsp;&middot;&nbsp;
     <a href="#核心能力">核心能力</a>
     &nbsp;&middot;&nbsp;
     <a href="#架构">架构</a>
@@ -45,6 +47,12 @@ OpenTopia 面向希望 AI Work Agent 能够在真实工作区中执行任务，�
 > OpenTopia 目前是持续开发中的**开发者预览版**，还不是稳定的最终用户产品。
 > 当前优先支持 Windows，尚未发布官方签名安装包，不同版本间的配置和存储
 > 格式也可能发生变化。
+
+## 演示视频
+
+观看 OpenTopia 的本地 AI Agent 在真实 Excel 工作流中自动处理 **1,166 条订单数据**：
+
+**[▶ 在哔哩哔哩观看 OpenTopia 项目演示](https://www.bilibili.com/video/BV1r3tn6YEwk/)**
 
 ## 核心能力
 
