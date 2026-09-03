@@ -120,29 +120,6 @@ fn find_stored_attachment(
     anyhow::bail!("attachment {attachment_id} is not available in this thread")
 }
 
-/// Resolve the host-selected source behind an attachment ID without reading it.
-///
-/// The returned path is only a locator. Callers must pass it through their
-/// normal execution-intent, policy, sandbox, and bounded-read path before
-/// touching the file.
-pub(super) fn stored_attachment_read_path(
-    ctx: &ToolInvocationContext,
-    attachment_id: Uuid,
-) -> anyhow::Result<PathBuf> {
-    match find_stored_attachment(ctx, attachment_id)? {
-        StoredAttachment::ContextSource { path, .. } => {
-            anyhow::ensure!(
-                !path.as_os_str().is_empty(),
-                "attachment {attachment_id} has no readable source path"
-            );
-            Ok(path)
-        }
-        StoredAttachment::InlineImage { .. } => {
-            anyhow::bail!("attachment {attachment_id} is an inline image, not a file source")
-        }
-    }
-}
-
 async fn load_stored_context_source(
     attachment: &StoredAttachment,
 ) -> anyhow::Result<LoadedContextSource> {

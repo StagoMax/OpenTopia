@@ -1,30 +1,24 @@
 use super::{
-    decode_typed_tool_input, derived_tool_schema, enforce_policy_decision, enforce_read_policy,
+    decode_typed_tool_input, enforce_policy_decision, enforce_read_policy,
     insert_attachment_provenance, normalize_workspace_path, read_stored_attachment_file,
-    required_typed_string, tool_resource_key, Tool, ToolExecutionPolicy, ToolInvocationContext,
-    ToolSideEffect, TypedTool,
+    required_typed_string, ToolInvocationContext,
 };
 use crate::execution::{FileReadRequest, FileWriteRequest};
-use crate::execution_authorization::ToolExecutionIntent;
 use crate::file_mutation::read_optional;
-use crate::model::{ModelContentPart, ToolCall, ToolResult};
-use crate::policy::PolicyDecision;
+use crate::model::{ModelContentPart, ToolResult};
 use crate::spreadsheet::{
-    execute_spreadsheet, CellAddress, CellRange, CellUpdate, DelimitedColumnMapping,
-    DelimitedFormat, DelimitedFormulaMode, ExportDelimitedRequest, FillTemplateRequest,
-    FilterRowsRequest, FindCellsRequest, FormulaInput, InspectDelimitedRequest,
-    InspectWorkbookRequest, ListSheetsRequest, ReadRangeRequest, ReadRangesRequest,
-    SheetRangeRequest, SheetWriteRequest, SpreadsheetAction, SpreadsheetCell, SpreadsheetCellInput,
-    SpreadsheetCellValue, SpreadsheetFileFormat, SpreadsheetFilterCondition,
+    execute_spreadsheet, CellAddress, CellRange, CellUpdate, DelimitedFormat, DelimitedFormulaMode,
+    ExportDelimitedRequest, FilterRowsRequest, FindCellsRequest, FormulaInput,
+    InspectDelimitedRequest, InspectWorkbookRequest, ListSheetsRequest, ReadRangeRequest,
+    ReadRangesRequest, SheetRangeRequest, SheetWriteRequest, SpreadsheetAction, SpreadsheetCell,
+    SpreadsheetCellInput, SpreadsheetCellValue, SpreadsheetFileFormat, SpreadsheetFilterCondition,
     SpreadsheetFilterMatchMode, SpreadsheetRequest, SpreadsheetResult, SpreadsheetSheetValidation,
-    SpreadsheetTextMatchMode, TransferColumn, TransferRowFilter, TransferRowsRequest,
-    ValidateWorkbookRequest, WriteWorkbookRequest,
+    SpreadsheetTextMatchMode, ValidateWorkbookRequest, WriteWorkbookRequest,
     MAX_INPUT_FILE_BYTES as MAX_SPREADSHEET_INPUT_BYTES,
 };
 use anyhow::Context;
-use async_trait::async_trait;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
@@ -44,18 +38,15 @@ enum SpreadsheetToolAction {
     Find,
     FilterRows,
     Validate,
-    FillTemplate,
-    TransferRows,
     ExportDelimited,
     Write,
     WriteRows,
     WriteColumns,
     CopyRows,
     CopyColumns,
-    Batch,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum SpreadsheetCopyContentMode {
     #[default]
@@ -63,29 +54,18 @@ pub(super) enum SpreadsheetCopyContentMode {
     ValuesAndFormulas,
 }
 
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(
-    tag = "type",
-    rename_all = "snake_case",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
-)]
-pub(super) enum SpreadsheetBatchOperation {
-    #[schemars(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
+enum SpreadsheetMutation {
     WriteRows {
         sheet: String,
         start: CellAddress,
-        #[schemars(length(max = 10000))]
         rows: Vec<Vec<SpreadsheetCellInput>>,
     },
-    #[schemars(rename_all = "camelCase")]
     WriteColumns {
         sheet: String,
         start: CellAddress,
-        #[schemars(length(max = 256))]
         columns: Vec<Vec<SpreadsheetCellInput>>,
     },
-    #[schemars(rename_all = "camelCase")]
     CopyRows {
         source_path: String,
         source_sheet: String,
@@ -94,10 +74,8 @@ pub(super) enum SpreadsheetBatchOperation {
         column_count: u32,
         destination_sheet: String,
         destination_start: CellAddress,
-        #[serde(default)]
         content_mode: SpreadsheetCopyContentMode,
     },
-    #[schemars(rename_all = "camelCase")]
     CopyColumns {
         source_path: String,
         source_sheet: String,
@@ -106,7 +84,6 @@ pub(super) enum SpreadsheetBatchOperation {
         column_count: u32,
         destination_sheet: String,
         destination_start: CellAddress,
-        #[serde(default)]
         content_mode: SpreadsheetCopyContentMode,
     },
 }
@@ -250,55 +227,6 @@ pub(super) enum SpreadsheetToolInput {
         sheets: Vec<SpreadsheetSheetValidation>,
     },
     #[schemars(rename_all = "camelCase")]
-    FillTemplate {
-        /// CSV/TSV source data path.
-        data_path: String,
-        /// Existing XLSX template path.
-        template_path: String,
-        /// Destination XLSX path.
-        output_path: String,
-        target_sheet: String,
-        #[serde(default)]
-        source_format: Option<DelimitedFormat>,
-        #[serde(default)]
-        source_header_row: u32,
-        #[serde(default)]
-        target_header_row: u32,
-        #[serde(default)]
-        target_start_row: Option<u32>,
-        /// Omit when equal header names can be matched automatically.
-        #[serde(default)]
-        mappings: Vec<DelimitedColumnMapping>,
-        #[serde(default)]
-        rstrip_tabs: bool,
-    },
-    #[schemars(rename_all = "camelCase")]
-    TransferRows {
-        /// Source workbook/data path. The protocol binds this from resource.
-        source_path: String,
-        source_sheet: String,
-        /// Existing XLSX template path.
-        template_path: String,
-        /// Destination XLSX path.
-        output_path: String,
-        target_sheet: String,
-        #[serde(default)]
-        source_header_row: u32,
-        #[serde(default)]
-        source_start_row: Option<u32>,
-        #[serde(default)]
-        target_header_row: u32,
-        #[serde(default)]
-        target_start_row: Option<u32>,
-        #[serde(default)]
-        #[schemars(length(max = 32))]
-        filters: Vec<TransferRowFilter>,
-        #[serde(default)]
-        filter_match_mode: Option<SpreadsheetFilterMatchMode>,
-        #[schemars(length(min = 1, max = 256))]
-        columns: Vec<TransferColumn>,
-    },
-    #[schemars(rename_all = "camelCase")]
     ExportDelimited {
         /// Source workbook path.
         path: String,
@@ -314,13 +242,8 @@ pub(super) enum SpreadsheetToolInput {
     },
     #[schemars(rename_all = "camelCase")]
     Write {
-        /// Destination selected by the model from the user's request. Relative and absolute paths follow the active filesystem authority.
         #[serde(default)]
         path: Option<String>,
-        #[serde(default)]
-        source_path: Option<String>,
-        #[serde(default)]
-        output_path: Option<String>,
         #[schemars(length(max = 256))]
         sheets: Vec<SheetWriteRequest>,
     },
@@ -332,12 +255,6 @@ pub(super) enum SpreadsheetToolInput {
         start: CellAddress,
         #[schemars(length(min = 1, max = 10000))]
         rows: Vec<Vec<SpreadsheetCellInput>>,
-        #[serde(default)]
-        source_path: Option<String>,
-        #[serde(default)]
-        output_path: Option<String>,
-        #[serde(default)]
-        atomic: Option<bool>,
     },
     #[schemars(rename_all = "camelCase")]
     WriteColumns {
@@ -347,12 +264,6 @@ pub(super) enum SpreadsheetToolInput {
         start: CellAddress,
         #[schemars(length(min = 1, max = 256))]
         columns: Vec<Vec<SpreadsheetCellInput>>,
-        #[serde(default)]
-        source_path: Option<String>,
-        #[serde(default)]
-        output_path: Option<String>,
-        #[serde(default)]
-        atomic: Option<bool>,
     },
     #[schemars(rename_all = "camelCase")]
     CopyRows {
@@ -369,12 +280,6 @@ pub(super) enum SpreadsheetToolInput {
         destination_start: CellAddress,
         #[serde(default)]
         content_mode: SpreadsheetCopyContentMode,
-        #[serde(default)]
-        source_path: Option<String>,
-        #[serde(default)]
-        output_path: Option<String>,
-        #[serde(default)]
-        atomic: Option<bool>,
     },
     #[schemars(rename_all = "camelCase")]
     CopyColumns {
@@ -391,27 +296,6 @@ pub(super) enum SpreadsheetToolInput {
         destination_start: CellAddress,
         #[serde(default)]
         content_mode: SpreadsheetCopyContentMode,
-        #[serde(default)]
-        source_path: Option<String>,
-        #[serde(default)]
-        output_path: Option<String>,
-        #[serde(default)]
-        atomic: Option<bool>,
-    },
-    #[schemars(rename_all = "camelCase")]
-    Batch {
-        #[serde(default)]
-        path: Option<String>,
-        #[serde(default)]
-        source_path: Option<String>,
-        #[serde(default)]
-        output_path: Option<String>,
-        /// Ordered operations validated before the output is written.
-        #[schemars(length(min = 1, max = 64))]
-        operations: Vec<SpreadsheetBatchOperation>,
-        /// Mutations are validate-then-write and atomic. Omit or set true.
-        #[serde(default)]
-        atomic: Option<bool>,
     },
 }
 
@@ -428,259 +312,13 @@ impl SpreadsheetToolInput {
             Self::Find { .. } => SpreadsheetToolAction::Find,
             Self::FilterRows { .. } => SpreadsheetToolAction::FilterRows,
             Self::Validate { .. } => SpreadsheetToolAction::Validate,
-            Self::FillTemplate { .. } => SpreadsheetToolAction::FillTemplate,
-            Self::TransferRows { .. } => SpreadsheetToolAction::TransferRows,
             Self::ExportDelimited { .. } => SpreadsheetToolAction::ExportDelimited,
             Self::Write { .. } => SpreadsheetToolAction::Write,
             Self::WriteRows { .. } => SpreadsheetToolAction::WriteRows,
             Self::WriteColumns { .. } => SpreadsheetToolAction::WriteColumns,
             Self::CopyRows { .. } => SpreadsheetToolAction::CopyRows,
             Self::CopyColumns { .. } => SpreadsheetToolAction::CopyColumns,
-            Self::Batch { .. } => SpreadsheetToolAction::Batch,
         }
-    }
-
-    fn path(&self) -> Option<&str> {
-        match self {
-            Self::InspectDelimited { path, .. }
-            | Self::Inspect { path, .. }
-            | Self::ListSheets { path, .. }
-            | Self::ReadRange { path, .. }
-            | Self::ReadRanges { path, .. }
-            | Self::ReadRows { path, .. }
-            | Self::ReadColumns { path, .. }
-            | Self::Find { path, .. }
-            | Self::FilterRows { path, .. }
-            | Self::Validate { path, .. }
-            | Self::Write { path, .. }
-            | Self::WriteRows { path, .. }
-            | Self::WriteColumns { path, .. }
-            | Self::CopyRows { path, .. }
-            | Self::CopyColumns { path, .. }
-            | Self::Batch { path, .. } => path.as_deref(),
-            Self::ExportDelimited { path, .. } => Some(path.as_str()),
-            Self::FillTemplate { .. } | Self::TransferRows { .. } => None,
-        }
-    }
-
-    fn attachment_id(&self) -> Option<&str> {
-        match self {
-            Self::InspectDelimited { attachment_id, .. }
-            | Self::Inspect { attachment_id, .. }
-            | Self::ListSheets { attachment_id, .. }
-            | Self::ReadRange { attachment_id, .. }
-            | Self::ReadRanges { attachment_id, .. }
-            | Self::ReadRows { attachment_id, .. }
-            | Self::ReadColumns { attachment_id, .. }
-            | Self::Find { attachment_id, .. }
-            | Self::FilterRows { attachment_id, .. }
-            | Self::Validate { attachment_id, .. } => attachment_id.as_deref(),
-            Self::FillTemplate { .. }
-            | Self::TransferRows { .. }
-            | Self::ExportDelimited { .. }
-            | Self::Write { .. }
-            | Self::WriteRows { .. }
-            | Self::WriteColumns { .. }
-            | Self::CopyRows { .. }
-            | Self::CopyColumns { .. }
-            | Self::Batch { .. } => None,
-        }
-    }
-
-    fn mutation_paths(&self) -> Vec<&str> {
-        let mut paths = Vec::new();
-        match self {
-            Self::FillTemplate {
-                data_path,
-                template_path,
-                output_path,
-                ..
-            } => paths.extend([
-                data_path.as_str(),
-                template_path.as_str(),
-                output_path.as_str(),
-            ]),
-            Self::TransferRows {
-                source_path,
-                template_path,
-                output_path,
-                ..
-            } => paths.extend([
-                source_path.as_str(),
-                template_path.as_str(),
-                output_path.as_str(),
-            ]),
-            Self::ExportDelimited {
-                path, output_path, ..
-            } => paths.extend([path.as_str(), output_path.as_str()]),
-            Self::Write {
-                path,
-                source_path,
-                output_path,
-                ..
-            }
-            | Self::WriteRows {
-                path,
-                source_path,
-                output_path,
-                ..
-            }
-            | Self::WriteColumns {
-                path,
-                source_path,
-                output_path,
-                ..
-            }
-            | Self::Batch {
-                path,
-                source_path,
-                output_path,
-                ..
-            } => paths.extend(
-                path.iter()
-                    .chain(source_path.iter())
-                    .chain(output_path.iter())
-                    .map(String::as_str),
-            ),
-            Self::CopyRows {
-                path,
-                from,
-                source_path,
-                output_path,
-                ..
-            }
-            | Self::CopyColumns {
-                path,
-                from,
-                source_path,
-                output_path,
-                ..
-            } => {
-                paths.extend(
-                    path.iter()
-                        .chain(source_path.iter())
-                        .chain(output_path.iter())
-                        .map(String::as_str),
-                );
-                paths.push(from);
-            }
-            Self::InspectDelimited { .. }
-            | Self::Inspect { .. }
-            | Self::ListSheets { .. }
-            | Self::ReadRange { .. }
-            | Self::ReadRanges { .. }
-            | Self::ReadRows { .. }
-            | Self::ReadColumns { .. }
-            | Self::Find { .. }
-            | Self::FilterRows { .. }
-            | Self::Validate { .. } => {}
-        }
-        if let Self::Batch { operations, .. } = self {
-            paths.extend(
-                operations
-                    .iter()
-                    .filter_map(spreadsheet_operation_source_path),
-            );
-        }
-        paths
-    }
-
-    fn mutation_output_path(&self) -> Option<&str> {
-        match self {
-            Self::FillTemplate { output_path, .. }
-            | Self::TransferRows { output_path, .. }
-            | Self::ExportDelimited { output_path, .. } => Some(output_path.as_str()),
-            Self::Write {
-                path, output_path, ..
-            }
-            | Self::WriteRows {
-                path, output_path, ..
-            }
-            | Self::WriteColumns {
-                path, output_path, ..
-            }
-            | Self::CopyRows {
-                path, output_path, ..
-            }
-            | Self::CopyColumns {
-                path, output_path, ..
-            }
-            | Self::Batch {
-                path, output_path, ..
-            } => output_path.as_deref().or(path.as_deref()),
-            Self::InspectDelimited { .. }
-            | Self::Inspect { .. }
-            | Self::ListSheets { .. }
-            | Self::ReadRange { .. }
-            | Self::ReadRanges { .. }
-            | Self::ReadRows { .. }
-            | Self::ReadColumns { .. }
-            | Self::Find { .. }
-            | Self::FilterRows { .. }
-            | Self::Validate { .. } => None,
-        }
-    }
-
-    fn mutation_read_paths(&self) -> Vec<&str> {
-        let mut paths = Vec::new();
-        match self {
-            Self::FillTemplate {
-                data_path,
-                template_path,
-                ..
-            } => paths.extend([data_path.as_str(), template_path.as_str()]),
-            Self::TransferRows {
-                source_path,
-                template_path,
-                ..
-            } => paths.extend([source_path.as_str(), template_path.as_str()]),
-            Self::ExportDelimited { path, .. } => paths.push(path.as_str()),
-            Self::Write {
-                path, source_path, ..
-            }
-            | Self::WriteRows {
-                path, source_path, ..
-            }
-            | Self::WriteColumns {
-                path, source_path, ..
-            }
-            | Self::Batch {
-                path, source_path, ..
-            } => paths.extend(source_path.iter().chain(path.iter()).map(String::as_str)),
-            Self::CopyRows {
-                path,
-                from,
-                source_path,
-                ..
-            }
-            | Self::CopyColumns {
-                path,
-                from,
-                source_path,
-                ..
-            } => {
-                paths.extend(source_path.iter().chain(path.iter()).map(String::as_str));
-                paths.push(from);
-            }
-            Self::InspectDelimited { .. }
-            | Self::Inspect { .. }
-            | Self::ListSheets { .. }
-            | Self::ReadRange { .. }
-            | Self::ReadRanges { .. }
-            | Self::ReadRows { .. }
-            | Self::ReadColumns { .. }
-            | Self::Find { .. }
-            | Self::FilterRows { .. }
-            | Self::Validate { .. } => {}
-        }
-        if let Self::Batch { operations, .. } = self {
-            paths.extend(
-                operations
-                    .iter()
-                    .filter_map(spreadsheet_operation_source_path),
-            );
-        }
-        paths
     }
 
     fn into_execution_input(self) -> SpreadsheetExecutionInput {
@@ -715,50 +353,39 @@ struct SpreadsheetExecutionInput {
     columns: Vec<Vec<SpreadsheetCellInput>>,
     from: Option<String>,
     source_sheet: Option<String>,
-    source_start_row: Option<u32>,
     source_start: Option<CellAddress>,
     destination_sheet: Option<String>,
     destination_start: Option<CellAddress>,
     content_mode: SpreadsheetCopyContentMode,
-    source_path: Option<String>,
     output_path: Option<String>,
-    data_path: Option<String>,
-    template_path: Option<String>,
-    target_header_row: u32,
-    target_start_row: Option<u32>,
-    transfer_filters: Vec<TransferRowFilter>,
-    transfer_columns: Vec<TransferColumn>,
-    mappings: Vec<DelimitedColumnMapping>,
     formula_mode: DelimitedFormulaMode,
     expected_sheets: Vec<String>,
     expected_populated_cells: Option<u64>,
     sheet_validations: Vec<SpreadsheetSheetValidation>,
     sheets: Vec<SheetWriteRequest>,
-    operations: Vec<SpreadsheetBatchOperation>,
-    atomic: Option<bool>,
 }
 
 impl SpreadsheetExecutionInput {
     fn mutation_output_path(&self) -> Option<&str> {
-        self.output_path.as_deref().or(self.path.as_deref())
+        self.path.as_deref()
     }
 
-    fn compact_direct_operation(&self) -> anyhow::Result<Option<SpreadsheetBatchOperation>> {
+    fn direct_mutation(&self) -> anyhow::Result<SpreadsheetMutation> {
         let operation = match self.action {
-            SpreadsheetToolAction::WriteRows => Some(SpreadsheetBatchOperation::WriteRows {
+            SpreadsheetToolAction::WriteRows => SpreadsheetMutation::WriteRows {
                 sheet: required_typed_string(self.sheet.as_deref(), "sheet")?,
                 start: self
                     .start
                     .context("spreadsheet write_rows requires start")?,
                 rows: self.rows.clone(),
-            }),
-            SpreadsheetToolAction::WriteColumns => Some(SpreadsheetBatchOperation::WriteColumns {
+            },
+            SpreadsheetToolAction::WriteColumns => SpreadsheetMutation::WriteColumns {
                 sheet: required_typed_string(self.sheet.as_deref(), "sheet")?,
                 start: self
                     .start
                     .context("spreadsheet write_columns requires start")?,
                 columns: self.columns.clone(),
-            }),
+            },
             SpreadsheetToolAction::CopyRows | SpreadsheetToolAction::CopyColumns => {
                 let source_path = required_typed_string(self.from.as_deref(), "from")?;
                 let source_sheet =
@@ -777,8 +404,8 @@ impl SpreadsheetExecutionInput {
                 let destination_start = self
                     .destination_start
                     .context("spreadsheet copy requires destinationStart")?;
-                Some(if self.action == SpreadsheetToolAction::CopyRows {
-                    SpreadsheetBatchOperation::CopyRows {
+                if self.action == SpreadsheetToolAction::CopyRows {
+                    SpreadsheetMutation::CopyRows {
                         source_path,
                         source_sheet,
                         source_start,
@@ -789,7 +416,7 @@ impl SpreadsheetExecutionInput {
                         content_mode: self.content_mode,
                     }
                 } else {
-                    SpreadsheetBatchOperation::CopyColumns {
+                    SpreadsheetMutation::CopyColumns {
                         source_path,
                         source_sheet,
                         source_start,
@@ -799,23 +426,9 @@ impl SpreadsheetExecutionInput {
                         destination_start,
                         content_mode: self.content_mode,
                     }
-                })
+                }
             }
-            SpreadsheetToolAction::InspectDelimited
-            | SpreadsheetToolAction::Inspect
-            | SpreadsheetToolAction::ListSheets
-            | SpreadsheetToolAction::ReadRange
-            | SpreadsheetToolAction::ReadRanges
-            | SpreadsheetToolAction::ReadRows
-            | SpreadsheetToolAction::ReadColumns
-            | SpreadsheetToolAction::Find
-            | SpreadsheetToolAction::FilterRows
-            | SpreadsheetToolAction::Validate
-            | SpreadsheetToolAction::FillTemplate
-            | SpreadsheetToolAction::TransferRows
-            | SpreadsheetToolAction::ExportDelimited
-            | SpreadsheetToolAction::Write
-            | SpreadsheetToolAction::Batch => None,
+            _ => anyhow::bail!("spreadsheet action is not an atomic mutation"),
         };
         Ok(operation)
     }
@@ -850,27 +463,16 @@ impl From<SpreadsheetToolInput> for SpreadsheetExecutionInput {
             columns: Vec::new(),
             from: None,
             source_sheet: None,
-            source_start_row: None,
             source_start: None,
             destination_sheet: None,
             destination_start: None,
             content_mode: SpreadsheetCopyContentMode::Values,
-            source_path: None,
             output_path: None,
-            data_path: None,
-            template_path: None,
-            target_header_row: 0,
-            target_start_row: None,
-            transfer_filters: Vec::new(),
-            transfer_columns: Vec::new(),
-            mappings: Vec::new(),
             formula_mode: DelimitedFormulaMode::Values,
             expected_sheets: Vec::new(),
             expected_populated_cells: None,
             sheet_validations: Vec::new(),
             sheets: Vec::new(),
-            operations: Vec::new(),
-            atomic: None,
         };
         match input {
             SpreadsheetToolInput::InspectDelimited {
@@ -996,56 +598,6 @@ impl From<SpreadsheetToolInput> for SpreadsheetExecutionInput {
                 execution.expected_populated_cells = expected_populated_cells;
                 execution.sheet_validations = sheets;
             }
-            SpreadsheetToolInput::FillTemplate {
-                data_path,
-                template_path,
-                output_path,
-                target_sheet,
-                source_format,
-                source_header_row,
-                target_header_row,
-                target_start_row,
-                mappings,
-                rstrip_tabs,
-            } => {
-                execution.data_path = Some(data_path);
-                execution.template_path = Some(template_path);
-                execution.output_path = Some(output_path);
-                execution.sheet = Some(target_sheet);
-                execution.format = source_format;
-                execution.header_row = source_header_row;
-                execution.target_header_row = target_header_row;
-                execution.target_start_row = target_start_row;
-                execution.mappings = mappings;
-                execution.rstrip_tabs = rstrip_tabs;
-            }
-            SpreadsheetToolInput::TransferRows {
-                source_path,
-                source_sheet,
-                template_path,
-                output_path,
-                target_sheet,
-                source_header_row,
-                source_start_row,
-                target_header_row,
-                target_start_row,
-                filters,
-                filter_match_mode,
-                columns,
-            } => {
-                execution.source_path = Some(source_path);
-                execution.source_sheet = Some(source_sheet);
-                execution.template_path = Some(template_path);
-                execution.output_path = Some(output_path);
-                execution.sheet = Some(target_sheet);
-                execution.header_row = source_header_row;
-                execution.source_start_row = source_start_row;
-                execution.target_header_row = target_header_row;
-                execution.target_start_row = target_start_row;
-                execution.transfer_filters = filters;
-                execution.filter_match_mode = filter_match_mode;
-                execution.transfer_columns = columns;
-            }
             SpreadsheetToolInput::ExportDelimited {
                 path,
                 output_path,
@@ -1061,15 +613,8 @@ impl From<SpreadsheetToolInput> for SpreadsheetExecutionInput {
                 execution.format = format;
                 execution.formula_mode = formula_mode;
             }
-            SpreadsheetToolInput::Write {
-                path,
-                source_path,
-                output_path,
-                sheets,
-            } => {
+            SpreadsheetToolInput::Write { path, sheets } => {
                 execution.path = path;
-                execution.source_path = source_path;
-                execution.output_path = output_path;
                 execution.sheets = sheets;
             }
             SpreadsheetToolInput::WriteRows {
@@ -1077,34 +622,22 @@ impl From<SpreadsheetToolInput> for SpreadsheetExecutionInput {
                 sheet,
                 start,
                 rows,
-                source_path,
-                output_path,
-                atomic,
             } => {
                 execution.path = path;
                 execution.sheet = Some(sheet);
                 execution.start = Some(start);
                 execution.rows = rows;
-                execution.source_path = source_path;
-                execution.output_path = output_path;
-                execution.atomic = atomic;
             }
             SpreadsheetToolInput::WriteColumns {
                 path,
                 sheet,
                 start,
                 columns,
-                source_path,
-                output_path,
-                atomic,
             } => {
                 execution.path = path;
                 execution.sheet = Some(sheet);
                 execution.start = Some(start);
                 execution.columns = columns;
-                execution.source_path = source_path;
-                execution.output_path = output_path;
-                execution.atomic = atomic;
             }
             SpreadsheetToolInput::CopyRows {
                 path,
@@ -1116,9 +649,6 @@ impl From<SpreadsheetToolInput> for SpreadsheetExecutionInput {
                 destination_sheet,
                 destination_start,
                 content_mode,
-                source_path,
-                output_path,
-                atomic,
             }
             | SpreadsheetToolInput::CopyColumns {
                 path,
@@ -1130,9 +660,6 @@ impl From<SpreadsheetToolInput> for SpreadsheetExecutionInput {
                 destination_sheet,
                 destination_start,
                 content_mode,
-                source_path,
-                output_path,
-                atomic,
             } => {
                 execution.path = path;
                 execution.from = Some(from);
@@ -1143,175 +670,49 @@ impl From<SpreadsheetToolInput> for SpreadsheetExecutionInput {
                 execution.destination_sheet = Some(destination_sheet);
                 execution.destination_start = Some(destination_start);
                 execution.content_mode = content_mode;
-                execution.source_path = source_path;
-                execution.output_path = output_path;
-                execution.atomic = atomic;
-            }
-            SpreadsheetToolInput::Batch {
-                path,
-                source_path,
-                output_path,
-                operations,
-                atomic,
-            } => {
-                execution.path = path;
-                execution.source_path = source_path;
-                execution.output_path = output_path;
-                execution.operations = operations;
-                execution.atomic = atomic;
             }
         }
         execution
     }
 }
 
-pub struct SpreadsheetTool;
-
-#[async_trait]
-impl TypedTool for SpreadsheetTool {
-    type Input = SpreadsheetToolInput;
-
-    fn name(&self) -> &str {
-        "spreadsheet"
-    }
-
-    fn description(&self) -> &str {
-        "Inspect common workbook and delimited-data files, then execute bounded reads or atomic writes to the destination selected by the model. CSV quoting, embedded newlines, duplicate headers, and optional trailing-tab cleanup are handled server-side."
-    }
-
-    fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
-        match input.action() {
-            SpreadsheetToolAction::InspectDelimited
-            | SpreadsheetToolAction::Inspect
-            | SpreadsheetToolAction::ListSheets
-            | SpreadsheetToolAction::ReadRange
-            | SpreadsheetToolAction::ReadRanges
-            | SpreadsheetToolAction::ReadRows
-            | SpreadsheetToolAction::ReadColumns
-            | SpreadsheetToolAction::Find
-            | SpreadsheetToolAction::FilterRows
-            | SpreadsheetToolAction::Validate => {
-                ToolExecutionPolicy::read_only(vec![tool_resource_key(
-                    if input.attachment_id().is_some() {
-                        "attachment"
-                    } else {
-                        "file"
-                    },
-                    input.attachment_id().or(input.path()).unwrap_or("*"),
-                )])
-            }
-            SpreadsheetToolAction::FillTemplate
-            | SpreadsheetToolAction::TransferRows
-            | SpreadsheetToolAction::ExportDelimited
-            | SpreadsheetToolAction::Write
-            | SpreadsheetToolAction::WriteRows
-            | SpreadsheetToolAction::WriteColumns
-            | SpreadsheetToolAction::CopyRows
-            | SpreadsheetToolAction::CopyColumns
-            | SpreadsheetToolAction::Batch => {
-                let mut resource_keys = input
-                    .mutation_paths()
-                    .into_iter()
-                    .map(|path| tool_resource_key("file", path))
-                    .collect::<Vec<_>>();
-                resource_keys.sort();
-                resource_keys.dedup();
-                if resource_keys.is_empty() {
-                    resource_keys.push("*".to_string());
-                }
-                ToolExecutionPolicy {
-                    read_only: false,
-                    idempotent: false,
-                    parallel_safe: true,
-                    side_effect: ToolSideEffect::WorkspaceWrite,
-                    resource_keys,
-                }
-            }
+pub(super) async fn execute_spreadsheet_backend(
+    call_id: Uuid,
+    input: Value,
+    ctx: ToolInvocationContext,
+) -> anyhow::Result<ToolResult> {
+    let input: SpreadsheetToolInput = decode_typed_tool_input("spreadsheet backend", input)?;
+    let action = input.action();
+    let input = input.into_execution_input();
+    match action {
+        SpreadsheetToolAction::InspectDelimited
+        | SpreadsheetToolAction::Inspect
+        | SpreadsheetToolAction::ListSheets
+        | SpreadsheetToolAction::ReadRange
+        | SpreadsheetToolAction::ReadRanges
+        | SpreadsheetToolAction::ReadRows
+        | SpreadsheetToolAction::ReadColumns
+        | SpreadsheetToolAction::Find
+        | SpreadsheetToolAction::FilterRows
+        | SpreadsheetToolAction::Validate => execute_spreadsheet_read(call_id, input, ctx).await,
+        SpreadsheetToolAction::ExportDelimited => {
+            execute_spreadsheet_export_delimited(call_id, input, ctx).await
         }
-    }
-
-    fn execution_intent(&self, input: &Self::Input, _workspace_root: &Path) -> ToolExecutionIntent {
-        match input.action() {
-            SpreadsheetToolAction::InspectDelimited
-            | SpreadsheetToolAction::Inspect
-            | SpreadsheetToolAction::ListSheets
-            | SpreadsheetToolAction::ReadRange
-            | SpreadsheetToolAction::ReadRanges
-            | SpreadsheetToolAction::ReadRows
-            | SpreadsheetToolAction::ReadColumns
-            | SpreadsheetToolAction::Find
-            | SpreadsheetToolAction::FilterRows
-            | SpreadsheetToolAction::Validate => {
-                ToolExecutionIntent::observation(input.path().map(PathBuf::from))
-            }
-            SpreadsheetToolAction::FillTemplate
-            | SpreadsheetToolAction::TransferRows
-            | SpreadsheetToolAction::ExportDelimited
-            | SpreadsheetToolAction::Write
-            | SpreadsheetToolAction::WriteRows
-            | SpreadsheetToolAction::WriteColumns
-            | SpreadsheetToolAction::CopyRows
-            | SpreadsheetToolAction::CopyColumns
-            | SpreadsheetToolAction::Batch => {
-                let read_paths = input.mutation_read_paths().into_iter().map(PathBuf::from);
-                ToolExecutionIntent::workspace_mutation(
-                    input.mutation_output_path().map(PathBuf::from),
-                )
-                .with_read_paths(read_paths)
-            }
-        }
-    }
-
-    async fn execute_typed(
-        &self,
-        call_id: Uuid,
-        input: Self::Input,
-        ctx: ToolInvocationContext,
-    ) -> anyhow::Result<ToolResult> {
-        let action = input.action();
-        let input = input.into_execution_input();
-        match action {
-            SpreadsheetToolAction::InspectDelimited
-            | SpreadsheetToolAction::Inspect
-            | SpreadsheetToolAction::ListSheets
-            | SpreadsheetToolAction::ReadRange
-            | SpreadsheetToolAction::ReadRanges
-            | SpreadsheetToolAction::ReadRows
-            | SpreadsheetToolAction::ReadColumns
-            | SpreadsheetToolAction::Find
-            | SpreadsheetToolAction::FilterRows
-            | SpreadsheetToolAction::Validate => {
-                execute_spreadsheet_read(call_id, input, ctx).await
-            }
-            SpreadsheetToolAction::FillTemplate => {
-                execute_spreadsheet_fill_template(call_id, input, ctx).await
-            }
-            SpreadsheetToolAction::TransferRows => {
-                execute_spreadsheet_transfer_rows(call_id, input, ctx).await
-            }
-            SpreadsheetToolAction::ExportDelimited => {
-                execute_spreadsheet_export_delimited(call_id, input, ctx).await
-            }
-            SpreadsheetToolAction::Write => execute_spreadsheet_write(call_id, input, ctx).await,
-            SpreadsheetToolAction::WriteRows
-            | SpreadsheetToolAction::WriteColumns
-            | SpreadsheetToolAction::CopyRows
-            | SpreadsheetToolAction::CopyColumns
-            | SpreadsheetToolAction::Batch => {
-                execute_spreadsheet_mutations(call_id, input, ctx).await
-            }
+        SpreadsheetToolAction::Write => execute_spreadsheet_write(call_id, input, ctx).await,
+        SpreadsheetToolAction::WriteRows
+        | SpreadsheetToolAction::WriteColumns
+        | SpreadsheetToolAction::CopyRows
+        | SpreadsheetToolAction::CopyColumns => {
+            execute_spreadsheet_mutations(call_id, input, ctx).await
         }
     }
 }
 
-impl_typed_tool!(SpreadsheetTool);
-
-fn spreadsheet_operation_source_path(operation: &SpreadsheetBatchOperation) -> Option<&str> {
+fn spreadsheet_operation_source_path(operation: &SpreadsheetMutation) -> Option<&str> {
     match operation {
-        SpreadsheetBatchOperation::CopyRows { source_path, .. }
-        | SpreadsheetBatchOperation::CopyColumns { source_path, .. } => Some(source_path),
-        SpreadsheetBatchOperation::WriteRows { .. }
-        | SpreadsheetBatchOperation::WriteColumns { .. } => None,
+        SpreadsheetMutation::CopyRows { source_path, .. }
+        | SpreadsheetMutation::CopyColumns { source_path, .. } => Some(source_path),
+        SpreadsheetMutation::WriteRows { .. } | SpreadsheetMutation::WriteColumns { .. } => None,
     }
 }
 
@@ -1520,15 +921,12 @@ async fn execute_spreadsheet_read(
                     sheets: sheet_validations,
                 })
             }
-            SpreadsheetToolAction::FillTemplate
-            | SpreadsheetToolAction::TransferRows
-            | SpreadsheetToolAction::ExportDelimited
+            SpreadsheetToolAction::ExportDelimited
             | SpreadsheetToolAction::Write
             | SpreadsheetToolAction::WriteRows
             | SpreadsheetToolAction::WriteColumns
             | SpreadsheetToolAction::CopyRows
-            | SpreadsheetToolAction::CopyColumns
-            | SpreadsheetToolAction::Batch => unreachable!(),
+            | SpreadsheetToolAction::CopyColumns => unreachable!(),
         };
         Ok(execute_spreadsheet(SpreadsheetRequest { action }))
     })
@@ -1550,185 +948,6 @@ async fn execute_spreadsheet_read(
         insert_attachment_provenance(&mut result.metadata, &metadata);
     }
     Ok(result)
-}
-
-async fn execute_spreadsheet_fill_template(
-    call_id: Uuid,
-    input: SpreadsheetExecutionInput,
-    ctx: ToolInvocationContext,
-) -> anyhow::Result<ToolResult> {
-    let data_relative = required_typed_string(input.data_path.as_deref(), "dataPath")?;
-    let template_relative = required_typed_string(input.template_path.as_deref(), "templatePath")?;
-    let output_relative = required_typed_string(input.output_path.as_deref(), "outputPath")?;
-    let data_logical = normalize_workspace_path(&ctx.workspace_root, &data_relative)?;
-    let template_logical = normalize_workspace_path(&ctx.workspace_root, &template_relative)?;
-    let output_path = normalize_workspace_path(&ctx.workspace_root, &output_relative)?;
-    enforce_read_policy(&ctx, &data_logical)?;
-    enforce_read_policy(&ctx, &template_logical)?;
-    let source_format = resolve_delimited_format(&data_logical, input.format)?;
-    ensure_xlsx_path(&template_logical)?;
-    ensure_xlsx_path(&output_path)?;
-    enforce_policy_decision(ctx.policy.inspect_write(&output_path), &ctx)?;
-
-    let data_path = ctx.environment.resolve_read_path(&data_logical)?;
-    let template_path = ctx.environment.resolve_read_path(&template_logical)?;
-    let data = ctx
-        .environment
-        .read_file(FileReadRequest::new(&data_path).with_max_bytes(MAX_SPREADSHEET_INPUT_BYTES))
-        .await?;
-    let template = ctx
-        .environment
-        .read_file(FileReadRequest::new(&template_path).with_max_bytes(MAX_SPREADSHEET_INPUT_BYTES))
-        .await?;
-    let source_format = Some(source_format);
-    let target_sheet = required_typed_string(input.sheet.as_deref(), "targetSheet")?;
-    let source_header_row = input.header_row;
-    let target_header_row = input.target_header_row;
-    let target_start_row = input.target_start_row;
-    let mappings = input.mappings;
-    let rstrip_tabs = input.rstrip_tabs;
-    let staged = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let staging = SpreadsheetStaging::new()?;
-        let staged_data = staging.path(match source_format.unwrap_or_default() {
-            DelimitedFormat::Csv => "source.csv",
-            DelimitedFormat::Tsv => "source.tsv",
-        });
-        let staged_template = staging.path("template.xlsx");
-        let staged_output = staging.path("output.xlsx");
-        fs::write(&staged_data, data.bytes)
-            .with_context(|| format!("failed to stage {}", data.path.display()))?;
-        fs::write(&staged_template, template.bytes)
-            .with_context(|| format!("failed to stage {}", template.path.display()))?;
-        let outcome = execute_spreadsheet(SpreadsheetRequest {
-            action: SpreadsheetAction::FillTemplate(FillTemplateRequest {
-                source: staged_data,
-                source_format,
-                template: staged_template,
-                output: staged_output.clone(),
-                target_sheet,
-                source_header_row,
-                target_header_row,
-                target_start_row,
-                mappings,
-                rstrip_tabs,
-            }),
-        });
-        match outcome {
-            Ok(result) => {
-                let bytes = fs::read(&staged_output)
-                    .with_context(|| format!("failed to read {}", staged_output.display()))?;
-                Ok(Ok((result, bytes, data.path, template.path)))
-            }
-            Err(error) => Ok(Err(error)),
-        }
-    })
-    .await
-    .context("spreadsheet fill_template worker task failed")??;
-    let (mut result, bytes, resolved_data_path, resolved_template_path) = match staged {
-        Ok(result) => result,
-        Err(error) => return Ok(spreadsheet_error_result(call_id, error)),
-    };
-    let written = ctx
-        .environment
-        .write_file(FileWriteRequest::new(&output_path, bytes))
-        .await?;
-    if let SpreadsheetResult::TemplateFilled(filled) = &mut result {
-        filled.source = resolved_data_path;
-        filled.template = resolved_template_path;
-    }
-    remap_spreadsheet_paths(&mut result, None, Some(&written.path));
-    spreadsheet_success_result(call_id, result, Some(written.path))
-}
-
-async fn execute_spreadsheet_transfer_rows(
-    call_id: Uuid,
-    input: SpreadsheetExecutionInput,
-    ctx: ToolInvocationContext,
-) -> anyhow::Result<ToolResult> {
-    let source_relative = required_typed_string(input.source_path.as_deref(), "sourcePath")?;
-    let template_relative = required_typed_string(input.template_path.as_deref(), "templatePath")?;
-    let output_relative = required_typed_string(input.output_path.as_deref(), "outputPath")?;
-    let source_logical = normalize_workspace_path(&ctx.workspace_root, &source_relative)?;
-    let template_logical = normalize_workspace_path(&ctx.workspace_root, &template_relative)?;
-    let output_path = normalize_workspace_path(&ctx.workspace_root, &output_relative)?;
-    enforce_read_policy(&ctx, &source_logical)?;
-    enforce_read_policy(&ctx, &template_logical)?;
-    ensure_spreadsheet_source_path(&source_logical)?;
-    ensure_xlsx_path(&template_logical)?;
-    ensure_xlsx_path(&output_path)?;
-    enforce_policy_decision(ctx.policy.inspect_write(&output_path), &ctx)?;
-
-    let resolved_source = ctx.environment.resolve_read_path(&source_logical)?;
-    let resolved_template = ctx.environment.resolve_read_path(&template_logical)?;
-    let source = ctx
-        .environment
-        .read_file(
-            FileReadRequest::new(&resolved_source).with_max_bytes(MAX_SPREADSHEET_INPUT_BYTES),
-        )
-        .await?;
-    let template = ctx
-        .environment
-        .read_file(
-            FileReadRequest::new(&resolved_template).with_max_bytes(MAX_SPREADSHEET_INPUT_BYTES),
-        )
-        .await?;
-    let source_sheet = required_typed_string(input.source_sheet.as_deref(), "sourceSheet")?;
-    let target_sheet = required_typed_string(input.sheet.as_deref(), "targetSheet")?;
-    let request = TransferRowsRequest {
-        source: PathBuf::new(),
-        source_sheet,
-        template: PathBuf::new(),
-        output: PathBuf::new(),
-        target_sheet,
-        source_header_row: input.header_row,
-        source_start_row: input.source_start_row,
-        target_header_row: input.target_header_row,
-        target_start_row: input.target_start_row,
-        filters: input.transfer_filters,
-        filter_match_mode: input.filter_match_mode.unwrap_or_default(),
-        columns: input.transfer_columns,
-    };
-    let staged = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let staging = SpreadsheetStaging::new()?;
-        let staged_source = staging.path(&staging_file_name("source", &source.path, "xlsx"));
-        let staged_template = staging.path("template.xlsx");
-        let staged_output = staging.path("output.xlsx");
-        fs::write(&staged_source, source.bytes)
-            .with_context(|| format!("failed to stage {}", source.path.display()))?;
-        fs::write(&staged_template, template.bytes)
-            .with_context(|| format!("failed to stage {}", template.path.display()))?;
-        let mut request = request;
-        request.source = staged_source;
-        request.template = staged_template;
-        request.output = staged_output.clone();
-        let outcome = execute_spreadsheet(SpreadsheetRequest {
-            action: SpreadsheetAction::TransferRows(request),
-        });
-        match outcome {
-            Ok(result) => {
-                let bytes = fs::read(&staged_output)
-                    .with_context(|| format!("failed to read {}", staged_output.display()))?;
-                Ok(Ok((result, bytes, source.path, template.path)))
-            }
-            Err(error) => Ok(Err(error)),
-        }
-    })
-    .await
-    .context("spreadsheet transfer_rows worker task failed")??;
-    let (mut result, bytes, resolved_source_path, resolved_template_path) = match staged {
-        Ok(result) => result,
-        Err(error) => return Ok(spreadsheet_error_result(call_id, error)),
-    };
-    let written = ctx
-        .environment
-        .write_file(FileWriteRequest::new(&output_path, bytes))
-        .await?;
-    if let SpreadsheetResult::RowsTransferred(transferred) = &mut result {
-        transferred.source = resolved_source_path;
-        transferred.template = resolved_template_path;
-    }
-    remap_spreadsheet_paths(&mut result, None, Some(&written.path));
-    spreadsheet_success_result(call_id, result, Some(written.path))
 }
 
 async fn execute_spreadsheet_export_delimited(
@@ -1845,30 +1064,13 @@ async fn execute_spreadsheet_write(
     let output_path = normalize_workspace_path(&ctx.workspace_root, output_relative)?;
     enforce_policy_decision(ctx.policy.inspect_write(&output_path), &ctx)?;
 
-    let source = if let Some(relative) = input
-        .source_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-    {
-        let logical_path = normalize_workspace_path(&ctx.workspace_root, relative)?;
-        enforce_read_policy(&ctx, &logical_path)?;
-        let path = ctx.environment.resolve_read_path(&logical_path)?;
-        ensure_spreadsheet_source_path(&path)?;
-        Some(
-            ctx.environment
-                .read_file(FileReadRequest::new(&path).with_max_bytes(MAX_SPREADSHEET_INPUT_BYTES))
-                .await?,
-        )
-    } else {
-        enforce_read_policy(&ctx, &output_path)?;
-        read_optional(ctx.environment.as_ref(), &output_path)
-            .await?
-            .map(|bytes| crate::execution::FileReadResult {
-                path: output_path.clone(),
-                bytes,
-            })
-    };
+    enforce_read_policy(&ctx, &output_path)?;
+    let source = read_optional(ctx.environment.as_ref(), &output_path)
+        .await?
+        .map(|bytes| crate::execution::FileReadResult {
+            path: output_path.clone(),
+            bytes,
+        });
 
     let sheets = input.sheets;
     let staged_output_format_path = output_path.clone();
@@ -1920,10 +1122,6 @@ async fn execute_spreadsheet_mutations(
     input: SpreadsheetExecutionInput,
     ctx: ToolInvocationContext,
 ) -> anyhow::Result<ToolResult> {
-    anyhow::ensure!(
-        input.atomic.unwrap_or(true),
-        "spreadsheet mutations are always atomic; atomic=false is not supported"
-    );
     let output_relative = input
         .mutation_output_path()
         .map(str::trim)
@@ -1932,33 +1130,14 @@ async fn execute_spreadsheet_mutations(
     let output_path = normalize_workspace_path(&ctx.workspace_root, output_relative)?;
     enforce_policy_decision(ctx.policy.inspect_write(&output_path), &ctx)?;
 
-    let compact_operation = input.compact_direct_operation()?;
-    let operations =
-        spreadsheet_operations_for_action(input.action, compact_operation, input.operations)?;
-    let base_source = if let Some(relative) = input
-        .source_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-    {
-        let logical_path = normalize_workspace_path(&ctx.workspace_root, relative)?;
-        enforce_read_policy(&ctx, &logical_path)?;
-        let path = ctx.environment.resolve_read_path(&logical_path)?;
-        ensure_spreadsheet_source_path(&path)?;
-        Some(
-            ctx.environment
-                .read_file(FileReadRequest::new(&path).with_max_bytes(MAX_SPREADSHEET_INPUT_BYTES))
-                .await?,
-        )
-    } else {
-        enforce_read_policy(&ctx, &output_path)?;
-        read_optional(ctx.environment.as_ref(), &output_path)
-            .await?
-            .map(|bytes| crate::execution::FileReadResult {
-                path: output_path.clone(),
-                bytes,
-            })
-    };
+    let operations = vec![input.direct_mutation()?];
+    enforce_read_policy(&ctx, &output_path)?;
+    let base_source = read_optional(ctx.environment.as_ref(), &output_path)
+        .await?
+        .map(|bytes| crate::execution::FileReadResult {
+            path: output_path.clone(),
+            bytes,
+        });
 
     let mut copy_sources = BTreeMap::<String, (PathBuf, Vec<u8>)>::new();
     for relative in operations
@@ -2037,68 +1216,24 @@ async fn execute_spreadsheet_mutations(
     spreadsheet_success_result(call_id, result, Some(written.path))
 }
 
-fn spreadsheet_operations_for_action(
-    action: SpreadsheetToolAction,
-    operation: Option<SpreadsheetBatchOperation>,
-    operations: Vec<SpreadsheetBatchOperation>,
-) -> anyhow::Result<Vec<SpreadsheetBatchOperation>> {
-    if action == SpreadsheetToolAction::Batch {
-        anyhow::ensure!(
-            operation.is_none(),
-            "spreadsheet batch uses operations, not operation"
-        );
-        anyhow::ensure!(
-            !operations.is_empty(),
-            "spreadsheet batch requires operations"
-        );
-        return Ok(operations);
-    }
-    anyhow::ensure!(
-        operations.is_empty(),
-        "direct spreadsheet mutations use operation, not operations"
-    );
-    let operation = operation.context("spreadsheet mutation requires operation")?;
-    let matches_action = matches!(
-        (&action, &operation),
-        (
-            SpreadsheetToolAction::WriteRows,
-            SpreadsheetBatchOperation::WriteRows { .. }
-        ) | (
-            SpreadsheetToolAction::WriteColumns,
-            SpreadsheetBatchOperation::WriteColumns { .. }
-        ) | (
-            SpreadsheetToolAction::CopyRows,
-            SpreadsheetBatchOperation::CopyRows { .. }
-        ) | (
-            SpreadsheetToolAction::CopyColumns,
-            SpreadsheetBatchOperation::CopyColumns { .. }
-        )
-    );
-    anyhow::ensure!(
-        matches_action,
-        "spreadsheet operation type must match action"
-    );
-    Ok(vec![operation])
-}
-
 fn materialize_spreadsheet_operations(
-    operations: &[SpreadsheetBatchOperation],
+    operations: &[SpreadsheetMutation],
     copy_sources: &BTreeMap<String, PathBuf>,
 ) -> anyhow::Result<Vec<SheetWriteRequest>> {
     let mut updates = BTreeMap::<String, Vec<CellUpdate>>::new();
     for operation in operations {
         match operation {
-            SpreadsheetBatchOperation::WriteRows { sheet, start, rows } => {
+            SpreadsheetMutation::WriteRows { sheet, start, rows } => {
                 append_row_updates(&mut updates, sheet, *start, rows)?;
             }
-            SpreadsheetBatchOperation::WriteColumns {
+            SpreadsheetMutation::WriteColumns {
                 sheet,
                 start,
                 columns,
             } => {
                 append_column_updates(&mut updates, sheet, *start, columns)?;
             }
-            SpreadsheetBatchOperation::CopyRows {
+            SpreadsheetMutation::CopyRows {
                 source_path,
                 source_sheet,
                 source_start,
@@ -2108,7 +1243,7 @@ fn materialize_spreadsheet_operations(
                 destination_start,
                 content_mode,
             }
-            | SpreadsheetBatchOperation::CopyColumns {
+            | SpreadsheetMutation::CopyColumns {
                 source_path,
                 source_sheet,
                 source_start,
@@ -2405,18 +1540,6 @@ fn remap_spreadsheet_paths(
     }
 }
 
-fn ensure_xlsx_path(path: &Path) -> anyhow::Result<()> {
-    if path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("xlsx"))
-    {
-        Ok(())
-    } else {
-        anyhow::bail!("spreadsheet tool supports only .xlsx files")
-    }
-}
-
 fn ensure_workbook_path(path: &Path) -> anyhow::Result<SpreadsheetFileFormat> {
     let format = SpreadsheetFileFormat::from_path(path).with_context(|| {
         format!(
@@ -2431,16 +1554,6 @@ fn ensure_workbook_path(path: &Path) -> anyhow::Result<SpreadsheetFileFormat> {
         path.display()
     );
     Ok(format)
-}
-
-fn ensure_spreadsheet_source_path(path: &Path) -> anyhow::Result<SpreadsheetFileFormat> {
-    SpreadsheetFileFormat::from_path(path).with_context(|| {
-        format!(
-            "unsupported spreadsheet source {}; expected one of {}",
-            path.display(),
-            SpreadsheetFileFormat::ATTACHMENT_EXTENSIONS.join(", ")
-        )
-    })
 }
 
 fn staging_file_name(prefix: &str, path: &Path, fallback_extension: &str) -> String {

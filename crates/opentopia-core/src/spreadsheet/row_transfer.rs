@@ -465,13 +465,21 @@ fn source_cell(sheet: &super::LoadedSheet, row: u32, column: u32) -> Spreadsheet
         })
 }
 
-fn transform_cell(
+pub(crate) fn transform_cell(
     source: SpreadsheetCellValue,
     transforms: &[SpreadsheetValueTransform],
     row: u32,
     column: u32,
 ) -> Result<SpreadsheetCellInput, SpreadsheetError> {
-    let mut value = cell_input(source);
+    transform_cell_input(cell_input(source), transforms, row, column)
+}
+
+pub(crate) fn transform_cell_input(
+    mut value: SpreadsheetCellInput,
+    transforms: &[SpreadsheetValueTransform],
+    row: u32,
+    column: u32,
+) -> Result<SpreadsheetCellInput, SpreadsheetError> {
     for transform in transforms {
         value = match transform {
             SpreadsheetValueTransform::AsString => match value {

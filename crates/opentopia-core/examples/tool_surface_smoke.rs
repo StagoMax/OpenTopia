@@ -34,9 +34,9 @@ const EXPECTED_TOOLS: [&str; 17] = [
     "read_skill",
     "request_user_input",
     "shell",
-    "spreadsheet_describe",
-    "spreadsheet_execute",
-    "spreadsheet_inspect",
+    "document_execute",
+    "document_get_operation_schemas",
+    "document_open",
     "update_plan",
     "view_attachment",
 ];
@@ -140,6 +140,19 @@ impl SmokeProvider {
             .and_then(Value::as_str)
             .map(str::to_string)
             .context("background shell result did not expose jobId")
+    }
+
+    fn document_id(request: &ModelRequest) -> anyhow::Result<String> {
+        request
+            .input
+            .tool_results
+            .iter()
+            .rev()
+            .find(|result| result.name == "document_open")
+            .and_then(|result| result.metadata.get("documentId"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .context("document_open result did not expose documentId")
     }
 
     fn created_skill_id(&self) -> anyhow::Result<String> {
@@ -279,19 +292,27 @@ impl ModelProvider for SmokeProvider {
             ),
             11 => Self::one_call(
                 11,
-                "spreadsheet_describe",
+                "document_open",
                 json!({
                     "resource": { "kind": "file", "path": "smoke.xlsx" },
-                    "operations": ["write"]
+                    "mode": "create"
                 }),
             ),
             12 => Self::one_call(
                 12,
-                "spreadsheet_execute",
+                "document_get_operation_schemas",
                 json!({
+                    "documentId": Self::document_id(&request)?,
+                    "operations": ["write"]
+                }),
+            ),
+            13 => Self::one_call(
+                13,
+                "document_execute",
+                json!({
+                    "documentId": Self::document_id(&request)?,
                     "operation": "write",
                     "arguments": {
-                        "outputPath": "smoke.xlsx",
                         "sheets": [{
                             "name": "Smoke",
                             "cells": [{
@@ -300,13 +321,6 @@ impl ModelProvider for SmokeProvider {
                             }]
                         }]
                     }
-                }),
-            ),
-            13 => Self::one_call(
-                13,
-                "spreadsheet_inspect",
-                json!({
-                    "resource": { "kind": "file", "path": "smoke.xlsx" }
                 }),
             ),
             14 => Self::one_call(

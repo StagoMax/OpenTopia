@@ -1,9 +1,9 @@
 use opentopia_core::spreadsheet::{
     write_workbook_preferred, SpreadsheetErrorCode, WriteWorkbookRequest,
 };
-use opentopia_core::tools::SpreadsheetDescribeTool;
 use opentopia_core::{
-    CapabilityProjection, ExecutionAuthority, LocalSandboxConfig, PermissionMode, Tool, ToolCall,
+    CapabilityProjection, DocumentGetOperationSchemasTool, DocumentOpenTool, ExecutionAuthority,
+    LocalSandboxConfig, PermissionMode, Tool, ToolCall,
 };
 use serde_json::json;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -41,22 +41,34 @@ async fn mutation_contract_does_not_override_the_model_selected_output() {
         CapabilityProjection::unrestricted(),
     )
     .expect("valid local test authority");
-    let described = SpreadsheetDescribeTool
+    let opened = DocumentOpenTool
         .execute(
             ToolCall::new(
-                "spreadsheet_describe",
+                "document_open",
                 json!({
                     "resource": { "kind": "file", "path": "source.xls" },
-                    "operations": ["write_rows"]
+                    "mode": "create"
                 }),
             ),
             authority.local_tool_context(),
         )
         .await
-        .expect("describe spreadsheet mutation contract");
+        .expect("open model-selected spreadsheet path");
+    let document_id = opened.metadata["documentId"].clone();
+    let described = DocumentGetOperationSchemasTool
+        .execute(
+            ToolCall::new(
+                "document_get_operation_schemas",
+                json!({ "documentId": document_id, "operations": ["write_rows"] }),
+            ),
+            authority.local_tool_context(),
+        )
+        .await
+        .expect("load spreadsheet mutation contract");
 
     assert_eq!(described.metadata["success"], true);
-    assert!(described.output.contains("active filesystem authority"));
-    assert!(!described.output.contains("read-only sources"));
-    assert!(!described.output.contains("write changed workbooks to XLSX"));
+    let payload: serde_json::Value = serde_json::from_str(&described.output).unwrap();
+    let schema = &payload["operations"][0]["argumentsSchema"];
+    assert!(schema["properties"].get("path").is_none());
+    assert!(schema["properties"].get("outputPath").is_none());
 }

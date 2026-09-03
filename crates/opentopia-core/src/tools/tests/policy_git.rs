@@ -41,45 +41,22 @@ fn tool_execution_policy_marks_observations_as_parallel_safe() {
 
 #[test]
 fn structured_observation_and_control_tools_declare_scoped_parallelism() {
-    let spreadsheet_read = <SpreadsheetTool as TypedTool>::execution_policy(
-        &SpreadsheetTool,
-        &SpreadsheetToolInput::Inspect {
-            path: Some("reports/a.xlsx".to_string()),
-            attachment_id: None,
-        },
-    );
-    assert!(spreadsheet_read.read_only);
-    assert!(spreadsheet_read.parallel_safe);
-    assert_eq!(spreadsheet_read.resource_keys, vec!["file:reports/a.xlsx"]);
-
-    let attachment_id = Uuid::new_v4().to_string();
-    let spreadsheet_attachment = <SpreadsheetTool as TypedTool>::execution_policy(
-        &SpreadsheetTool,
-        &SpreadsheetToolInput::Inspect {
-            path: None,
-            attachment_id: Some(attachment_id.clone()),
-        },
-    );
-    assert_eq!(
-        spreadsheet_attachment.resource_keys,
-        vec![format!("attachment:{attachment_id}")]
-    );
-
-    let spreadsheet_write = <SpreadsheetTool as TypedTool>::execution_policy(
-        &SpreadsheetTool,
-        &SpreadsheetToolInput::Write {
-            path: None,
-            source_path: Some("reports/source.xlsx".to_string()),
-            output_path: Some("reports/output.xlsx".to_string()),
-            sheets: Vec::new(),
-        },
-    );
-    assert!(!spreadsheet_write.read_only);
-    assert!(spreadsheet_write.parallel_safe);
-    assert_eq!(
-        spreadsheet_write.resource_keys,
-        vec!["file:reports/output.xlsx", "file:reports/source.xlsx"]
-    );
+    let registry = ToolRegistry::with_builtins();
+    let document_open = registry
+        .execution_policy(
+            "document_open",
+            &ToolCall::new(
+                "document_open",
+                json!({
+                    "resource": { "kind": "file", "path": "reports/a.xlsx" },
+                    "mode": "read"
+                }),
+            ),
+        )
+        .unwrap();
+    assert!(document_open.read_only);
+    assert!(document_open.parallel_safe);
+    assert_eq!(document_open.resource_keys, vec!["file:reports/a.xlsx"]);
 
     let list_skills =
         <ListSkillsTool as TypedTool>::execution_policy(&ListSkillsTool, &EmptyToolInput {});

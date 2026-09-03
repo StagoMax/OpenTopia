@@ -228,30 +228,6 @@ fn background_read_schema_exposes_a_bounded_wait() {
 #[test]
 fn action_driven_tools_expose_only_action_specific_fields() {
     assert_discriminated_action_schema(
-        &SpreadsheetTool,
-        &[
-            "inspect_delimited",
-            "inspect",
-            "list_sheets",
-            "read_range",
-            "read_ranges",
-            "read_rows",
-            "read_columns",
-            "find",
-            "filter_rows",
-            "validate",
-            "fill_template",
-            "transfer_rows",
-            "export_delimited",
-            "write",
-            "write_rows",
-            "write_columns",
-            "copy_rows",
-            "copy_columns",
-            "batch",
-        ],
-    );
-    assert_discriminated_action_schema(
         &BrowserTool,
         &[
             "navigate",
@@ -284,32 +260,12 @@ fn action_driven_tools_expose_only_action_specific_fields() {
     );
     assert_discriminated_action_schema(&PdfTool, &["inspect", "extract", "render", "validate"]);
     assert_discriminated_action_schema(&DocumentTool, &["inspect", "extract", "validate"]);
-    let spreadsheet = SpreadsheetTool.schema();
-    let fill_template = &action_schema_branch(&spreadsheet, "fill_template")["properties"];
-    assert!(fill_template.get("dataPath").is_some());
-    assert!(fill_template.get("templatePath").is_some());
-    assert!(fill_template.get("mappings").is_some());
-    assert!(fill_template.get("rows").is_none());
-    let transfer_rows = &action_schema_branch(&spreadsheet, "transfer_rows")["properties"];
-    assert!(transfer_rows.get("sourcePath").is_some());
-    assert!(transfer_rows.get("templatePath").is_some());
-    assert!(transfer_rows.get("filters").is_some());
-    assert!(transfer_rows.get("columns").is_some());
-    assert!(transfer_rows.get("rows").is_none());
-    let export_delimited = &action_schema_branch(&spreadsheet, "export_delimited")["properties"];
-    assert!(export_delimited.get("outputPath").is_some());
-    assert!(export_delimited.get("format").is_some());
-    assert!(export_delimited.get("sheets").is_none());
-    let read_range = &action_schema_branch(&spreadsheet, "read_range")["properties"];
-    assert!(read_range.get("range").is_some());
-    assert!(read_range.get("rows").is_none());
-    let write_rows = &action_schema_branch(&spreadsheet, "write_rows")["properties"];
-    assert!(write_rows.get("rows").is_some());
-    assert!(write_rows.get("query").is_none());
-    assert!(write_rows.get("operations").is_none());
-    let batch = &action_schema_branch(&spreadsheet, "batch")["properties"];
-    assert!(batch.get("operations").is_some());
-    assert!(batch.get("rows").is_none());
+    let execute = DocumentExecuteTool.schema();
+    assert!(execute.get("oneOf").is_none());
+    assert!(execute["properties"].get("documentId").is_some());
+    assert!(execute["properties"].get("operation").is_some());
+    assert!(execute["properties"].get("arguments").is_some());
+    assert!(execute["properties"].get("action").is_none());
 
     let browser = BrowserTool.schema();
     let navigate = &action_schema_branch(&browser, "navigate")["properties"];
@@ -365,11 +321,10 @@ fn builtin_action_discriminators_never_use_a_flat_optional_field_bag() {
 
 #[test]
 fn action_driven_tools_reject_cross_action_or_incomplete_inputs() {
-    assert!(SpreadsheetTool
+    assert!(DocumentExecuteTool
         .input_error(&json!({
-            "action": "read_range",
-            "path": "book.xlsx",
-            "sheet": "Sheet1"
+            "operation": "read_range",
+            "arguments": {}
         }))
         .is_some());
     assert!(BrowserTool
@@ -416,15 +371,11 @@ fn action_driven_tools_reject_cross_action_or_incomplete_inputs() {
         }))
         .is_some());
 
-    assert!(SpreadsheetTool
+    assert!(DocumentExecuteTool
         .input_error(&json!({
-            "action": "read_range",
-            "path": "book.xlsx",
-            "sheet": "Sheet1",
-            "range": {
-                "start": { "row": 0, "column": 0 },
-                "end": { "row": 1, "column": 1 }
-            }
+            "documentId": Uuid::new_v4(),
+            "operation": "read_range",
+            "arguments": {}
         }))
         .is_none());
     assert!(BackgroundOutputTool

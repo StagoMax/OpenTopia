@@ -270,7 +270,7 @@ fn bundled_native_tools_are_not_core_tools_and_keep_their_plugin_source() {
     assert!(core.get("document").is_none());
     assert!(core.get("pdf").is_none());
     assert!(core.get("spreadsheet").is_none());
-    assert!(core.get("spreadsheet_inspect").is_none());
+    assert!(core.get("document_open").is_none());
 
     let defaults = ToolRegistry::with_builtins();
     assert_eq!(
@@ -297,16 +297,10 @@ fn bundled_native_tools_are_not_core_tools_and_keep_their_plugin_source() {
             plugin_name: "pdf".to_string(),
         })
     );
-    assert_eq!(
-        defaults.source("spreadsheet"),
-        Some(ToolSource::BundledPlugin {
-            plugin_name: "spreadsheet".to_string(),
-        })
-    );
     for name in [
-        "spreadsheet_inspect",
-        "spreadsheet_describe",
-        "spreadsheet_execute",
+        "document_open",
+        "document_get_operation_schemas",
+        "document_execute",
     ] {
         assert_eq!(
             defaults.source(name),

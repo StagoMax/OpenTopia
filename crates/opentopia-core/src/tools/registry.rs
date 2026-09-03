@@ -1,11 +1,11 @@
 use super::{
-    ApplyPatchTool, BackgroundOutputTool, BrowserTool, ComputerTool, CreateSkillTool, DocumentTool,
+    ApplyPatchTool, BackgroundOutputTool, BrowserTool, ComputerTool, CreateSkillTool,
+    DocumentExecuteTool, DocumentGetOperationSchemasTool, DocumentOpenTool, DocumentTool,
     FilesystemTool, FollowupAgentTaskTool, InterruptAgentTool, ListAgentsTool, ListSkillsTool,
     PdfTool, ReadArtifactTool, ReadAttachmentTool, ReadSkillTool, RegisteredTool,
-    RequestUserInputTool, SendAgentMessageTool, ShellTool, SpawnAgentTool, SpreadsheetDescribeTool,
-    SpreadsheetExecuteTool, SpreadsheetInspectTool, SpreadsheetTool, Tool, ToolApprovalMode,
-    ToolCapabilityDescriptor, ToolClass, ToolExecutionPolicy, ToolGovernance, ToolModelVisibility,
-    ToolRiskLevel, ToolSideEffect, ToolSource, UpdatePlanTool, ViewAttachmentTool, WaitAgentTool,
+    RequestUserInputTool, SendAgentMessageTool, ShellTool, SpawnAgentTool, Tool, ToolApprovalMode,
+    ToolCapabilityDescriptor, ToolClass, ToolExecutionPolicy, ToolGovernance, ToolRiskLevel,
+    ToolSideEffect, ToolSource, UpdatePlanTool, ViewAttachmentTool, WaitAgentTool,
 };
 use crate::bundled_plugins::bundled_plugin_catalog;
 use crate::enterprise::DataClassification;
@@ -231,17 +231,17 @@ impl ToolRegistry {
                             DataClassification::Restricted,
                         ),
                     ),
-                    "spreadsheet" => (
-                        Arc::new(SpreadsheetTool),
+                    "document_open" => (
+                        Arc::new(DocumentOpenTool),
                         governed(
-                            ToolRiskLevel::High,
-                            ToolSideEffect::WorkspaceWrite,
+                            ToolRiskLevel::Low,
+                            ToolSideEffect::SessionMutation,
                             ToolApprovalMode::PolicyControlled,
                             DataClassification::Restricted,
                         ),
                     ),
-                    "spreadsheet_inspect" => (
-                        Arc::new(SpreadsheetInspectTool),
+                    "document_get_operation_schemas" => (
+                        Arc::new(DocumentGetOperationSchemasTool),
                         governed(
                             ToolRiskLevel::Low,
                             ToolSideEffect::None,
@@ -249,17 +249,8 @@ impl ToolRegistry {
                             DataClassification::Restricted,
                         ),
                     ),
-                    "spreadsheet_describe" => (
-                        Arc::new(SpreadsheetDescribeTool),
-                        governed(
-                            ToolRiskLevel::Low,
-                            ToolSideEffect::None,
-                            ToolApprovalMode::PolicyControlled,
-                            DataClassification::Restricted,
-                        ),
-                    ),
-                    "spreadsheet_execute" => (
-                        Arc::new(SpreadsheetExecuteTool),
+                    "document_execute" => (
+                        Arc::new(DocumentExecuteTool),
                         governed(
                             ToolRiskLevel::High,
                             ToolSideEffect::WorkspaceWrite,
@@ -277,14 +268,6 @@ impl ToolRegistry {
                     ToolClass::Standard,
                     governance,
                 );
-                // The v1 action-union implementation is retained as the shared
-                // executor for persisted calls and the v2 protocol adapter. It
-                // must never contribute its large schema to a model request.
-                let registration = if *capability == "spreadsheet" {
-                    registration.internal_only()
-                } else {
-                    registration
-                };
                 self.register_entry(registration);
             }
         }
@@ -304,27 +287,16 @@ impl ToolRegistry {
     }
 
     /// Registers a server-composed local tool without repeating its ID. When a
-    /// tool replaces an existing record, its static class, model visibility,
-    /// and governance stay attached to that registry slot.
+    /// tool replaces an existing record, its static class and governance stay
+    /// attached to that registry slot.
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
         let name = tool.name();
-        let (class, model_visibility, governance) = self
+        let (class, governance) = self
             .entries
             .get(name)
-            .map(|entry| {
-                (
-                    entry.class,
-                    entry.model_visibility,
-                    entry.governance.clone(),
-                )
-            })
-            .unwrap_or((
-                ToolClass::Standard,
-                ToolModelVisibility::Visible,
-                ToolGovernance::unknown(),
-            ));
-        let mut registration = RegisteredTool::core(tool, class, governance);
-        registration.model_visibility = model_visibility;
+            .map(|entry| (entry.class, entry.governance.clone()))
+            .unwrap_or((ToolClass::Standard, ToolGovernance::unknown()));
+        let registration = RegisteredTool::core(tool, class, governance);
         self.register_entry(registration);
     }
 
@@ -408,9 +380,7 @@ impl ToolRegistry {
     }
 
     pub(crate) fn is_model_visible(&self, name: &str) -> bool {
-        self.entries
-            .get(name)
-            .is_some_and(|entry| entry.model_visibility == ToolModelVisibility::Visible)
+        self.entries.contains_key(name)
     }
 
     pub fn execution_policy(&self, name: &str, call: &ToolCall) -> Option<ToolExecutionPolicy> {
@@ -452,25 +422,22 @@ mod tests {
     }
 
     #[test]
-    fn legacy_spreadsheet_executor_is_internal_only() {
-        let mut registry = ToolRegistry::with_builtins();
+    fn document_executor_is_loaded_progressively() {
+        let registry = ToolRegistry::with_builtins();
 
-        assert!(registry.get("spreadsheet").is_some());
-        assert!(!registry.is_model_visible("spreadsheet"));
-        registry.register(Arc::new(SpreadsheetTool));
-        assert!(!registry.is_model_visible("spreadsheet"));
+        assert!(registry.get("spreadsheet").is_none());
         for name in [
-            "spreadsheet_inspect",
-            "spreadsheet_describe",
-            "spreadsheet_execute",
+            "document_open",
+            "document_get_operation_schemas",
+            "document_execute",
         ] {
             assert!(registry.is_model_visible(name), "{name} should be visible");
         }
         assert_eq!(
-            registry.provider_contract_loader("spreadsheet_execute"),
-            Some("spreadsheet_describe")
+            registry.provider_contract_loader("document_execute"),
+            Some("document_get_operation_schemas")
         );
-        assert!(registry.is_provider_contract_loader("spreadsheet_describe"));
+        assert!(registry.is_provider_contract_loader("document_get_operation_schemas"));
         assert!(!registry.is_provider_contract_loader("filesystem"));
     }
 

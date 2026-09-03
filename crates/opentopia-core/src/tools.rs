@@ -630,7 +630,7 @@ impl ToolExecutionPolicy {
 }
 
 mod descriptor;
-pub(crate) use descriptor::{RegisteredTool, ToolGovernance, ToolModelVisibility};
+pub(crate) use descriptor::{RegisteredTool, ToolGovernance};
 pub use descriptor::{
     ToolApprovalMode, ToolCapabilityDescriptor, ToolClass, ToolRiskLevel, ToolSource,
 };
@@ -645,20 +645,18 @@ fn truncate_chars(value: &str, limit: usize) -> String {
 }
 
 mod spreadsheet_tool;
-pub use spreadsheet_tool::SpreadsheetTool;
-#[cfg(test)]
-use spreadsheet_tool::SpreadsheetToolInput;
 
 mod office_resource;
-use office_resource::OfficeResourceRef;
-mod spreadsheet_protocol_contract;
-mod spreadsheet_protocol_tools;
-pub use spreadsheet_protocol_tools::{
-    SpreadsheetDescribeTool, SpreadsheetExecuteTool, SpreadsheetInspectTool,
+use office_resource::DocumentResourceRef;
+mod document_protocol_tools;
+mod document_session;
+mod spreadsheet_operations;
+pub use document_protocol_tools::{
+    DocumentExecuteTool, DocumentGetOperationSchemasTool, DocumentOpenTool,
 };
-impl_typed_tool!(SpreadsheetInspectTool);
-impl_typed_tool!(SpreadsheetDescribeTool);
-impl_typed_tool!(SpreadsheetExecuteTool);
+impl_typed_tool!(DocumentOpenTool);
+impl_typed_tool!(DocumentGetOperationSchemasTool);
+impl_typed_tool!(DocumentExecuteTool);
 
 mod request_user_input_tool;
 pub use request_user_input_tool::RequestUserInputTool;

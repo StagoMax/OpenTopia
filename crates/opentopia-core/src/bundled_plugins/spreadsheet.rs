@@ -19,14 +19,13 @@ const FILES: &[BundledPluginFile] = &[
 pub(super) const PACKAGE: BundledPluginPackage = BundledPluginPackage {
     metadata: BundledPluginMetadata {
         name: "spreadsheet",
-        version: "2.0.0",
+        version: "3.0.0",
         trust: BundledPluginTrust::Official,
         default_enabled: true,
         native_capabilities: &[
-            "spreadsheet",
-            "spreadsheet_inspect",
-            "spreadsheet_describe",
-            "spreadsheet_execute",
+            "document_open",
+            "document_get_operation_schemas",
+            "document_execute",
         ],
     },
     files: FILES,
@@ -36,24 +35,9 @@ pub(super) const PACKAGE: BundledPluginPackage = BundledPluginPackage {
 mod tests {
     use super::*;
     use crate::tools::{
-        SpreadsheetDescribeTool, SpreadsheetExecuteTool, SpreadsheetInspectTool, SpreadsheetTool,
-        Tool,
+        DocumentExecuteTool, DocumentGetOperationSchemasTool, DocumentOpenTool, Tool,
     };
     use serde_json::Value;
-
-    fn action_names(schema: &Value) -> Vec<String> {
-        schema["oneOf"]
-            .as_array()
-            .expect("action branches")
-            .iter()
-            .map(|branch| {
-                branch["properties"]["action"]["enum"][0]
-                    .as_str()
-                    .expect("action name")
-                    .to_string()
-            })
-            .collect()
-    }
 
     #[test]
     fn package_and_manifest_keep_host_owned_trust_out_of_plugin_data() {
@@ -66,28 +50,26 @@ mod tests {
         assert_eq!(
             PACKAGE.metadata.native_capabilities,
             &[
-                "spreadsheet",
-                "spreadsheet_inspect",
-                "spreadsheet_describe",
-                "spreadsheet_execute",
+                "document_open",
+                "document_get_operation_schemas",
+                "document_execute",
             ]
         );
         assert!(manifest.get("trust").is_none());
         assert!(manifest.get("official").is_none());
         assert!(manifest["opentopia"].get("trust").is_none());
         assert!(manifest["opentopia"].get("official").is_none());
+        assert!(manifest["interface"].get("defaultPrompt").is_none());
     }
 
     #[test]
     fn manifest_registers_the_model_tool_without_owning_desktop_preview() {
         let manifest: Value = serde_json::from_slice(MANIFEST).expect("valid plugin manifest");
         let opentopia = &manifest["opentopia"];
-        let tool = SpreadsheetTool;
-
         assert_eq!(opentopia["apiVersion"], "1");
         assert_eq!(
             opentopia["contributes"]["nativeTools"][0]["id"],
-            tool.name()
+            DocumentOpenTool.name()
         );
         assert_eq!(
             opentopia["contributes"]["nativeTools"]
@@ -98,35 +80,11 @@ mod tests {
                 .map(|entry| entry["id"].as_str().expect("tool id"))
                 .collect::<Vec<_>>(),
             vec![
-                SpreadsheetInspectTool.name(),
-                SpreadsheetDescribeTool.name(),
-                SpreadsheetExecuteTool.name(),
+                DocumentGetOperationSchemasTool.name(),
+                DocumentExecuteTool.name(),
             ]
         );
-        assert_eq!(
-            action_names(&tool.schema()),
-            vec![
-                "inspect_delimited",
-                "inspect",
-                "list_sheets",
-                "read_range",
-                "read_ranges",
-                "read_rows",
-                "read_columns",
-                "find",
-                "filter_rows",
-                "validate",
-                "fill_template",
-                "transfer_rows",
-                "export_delimited",
-                "write",
-                "write_rows",
-                "write_columns",
-                "copy_rows",
-                "copy_columns",
-                "batch",
-            ]
-        );
+        assert!(DocumentExecuteTool.schema().get("oneOf").is_none());
         assert!(opentopia["contributes"].get("previewers").is_none());
         assert_eq!(
             opentopia["configuration"]["schema"],

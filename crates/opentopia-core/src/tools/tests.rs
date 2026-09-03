@@ -17,5 +17,3 @@ mod patch;
 mod policy_git;
 mod schemas;
 mod spreadsheet;
-
-use schemas::action_schema_branch;
