@@ -50,6 +50,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--logs-dir", required=True, type=Path)
     parser.add_argument("--run-label", required=True)
     parser.add_argument("--reasoning-effort", default="high")
+    parser.add_argument(
+        "--permission-mode",
+        choices=("full-access", "unrestricted"),
+        default="full-access",
+        help="OpenTopia permission preset used for the evaluated turn.",
+    )
+    parser.add_argument(
+        "--approval-strategy",
+        choices=("external-auto-approve", "none"),
+        default="external-auto-approve",
+        help=(
+            "How the benchmark adapter handles product approval requests. "
+            "Use none with unrestricted to avoid reviewer or simulated-user overhead."
+        ),
+    )
     parser.add_argument("--max-output-tokens", type=int, default=8192)
     parser.add_argument("--rollout-limit-tokens", type=int)
     parser.add_argument("--run-timeout-seconds", type=int, default=1800)
@@ -145,14 +160,14 @@ def configure_server(
         "OPENTOPIA_MODEL": required_env(config, "OPENTOPIA_EVAL_MODEL"),
         "OPENTOPIA_API_TOKEN": token,
         "OPENTOPIA_DB": SERVER_DB_PATH,
-        "OPENTOPIA_PERMISSION": "full-access",
+        "OPENTOPIA_PERMISSION": args.permission_mode,
         "OPENTOPIA_SANDBOX_MODE": "danger-full-access",
         "OPENTOPIA_SANDBOX_ENFORCEMENT": "disabled",
         "OPENTOPIA_SANDBOX_NETWORK": "inherit",
     }
     exec_checked(
         container,
-        f"nohup {SERVER_PATH} --host 127.0.0.1 --port {SERVER_PORT} --db {SERVER_DB_PATH} --permission full-access > {SERVER_LOG_PATH} 2>&1 < /dev/null &",
+        f"nohup {SERVER_PATH} --host 127.0.0.1 --port {SERVER_PORT} --db {SERVER_DB_PATH} --permission {args.permission_mode} > {SERVER_LOG_PATH} 2>&1 < /dev/null &",
         env=server_env,
     )
     deadline = time.monotonic() + 30
@@ -191,7 +206,8 @@ def configure_server(
     return token, {
         "executionRuntime": "official-swebench-instance-container",
         "workspace": WORKSPACE,
-        "permissionMode": "full-access",
+        "permissionMode": args.permission_mode,
+        "approvalStrategy": args.approval_strategy,
         "model": required_env(config, "OPENTOPIA_EVAL_MODEL"),
         "reasoningEffort": args.reasoning_effort,
         "maxOutputTokens": args.max_output_tokens,
@@ -266,6 +282,10 @@ def run_agent(
             terminal = candidate
             break
         if status == "waiting_approval":
+            if args.approval_strategy == "none":
+                raise RuntimeError(
+                    "turn requested approval while the evaluation approval strategy was none"
+                )
             pending = api(container, token, "GET", f"/api/threads/{thread_id}/approvals?status=pending")
             for approval in pending:
                 approval_id = approval.get("approvalId")
@@ -322,6 +342,10 @@ def run_agent(
 
 def main() -> None:
     args = parse_args()
+    if args.permission_mode == "unrestricted" and args.approval_strategy != "none":
+        raise SystemExit(
+            "--permission-mode unrestricted requires --approval-strategy none"
+        )
     if not args.server_binary.is_file():
         raise SystemExit(f"server binary not found: {args.server_binary}")
     instance = read_instance(args.instances, args.instance_id)
