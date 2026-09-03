@@ -1,16 +1,21 @@
-import type { AgentEvent, ToolCall, ToolResult, WorkForm } from "../../types";
+import type {
+  AgentEvent,
+  ToolCall,
+  ToolResult,
+  WorkForm,
+} from "../../types.ts";
 import {
   asRecord,
   classifyToolCall,
   stringField,
   toolActivityGroup,
   type ToolActivityGroup as ToolGroupKey,
-} from "../../toolActivity";
-import type { GuardianReviewCompletedPayload } from "../../guardianActivity";
+} from "../../toolActivity.ts";
+import type { GuardianReviewCompletedPayload } from "../../guardianActivity.ts";
 import {
   buildContextCompactionActivities,
   type ContextCompactionActivityEntry,
-} from "./contextCompactionActivity";
+} from "./contextCompactionActivity.ts";
 
 export type ToolExecution = {
   call: ToolCall;
@@ -126,7 +131,11 @@ export type ActivityState =
   "running" | "complete" | "waiting" | "cancelled" | "error";
 
 export function buildActivityEntries(events: AgentEvent[]): ActivityEntry[] {
-  const sorted = [...events].sort((left, right) => left.seq - right.seq);
+  const ordered = [...events].sort((left, right) => left.seq - right.seq);
+  const discardedProviderDeltaSeqs = findDiscardedProviderDeltaSeqs(ordered);
+  const sorted = ordered.filter(
+    (event) => !discardedProviderDeltaSeqs.has(event.seq),
+  );
   const finalResponseDeltaSeqs = findFinalResponseDeltaSeqs(sorted);
   const resultEvents = new Map<
     string,
@@ -411,6 +420,73 @@ export function buildActivityEntries(events: AgentEvent[]): ActivityEntry[] {
   return entries;
 }
 
+/**
+ * Provider text is rendered while an atomic, tool-capable response is still
+ * provisional. A retry starts a new attempt for the same request, so deltas
+ * from the uncommitted attempt must disappear instead of being duplicated by
+ * the replacement response. Canonical diagnostics remain append-only; this is
+ * only the user-facing projection of those events.
+ */
+function findDiscardedProviderDeltaSeqs(events: AgentEvent[]): Set<number> {
+  const discarded = new Set<number>();
+  const committedAttempts = new Set<string>();
+  const latestAttemptByRequest = new Map<string, number>();
+  const failed = events.some(
+    (event) =>
+      event.payload.type === "error" || event.payload.type === "turn_cancelled",
+  );
+
+  for (const event of events) {
+    const payload = event.payload;
+    if (payload.type === "provider_request_retried") {
+      const requestKey = providerRequestKey(payload.request_id, payload.round);
+      const previous = latestAttemptByRequest.get(requestKey) ?? 1;
+      latestAttemptByRequest.set(
+        requestKey,
+        Math.max(previous, payload.attempt),
+      );
+    } else if (payload.type === "provider_response_commit_started") {
+      committedAttempts.add(
+        providerAttemptKey(payload.request_id, payload.round, payload.attempt),
+      );
+    }
+  }
+
+  for (const event of events) {
+    const payload = event.payload;
+    if (payload.type !== "model_delta" && payload.type !== "reasoning_delta") {
+      continue;
+    }
+    const origin = payload.provider_attempt;
+    if (!origin) continue;
+    const superseded =
+      origin.attempt <
+      (latestAttemptByRequest.get(
+        providerRequestKey(origin.request_id, origin.round),
+      ) ?? 1);
+    const uncommittedFailure =
+      failed &&
+      !committedAttempts.has(
+        providerAttemptKey(origin.request_id, origin.round, origin.attempt),
+      );
+    if (superseded || uncommittedFailure) discarded.add(event.seq);
+  }
+
+  return discarded;
+}
+
+function providerRequestKey(requestId: string, round: number): string {
+  return `${requestId}:${round}`;
+}
+
+function providerAttemptKey(
+  requestId: string,
+  round: number,
+  attempt: number,
+): string {
+  return `${providerRequestKey(requestId, round)}:${attempt}`;
+}
+
 function findFinalResponseDeltaSeqs(events: AgentEvent[]): Set<number> {
   let assistantIndex = -1;
   for (let index = events.length - 1; index >= 0; index -= 1) {
@@ -424,9 +500,7 @@ function findFinalResponseDeltaSeqs(events: AgentEvent[]): Set<number> {
   const assistantEvent = events[assistantIndex];
   if (assistantEvent.payload.type !== "assistant_message") return new Set();
   const finalText = assistantEvent.payload.message.parts
-    .filter(
-      (part) => part.type === "text" || part.type === "proposed_plan",
-    )
+    .filter((part) => part.type === "text" || part.type === "proposed_plan")
     .map((part) =>
       part.type === "text" || part.type === "proposed_plan" ? part.text : "",
     )

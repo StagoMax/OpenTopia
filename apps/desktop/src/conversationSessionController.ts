@@ -32,6 +32,7 @@ export type ConversationSendRequest = {
   imageAttachments?: InlineImageAttachment[];
   contentParts?: InlineMessageContentPart[];
   libraryProvider?: LibraryProviderId;
+  replaceMessageId?: string;
 };
 
 export type ConversationSendResult = {
@@ -190,11 +191,13 @@ export class ConversationSessionController {
         request.contentParts ?? [],
         request.libraryProvider,
         trace,
+        request.replaceMessageId,
       );
       this.dispatch({
         type: "sendSucceeded",
         message: result.message,
         queued: result.queued,
+        replaceMessageId: request.replaceMessageId,
       });
       recordConversationSendTrace(
         conversationSendTrace(trace, "state_confirmed", {

@@ -59,9 +59,11 @@ async fn activity_event_batches_receive_contiguous_session_sequences() {
             vec![
                 AgentEventPayload::ReasoningDelta {
                     text: "one".to_string(),
+                    provider_attempt: None,
                 },
                 AgentEventPayload::ModelDelta {
                     text: "two".to_string(),
+                    provider_attempt: None,
                 },
             ],
             None,
@@ -92,9 +94,11 @@ async fn activity_summary_materializes_and_reads_a_bounded_reasoning_tail() {
             vec![
                 AgentEventPayload::ReasoningDelta {
                     text: "one".to_string(),
+                    provider_attempt: None,
                 },
                 AgentEventPayload::ReasoningDelta {
                     text: "two".to_string(),
+                    provider_attempt: None,
                 },
             ],
             None,

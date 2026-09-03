@@ -320,7 +320,7 @@ impl AnthropicMessagesProvider {
         let decoded = {
             let mut observed_delta = |delta| {
                 telemetry.observe(&delta, on_transport)?;
-                if atomic_response && !delta.is_tool_call_done() {
+                if atomic_response && delta.waits_for_atomic_commit() {
                     provisional_deltas.push(delta);
                     Ok(())
                 } else {

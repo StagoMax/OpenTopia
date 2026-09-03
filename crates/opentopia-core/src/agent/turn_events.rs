@@ -1,4 +1,4 @@
-use crate::model::AgentEventPayload;
+use crate::model::{AgentEventPayload, ProviderDeltaAttempt};
 use crate::tool_error::ensure_tool_error_record;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -26,6 +26,7 @@ enum StreamEventKind {
 struct PendingStreamEvent {
     kind: StreamEventKind,
     text: String,
+    provider_attempt: Option<ProviderDeltaAttempt>,
     started_at: Instant,
 }
 
@@ -52,11 +53,17 @@ impl TurnEvents {
 
     pub(super) fn push(&mut self, payload: AgentEventPayload) {
         match payload {
-            AgentEventPayload::ModelDelta { text } => {
-                self.push_stream_delta(StreamEventKind::Model, text);
+            AgentEventPayload::ModelDelta {
+                text,
+                provider_attempt,
+            } => {
+                self.push_stream_delta(StreamEventKind::Model, text, provider_attempt);
             }
-            AgentEventPayload::ReasoningDelta { text } => {
-                self.push_stream_delta(StreamEventKind::Reasoning, text);
+            AgentEventPayload::ReasoningDelta {
+                text,
+                provider_attempt,
+            } => {
+                self.push_stream_delta(StreamEventKind::Reasoning, text, provider_attempt);
             }
             payload => {
                 self.flush_pending_stream();
@@ -89,16 +96,19 @@ impl TurnEvents {
         self.items.push(payload);
     }
 
-    fn push_stream_delta(&mut self, kind: StreamEventKind, text: String) {
+    fn push_stream_delta(
+        &mut self,
+        kind: StreamEventKind,
+        text: String,
+        provider_attempt: Option<ProviderDeltaAttempt>,
+    ) {
         if text.is_empty() {
             return;
         }
 
-        if self
-            .pending_stream
-            .as_ref()
-            .is_some_and(|pending| pending.kind != kind)
-        {
+        if self.pending_stream.as_ref().is_some_and(|pending| {
+            pending.kind != kind || pending.provider_attempt != provider_attempt
+        }) {
             self.flush_pending_stream();
         }
 
@@ -107,6 +117,7 @@ impl TurnEvents {
             .get_or_insert_with(|| PendingStreamEvent {
                 kind,
                 text: String::new(),
+                provider_attempt,
                 started_at: Instant::now(),
             });
         pending.text.push_str(&text);
@@ -122,8 +133,14 @@ impl TurnEvents {
             return;
         };
         let payload = match pending.kind {
-            StreamEventKind::Model => AgentEventPayload::ModelDelta { text: pending.text },
-            StreamEventKind::Reasoning => AgentEventPayload::ReasoningDelta { text: pending.text },
+            StreamEventKind::Model => AgentEventPayload::ModelDelta {
+                text: pending.text,
+                provider_attempt: pending.provider_attempt,
+            },
+            StreamEventKind::Reasoning => AgentEventPayload::ReasoningDelta {
+                text: pending.text,
+                provider_attempt: pending.provider_attempt,
+            },
         };
         self.push_immediate(payload, true);
     }
@@ -179,5 +196,39 @@ mod tests {
             .expect("serialize event")
             .get("checkpoint")
             .is_none());
+    }
+
+    #[test]
+    fn stream_coalescing_preserves_provider_attempt_boundaries() {
+        let request_id = Uuid::new_v4();
+        let mut events = TurnEvents::new(None);
+
+        for (text, attempt) in [("old", 1), ("new", 2)] {
+            events.push(AgentEventPayload::ModelDelta {
+                text: text.to_string(),
+                provider_attempt: Some(ProviderDeltaAttempt {
+                    request_id,
+                    round: 1,
+                    attempt,
+                }),
+            });
+        }
+
+        let events = events.into_vec();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            AgentEventPayload::ModelDelta {
+                text,
+                provider_attempt: Some(origin),
+            } if text == "old" && origin.attempt == 1
+        ));
+        assert!(matches!(
+            &events[1],
+            AgentEventPayload::ModelDelta {
+                text,
+                provider_attempt: Some(origin),
+            } if text == "new" && origin.attempt == 2
+        ));
     }
 }

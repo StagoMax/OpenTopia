@@ -280,7 +280,7 @@ pub(super) fn attachment_preloaded_tools(messages: &[Message]) -> BTreeSet<&'sta
                 if SpreadsheetFileFormat::from_content_type(content_type).is_some()
                     || SpreadsheetFileFormat::from_extension(extension).is_some() =>
             {
-                tools.insert("spreadsheet_inspect");
+                tools.insert("document_open");
             }
             _ => {}
         }

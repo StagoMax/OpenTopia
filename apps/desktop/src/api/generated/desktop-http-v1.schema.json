@@ -862,6 +862,16 @@
         },
         {
           "properties": {
+            "provider_attempt": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ProviderDeltaAttempt"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "text": {
               "type": "string"
             },
@@ -880,6 +890,16 @@
         },
         {
           "properties": {
+            "provider_attempt": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ProviderDeltaAttempt"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "text": {
               "type": "string"
             },
@@ -10640,6 +10660,31 @@
         "unknown"
       ],
       "type": "string"
+    },
+    "ProviderDeltaAttempt": {
+      "description": "Identifies semantic output from one provider request attempt. Consumers may render it provisionally while the matching response is in flight; a retry supersedes an earlier uncommitted attempt.",
+      "properties": {
+        "attempt": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "request_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "round": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "attempt",
+        "request_id",
+        "round"
+      ],
+      "type": "object"
     },
     "ProviderDriverDescriptor": {
       "properties": {

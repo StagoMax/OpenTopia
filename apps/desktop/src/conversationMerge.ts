@@ -51,16 +51,38 @@ function appendCompactedEvent(
     previous?.payload.type === "model_delta" &&
     event.payload.type === "model_delta" &&
     previous.threadId === event.threadId &&
-    previous.turnId === event.turnId
+    previous.turnId === event.turnId &&
+    sameProviderAttempt(
+      previous.payload.provider_attempt,
+      event.payload.provider_attempt,
+    )
   ) {
     compacted[compacted.length - 1] = {
       ...event,
       payload: {
-        type: "model_delta",
+        ...event.payload,
         text: previous.payload.text + event.payload.text,
       },
     };
     return;
   }
   compacted.push(event);
+}
+
+function sameProviderAttempt(
+  left: Extract<
+    AgentEvent["payload"],
+    { type: "model_delta" }
+  >["provider_attempt"],
+  right: Extract<
+    AgentEvent["payload"],
+    { type: "model_delta" }
+  >["provider_attempt"],
+): boolean {
+  if (!left || !right) return left === right;
+  return (
+    left.request_id === right.request_id &&
+    left.round === right.round &&
+    left.attempt === right.attempt
+  );
 }

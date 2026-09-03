@@ -203,10 +203,9 @@ pub(crate) fn provider_tool_result_metadata(tool_name: &str, metadata: &Value) -
         }
         "document"
         | "pdf"
-        | "spreadsheet"
-        | "spreadsheet_inspect"
-        | "spreadsheet_describe"
-        | "spreadsheet_execute" => {
+        | "document_open"
+        | "document_get_operation_schemas"
+        | "document_execute" => {
             object.remove("action");
         }
         _ => {}
@@ -352,12 +351,11 @@ fn bound_structured_content(
             continue;
         }
 
-        let compacted =
-            if remaining >= 1_000 && matches!(tool_name, "spreadsheet" | "spreadsheet_execute") {
-                compact_spreadsheet_json(value, remaining, artifact_id)
-            } else {
-                compact_generic_json(value, artifact_id)
-            };
+        let compacted = if remaining >= 1_000 && tool_name == "document_execute" {
+            compact_spreadsheet_json(value, remaining, artifact_id)
+        } else {
+            compact_generic_json(value, artifact_id)
+        };
         let compacted_bytes = serde_json::to_vec(&compacted)
             .map(|encoded| encoded.len())
             .unwrap_or(usize::MAX);
@@ -470,7 +468,7 @@ fn compact_spreadsheet_json(value: &Value, max_bytes: usize, artifact_id: Uuid) 
             compacted_result.insert("nextRow".to_string(), json!(start_row + returned as u64));
             compacted_result.insert(
                 "continuation".to_string(),
-                json!("Call spreadsheet read_rows/read_range for the remaining rows, or read_artifact for the full serialized result."),
+                json!("Call document_execute with read_rows/read_range for the remaining rows, or read_artifact for the full serialized result."),
             );
         }
         if serde_json::to_vec(&compacted)
@@ -510,11 +508,17 @@ fn compact_provider_metadata(metadata: &Value) -> Value {
     const KEYS: &[&str] = &[
         "toolName",
         "action",
+        "operation",
         "success",
         "isError",
         "errorCode",
         "error",
         "changedPath",
+        "documentId",
+        "documentType",
+        "selectionId",
+        "rowsWritten",
+        "columnsWritten",
         "artifactId",
         "artifactKind",
         "artifact",
@@ -872,11 +876,19 @@ mod tests {
             call_id: Uuid::new_v4(),
             output: output.clone(),
             content: vec![ModelContentPart::json(value)],
-            metadata: json!({ "toolName": "spreadsheet", "success": true }),
+            metadata: json!({
+                "toolName": "document_execute",
+                "operation": "read_range",
+                "success": true
+            }),
         };
 
-        let normalized =
-            normalize_tool_result_at_ingress("spreadsheet", result, Some(&state), Some(thread.id));
+        let normalized = normalize_tool_result_at_ingress(
+            "document_execute",
+            result,
+            Some(&state),
+            Some(thread.id),
+        );
         let projected = provider_tool_result_content(&normalized);
         let ModelContentPart::Json { value } = &projected[0] else {
             panic!("spreadsheet projection must stay structured");

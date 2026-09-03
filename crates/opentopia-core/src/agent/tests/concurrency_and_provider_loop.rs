@@ -494,7 +494,7 @@ async fn model_driven_direction_choice_resumes_and_executes_the_answer() {
     assert!(resumed.events.iter().all(|event| {
         !matches!(
             event,
-            AgentEventPayload::ModelDelta { text }
+            AgentEventPayload::ModelDelta { text, .. }
                 if text.contains("<proposed_plan>") || text.contains("</proposed_plan>")
         )
     }));
@@ -702,7 +702,7 @@ async fn provider_reasoning_stream_becomes_a_reasoning_event() {
 
     assert!(events.iter().any(|event| matches!(
         event,
-        AgentEventPayload::ReasoningDelta { text }
+        AgentEventPayload::ReasoningDelta { text, .. }
             if text == "正在检查项目结构"
     )));
 

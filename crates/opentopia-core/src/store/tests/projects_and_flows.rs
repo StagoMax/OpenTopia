@@ -504,10 +504,10 @@ fn sqlite_store_persists_terminal_history() {
 }
 
 #[test]
-fn flow_drafts_require_current_validation_and_trial_before_immutable_publish() {
+fn flow_drafts_require_current_validation_and_test_run_before_immutable_publish() {
     use crate::enterprise::{AgentRiskClassV1, CapabilityProjection};
     use crate::flow::{
-        simulate_flow, validate_flow_spec, FlowBudgetV1, FlowSourceV1, FlowSpecV1,
+        validate_flow_spec, FlowBudgetV1, FlowSourceV1, FlowSpecV1,
         GraphDefinitionV1, GraphNodeKindV1, GraphNodeV1,
     };
     use std::collections::BTreeSet;
@@ -568,8 +568,6 @@ fn flow_drafts_require_current_validation_and_trial_before_immutable_publish() {
     store
         .update_flow_draft(&draft, draft.revision)
         .expect("persist validation");
-    let trial = simulate_flow(&draft, serde_json::json!({}), &capabilities);
-    store.insert_flow_trial(&trial).expect("persist trial");
     assert!(matches!(
         store
             .publish_flow_draft(draft.id, "reviewer")
@@ -578,6 +576,28 @@ fn flow_drafts_require_current_validation_and_trial_before_immutable_publish() {
         Some(FlowStoreError::SuccessfulTestRunRequired)
     ));
     let candidate = crate::definition_from_draft(&draft, draft.revision, "test-runner");
+    let mut stale_test_run = crate::FlowRunV1::new(
+        thread.id,
+        &candidate,
+        serde_json::json!({}),
+        &capabilities,
+    )
+    .expect("create stale Test Run");
+    stale_test_run.test_draft_id = Some(draft.id);
+    stale_test_run.test_draft_revision = Some(draft.revision);
+    stale_test_run.definition_content_hash = "stale-content".to_string();
+    stale_test_run.status = crate::FlowRunStatusV1::Succeeded;
+    stale_test_run.completed_at = Some(Utc::now());
+    store
+        .insert_flow_run(&stale_test_run)
+        .expect("persist stale Test Run");
+    assert!(matches!(
+        store
+            .publish_flow_draft(draft.id, "reviewer")
+            .unwrap_err()
+            .downcast_ref::<FlowStoreError>(),
+        Some(FlowStoreError::SuccessfulTestRunRequired)
+    ));
     let mut test_run = crate::FlowRunV1::new(
         thread.id,
         &candidate,

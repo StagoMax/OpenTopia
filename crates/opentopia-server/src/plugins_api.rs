@@ -981,7 +981,7 @@ mod tests {
     }
 
     #[test]
-    fn bundled_plugins_keep_privileged_surfaces_off_and_activate_authorized_office_tools() {
+    fn default_bundled_plugins_activate_browser_and_office_while_computer_stays_opt_in() {
         let workspace = TestWorkspace::new();
         let store = SqliteSessionStore::open(":memory:").expect("open store");
         let thread = store
@@ -1014,12 +1014,12 @@ mod tests {
         assert!(spreadsheet.default_enabled);
         assert!(pdf.default_enabled);
         assert!(documents.default_enabled);
-        assert!(!browser.default_enabled);
+        assert!(browser.default_enabled);
         assert!(!computer.default_enabled);
 
         let outcome = load_plugin_outcome_for_thread(&store, &thread).expect("plugin load outcome");
         let snapshot = outcome.capability_snapshot();
-        for plugin in [spreadsheet, pdf, documents] {
+        for plugin in [spreadsheet, pdf, documents, browser] {
             assert!(snapshot.unavailable.iter().any(|item| {
                 item.contribution.contribution.plugin_id == plugin.id
                     && matches!(
@@ -1032,7 +1032,7 @@ mod tests {
                 .iter()
                 .any(|item| item.contribution.plugin_id == plugin.id));
         }
-        for plugin in [browser, computer] {
+        for plugin in [computer] {
             assert!(snapshot.unavailable.iter().any(|item| {
                 item.contribution.contribution.plugin_id == plugin.id
                     && matches!(item.reason, CapabilityUnavailableReason::Disabled)
@@ -1072,6 +1072,20 @@ mod tests {
             document_kinds,
             BTreeSet::from([ContributionKind::NativeTool])
         );
+        let browser_kinds = snapshot
+            .active
+            .iter()
+            .filter(|item| item.contribution.plugin_id == browser.id)
+            .map(|item| item.contribution.kind)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            browser_kinds,
+            BTreeSet::from([ContributionKind::Skill, ContributionKind::NativeTool])
+        );
+        assert!(!snapshot
+            .active
+            .iter()
+            .any(|item| item.contribution.plugin_id == computer.id));
     }
 
     #[test]

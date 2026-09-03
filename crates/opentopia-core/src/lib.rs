@@ -296,11 +296,11 @@ pub use model::{
     ContextCheckpointWorkspace, ContextCompactionDetails, ContextCompactionMetrics,
     ContextFactStatus, ContextProjection, ContextSourceRef, ContextSummary, ExperienceMode,
     GoalRecord, GoalSnapshot, GoalStatus, Message, MessagePart, MessageRole, ModelCallPurpose,
-    ModelContentPart, Project, SkillRef, TerminalCommandHistory, TerminalCommandStatus, Thread,
-    ThreadModelSelection, ToolCall, ToolResult, TurnChangeSet, TurnChangeSetStatus, TurnFileChange,
-    TurnFileChangeKind, TurnRecord, TurnStatus, UserInputAnswer, UserInputOption,
-    UserInputQuestion, UserInputRecord, UserInputRequest, UserInputResponse, UserInputStatus,
-    CONTEXT_CHECKPOINT_SCHEMA_VERSION,
+    ModelContentPart, Project, ProviderDeltaAttempt, SkillRef, TerminalCommandHistory,
+    TerminalCommandStatus, Thread, ThreadModelSelection, ToolCall, ToolResult, TurnChangeSet,
+    TurnChangeSetStatus, TurnFileChange, TurnFileChangeKind, TurnRecord, TurnStatus,
+    UserInputAnswer, UserInputOption, UserInputQuestion, UserInputRecord, UserInputRequest,
+    UserInputResponse, UserInputStatus, CONTEXT_CHECKPOINT_SCHEMA_VERSION,
 };
 pub use model_context::{
     content_fingerprint, estimate_tokens as estimate_model_context_tokens,
@@ -436,10 +436,11 @@ pub use tool_runtime::{
 pub use tool_state::ToolStateStore;
 pub use tools::{
     browser_handoff_for_node, browser_handoff_required, ApplyPatchTool, BrowserHandoffRequired,
-    BrowserTool, ComputerTool, DocumentTool, ListSkillsTool, McpToolWrapper, NativePatchOperation,
-    PdfTool, ReadArtifactTool, ReadSkillTool, RequestUserInputTool, ShellTool, SpreadsheetTool,
-    Tool, ToolApprovalMode, ToolCapabilityDescriptor, ToolExecutionPolicy, ToolInvocationContext,
-    ToolRegistry, ToolRiskLevel, ToolSource, UpdatePlanTool, WorkspaceSearchTool,
+    BrowserTool, ComputerTool, DocumentExecuteTool, DocumentGetOperationSchemasTool,
+    DocumentOpenTool, DocumentTool, ListSkillsTool, McpToolWrapper, NativePatchOperation, PdfTool,
+    ReadArtifactTool, ReadSkillTool, RequestUserInputTool, ShellTool, Tool, ToolApprovalMode,
+    ToolCapabilityDescriptor, ToolExecutionPolicy, ToolInvocationContext, ToolRegistry,
+    ToolRiskLevel, ToolSource, UpdatePlanTool, WorkspaceSearchTool,
 };
 pub use turn_inbox::{BufferedTurnInbox, TurnInbox, TurnInboxItem};
 pub use work_form::{WorkForm, WorkFormStatus, WorkItem, WorkItemStatus, WorkScope};

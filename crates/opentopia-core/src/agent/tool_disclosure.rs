@@ -2,10 +2,11 @@ use super::{
     bundle_is_visible, calibrated_input_estimate, estimate_provider_tool_surface_tokens,
     external_namespace, json, mcp_tool_declares_image_inspection, normalize_tool_argument_keys,
     redact_model_observation, tool_bundle, AgentCore, AgentEventPayload, Arc, AtomicBool,
-    AtomicOrdering, BTreeMap, CancellationToken, CanonicalModelRequest, CollaborationMode,
-    CompiledModelContext, ContextAssemblyInput, HashSet, ModelCallPurpose, ModelContentPart,
-    ModelConversationMessage, ModelGatewayMetricEvent, ModelResponse, ModelStreamDelta,
-    MultiAgentMode, PromptCacheBreakpointPolicy, ProviderFeatureSupport, ProviderRequestCheckpoint,
+    AtomicOrdering, AtomicUsize, BTreeMap, CancellationToken, CanonicalModelRequest,
+    CollaborationMode, CompiledModelContext, ContextAssemblyInput, HashSet, ModelCallPurpose,
+    ModelContentPart, ModelConversationMessage, ModelGatewayMetricEvent, ModelResponse,
+    ModelStreamDelta, MultiAgentMode, PromptCacheBreakpointPolicy, ProviderDeltaAttempt,
+    ProviderFeatureSupport, ProviderRequestCheckpoint, ProviderResponseCommitMode,
     ProviderToolCall, ProviderToolCandidate, ProviderToolDisclosure, ProviderToolNamespace,
     ProviderToolResult, ProviderTransportEvent, ToolClass, ToolExposurePolicy, ToolSource,
     TurnEvents, Uuid, Value, AUTOMATIC_TOOL_DISCLOSURE_COUNT_THRESHOLD,
@@ -94,6 +95,8 @@ impl AgentCore {
                     compatibility_hash: provider_compatibility_hash.to_string(),
                     transcript,
                 });
+        let attempt_scoped_output = prepared.response_commit == ProviderResponseCommitMode::Atomic;
+        let provider_attempt = Arc::new(AtomicUsize::new(1));
         events.push(AgentEventPayload::ProviderRequestSent {
             request_id,
             round,
@@ -109,8 +112,10 @@ impl AgentCore {
         let first_token_pending = Arc::new(AtomicBool::new(false));
         let first_token_observed = Arc::new(AtomicBool::new(false));
         let transport_first_token_observed = Arc::clone(&first_token_observed);
+        let transport_provider_attempt = Arc::clone(&provider_attempt);
         let mut transport_events = Vec::new();
-        let mut on_transport = |observation| {
+        let mut on_transport = |observation: ProviderTransportEvent| {
+            transport_provider_attempt.store(observation.attempt(), AtomicOrdering::SeqCst);
             let mut payloads = Vec::new();
             match observation {
                 ProviderTransportEvent::ResponseHeaders { attempt, status } => {
@@ -223,6 +228,7 @@ impl AgentCore {
         let metric_pending = Arc::clone(&first_token_pending);
         let metric_first_token_observed = Arc::clone(&first_token_observed);
         let metric_event_sender = events.sender.clone();
+        let delta_provider_attempt = Arc::clone(&provider_attempt);
         let mut on_metric = |metric| {
             match metric {
                 ModelGatewayMetricEvent::FirstOutputTokenReceived {
@@ -252,11 +258,25 @@ impl AgentCore {
                         .map(|parser| parser.push_str(&text))
                         .unwrap_or(text);
                     if !visible.is_empty() {
-                        events.push(AgentEventPayload::ModelDelta { text: visible });
+                        events.push(AgentEventPayload::ModelDelta {
+                            text: visible,
+                            provider_attempt: attempt_scoped_output.then(|| ProviderDeltaAttempt {
+                                request_id,
+                                round,
+                                attempt: delta_provider_attempt.load(AtomicOrdering::SeqCst),
+                            }),
+                        });
                     }
                 }
                 ModelStreamDelta::Reasoning { text } => {
-                    events.push(AgentEventPayload::ReasoningDelta { text });
+                    events.push(AgentEventPayload::ReasoningDelta {
+                        text,
+                        provider_attempt: attempt_scoped_output.then(|| ProviderDeltaAttempt {
+                            request_id,
+                            round,
+                            attempt: delta_provider_attempt.load(AtomicOrdering::SeqCst),
+                        }),
+                    });
                 }
                 ModelStreamDelta::Usage { usage } => {
                     latest_usage = Some(usage);
@@ -312,7 +332,14 @@ impl AgentCore {
         if let Some(parser) = proposed_plan_parser {
             let visible = parser.finish();
             if !visible.is_empty() {
-                events.push(AgentEventPayload::ModelDelta { text: visible });
+                events.push(AgentEventPayload::ModelDelta {
+                    text: visible,
+                    provider_attempt: attempt_scoped_output.then(|| ProviderDeltaAttempt {
+                        request_id,
+                        round,
+                        attempt: delta_provider_attempt.load(AtomicOrdering::SeqCst),
+                    }),
+                });
             }
         }
         if first_token_pending.swap(false, AtomicOrdering::SeqCst) {

@@ -180,7 +180,7 @@ impl AgentActivityReader {
             .iter()
             .filter(|event| event.seq > reasoning_start)
             .filter_map(|event| match &event.payload {
-                AgentEventPayload::ReasoningDelta { text } => Some(text.as_str()),
+                AgentEventPayload::ReasoningDelta { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<String>();
@@ -452,6 +452,7 @@ mod tests {
                 2,
                 AgentEventPayload::ReasoningDelta {
                     text: "准备运行测试。".to_string(),
+                    provider_attempt: None,
                 },
             ),
             event(

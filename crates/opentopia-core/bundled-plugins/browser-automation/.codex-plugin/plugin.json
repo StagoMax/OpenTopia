@@ -1,6 +1,6 @@
 {
   "name": "browser-automation",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Observe and automate a bounded OpenTopia browser session.",
   "author": {
     "name": "OpenTopia Contributors"

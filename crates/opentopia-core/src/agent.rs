@@ -37,7 +37,8 @@ use crate::mcp_host::McpExtensionHost;
 use crate::model::UserInputResponse;
 use crate::model::{
     AgentEventPayload, CollaborationMode, ExperienceMode, GoalRecord, Message, MessagePart,
-    MessageRole, ModelCallPurpose, ModelContentPart, ToolCall, ToolResult, UserInputRequest,
+    MessageRole, ModelCallPurpose, ModelContentPart, ProviderDeltaAttempt, ToolCall, ToolResult,
+    UserInputRequest,
 };
 use crate::model_context::{
     CompiledModelContext, ContextCacheScope, ContextItemKind, ContextRole, ContextSensitivity,
@@ -59,10 +60,10 @@ use crate::provider::{
     redact_model_observation, tool_input_schema_error, IncompleteReason, ModelConversationMessage,
     ModelConversationRole, ModelDecision, ModelProvider, ModelRequest, ModelResponse,
     ModelStreamDelta, ModelUsage, PromptCacheBreakpointPolicy, ProviderLoadedToolContract,
-    ProviderRequestCheckpoint, ProviderToolCall, ProviderToolCandidate, ProviderToolContractLoad,
-    ProviderToolDisclosure, ProviderToolNamespace, ProviderToolResult, ProviderTransportEvent,
-    PROVIDER_TOOL_CONTRACT_LOADS_METADATA_KEY, PROVIDER_TRANSCRIPT_CANDIDATE_TYPE,
-    PROVIDER_TRANSCRIPT_STATE_TYPE,
+    ProviderRequestCheckpoint, ProviderResponseCommitMode, ProviderToolCall, ProviderToolCandidate,
+    ProviderToolContractLoad, ProviderToolDisclosure, ProviderToolNamespace, ProviderToolResult,
+    ProviderTransportEvent, PROVIDER_TOOL_CONTRACT_LOADS_METADATA_KEY,
+    PROVIDER_TRANSCRIPT_CANDIDATE_TYPE, PROVIDER_TRANSCRIPT_STATE_TYPE,
 };
 #[cfg(test)]
 use crate::provider::{
@@ -104,7 +105,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 #[cfg(test)]
 use tokio::sync::mpsc;
@@ -150,8 +151,8 @@ const AUTOMATIC_TOOL_DISCLOSURE_TOKEN_THRESHOLD: usize = 12_000;
 const DEFAULT_EAGER_OFFICE_TOOLS: [(&str, &str); 4] = [
     ("document", "documents"),
     ("pdf", "pdf"),
-    ("spreadsheet_inspect", "spreadsheet"),
-    ("spreadsheet_describe", "spreadsheet"),
+    ("document_open", "spreadsheet"),
+    ("document_get_operation_schemas", "spreadsheet"),
 ];
 const ROLLOUT_CHECKPOINT_TOOL_NAME: &str = "runtime_rollout_checkpoint";
 const STEP_REMINDER_TOOL_NAME: &str = "runtime_step_reminder";
@@ -2062,6 +2063,7 @@ fn finalize_provider_turn(
         for warning in &budget.warnings {
             events.push(AgentEventPayload::ModelDelta {
                 text: format!("**Context budget warning:** {}\n", warning),
+                provider_attempt: None,
             });
         }
     }

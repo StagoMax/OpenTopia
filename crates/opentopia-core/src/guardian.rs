@@ -207,7 +207,7 @@ impl GuardianApprovalAction {
                         .map(str::to_string),
                 }
             }
-            "filesystem" | "spreadsheet" | "spreadsheet_execute" => {
+            "filesystem" => {
                 let path = call
                     .arguments
                     .get("path")

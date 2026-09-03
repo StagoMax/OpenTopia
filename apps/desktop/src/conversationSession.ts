@@ -62,6 +62,7 @@ export type ConversationSessionAction =
       type: "sendSucceeded";
       message: Message;
       queued: boolean;
+      replaceMessageId?: string;
     }
   | { type: "sendFailed"; error: string }
   | { type: "cancelReconciled"; error?: string }
@@ -203,12 +204,31 @@ export function conversationSessionReducer(
         ...state,
         commandError: null,
       };
-    case "sendSucceeded":
+    case "sendSucceeded": {
+      const currentIndex = action.replaceMessageId
+        ? state.messages.findIndex(
+            (message) => message.id === action.replaceMessageId,
+          )
+        : -1;
+      const messages =
+        currentIndex >= 0
+          ? mergeConversationMessages(state.messages.slice(0, currentIndex), [
+              action.message,
+            ])
+          : mergeConversationMessages(state.messages, [action.message]);
+      const events =
+        currentIndex >= 0
+          ? state.events.filter(
+              (event) => event.createdAt <= action.message.createdAt,
+            )
+          : state.events;
       return {
         ...state,
-        messages: mergeConversationMessages(state.messages, [action.message]),
+        messages,
+        events,
         queuedMessageCount: state.queuedMessageCount + (action.queued ? 1 : 0),
       };
+    }
     case "sendFailed":
       return {
         ...state,

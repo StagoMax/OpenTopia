@@ -117,8 +117,6 @@ pub enum FlowStoreError {
     RevisionConflict(u32),
     #[error("Flow draft cannot be published until validation passes")]
     ValidationRequired,
-    #[error("Flow draft cannot be published without a passed Dry Run for its current revision")]
-    PassedTrialRequired,
     #[error(
         "Flow draft cannot be published without a successful Test Run for its current revision"
     )]
@@ -523,17 +521,6 @@ impl SessionStore for SqliteSessionStore {
             .is_some_and(|report| report.valid)
         {
             return Err(FlowStoreError::ValidationRequired.into());
-        }
-        let passed_trials: i64 = tx.query_row(
-            r#"
-            SELECT COUNT(*) FROM flow_trials
-            WHERE draft_id = ?1 AND draft_revision = ?2 AND status = 'passed'
-            "#,
-            params![draft_id.to_string(), i64::from(draft.revision)],
-            |row| row.get(0),
-        )?;
-        if passed_trials == 0 {
-            return Err(FlowStoreError::PassedTrialRequired.into());
         }
         let successful_test_runs: i64 = tx.query_row(
             r#"
@@ -1562,6 +1549,51 @@ impl SessionStore for SqliteSessionStore {
         let stored = message.clone();
         self.append_conversation_batch(vec![message], Vec::new())?;
         Ok(stored)
+    }
+
+    fn replace_message(&self, message: Message) -> anyhow::Result<Message> {
+        let parts_json = serde_json::to_string(&message.parts)?;
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let changed = conn.execute(
+            "UPDATE messages SET parts_json = ?1 WHERE id = ?2 AND thread_id = ?3 AND role = 'user'",
+            params![parts_json, message.id.to_string(), message.thread_id.to_string()],
+        )?;
+        anyhow::ensure!(changed == 1, "user message was not found for replacement");
+        // Editing a message creates a new branch. Remove the old assistant
+        // replies and later user turns so they cannot reappear in history or
+        // leak into the next model context after a refresh.
+        let cutoff = message.created_at.to_rfc3339();
+        let message_rowid: i64 = conn.query_row(
+            "SELECT rowid FROM messages WHERE id = ?1 AND thread_id = ?2",
+            params![message.id.to_string(), message.thread_id.to_string()],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "DELETE FROM turn_queue WHERE thread_id = ?1 AND message_id IN (SELECT id FROM messages WHERE thread_id = ?1 AND rowid > ?2)",
+            params![message.thread_id.to_string(), message_rowid],
+        )?;
+        conn.execute(
+            "DELETE FROM conversation_events WHERE thread_id = ?1 AND created_at > ?2",
+            params![message.thread_id.to_string(), cutoff],
+        )?;
+        conn.execute(
+            "DELETE FROM events WHERE thread_id = ?1 AND created_at > ?2",
+            params![message.thread_id.to_string(), cutoff],
+        )?;
+        conn.execute(
+            "DELETE FROM turns WHERE thread_id = ?1 AND user_message_id IN (SELECT id FROM messages WHERE thread_id = ?1 AND created_at > ?2)",
+            params![message.thread_id.to_string(), cutoff],
+        )?;
+        conn.execute(
+            "DELETE FROM turns WHERE thread_id = ?1 AND user_message_id = ?2",
+            params![message.thread_id.to_string(), message.id.to_string()],
+        )?;
+        conn.execute(
+            "DELETE FROM messages WHERE thread_id = ?1 AND rowid > ?2",
+            params![message.thread_id.to_string(), message_rowid],
+        )?;
+        touch_thread(&conn, message.thread_id)?;
+        Ok(message)
     }
 
     fn append_conversation_batch(

@@ -61,12 +61,7 @@ impl AgentProfile {
             description: "Read-only agent for codebase exploration and evidence gathering.".to_string(),
             developer_instructions: "Explore and analyze without modifying files or external state. Return concrete evidence with paths, symbols, and unresolved uncertainty.".to_string(),
             sandbox_mode: Some(SandboxMode::ReadOnly),
-            denied_tools: vec![
-                "apply_patch".to_string(),
-                "create_skill".to_string(),
-                "spreadsheet".to_string(),
-                "spreadsheet_execute".to_string(),
-            ],
+            denied_tools: vec!["apply_patch".to_string(), "create_skill".to_string()],
             ..Self::default_profile()
         }
     }

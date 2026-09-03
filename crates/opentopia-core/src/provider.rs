@@ -443,6 +443,18 @@ impl ModelStreamDelta {
     pub fn is_tool_call_done(&self) -> bool {
         matches!(self, Self::ToolCallDone { .. })
     }
+
+    /// Returns whether an atomic provider response must retain this delta until
+    /// the response has been decoded and validated.
+    ///
+    /// Text and reasoning are safe to expose as provisional turn activity as
+    /// they arrive. Incomplete tool arguments are not executable semantic
+    /// state, and usage belongs to the attempt that ultimately commits, so
+    /// those remain behind the validation barrier. `ToolCallDone` is already a
+    /// validated tool boundary and is intentionally delivered immediately.
+    pub(crate) fn waits_for_atomic_commit(&self) -> bool {
+        matches!(self, Self::ToolCall { .. } | Self::Usage { .. })
+    }
 }
 
 /// Responses assistant-message phase values. The stream adapter uses these to
@@ -615,6 +627,19 @@ pub enum ProviderTransportEvent {
         response_id: Option<String>,
         body: Value,
     },
+}
+
+impl ProviderTransportEvent {
+    pub(crate) fn attempt(&self) -> usize {
+        match self {
+            Self::ResponseHeaders { attempt, .. }
+            | Self::OutputStarted { attempt }
+            | Self::StreamProgress { attempt, .. }
+            | Self::ResponseCommitStarted { attempt, .. }
+            | Self::Retry { attempt, .. }
+            | Self::Response { attempt, .. } => *attempt,
+        }
+    }
 }
 
 pub type ProviderTransportCallback<'a> =
@@ -807,7 +832,7 @@ pub trait ModelProvider: Send + Sync {
         let response = {
             let mut observed_delta = |delta| {
                 telemetry.observe(&delta, on_transport)?;
-                if atomic_response && !delta.is_tool_call_done() {
+                if atomic_response && delta.waits_for_atomic_commit() {
                     provisional_deltas.push(delta);
                     Ok(())
                 } else {

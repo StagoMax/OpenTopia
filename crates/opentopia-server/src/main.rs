@@ -2989,16 +2989,32 @@ fn compact_stream_payload_batch(payloads: Vec<AgentEventPayload>) -> Vec<AgentEv
     for payload in payloads {
         let merged = match (compacted.last_mut(), &payload) {
             (
-                Some(AgentEventPayload::ModelDelta { text: current }),
-                AgentEventPayload::ModelDelta { text },
-            ) if current.len().saturating_add(text.len()) <= STREAM_EVENT_CHUNK_BYTES => {
+                Some(AgentEventPayload::ModelDelta {
+                    text: current,
+                    provider_attempt: current_attempt,
+                }),
+                AgentEventPayload::ModelDelta {
+                    text,
+                    provider_attempt,
+                },
+            ) if current_attempt == provider_attempt
+                && current.len().saturating_add(text.len()) <= STREAM_EVENT_CHUNK_BYTES =>
+            {
                 current.push_str(text);
                 true
             }
             (
-                Some(AgentEventPayload::ReasoningDelta { text: current }),
-                AgentEventPayload::ReasoningDelta { text },
-            ) if current.len().saturating_add(text.len()) <= STREAM_EVENT_CHUNK_BYTES => {
+                Some(AgentEventPayload::ReasoningDelta {
+                    text: current,
+                    provider_attempt: current_attempt,
+                }),
+                AgentEventPayload::ReasoningDelta {
+                    text,
+                    provider_attempt,
+                },
+            ) if current_attempt == provider_attempt
+                && current.len().saturating_add(text.len()) <= STREAM_EVENT_CHUNK_BYTES =>
+            {
                 current.push_str(text);
                 true
             }

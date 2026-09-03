@@ -792,6 +792,7 @@ fn flow_transcript_keeps_tool_activity_without_hidden_reasoning() {
     let events = vec![
         AgentEventPayload::ReasoningDelta {
             text: "private reasoning must not be persisted".to_string(),
+            provider_attempt: None,
         },
         AgentEventPayload::ToolCallStarted { call: call.clone() },
         AgentEventPayload::ToolCallFinished {

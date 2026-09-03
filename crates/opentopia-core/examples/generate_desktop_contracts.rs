@@ -183,6 +183,7 @@ fn stream_fixtures() -> StreamFixtures {
         created_at: "2026-08-17T00:00:00Z".parse().expect("fixture datetime"),
         payload: AgentEventPayload::ModelDelta {
             text: "hello".to_string(),
+            provider_attempt: None,
         },
     };
     let agent_activity = AgentActivityNotification {

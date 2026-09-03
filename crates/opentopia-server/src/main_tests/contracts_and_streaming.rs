@@ -491,6 +491,7 @@ async fn event_replay_deduplicates_events_seen_after_subscribe() {
         1,
         AgentEventPayload::ModelDelta {
             text: "first".to_string(),
+            provider_attempt: None,
         },
     );
     bus.publish(first.clone());
@@ -504,6 +505,7 @@ async fn event_replay_deduplicates_events_seen_after_subscribe() {
         2,
         AgentEventPayload::ModelDelta {
             text: "second".to_string(),
+            provider_attempt: None,
         },
     );
     bus.publish(second);
@@ -542,6 +544,7 @@ fn conversation_stream_projection_drops_hidden_reasoning() {
         5,
         AgentEventPayload::ReasoningDelta {
             text: "hidden".to_string(),
+            provider_attempt: None,
         },
     );
 
@@ -600,27 +603,47 @@ fn stream_payload_batches_merge_only_adjacent_compatible_deltas() {
     let payloads = compact_stream_payload_batch(vec![
         AgentEventPayload::ModelDelta {
             text: "hello ".to_string(),
+            provider_attempt: None,
         },
         AgentEventPayload::ModelDelta {
             text: "world".to_string(),
+            provider_attempt: None,
         },
         AgentEventPayload::Error {
             message: "boundary".to_string(),
         },
         AgentEventPayload::ModelDelta {
             text: "after boundary".to_string(),
+            provider_attempt: None,
         },
     ]);
 
     assert_eq!(payloads.len(), 3);
     assert!(matches!(
         &payloads[0],
-        AgentEventPayload::ModelDelta { text } if text == "hello world"
+        AgentEventPayload::ModelDelta { text, .. } if text == "hello world"
     ));
     assert!(matches!(
         &payloads[2],
-        AgentEventPayload::ModelDelta { text } if text == "after boundary"
+        AgentEventPayload::ModelDelta { text, .. } if text == "after boundary"
     ));
+}
+
+#[test]
+fn stream_payload_batches_preserve_provider_attempt_boundaries() {
+    let request_id = Uuid::new_v4();
+    let delta = |text: &str, attempt| AgentEventPayload::ModelDelta {
+        text: text.to_string(),
+        provider_attempt: Some(opentopia_core::ProviderDeltaAttempt {
+            request_id,
+            round: 1,
+            attempt,
+        }),
+    };
+
+    let payloads = compact_stream_payload_batch(vec![delta("old", 1), delta("new", 2)]);
+
+    assert_eq!(payloads.len(), 2);
 }
 
 #[test]

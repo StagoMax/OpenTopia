@@ -228,6 +228,7 @@ struct StreamRow {
     seq: i64,
     kind: String,
     text: Option<String>,
+    provider_attempt: Option<crate::model::ProviderDeltaAttempt>,
 }
 
 #[derive(Debug)]
@@ -237,27 +238,43 @@ struct StreamMerge {
     delete_ids: Vec<String>,
 }
 
-fn stream_text(kind: &str, payload_json: &str) -> rusqlite::Result<Option<String>> {
+struct PendingStreamMerge {
+    keep_id: String,
+    last_seq: i64,
+    kind: String,
+    text: String,
+    provider_attempt: Option<crate::model::ProviderDeltaAttempt>,
+    delete_ids: Vec<String>,
+}
+
+fn stream_payload(
+    kind: &str,
+    payload_json: &str,
+) -> rusqlite::Result<Option<(String, Option<crate::model::ProviderDeltaAttempt>)>> {
     if !matches!(kind, "model_delta" | "reasoning_delta") {
         return Ok(None);
     }
-    let payload: serde_json::Value = serde_json::from_str(payload_json).map_err(|error| {
+    let payload: AgentEventPayload = serde_json::from_str(payload_json).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(error))
     })?;
-    payload
-        .get("text")
-        .and_then(serde_json::Value::as_str)
-        .map(|text| Some(text.to_string()))
-        .ok_or_else(|| {
-            rusqlite::Error::FromSqlConversionFailure(
-                3,
-                rusqlite::types::Type::Text,
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "stream event is missing text",
-                )),
-            )
-        })
+    match payload {
+        AgentEventPayload::ModelDelta {
+            text,
+            provider_attempt,
+        }
+        | AgentEventPayload::ReasoningDelta {
+            text,
+            provider_attempt,
+        } => Ok(Some((text, provider_attempt))),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stream event kind does not match its payload",
+            )),
+        )),
+    }
 }
 
 fn compact_stream_events(connection: &mut Connection, table: &str) -> anyhow::Result<u64> {
@@ -302,12 +319,16 @@ fn compact_stream_events(connection: &mut Connection, table: &str) -> anyhow::Re
             let mapped = statement.query_map(params![thread_id, turn_id], |row| {
                 let kind: String = row.get(2)?;
                 let payload_json: String = row.get(3)?;
-                let text = stream_text(&kind, &payload_json)?;
+                let payload = stream_payload(&kind, &payload_json)?;
+                let (text, provider_attempt) = payload
+                    .map(|(text, provider_attempt)| (Some(text), provider_attempt))
+                    .unwrap_or((None, None));
                 Ok(StreamRow {
                     id: row.get(0)?,
                     seq: row.get(1)?,
                     kind,
                     text,
+                    provider_attempt,
                 })
             })?;
             mapped.collect::<rusqlite::Result<Vec<_>>>()?
@@ -342,27 +363,33 @@ fn compact_stream_events(connection: &mut Connection, table: &str) -> anyhow::Re
 
 fn plan_stream_merges(rows: Vec<StreamRow>) -> anyhow::Result<Vec<StreamMerge>> {
     let mut merges = Vec::new();
-    let mut pending: Option<(String, i64, String, String, Vec<String>)> = None;
+    let mut pending: Option<PendingStreamMerge> = None;
     for row in rows {
         let Some(text) = row.text else {
             flush_stream_merge(&mut pending, &mut merges)?;
             continue;
         };
-        let can_merge = pending
-            .as_ref()
-            .is_some_and(|(_, last_seq, kind, combined, _)| {
-                *last_seq + 1 == row.seq
-                    && *kind == row.kind
-                    && combined.len() + text.len() <= COMPACTED_STREAM_CHUNK_BYTES
-            });
+        let can_merge = pending.as_ref().is_some_and(|pending| {
+            pending.last_seq + 1 == row.seq
+                && pending.kind == row.kind
+                && pending.provider_attempt == row.provider_attempt
+                && pending.text.len() + text.len() <= COMPACTED_STREAM_CHUNK_BYTES
+        });
         if can_merge {
-            let (_, last_seq, _, combined, delete_ids) = pending.as_mut().unwrap();
-            *last_seq = row.seq;
-            combined.push_str(&text);
-            delete_ids.push(row.id);
+            let pending = pending.as_mut().unwrap();
+            pending.last_seq = row.seq;
+            pending.text.push_str(&text);
+            pending.delete_ids.push(row.id);
         } else {
             flush_stream_merge(&mut pending, &mut merges)?;
-            pending = Some((row.id, row.seq, row.kind, text, Vec::new()));
+            pending = Some(PendingStreamMerge {
+                keep_id: row.id,
+                last_seq: row.seq,
+                kind: row.kind,
+                text,
+                provider_attempt: row.provider_attempt,
+                delete_ids: Vec::new(),
+            });
         }
     }
     flush_stream_merge(&mut pending, &mut merges)?;
@@ -370,24 +397,30 @@ fn plan_stream_merges(rows: Vec<StreamRow>) -> anyhow::Result<Vec<StreamMerge>> 
 }
 
 fn flush_stream_merge(
-    pending: &mut Option<(String, i64, String, String, Vec<String>)>,
+    pending: &mut Option<PendingStreamMerge>,
     merges: &mut Vec<StreamMerge>,
 ) -> anyhow::Result<()> {
-    let Some((keep_id, _, kind, text, delete_ids)) = pending.take() else {
+    let Some(pending) = pending.take() else {
         return Ok(());
     };
-    if delete_ids.is_empty() {
+    if pending.delete_ids.is_empty() {
         return Ok(());
     }
-    let payload = match kind.as_str() {
-        "model_delta" => AgentEventPayload::ModelDelta { text },
-        "reasoning_delta" => AgentEventPayload::ReasoningDelta { text },
-        _ => anyhow::bail!("unexpected stream event kind {kind}"),
+    let payload = match pending.kind.as_str() {
+        "model_delta" => AgentEventPayload::ModelDelta {
+            text: pending.text,
+            provider_attempt: pending.provider_attempt,
+        },
+        "reasoning_delta" => AgentEventPayload::ReasoningDelta {
+            text: pending.text,
+            provider_attempt: pending.provider_attempt,
+        },
+        _ => anyhow::bail!("unexpected stream event kind {}", pending.kind),
     };
     merges.push(StreamMerge {
-        keep_id,
+        keep_id: pending.keep_id,
         payload_json: serde_json::to_string(&payload)?,
-        delete_ids,
+        delete_ids: pending.delete_ids,
     });
     Ok(())
 }
@@ -427,7 +460,7 @@ fn prune_completed_conversation_streams(connection: &Connection) -> anyhow::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::AgentEvent;
+    use crate::model::{AgentEvent, ProviderDeltaAttempt};
     use crate::store::{SessionStore, SqliteSessionStore};
     use uuid::Uuid;
 
@@ -446,14 +479,14 @@ mod tests {
             serde_json::from_str(&merges[0].payload_json).expect("parse merged payload");
         assert!(matches!(
             payload,
-            AgentEventPayload::ReasoningDelta { text } if text == "onetwo"
+            AgentEventPayload::ReasoningDelta { text, .. } if text == "onetwo"
         ));
     }
 
     #[test]
     fn legacy_non_stream_payloads_are_boundaries_without_deserialization() {
         assert_eq!(
-            stream_text(
+            stream_payload(
                 "model_context_built",
                 r#"{"type":"model_context_built","items":[{"missing":"directToolSchemas"}]}"#,
             )
@@ -462,12 +495,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stream_merge_planning_preserves_provider_attempt_boundaries() {
+        let request_id = Uuid::new_v4();
+        let rows = vec![
+            stream_row_with_attempt(1, "model_delta", "old", request_id, 1),
+            stream_row_with_attempt(2, "model_delta", "new", request_id, 2),
+        ];
+
+        assert!(plan_stream_merges(rows)
+            .expect("plan attempt-aware stream merges")
+            .is_empty());
+    }
+
     fn stream_row(seq: i64, kind: &str, text: &str) -> StreamRow {
         StreamRow {
             id: Uuid::new_v4().to_string(),
             seq,
             kind: kind.to_string(),
             text: Some(text.to_string()),
+            provider_attempt: None,
+        }
+    }
+
+    fn stream_row_with_attempt(
+        seq: i64,
+        kind: &str,
+        text: &str,
+        request_id: Uuid,
+        attempt: usize,
+    ) -> StreamRow {
+        StreamRow {
+            id: Uuid::new_v4().to_string(),
+            seq,
+            kind: kind.to_string(),
+            text: Some(text.to_string()),
+            provider_attempt: Some(ProviderDeltaAttempt {
+                request_id,
+                round: 1,
+                attempt,
+            }),
         }
     }
 
@@ -494,6 +561,7 @@ mod tests {
                         0,
                         AgentEventPayload::ReasoningDelta {
                             text: "one".to_string(),
+                            provider_attempt: None,
                         },
                     ),
                     AgentEvent::new(
@@ -502,6 +570,7 @@ mod tests {
                         0,
                         AgentEventPayload::ReasoningDelta {
                             text: "two".to_string(),
+                            provider_attempt: None,
                         },
                     ),
                 ])
@@ -524,7 +593,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(
             &events[0].payload,
-            AgentEventPayload::ReasoningDelta { text } if text == "onetwo"
+            AgentEventPayload::ReasoningDelta { text, .. } if text == "onetwo"
         ));
         drop(compact);
         let _ = fs::remove_dir_all(directory);

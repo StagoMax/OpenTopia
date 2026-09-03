@@ -44,6 +44,38 @@ async fn send_message(
         ));
     }
     let thread = ensure_thread(&state, thread_id)?;
+    let replacing_message_id = request.replace_message_id;
+    let replaced_message_created_at = if let Some(message_id) = replacing_message_id {
+        if request.delivery != MessageDelivery::QueueNext {
+            return Err(ApiError::bad_request(
+                "replaceMessageId cannot be used while steering a running Turn",
+            ));
+        }
+        if state.turns.status(thread_id)?.is_some() {
+            return Err(ApiError::conflict(
+                "wait for the current Turn to finish before editing a message",
+            ));
+        }
+        let existing = state
+            .store
+            .list_messages(thread_id)?
+            .into_iter()
+            .find(|message| message.id == message_id && message.role == MessageRole::User)
+            .ok_or_else(|| ApiError::not_found("user message to replace was not found"))?;
+        if existing.parts.iter().any(|part| {
+            !matches!(
+                part,
+                MessagePart::Text { .. } | MessagePart::TurnContext { .. }
+            )
+        }) {
+            return Err(ApiError::bad_request(
+                "only plain text user messages can be replaced",
+            ));
+        }
+        Some(existing.created_at)
+    } else {
+        None
+    };
     let library_provider = request.library_provider;
     if library_provider.is_some() && thread.experience_mode != ExperienceMode::Flow {
         return Err(ApiError::bad_request(
@@ -200,6 +232,20 @@ async fn send_message(
             .into_iter()
             .map(|skill| MessagePart::SkillRef { skill }),
     );
+    if let Some(message_id) = replacing_message_id {
+        pending_message.id = message_id;
+        if let Some(created_at) = replaced_message_created_at {
+            pending_message.created_at = created_at;
+        }
+    }
+    let replaced_message = if replacing_message_id.is_some() {
+        send_trace.phase("message_replacement_started", thread_id, None);
+        let message = state.store.replace_message(pending_message.clone())?;
+        send_trace.phase("message_replaced", thread_id, None);
+        Some(message)
+    } else {
+        None
+    };
     if let Some(active) = steer_turn {
         send_trace.phase(
             "message_persistence_started",
@@ -236,7 +282,10 @@ async fn send_message(
         Ok(turn) => turn,
         Err(_) => {
             send_trace.phase("message_persistence_started", thread_id, None);
-            let user_message = state.store.append_message(pending_message)?;
+            let user_message = match replaced_message.clone() {
+                Some(message) => message,
+                None => state.store.append_message(pending_message)?,
+            };
             send_trace.phase("message_persisted", thread_id, None);
             state
                 .store
@@ -252,7 +301,11 @@ async fn send_message(
     let turn_id = turn.turn_id;
     send_trace.phase("turn_reserved", thread_id, Some(turn_id));
     send_trace.phase("message_persistence_started", thread_id, Some(turn_id));
-    let user_message = match state.store.append_message(pending_message) {
+    let user_message_result = match replaced_message {
+        Some(message) => Ok(message),
+        None => state.store.append_message(pending_message),
+    };
+    let user_message = match user_message_result {
         Ok(message) => message,
         Err(err) => {
             finish_turn(
@@ -579,6 +632,8 @@ fn fail_queued_turn(state: &AppState, thread_id: Uuid, turn_id: Uuid, message: S
 #[serde(rename_all = "camelCase")]
 struct SendMessageRequest {
     content: String,
+    #[serde(default)]
+    replace_message_id: Option<Uuid>,
     #[serde(default)]
     delivery: MessageDelivery,
     #[serde(default)]

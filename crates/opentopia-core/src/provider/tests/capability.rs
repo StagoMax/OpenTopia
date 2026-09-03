@@ -1056,12 +1056,7 @@ fn root_discriminated_tools_compile_to_portable_objects_across_openai_transports
         strict_function_tools: ProviderFeatureSupport::Supported,
         ..ProviderToolProtocolCapabilities::default()
     };
-    let tools: [&dyn Tool; 4] = [
-        &BackgroundOutputTool,
-        &DocumentTool,
-        &PdfTool,
-        &SpreadsheetTool,
-    ];
+    let tools: [&dyn Tool; 3] = [&BackgroundOutputTool, &DocumentTool, &PdfTool];
     let candidates = tools
         .iter()
         .map(|tool| ProviderToolCandidate::direct(tool.name(), tool.description(), tool.schema()))

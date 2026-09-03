@@ -18,14 +18,27 @@ function event(id: string, seq: number): AgentEvent {
   };
 }
 
-function modelDelta(id: string, seq: number, text: string): AgentEvent {
+function modelDelta(
+  id: string,
+  seq: number,
+  text: string,
+  attempt?: number,
+): AgentEvent {
   return {
     id,
     seq,
     threadId: "thread-1",
     turnId: "turn-1",
     createdAt: "2026-08-03T00:00:00Z",
-    payload: { type: "model_delta", text },
+    payload: {
+      type: "model_delta",
+      text,
+      ...(attempt === undefined
+        ? {}
+        : {
+            provider_attempt: { request_id: "request-1", round: 1, attempt },
+          }),
+    },
   };
 }
 
@@ -87,4 +100,18 @@ test("compacts adjacent model deltas without crossing activity boundaries", () =
   });
   assert.equal(merged[1]?.id, "boundary");
   assert.equal(merged[2]?.id, "delta-3");
+});
+
+test("does not compact model deltas across provider attempts", () => {
+  const merged = mergeConversationEvents(
+    [],
+    [
+      modelDelta("attempt-1", 1, "discard me", 1),
+      modelDelta("attempt-2", 2, "keep me", 2),
+    ],
+  );
+
+  assert.equal(merged.length, 2);
+  assert.equal(merged[0]?.id, "attempt-1");
+  assert.equal(merged[1]?.id, "attempt-2");
 });

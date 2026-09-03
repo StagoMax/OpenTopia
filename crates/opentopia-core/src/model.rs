@@ -1519,9 +1519,13 @@ pub enum AgentEventPayload {
     },
     ModelDelta {
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_attempt: Option<ProviderDeltaAttempt>,
     },
     ReasoningDelta {
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_attempt: Option<ProviderDeltaAttempt>,
     },
     ToolCallStarted {
         call: ToolCall,
@@ -1656,6 +1660,17 @@ pub enum AgentEventPayload {
     Error {
         message: String,
     },
+}
+
+/// Identifies semantic output from one provider request attempt. Consumers may
+/// render it provisionally while the matching response is in flight; a retry
+/// supersedes an earlier uncommitted attempt.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct ProviderDeltaAttempt {
+    pub request_id: Uuid,
+    pub round: usize,
+    pub attempt: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -1848,6 +1863,7 @@ mod tests {
     fn reasoning_delta_uses_the_public_snake_case_event_contract() {
         let payload = AgentEventPayload::ReasoningDelta {
             text: "检查项目结构".to_string(),
+            provider_attempt: None,
         };
 
         assert_eq!(

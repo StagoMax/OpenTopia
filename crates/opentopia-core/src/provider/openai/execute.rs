@@ -97,7 +97,7 @@ impl OpenAiCompatibleProvider {
                     normalize_stream_tool_call(&mut delta, &prepared);
                     tool_call_committed |= delta.is_tool_call_done();
                     telemetry.observe(&delta, on_transport)?;
-                    if atomic_response && !delta.is_tool_call_done() {
+                    if atomic_response && delta.waits_for_atomic_commit() {
                         provisional_deltas.push(delta);
                         Ok(())
                     } else {
@@ -287,7 +287,7 @@ impl OpenAiResponsesProvider {
                     normalize_stream_tool_call(&mut delta, &prepared);
                     tool_call_committed |= delta.is_tool_call_done();
                     telemetry.observe(&delta, on_transport)?;
-                    if atomic_response && !delta.is_tool_call_done() {
+                    if atomic_response && delta.waits_for_atomic_commit() {
                         provisional_deltas.push(delta);
                         Ok(())
                     } else {

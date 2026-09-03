@@ -255,7 +255,7 @@ fn attachment_tool_projection_accumulates_supported_office_formats() {
 
     assert_eq!(
         attachment_preloaded_tools(&messages),
-        BTreeSet::from(["document", "pdf", "spreadsheet_inspect"])
+        BTreeSet::from(["document", "document_open", "pdf"])
     );
 
     let mime_only = vec![source_message(
@@ -265,7 +265,7 @@ fn attachment_tool_projection_accumulates_supported_office_formats() {
     )];
     assert_eq!(
         attachment_preloaded_tools(&mime_only),
-        BTreeSet::from(["spreadsheet_inspect"])
+        BTreeSet::from(["document_open"])
     );
 }
 
@@ -367,8 +367,10 @@ fn model_plugin_requires_permission_grants_and_honors_project_disable() {
 }
 
 #[test]
-fn browser_plugin_projects_its_skill_and_tool_under_one_activation_boundary() {
+fn default_browser_plugin_projects_its_skill_and_tool_under_one_activation_boundary() {
     let store = SqliteSessionStore::open(":memory:").expect("open store");
+    plugins_api::ensure_default_bundled_plugin_permissions(&store)
+        .expect("bootstrap default Browser Automation permissions");
     let workspace = std::env::current_dir().expect("cwd");
     let thread = store
         .create_thread(None, workspace.clone())
@@ -379,16 +381,7 @@ fn browser_plugin_projects_its_skill_and_tool_under_one_activation_boundary() {
         .expect("Browser Automation bundled plugin");
 
     assert_eq!(plugin.skill_count, 1);
-    let inactive = plugin_runtime::load_plugin_outcome_for_thread(&store, &thread)
-        .expect("inactive plugin outcome");
-    assert!(!inactive
-        .active_contributions()
-        .any(|contribution| contribution.plugin_id == plugin.id));
-
-    store
-        .set_plugin_activation(&plugin.id, &PluginActivationScope::global(), true)
-        .expect("enable Browser Automation");
-    grant_all_plugin_permissions(&store, &plugin);
+    assert!(plugin.default_enabled);
 
     let active = plugin_runtime::load_plugin_outcome_for_thread(&store, &thread)
         .expect("active plugin outcome");

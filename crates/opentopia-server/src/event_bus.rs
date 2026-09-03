@@ -85,6 +85,7 @@ mod tests {
             1,
             AgentEventPayload::ModelDelta {
                 text: "token".to_string(),
+                provider_attempt: None,
             },
         ));
         assert!(matches!(

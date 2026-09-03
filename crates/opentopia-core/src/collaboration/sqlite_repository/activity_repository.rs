@@ -536,7 +536,7 @@ fn update_activity_state(
                 state.model_round = Some(round);
                 state.round_boundary = Some(event.seq);
                 state.reasoning_tail.clear();
-            } else if let AgentEventPayload::ReasoningDelta { text } = &event.payload {
+            } else if let AgentEventPayload::ReasoningDelta { text, .. } = &event.payload {
                 state.reasoning_tail.push_str(text);
                 state.reasoning_tail =
                     tail_chars(&state.reasoning_tail, MAX_ACTIVITY_REASONING_TAIL_CHARS);
@@ -626,7 +626,7 @@ fn read_reasoning_tail(
     let mut chars = 0usize;
     for row in rows {
         let payload: AgentEventPayload = serde_json::from_str(&row?)?;
-        let AgentEventPayload::ReasoningDelta { text } = payload else {
+        let AgentEventPayload::ReasoningDelta { text, .. } = payload else {
             continue;
         };
         chars = chars.saturating_add(text.chars().count());

@@ -145,6 +145,12 @@ export type ModelCallPurpose =
   | "title_generation"
   | "other";
 
+export type ProviderDeltaAttempt = {
+  request_id: string;
+  round: number;
+  attempt: number;
+};
+
 export type TokenEstimateDetail = {
   id: string;
   label: string;
@@ -369,8 +375,16 @@ export type AgentEventPayload =
       response_id?: string | null;
       body?: unknown;
     }
-  | { type: "model_delta"; text: string }
-  | { type: "reasoning_delta"; text: string }
+  | {
+      type: "model_delta";
+      text: string;
+      provider_attempt?: ProviderDeltaAttempt | null;
+    }
+  | {
+      type: "reasoning_delta";
+      text: string;
+      provider_attempt?: ProviderDeltaAttempt | null;
+    }
   | { type: "tool_call_started"; call: ToolCall }
   | { type: "tool_call_finished"; result: ToolResult }
   | { type: "work_form_updated"; form: WorkForm }

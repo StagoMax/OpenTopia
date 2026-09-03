@@ -137,6 +137,7 @@ pub trait SessionStore: Send + Sync + std::fmt::Debug {
         elapsed_seconds: u64,
     ) -> anyhow::Result<Option<GoalSnapshot>>;
     fn append_message(&self, message: Message) -> anyhow::Result<Message>;
+    fn replace_message(&self, message: Message) -> anyhow::Result<Message>;
     fn append_conversation_batch(
         &self,
         messages: Vec<Message>,

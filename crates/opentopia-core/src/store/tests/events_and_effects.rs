@@ -11,6 +11,7 @@ fn sqlite_store_round_trips_reasoning_delta_events() {
         0,
         AgentEventPayload::ReasoningDelta {
             text: "正在核对依赖".to_string(),
+            provider_attempt: None,
         },
     );
 
@@ -21,7 +22,7 @@ fn sqlite_store_round_trips_reasoning_delta_events() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].turn_id, Some(turn_id));
     match &events[0].payload {
-        AgentEventPayload::ReasoningDelta { text } => {
+        AgentEventPayload::ReasoningDelta { text, .. } => {
             assert_eq!(text, "正在核对依赖");
         }
         payload => panic!("unexpected payload: {payload:?}"),
@@ -43,6 +44,7 @@ fn sqlite_store_appends_event_batches_with_contiguous_sequences() {
                 0,
                 AgentEventPayload::ReasoningDelta {
                     text: "first".to_string(),
+                    provider_attempt: None,
                 },
             ),
             AgentEvent::new(
@@ -51,6 +53,7 @@ fn sqlite_store_appends_event_batches_with_contiguous_sequences() {
                 0,
                 AgentEventPayload::ModelDelta {
                     text: "second".to_string(),
+                    provider_attempt: None,
                 },
             ),
         ])
@@ -84,6 +87,7 @@ fn sqlite_store_commits_messages_and_events_in_one_conversation_batch() {
                 0,
                 AgentEventPayload::ModelDelta {
                     text: "progress".to_string(),
+                    provider_attempt: None,
                 },
             )],
         )
@@ -123,6 +127,7 @@ fn conversation_history_pages_keep_stable_message_and_event_order() {
                         0,
                         AgentEventPayload::ModelDelta {
                             text: index.to_string(),
+                            provider_attempt: None,
                         },
                     )
                 })
@@ -269,6 +274,7 @@ fn completed_assistant_message_replaces_historical_stream_in_conversation_view()
                 0,
                 AgentEventPayload::ModelDelta {
                     text: "partial ".to_string(),
+                    provider_attempt: None,
                 },
             ),
             AgentEvent::new(
@@ -380,6 +386,7 @@ fn conversation_event_view_removes_diagnostic_bodies_and_hidden_reasoning() {
         },
         AgentEventPayload::ReasoningDelta {
             text: "hidden historical reasoning".to_string(),
+            provider_attempt: None,
         },
         AgentEventPayload::ToolCallFinished {
             result: ToolResult::text(

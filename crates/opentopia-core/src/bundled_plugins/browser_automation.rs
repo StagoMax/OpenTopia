@@ -32,9 +32,9 @@ const FILES: &[BundledPluginFile] = &[
 pub(super) const PACKAGE: BundledPluginPackage = BundledPluginPackage {
     metadata: BundledPluginMetadata {
         name: "browser-automation",
-        version: "1.0.1",
+        version: "1.0.2",
         trust: BundledPluginTrust::Privileged,
-        default_enabled: false,
+        default_enabled: true,
         native_capabilities: &["browser"],
     },
     files: FILES,
@@ -52,7 +52,7 @@ mod tests {
         assert_eq!(PACKAGE.metadata.name, manifest["name"]);
         assert_eq!(PACKAGE.metadata.version, manifest["version"]);
         assert_eq!(PACKAGE.metadata.trust, BundledPluginTrust::Privileged);
-        assert!(!PACKAGE.metadata.default_enabled);
+        assert!(PACKAGE.metadata.default_enabled);
         assert_eq!(PACKAGE.metadata.native_capabilities, &["browser"]);
         assert_eq!(manifest["skills"], "./skills/");
         assert!(manifest.get("trust").is_none());

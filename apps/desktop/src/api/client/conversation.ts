@@ -221,6 +221,7 @@ export class ConversationApi extends ExtensionsApi {
     contentParts: InlineMessageContentPart[] = [],
     libraryProvider?: LibraryProviderId,
     trace?: ConversationSendTraceContext,
+    replaceMessageId?: string,
   ): Promise<{
     message: Message;
     turnId: string | null;
@@ -248,6 +249,7 @@ export class ConversationApi extends ExtensionsApi {
         },
         body: JSON.stringify({
           content,
+          replaceMessageId,
           sourcePaths,
           skillIds,
           collaborationMode,

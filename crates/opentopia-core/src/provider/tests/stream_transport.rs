@@ -449,12 +449,34 @@ async fn openai_provider_requests_and_collects_real_sse_stream() {
         ..Default::default()
     });
     let mut deltas = Vec::new();
+    let delivery_order = Arc::new(Mutex::new(Vec::new()));
+    let delta_delivery_order = Arc::clone(&delivery_order);
+    let transport_delivery_order = Arc::clone(&delivery_order);
+    let prepared = provider.prepare(Uuid::new_v4(), request).unwrap();
 
     let response = provider
-        .stream(request, &mut |delta| {
-            deltas.push(delta);
-            Ok(())
-        })
+        .stream_prepared(
+            prepared,
+            &mut |delta| {
+                if matches!(delta, ModelStreamDelta::Text { .. }) {
+                    delta_delivery_order
+                        .lock()
+                        .unwrap()
+                        .push("text_delta");
+                }
+                deltas.push(delta);
+                Ok(())
+            },
+            &mut |event| {
+                if matches!(event, ProviderTransportEvent::ResponseCommitStarted { .. }) {
+                    transport_delivery_order
+                        .lock()
+                        .unwrap()
+                        .push("commit_started");
+                }
+                Ok(())
+            },
+        )
         .await
         .unwrap();
     server.await.unwrap();
@@ -480,6 +502,11 @@ async fn openai_provider_requests_and_collects_real_sse_stream() {
             .filter(|delta| matches!(delta, ModelStreamDelta::Text { .. }))
             .count(),
         2
+    );
+    assert_eq!(
+        *delivery_order.lock().unwrap(),
+        vec!["text_delta", "text_delta", "commit_started"],
+        "text deltas from a tool-capable request must remain live while tool state stays atomic"
     );
 }
 

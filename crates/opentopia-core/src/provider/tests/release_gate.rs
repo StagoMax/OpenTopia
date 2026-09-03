@@ -207,8 +207,8 @@ fn root_union_wire_contract_is_widened_but_logical_validation_stays_exact() {
 }
 
 #[test]
-fn spreadsheet_wire_contract_is_accepted_by_the_typed_runtime_contract() {
-    let tool = SpreadsheetTool;
+fn document_execute_wire_contract_is_accepted_by_the_typed_runtime_contract() {
+    let tool = DocumentExecuteTool;
     let candidate = ProviderToolCandidate::direct(
         Tool::name(&tool),
         Tool::description(&tool),
@@ -222,14 +222,13 @@ fn spreadsheet_wire_contract_is_accepted_by_the_typed_runtime_contract() {
     let compiled = compile_openai_tools(&[candidate], capabilities);
     let contract = &compiled.contracts[0];
     let mut arguments = json!({
-        "action": "write_columns",
-        "path": null,
-        "sheet": "Orders",
-        "start": { "row": 0, "column": 0 },
-        "columns": [[{ "type": "string", "value": "sku" }]],
-        "sourcePath": null,
-        "outputPath": null,
-        "atomic": null
+        "documentId": Uuid::new_v4(),
+        "operation": "write_columns",
+        "arguments": {
+            "sheet": "Orders",
+            "start": { "row": 0, "column": 0 },
+            "columns": [[{ "type": "string", "value": "sku" }]]
+        }
     });
     assert_eq!(
         tool_input_schema_error(&contract.wire_input_schema, &arguments, "arguments"),
@@ -243,8 +242,8 @@ fn spreadsheet_wire_contract_is_accepted_by_the_typed_runtime_contract() {
     );
 
     assert_eq!(Tool::input_error(&tool, &arguments), None);
-    assert!(arguments["columns"].is_array());
-    assert!(arguments["path"].is_null());
+    assert!(arguments["arguments"]["columns"].is_array());
+    assert!(arguments.get("path").is_none());
 }
 
 #[test]

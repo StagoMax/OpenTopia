@@ -646,11 +646,13 @@ export type AgentEventPayload =
       [k: string]: unknown;
     }
   | {
+      provider_attempt?: ProviderDeltaAttempt | null;
       text: string;
       type: "model_delta";
       [k: string]: unknown;
     }
   | {
+      provider_attempt?: ProviderDeltaAttempt | null;
       text: string;
       type: "reasoning_delta";
       [k: string]: unknown;
@@ -3605,6 +3607,15 @@ export interface ProviderCacheTraceSegment {
   name?: string | null;
   source: string;
   tokenEstimate: number;
+  [k: string]: unknown;
+}
+/**
+ * Identifies semantic output from one provider request attempt. Consumers may render it provisionally while the matching response is in flight; a retry supersedes an earlier uncommitted attempt.
+ */
+export interface ProviderDeltaAttempt {
+  attempt: number;
+  request_id: string;
+  round: number;
   [k: string]: unknown;
 }
 export interface ToolCall {
