@@ -44,11 +44,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-file", required=True, type=Path)
     parser.add_argument("--runs-directory-name", required=True)
     parser.add_argument("--run-label-prefix", required=True)
+    parser.add_argument(
+        "--provider-label",
+        required=True,
+        help="Non-secret provider name recorded in every result and control-log event.",
+    )
+    parser.add_argument(
+        "--model-label",
+        required=True,
+        help="Exact configured model name recorded separately from the redacted env file.",
+    )
     parser.add_argument("--max-parallel", type=int, default=2, choices=range(1, 5))
     parser.add_argument("--max-parallel-scorers", type=int, default=2, choices=range(1, 5))
     parser.add_argument("--reasoning-effort", default="high")
     parser.add_argument("--max-output-tokens", type=int, default=8192)
     parser.add_argument("--agent-timeout-seconds", type=int, default=1800)
+    parser.add_argument("--provider-test-timeout-seconds", type=int, default=180)
     parser.add_argument("--score-timeout-seconds", type=int, default=1800)
     parser.add_argument("--permission-mode", default="unrestricted", choices=("unrestricted",))
     parser.add_argument("--cleanup-images", action="store_true")
@@ -145,6 +156,12 @@ def append_event(path: Path, lock: threading.Lock, payload: dict[str, Any]) -> N
             stream.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
 def run_command(command: list[str], stdout_path: Path, stderr_path: Path, timeout: int) -> int:
     with stdout_path.open("ab") as stdout, stderr_path.open("ab") as stderr:
         try:
@@ -190,11 +207,29 @@ def main() -> None:
     runs_root.mkdir(parents=True, exist_ok=True)
     run_log = runs_root / "control-log.jsonl"
     manifest_path = runs_root / "manifest.json"
+    segment_path = runs_root / "provider-segment.json"
     lock = threading.Lock()
     scorer_slots = threading.Semaphore(args.max_parallel_scorers)
     stop = threading.Event()
     results: dict[str, dict[str, Any]] = {}
     pending: list[tuple[str, dict[str, Any]]] = []
+
+    write_json_atomic(
+        segment_path,
+        {
+            "schemaVersion": 1,
+            "createdAtUtc": utc_now(),
+            "providerLabel": args.provider_label,
+            "model": args.model_label,
+            "reasoningEffort": args.reasoning_effort,
+            "permissionMode": args.permission_mode,
+            "approvalStrategy": "none",
+            "runLabelPrefix": args.run_label_prefix,
+            "instancesFile": str(args.instances.resolve()),
+            "selectedInstanceIds": selected_ids,
+            "credentialMaterial": "redacted-env-file",
+        },
+    )
 
     for instance_id in selected_ids:
         found = existing_valid(runs_root / instance_id, instance_id)
@@ -218,9 +253,26 @@ def main() -> None:
         common = {
             "instanceId": instance_id,
             "attempt": attempt.name,
+            "providerLabel": args.provider_label,
+            "model": args.model_label,
+            "reasoningEffort": args.reasoning_effort,
             "permissionMode": args.permission_mode,
             "approvalStrategy": "none",
         }
+        write_json_atomic(
+            attempt / "provider-provenance.json",
+            {
+                "schemaVersion": 1,
+                "recordedAtUtc": utc_now(),
+                "providerLabel": args.provider_label,
+                "model": args.model_label,
+                "reasoningEffort": args.reasoning_effort,
+                "permissionMode": args.permission_mode,
+                "approvalStrategy": "none",
+                "runLabel": run_label,
+                "credentialMaterial": "redacted-env-file",
+            },
+        )
         append_event(run_log, lock, {**common, "stage": "agent_started"})
         agent_command = [
             sys.executable,
@@ -235,6 +287,7 @@ def main() -> None:
             "--reasoning-effort", args.reasoning_effort,
             "--max-output-tokens", str(args.max_output_tokens),
             "--run-timeout-seconds", str(args.agent_timeout_seconds),
+            "--provider-test-timeout-seconds", str(args.provider_test_timeout_seconds),
             "--permission-mode", args.permission_mode,
             "--approval-strategy", "none",
         ]
@@ -318,17 +371,19 @@ def main() -> None:
 
     ordered = {instance_id: results.get(instance_id, {"status": "not_started"}) for instance_id in selected_ids}
     manifest = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "updatedAtUtc": utc_now(),
         "instancesFile": str(args.instances.resolve()),
         "serverBinary": str(args.server_binary.resolve()),
         "runLabelPrefix": args.run_label_prefix,
-        "model": "configured-in-redacted-env-file",
+        "providerLabel": args.provider_label,
+        "model": args.model_label,
         "reasoningEffort": args.reasoning_effort,
         "permissionMode": args.permission_mode,
         "approvalStrategy": "none",
         "maxParallel": args.max_parallel,
         "maxParallelScorers": args.max_parallel_scorers,
+        "providerTestTimeoutSeconds": args.provider_test_timeout_seconds,
         "cleanupImages": args.cleanup_images,
         "selectedCount": len(selected_ids),
         "validCount": sum(item.get("status") in {"valid", "valid_existing"} for item in ordered.values()),

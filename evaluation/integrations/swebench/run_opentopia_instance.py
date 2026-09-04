@@ -68,6 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-output-tokens", type=int, default=8192)
     parser.add_argument("--rollout-limit-tokens", type=int)
     parser.add_argument("--run-timeout-seconds", type=int, default=1800)
+    parser.add_argument("--provider-test-timeout-seconds", type=int, default=180)
     parser.add_argument("--prepare-only", action="store_true")
     return parser.parse_args()
 
@@ -200,7 +201,14 @@ def configure_server(
         else None
     )
     api(container, token, "PATCH", "/api/settings", {"providers": providers, "activeProviderId": provider_id})
-    profile = api(container, token, "POST", "/api/provider/test", {"providerId": provider_id})
+    profile = api(
+        container,
+        token,
+        "POST",
+        "/api/provider/test",
+        {"providerId": provider_id},
+        timeout_seconds=args.provider_test_timeout_seconds,
+    )
     if not profile.get("reachable") or not profile.get("modelAvailable"):
         raise RuntimeError("provider capability negotiation did not confirm the model")
     return token, {
@@ -213,6 +221,7 @@ def configure_server(
         "maxOutputTokens": args.max_output_tokens,
         "rolloutLimitTokens": args.rollout_limit_tokens,
         "providerCapabilityProfileTested": True,
+        "providerTestTimeoutSeconds": args.provider_test_timeout_seconds,
     }
 
 
