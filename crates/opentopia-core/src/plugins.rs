@@ -1,3 +1,5 @@
+mod codex_host_compatibility;
+
 use crate::bundled_plugins::{
     ensure_bundled_plugins_installed, verified_bundled_plugin_metadata, BundledPluginTrust,
 };
@@ -5,6 +7,7 @@ use crate::capabilities::{
     CodexCompatibleContributions, ContributionOrigin, OpenTopiaManifest, PluginCapabilityManifest,
     RegisteredPluginCapabilities,
 };
+use codex_host_compatibility::codex_host_skill_restriction;
 use schemars::JsonSchema;
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -536,16 +539,19 @@ fn descriptor_from_manifest(
         .filter(|legacy_id| legacy_id != &id)
         .collect();
     let mut issues = Vec::new();
-    let host_skill_replacement = codex_host_skill_replacement(&id);
-    if let Some(replacement) = host_skill_replacement {
-        issues.push(format!(
-            "The declared Skills require a Codex Desktop host runtime that OpenTopia cannot load from this package. Use the bundled {replacement} plugin instead."
-        ));
+    let host_skill_restriction = codex_host_skill_restriction(&id);
+    if let Some(restriction) = host_skill_restriction {
+        issues.push(match restriction.replacement {
+            Some(replacement) => format!(
+                "The declared Skills require a Codex Desktop host runtime that OpenTopia cannot load from this package. Use the bundled {replacement} plugin instead."
+            ),
+            None => "The declared Skills require a Codex Desktop host runtime that OpenTopia cannot load from this package.".to_string(),
+        });
     }
     let skill_root = match manifest
         .skills
         .as_deref()
-        .filter(|_| host_skill_replacement.is_none())
+        .filter(|_| host_skill_restriction.is_none())
     {
         Some(path) => match resolve_declared_path(&plugin_root, path, true) {
             Ok(path) => Some(path),
@@ -560,7 +566,7 @@ fn descriptor_from_manifest(
         .as_deref()
         .map(|root| count_named_files(root, "SKILL.md", 0))
         .unwrap_or_default();
-    if host_skill_replacement.is_none() && manifest.skills.is_some() && skill_count == 0 {
+    if host_skill_restriction.is_none() && manifest.skills.is_some() && skill_count == 0 {
         issues.push("The declared Skills directory contains no SKILL.md files.".to_string());
     }
 
@@ -568,7 +574,7 @@ fn descriptor_from_manifest(
         inspect_mcp_capability(&plugin_root, manifest.mcp_servers.as_deref());
     issues.extend(mcp_issues);
     let has_apps = manifest.apps.is_some();
-    if host_skill_replacement.is_none()
+    if host_skill_restriction.is_none()
         && skill_count == 0
         && mcp_server_count == 0
         && !has_apps
@@ -584,7 +590,7 @@ fn descriptor_from_manifest(
             skills: manifest
                 .skills
                 .as_deref()
-                .filter(|_| host_skill_replacement.is_none()),
+                .filter(|_| host_skill_restriction.is_none()),
             mcp_servers: manifest.mcp_servers.as_deref(),
             apps: manifest.apps.as_ref(),
         },
@@ -1081,19 +1087,6 @@ fn codex_marketplace_name(manifest_path: &Path, plugin_name: &str) -> Option<Str
         .map(str::to_string)
 }
 
-/// Some first-party Codex packages intentionally contain only instructions;
-/// their executable surface is injected by Codex Desktop and is not part of
-/// the plugin package. Projecting those Skills in another host advertises
-/// operations that cannot be called. Keep the package visible for diagnostics,
-/// but route users to the equivalent host-owned OpenTopia plugin.
-fn codex_host_skill_replacement(plugin_id: &str) -> Option<&'static str> {
-    match plugin_id {
-        "browser@openai-bundled" | "chrome@openai-bundled" => Some("Browser Automation"),
-        "computer-use@openai-bundled" => Some("Computer Use"),
-        _ => None,
-    }
-}
-
 fn legacy_plugin_id(source: PluginSource, manifest_path: &Path, plugin_name: &str) -> String {
     if source == PluginSource::Bundled {
         return format!("bundled:{plugin_name}");
@@ -1504,6 +1497,38 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.contains("bundled Browser Automation plugin")));
+    }
+
+    #[test]
+    fn codex_primary_runtime_spreadsheet_skill_is_not_projected_into_opentopia() {
+        let dir = TestDir::new();
+        let plugin_root = dir.0.join("openai-primary-runtime/spreadsheets/1.0.0");
+        let manifest = plugin_root.join(MANIFEST_RELATIVE_PATH);
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        fs::create_dir_all(plugin_root.join("skills/main")).unwrap();
+        fs::write(
+            &manifest,
+            r#"{"name":"spreadsheets","version":"1.0.0","skills":"./skills/"}"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin_root.join("skills/main/SKILL.md"),
+            "---\nname: spreadsheets\ndescription: Host-only skill\n---\n",
+        )
+        .unwrap();
+
+        let descriptor =
+            descriptor_from_manifest(&manifest, PluginScope::Codex, PluginSource::Codex, None)
+                .unwrap();
+
+        assert_eq!(descriptor.id, "spreadsheets@openai-primary-runtime");
+        assert_eq!(descriptor.skill_count, 0);
+        assert!(descriptor.skill_root.is_none());
+        assert!(descriptor.capability_manifest.contributions.is_empty());
+        assert!(descriptor
+            .issues
+            .iter()
+            .any(|issue| issue.contains("bundled Spreadsheet plugin")));
     }
 
     #[test]
