@@ -25,6 +25,11 @@ import {
   runStatusPresentation,
 } from "./runPresentation";
 import { StructuredPayload } from "./StructuredPayload";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
+import {
+  interfaceMessage,
+  type ApplicationLanguage,
+} from "../../applicationLanguage";
 
 export function RunDetails({
   flowName,
@@ -33,12 +38,16 @@ export function RunDetails({
   flowName: string;
   run: FlowRun;
 }) {
-  const status = runStatusPresentation(run.status);
+  const { language, t } = useApplicationLanguage();
+  const status = runStatusPresentation(run.status, language);
   const endedAt = run.completedAt ?? run.updatedAt;
   const workflow = run.flowRevision?.compiledWorkflow;
 
   return (
-    <article className="run-detail" aria-label={`${flowName} 运行详情`}>
+    <article
+      className="run-detail"
+      aria-label={`${flowName} ${t("flow.runDetails.aria")}`}
+    >
       <section
         className={`enterprise-core-detail__summary ${runToneClass(run.status)}`}
       >
@@ -46,41 +55,53 @@ export function RunDetails({
           <RunStatusIcon status={run.status} />
         </span>
         <div>
-          <small>运行记录 · Flow v{run.flowVersion}</small>
+          <small>
+            {t("flow.runDetails.record")} ·{" "}
+            {t("flow.runDetails.workflowVersion")}
+            {run.flowVersion}
+          </small>
           <span className="run-detail__title-row">
             <h2>{flowName}</h2>
             <Badge variant={status.variant}>{status.label}</Badge>
           </span>
           <p>
-            {status.description} 本次共执行 {run.nodeExecutions} 个节点，调用了{" "}
-            {run.toolCalls} 次工具。
+            {status.description} {t("flow.runDetails.summaryPrefix")}{" "}
+            {run.nodeExecutions} {t("flow.runDetails.nodes")} {run.toolCalls}{" "}
+            {t("flow.runDetails.tools")}
           </p>
         </div>
       </section>
 
-      <section className="run-detail__metrics" aria-label="本次运行摘要">
+      <section
+        className="run-detail__metrics"
+        aria-label={t("flow.runDetails.summaryAria")}
+      >
         <RunMetric
-          detail={run.completedAt ? "已完成" : "截至最近更新"}
+          detail={
+            run.completedAt
+              ? t("flow.runDetails.finished")
+              : t("flow.runDetails.asOfUpdate")
+          }
           icon={<Clock3 aria-hidden="true" size={16} />}
-          label="耗时"
-          value={formatDuration(run.startedAt, endedAt)}
+          label={t("flow.runs.duration")}
+          value={formatDuration(run.startedAt, endedAt, language)}
         />
         <RunMetric
-          detail={`预算上限 ${run.budget.maxNodeExecutions}`}
+          detail={`${t("flow.runDetails.budgetLimit")} ${run.budget.maxNodeExecutions}`}
           icon={<ListChecks aria-hidden="true" size={16} />}
-          label="节点执行"
+          label={t("flow.runs.nodeExecutions")}
           value={String(run.nodeExecutions)}
         />
         <RunMetric
-          detail={`预算上限 ${run.budget.maxToolCalls}`}
+          detail={`${t("flow.runDetails.budgetLimit")} ${run.budget.maxToolCalls}`}
           icon={<Wrench aria-hidden="true" size={16} />}
-          label="工具调用"
+          label={t("flow.runs.toolCalls")}
           value={String(run.toolCalls)}
         />
         <RunMetric
-          detail={`已推进 ${run.superstep} 轮`}
+          detail={`${t("flow.runDetails.supersteps")} ${run.superstep} ${t("flow.runDetails.rounds")}`}
           icon={<Gauge aria-hidden="true" size={16} />}
-          label="检查点"
+          label={t("flow.runs.checkpoints")}
           value={String(run.checkpointHistory.length)}
         />
       </section>
@@ -89,7 +110,7 @@ export function RunDetails({
         <p className="run-detail__error" role="alert">
           <CircleX aria-hidden="true" size={16} />
           <span>
-            <strong>运行未完成</strong>
+            <strong>{t("flow.runDetails.incomplete")}</strong>
             {run.error}
           </span>
         </p>
@@ -98,12 +119,12 @@ export function RunDetails({
       <section className="enterprise-core-detail__payload run-detail__result">
         <header>
           <span>
-            <h3>运行结果</h3>
-            <small>流程最终返回给调用方的数据</small>
+            <h3>{t("flow.runDetails.result")}</h3>
+            <small>{t("flow.runDetails.resultHint")}</small>
           </span>
         </header>
         <StructuredPayload
-          emptyLabel="本次运行尚未生成结果。"
+          emptyLabel={t("flow.runDetails.noResult")}
           schema={workflow?.outputSchema}
           value={run.output}
         />
@@ -112,10 +133,12 @@ export function RunDetails({
       <section className="enterprise-core-detail__payload run-detail__path">
         <header>
           <span>
-            <h3>执行路径</h3>
-            <small>按实际发生顺序展示节点、重试与工具调用</small>
+            <h3>{t("flow.runDetails.path")}</h3>
+            <small>{t("flow.runDetails.pathHint")}</small>
           </span>
-          <Badge variant="neutral">{run.nodeRuns.length} 条记录</Badge>
+          <Badge variant="neutral">
+            {run.nodeRuns.length} {t("flow.runDetails.records")}
+          </Badge>
         </header>
         <ol className="run-timeline">
           {run.nodeRuns.map((node, index) => (
@@ -127,7 +150,9 @@ export function RunDetails({
             />
           ))}
           {run.nodeRuns.length === 0 ? (
-            <li className="run-detail__empty">尚无节点执行记录。</li>
+            <li className="run-detail__empty">
+              {t("flow.runDetails.noNodeRuns")}
+            </li>
           ) : null}
         </ol>
       </section>
@@ -135,28 +160,28 @@ export function RunDetails({
       <details className="run-diagnostics">
         <summary>
           <span>
-            <strong>输入、检查点与技术信息</strong>
-            <small>需要排查、恢复或审计时再展开</small>
+            <strong>{t("flow.runDetails.diagnostics")}</strong>
+            <small>{t("flow.runDetails.diagnosticsHint")}</small>
           </span>
           <span className="run-diagnostics__summary-meta">
-            {run.checkpointHistory.length} 个检查点
+            {run.checkpointHistory.length} {t("flow.runs.checkpoints")}
             <ChevronDown aria-hidden="true" size={16} />
           </span>
         </summary>
         <div className="run-diagnostics__body">
           <section>
             <header>
-              <h3>本次输入</h3>
+              <h3>{t("flow.runDetails.input")}</h3>
             </header>
             <StructuredPayload
-              emptyLabel="本次运行没有输入数据。"
+              emptyLabel={t("flow.runDetails.noInput")}
               schema={workflow?.inputSchema}
               value={run.input}
             />
           </section>
           <section>
             <header>
-              <h3>恢复检查点</h3>
+              <h3>{t("flow.runDetails.recoveryCheckpoints")}</h3>
             </header>
             <ol className="run-checkpoints">
               {run.checkpointHistory.map((checkpoint) => (
@@ -168,20 +193,24 @@ export function RunDetails({
                     <strong>
                       {checkpoint.nodeIds
                         .map((nodeId) => nodeLabel(run, nodeId))
-                        .join("、") || "无节点"}
+                        .join(language === "zh-CN" ? "、" : ", ") ||
+                        t("flow.runDetails.noNode")}
                     </strong>
                     <small>
-                      {checkpoint.pendingWriteCount} 次状态写入 ·{" "}
-                      {formatDateTime(checkpoint.completedAt)}
+                      {checkpoint.pendingWriteCount}{" "}
+                      {t("flow.runDetails.stateWrites")} ·{" "}
+                      {formatDateTime(checkpoint.completedAt, language)}
                     </small>
                   </span>
                   <Badge variant={checkpointVariant(checkpoint.status)}>
-                    {checkpointStatusLabel(checkpoint.status)}
+                    {checkpointStatusLabel(checkpoint.status, language)}
                   </Badge>
                 </li>
               ))}
               {run.checkpointHistory.length === 0 ? (
-                <li className="run-detail__empty">尚未生成恢复检查点。</li>
+                <li className="run-detail__empty">
+                  {t("flow.runDetails.noCheckpoints")}
+                </li>
               ) : null}
             </ol>
           </section>
@@ -223,7 +252,8 @@ function NodeTimelineItem({
   label: string;
   node: FlowNodeRun;
 }) {
-  const status = nodeStatusPresentation(node.status);
+  const { language, t } = useApplicationLanguage();
+  const status = nodeStatusPresentation(node.status, language);
   return (
     <li className={`run-timeline__item is-${node.status}`}>
       <span
@@ -239,9 +269,15 @@ function NodeTimelineItem({
         </span>
         <small>
           <code>{node.nodeId}</code>
-          {node.attempt > 1 ? ` · 第 ${node.attempt} 次尝试` : ""} ·{" "}
-          {formatDuration(node.startedAt, node.completedAt)} ·{" "}
-          {node.toolCalls > 0 ? `${node.toolCalls} 次工具调用` : "未调用工具"}
+          {node.attempt > 1
+            ? language === "zh-CN"
+              ? ` · ${t("flow.runDetails.attempt")}${node.attempt}${t("flow.runDetails.attemptSuffix")}`
+              : ` · ${t("flow.runDetails.attempt")} ${node.attempt}`
+            : ""}{" "}
+          · {formatDuration(node.startedAt, node.completedAt, language)} ·{" "}
+          {node.toolCalls > 0
+            ? `${node.toolCalls} ${t("flow.runDetails.toolCallCount")}`
+            : t("flow.runDetails.noToolCalls")}
         </small>
         {node.error ? (
           <span className="run-timeline__error">{node.error}</span>
@@ -283,21 +319,49 @@ function NodeStatusIcon({ status }: { status: FlowNodeRun["status"] }) {
   return <Activity size={16} />;
 }
 
-function nodeStatusPresentation(status: FlowNodeRun["status"]): {
+function nodeStatusPresentation(
+  status: FlowNodeRun["status"],
+  language: ApplicationLanguage,
+): {
   label: string;
   variant: "success" | "danger" | "warning" | "info" | "neutral";
 } {
-  if (status === "succeeded") return { label: "成功", variant: "success" };
-  if (status === "failed") return { label: "失败", variant: "danger" };
-  if (status === "cancelled") return { label: "已取消", variant: "danger" };
+  if (status === "succeeded")
+    return {
+      label: interfaceMessage(language, "flow.nodeStatus.succeeded"),
+      variant: "success",
+    };
+  if (status === "failed")
+    return {
+      label: interfaceMessage(language, "flow.nodeStatus.failed"),
+      variant: "danger",
+    };
+  if (status === "cancelled")
+    return {
+      label: interfaceMessage(language, "flow.nodeStatus.cancelled"),
+      variant: "danger",
+    };
   if (status === "waiting_approval") {
-    return { label: "等待审批", variant: "warning" };
+    return {
+      label: interfaceMessage(language, "flow.nodeStatus.waitingApproval"),
+      variant: "warning",
+    };
   }
   if (status === "waiting_human") {
-    return { label: "等待处理", variant: "warning" };
+    return {
+      label: interfaceMessage(language, "flow.nodeStatus.waitingHuman"),
+      variant: "warning",
+    };
   }
-  if (status === "resuming") return { label: "恢复中", variant: "info" };
-  return { label: "运行中", variant: "info" };
+  if (status === "resuming")
+    return {
+      label: interfaceMessage(language, "flow.nodeStatus.resuming"),
+      variant: "info",
+    };
+  return {
+    label: interfaceMessage(language, "flow.nodeStatus.running"),
+    variant: "info",
+  };
 }
 
 function nodeLabel(run: FlowRun, nodeId: string): string {

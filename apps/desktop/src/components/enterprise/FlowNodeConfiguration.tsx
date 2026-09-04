@@ -1,11 +1,23 @@
 import { RadioTower, Settings2 } from "lucide-react";
 import type { AgentTemplateVersionView } from "../../types";
-import { Badge, Button, SelectField, Switch, TextField } from "../ui";
+import {
+  Badge,
+  Button,
+  DisclosureSummary,
+  SelectField,
+  Switch,
+  TextField,
+} from "../ui";
 import { AgentCapabilitySummary } from "./AgentCapabilitySummary";
 import { activationLabel, templateKey } from "./flowActivation";
 import { latestPublishedTemplateVersions } from "./model";
 import type { WorkflowNodeSelection } from "./workflowNodeSelection";
 import { WorkflowStateWritesEditor } from "./WorkflowStateWritesEditor";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
+import {
+  interfaceMessage,
+  type ApplicationLanguage,
+} from "../../applicationLanguage";
 
 export function FlowNodeConfiguration({
   node,
@@ -20,6 +32,7 @@ export function FlowNodeConfiguration({
   onEditTrigger(nodeId: string): void;
   templates: AgentTemplateVersionView[];
 }) {
+  const { language, t } = useApplicationLanguage();
   const selectedTemplate =
     node.kind === "agent"
       ? templates.find((item) => templateKey(item) === node.templateKey)
@@ -35,14 +48,14 @@ export function FlowNodeConfiguration({
     <>
       <section className="flow-editor-inspector__section">
         <header>
-          <strong>基本信息</strong>
+          <strong>{t("flow.node.basic")}</strong>
           <Badge variant={node.kind === "approval" ? "warning" : "neutral"}>
-            {nodeKindLabel(node.kind)}
+            {nodeKindLabel(node.kind, language)}
           </Badge>
         </header>
         {node.kind !== "agent" && node.kind !== "output" ? (
           <TextField
-            label="名称"
+            label={t("flow.node.name")}
             onChange={(event) =>
               onChange({ ...node, label: event.target.value })
             }
@@ -52,8 +65,8 @@ export function FlowNodeConfiguration({
         {node.kind === "agent" && agentTemplates.length > 0 ? (
           <>
             <SelectField
-              hint="这里只决定这个节点由哪个 Agent 执行。"
-              label="关联 Agent"
+              hint={t("flow.node.agentHint")}
+              label={t("flow.node.agent")}
               onChange={(templateId) => {
                 const latest = agentTemplates.find(
                   (item) => item.template.templateId === templateId,
@@ -65,7 +78,7 @@ export function FlowNodeConfiguration({
               options={[
                 {
                   value: "",
-                  label: "请选择一个已发布 Agent",
+                  label: t("flow.node.chooseAgent"),
                   disabled: true,
                 },
                 ...agentTemplates.map((item) => ({
@@ -78,44 +91,45 @@ export function FlowNodeConfiguration({
             />
             {selectedTemplate ? (
               <SelectField
-                hint="默认使用所选 Agent 的最新已发布版本，也可以固定到旧版本。"
-                label="版本"
+                hint={t("flow.node.versionHint")}
+                label={t("flow.node.version")}
                 onChange={(nextTemplateKey) =>
                   onChange({ ...node, templateKey: nextTemplateKey })
                 }
                 options={selectedAgentVersions.map((item, index) => ({
                   value: templateKey(item),
-                  label: `版本 ${item.template.version}${index === 0 ? "（最新）" : ""}`,
+                  label: `${t("flow.node.version")} ${item.template.version}${index === 0 ? ` (${t("flow.node.latest")})` : ""}`,
                 }))}
                 value={node.templateKey}
               />
             ) : (
               <p className="flow-editor-inspector__note">
-                选择 Agent 后再决定使用哪个已发布版本。
+                {t("flow.node.chooseVersion")}
               </p>
             )}
           </>
         ) : null}
         {node.kind === "agent" && agentTemplates.length === 0 ? (
           <p className="flow-editor-inspector__note" role="status">
-            还没有已发布的 Agent。请先在 Agents 中创建并发布，再回来完成关联。
+            {t("flow.node.noAgents")}
           </p>
         ) : null}
         {node.kind === "tool" ? (
           <p className="flow-editor-inspector__note">
-            Action 会按确定步骤直接调用 Tool，不经过 Agent 推理。若希望 Agent
-            自主决定何时调用，请把 Tool 配置到 Agent 模板中。
+            {t("flow.node.toolHint")}
           </p>
         ) : null}
         {node.kind === "skill" || node.kind === "tool" ? (
           <TextField
             hint={
               node.kind === "skill"
-                ? "填写 ExecutionContext 中可见的 Skill ID"
-                : "填写 Tool Registry 暴露的精确工具名"
+                ? t("flow.node.skillReferenceHint")
+                : t("flow.node.toolReferenceHint")
             }
             label={
-              node.kind === "skill" ? "Skill reference" : "执行 Tool / API"
+              node.kind === "skill"
+                ? t("flow.node.skillReference")
+                : t("flow.node.toolReference")
             }
             onChange={(event) =>
               onChange({ ...node, reference: event.target.value })
@@ -127,12 +141,12 @@ export function FlowNodeConfiguration({
         {node.kind === "tool" ? (
           <label className="flow-editor-inspector__switch-row">
             <span>
-              <strong>允许并行</strong>
-              <small>仅对确认线程安全且无冲突写入的工具开启</small>
+              <strong>{t("flow.node.parallel")}</strong>
+              <small>{t("flow.node.parallelHint")}</small>
             </span>
             <Switch
               checked={node.parallelSafe}
-              label="允许 Tool 并行执行"
+              label={t("flow.node.parallelLabel")}
               onChange={(parallelSafe) => onChange({ ...node, parallelSafe })}
             />
           </label>
@@ -140,11 +154,11 @@ export function FlowNodeConfiguration({
         {node.kind === "condition" ? (
           <>
             <p className="flow-editor-inspector__note">
-              这是旧版兼容节点。新建分支时，请选中连线并直接配置路由条件。
+              {t("flow.node.legacyCondition")}
             </p>
             <TextField
-              hint="支持路径真值、!path、== 和 !=；例如 score == 1"
-              label="条件表达式"
+              hint={t("flow.node.conditionHint")}
+              label={t("flow.node.condition")}
               onChange={(event) =>
                 onChange({ ...node, expression: event.target.value })
               }
@@ -156,8 +170,8 @@ export function FlowNodeConfiguration({
         {node.kind === "validator" ? (
           <>
             <TextField
-              hint="用逗号分隔；支持点路径，例如 customer.id"
-              label="必填字段"
+              hint={t("flow.node.requiredHint")}
+              label={t("flow.node.required")}
               onChange={(event) =>
                 onChange({
                   ...node,
@@ -168,8 +182,8 @@ export function FlowNodeConfiguration({
               value={node.requiredFields.join(", ")}
             />
             <TextField
-              hint="留空时仅校验必填字段"
-              label="附加表达式（可选）"
+              hint={t("flow.node.expressionHint")}
+              label={t("flow.node.expression")}
               onChange={(event) =>
                 onChange({ ...node, expression: event.target.value })
               }
@@ -180,7 +194,7 @@ export function FlowNodeConfiguration({
         ) : null}
         {node.kind === "approval" ? (
           <label className="flow-editor-inspector__textarea">
-            <span>审批说明</span>
+            <span>{t("flow.node.approval")}</span>
             <textarea
               onChange={(event) =>
                 onChange({ ...node, instructions: event.target.value })
@@ -192,33 +206,37 @@ export function FlowNodeConfiguration({
         ) : null}
         {node.kind === "join" ? (
           <p className="flow-editor-inspector__note">
-            Join 会等待全部上游节点完成，并把各上游输出按节点 ID 汇合后继续。
+            {t("flow.node.joinHint")}
           </p>
         ) : null}
         {node.kind === "loop" ? (
           <p className="flow-editor-inspector__note">
-            这是旧版兼容节点。新建循环时，直接把节点连回上游；编辑器会自动创建受限反馈边。
+            {t("flow.node.loopHint")}
           </p>
         ) : null}
         {node.kind === "skill" ? (
           <p className="flow-editor-inspector__note">
-            这是旧版兼容节点。新 Flow 的 Skill 能力由 Agent 模板统一配置。
+            {t("flow.node.skillHint")}
           </p>
         ) : null}
         {node.kind === "output" ? (
           <>
-            <TextField label="名称" readOnly value={node.label} />
+            <TextField
+              label={t("flow.node.name")}
+              readOnly
+              value={node.label}
+            />
             <p className="flow-editor-inspector__note">
-              Output 是当前 Flow 的固定终点，负责将最终结果写入 Inbox。
+              {t("flow.node.outputHint")}
             </p>
           </>
         ) : null}
         <details className="flow-editor-inspector__advanced">
-          <summary>
-            <Settings2 aria-hidden="true" size={14} /> 节点高级信息
-          </summary>
+          <DisclosureSummary icon={<Settings2 aria-hidden="true" size={14} />}>
+            {t("flow.node.advanced")}
+          </DisclosureSummary>
           <div className="flow-editor-inspector__advanced-body">
-            <TextField label="Node ID" readOnly value={node.id} />
+            <TextField label={t("flow.node.id")} readOnly value={node.id} />
           </div>
         </details>
       </section>
@@ -228,9 +246,9 @@ export function FlowNodeConfiguration({
       ) : null}
 
       <details className="flow-editor-inspector__advanced">
-        <summary>
-          <Settings2 aria-hidden="true" size={14} /> 共享状态（高级）
-        </summary>
+        <DisclosureSummary icon={<Settings2 aria-hidden="true" size={14} />}>
+          {t("flow.node.sharedState")}
+        </DisclosureSummary>
         <div className="flow-editor-inspector__advanced-body">
           <WorkflowStateWritesEditor
             onChange={(stateWrites) => onChange({ ...node, stateWrites })}
@@ -241,14 +259,14 @@ export function FlowNodeConfiguration({
 
       <section className="flow-editor-inspector__section">
         <header>
-          <strong>Activation</strong>
+          <strong>{t("flow.node.activation")}</strong>
         </header>
         <div className="flow-editor-inspector__activation">
           <RadioTower aria-hidden="true" size={14} />
           <span>
-            <small>Trigger / 上游来源</small>
+            <small>{t("flow.node.triggerSource")}</small>
             <strong>
-              {activationLabel(node.activation, nodes, templates)}
+              {activationLabel(node.activation, nodes, templates, language)}
             </strong>
           </span>
         </div>
@@ -258,7 +276,8 @@ export function FlowNodeConfiguration({
             size="compact"
             variant="secondary"
           >
-            <RadioTower aria-hidden="true" size={14} /> 配置 Trigger
+            <RadioTower aria-hidden="true" size={14} />
+            {t("flow.node.configureTrigger")}
           </Button>
         ) : null}
       </section>
@@ -266,12 +285,21 @@ export function FlowNodeConfiguration({
   );
 }
 
-function nodeKindLabel(kind: WorkflowNodeSelection["kind"]) {
-  if (kind === "tool") return "action";
-  if (kind === "skill" || kind === "condition" || kind === "loop") {
-    return `legacy ${kind}`;
-  }
-  return kind;
+function nodeKindLabel(
+  kind: WorkflowNodeSelection["kind"],
+  language: ApplicationLanguage,
+) {
+  const key =
+    kind === "tool"
+      ? "flow.node.kind.action"
+      : kind === "skill"
+        ? "flow.node.kind.legacySkill"
+        : kind === "condition"
+          ? "flow.node.kind.legacyCondition"
+          : kind === "loop"
+            ? "flow.node.kind.legacyLoop"
+            : (`flow.node.kind.${kind}` as const);
+  return interfaceMessage(language, key);
 }
 
 function commaSeparatedValues(value: string) {

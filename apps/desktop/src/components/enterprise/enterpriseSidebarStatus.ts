@@ -1,28 +1,34 @@
 import type { FlowPrimaryView } from "../../workspaceNavigation";
 import type { SidebarRowStatus } from "../ui";
+import {
+  defaultApplicationLanguage,
+  interfaceMessage,
+  type ApplicationLanguage,
+  type InterfaceMessageKey,
+} from "../../applicationLanguage.ts";
 
-const statusLabels: Record<string, string> = {
-  active: "运行中",
-  attention: "需要关注",
-  cancel_requested: "正在取消",
-  cancelled: "已取消",
-  completed: "已完成",
-  draft: "草稿",
-  failed: "运行失败",
-  healthy: "正常",
-  live: "运行中",
-  pause_requested: "正在暂停",
-  paused: "已暂停",
-  pending: "等待处理",
-  published: "已发布",
-  queued: "排队中",
-  ready: "就绪",
-  resuming: "正在恢复",
-  running: "运行中",
-  succeeded: "已完成",
-  waiting_approval: "等待审批",
-  waiting_human: "等待人工处理",
-  warning: "存在风险",
+const statusMessageKeys: Record<string, InterfaceMessageKey> = {
+  active: "flow.status.active",
+  attention: "flow.status.attention",
+  cancel_requested: "flow.status.cancel_requested",
+  cancelled: "flow.status.cancelled",
+  completed: "flow.status.completed",
+  draft: "flow.status.draft",
+  failed: "flow.status.failed",
+  healthy: "flow.status.healthy",
+  live: "flow.status.live",
+  pause_requested: "flow.status.pause_requested",
+  paused: "flow.status.paused",
+  pending: "flow.status.pending",
+  published: "flow.status.published",
+  queued: "flow.status.queued",
+  ready: "flow.status.ready",
+  resuming: "flow.status.resuming",
+  running: "flow.status.running",
+  succeeded: "flow.status.succeeded",
+  waiting_approval: "flow.status.waiting_approval",
+  waiting_human: "flow.status.waiting_human",
+  warning: "flow.status.warning",
 };
 
 const processingStatuses = new Set([
@@ -52,8 +58,12 @@ const warningStatuses = new Set([
 export function enterpriseSidebarStatus(
   view: FlowPrimaryView,
   status: string,
+  language: ApplicationLanguage = defaultApplicationLanguage,
 ): SidebarRowStatus {
-  const label = statusLabels[status] ?? status.replaceAll("_", " ");
+  const messageKey = statusMessageKeys[status];
+  const label = messageKey
+    ? interfaceMessage(language, messageKey)
+    : status.replaceAll("_", " ");
   if (processingStatuses.has(status)) {
     return { label, loading: view === "runs", tone: "info" };
   }

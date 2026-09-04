@@ -22,7 +22,13 @@ import type {
   FlowRun,
   FlowSpec,
 } from "../../types";
-import { Badge, Button, SelectField, TextField } from "../ui";
+import {
+  Badge,
+  Button,
+  DisclosureSummary,
+  SelectField,
+  TextField,
+} from "../ui";
 import {
   workflowNodeLabel,
   type WorkflowNodeSelection,
@@ -32,6 +38,7 @@ import type { WorkflowConnection } from "./workflowGraphOperations";
 import type { WorkflowEdgeConfiguration } from "./workflowNodeSelection";
 import { FlowNodeConfiguration } from "./FlowNodeConfiguration";
 import { FlowNodeTestRunDetails } from "./FlowNodeTestRunDetails";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
 
 export function FlowEditorInspector({
   draft,
@@ -81,10 +88,14 @@ export function FlowEditorInspector({
   testRun: FlowRun | null;
   templates: AgentTemplateVersionView[];
 }) {
+  const { t } = useApplicationLanguage();
   const selectedNode = nodes.find((node) => node.id === selectedNodeId) ?? null;
 
   return (
-    <aside className="flow-editor-inspector" aria-label="Flow 配置">
+    <aside
+      className="flow-editor-inspector"
+      aria-label={t("flow.editor.configuration")}
+    >
       <header className="flow-editor-inspector__header">
         <span className="flow-editor-inspector__title">
           {selectedConnection ? (
@@ -97,17 +108,17 @@ export function FlowEditorInspector({
           <span>
             <strong>
               {selectedConnection
-                ? "连线配置"
+                ? t("flow.editor.connectionSettings")
                 : selectedNode
-                  ? "节点设置"
-                  : "Flow 设置"}
+                  ? t("flow.editor.nodeSettings")
+                  : t("flow.editor.flowSettings")}
             </strong>
             <small>
               {selectedConnection
                 ? `${selectedConnection.sourceId} → ${selectedConnection.targetId}`
                 : selectedNode
                   ? workflowNodeLabel(selectedNode, templates)
-                  : `${nodes.filter((node) => node.kind !== "output").length} 个步骤 · ${draft ? "草稿已保存" : "尚未保存"}`}
+                  : `${nodes.filter((node) => node.kind !== "output").length} ${t("flow.toolbar.steps")} · ${draft ? t("flow.editor.savedDraft") : t("flow.editor.unsaved")}`}
             </small>
           </span>
         </span>
@@ -120,7 +131,8 @@ export function FlowEditorInspector({
             size="compact"
             variant="quiet"
           >
-            <ChevronLeft aria-hidden="true" size={14} /> Flow 设置
+            <ChevronLeft aria-hidden="true" size={14} />
+            {t("flow.editor.backToFlow")}
           </Button>
         ) : null}
       </header>
@@ -152,20 +164,22 @@ export function FlowEditorInspector({
             <section className="flow-editor-inspector__section">
               <header>
                 <span>
-                  <strong>Flow 目标</strong>
-                  <small>先说明要做什么；技术标识放在高级设置中。</small>
+                  <strong>{t("flow.editor.goal")}</strong>
+                  <small>{t("flow.editor.goalHint")}</small>
                 </span>
                 <Badge variant={draft ? "neutral" : "warning"}>
-                  {draft ? "已保存" : "未保存"}
+                  {draft
+                    ? t("flow.editor.saved")
+                    : t("flow.editor.notSaved")}
                 </Badge>
               </header>
               <TextField
-                label="名称"
+                label={t("flow.editor.name")}
                 onChange={(event) => onChangeFlow({ name: event.target.value })}
                 value={name}
               />
               <label className="flow-editor-inspector__textarea">
-                <span>要完成的结果</span>
+                <span>{t("flow.editor.outcome")}</span>
                 <textarea
                   onChange={(event) =>
                     onChangeFlow({ outcome: event.target.value })
@@ -178,7 +192,7 @@ export function FlowEditorInspector({
 
             <section className="flow-editor-inspector__section">
               <header>
-                <strong>发布进度</strong>
+                <strong>{t("flow.editor.progress")}</strong>
               </header>
               <WorkflowProgress
                 draft={draft}
@@ -187,28 +201,30 @@ export function FlowEditorInspector({
             </section>
 
             <details className="flow-editor-inspector__advanced">
-              <summary>
-                <Settings2 aria-hidden="true" size={14} /> 高级设置
-              </summary>
+              <DisclosureSummary
+                icon={<Settings2 aria-hidden="true" size={14} />}
+              >
+                {t("flow.editor.advanced")}
+              </DisclosureSummary>
               <div className="flow-editor-inspector__advanced-body">
                 <TextField
-                  hint="用于 API、日志和版本引用。"
-                  label="Workflow ID"
+                  hint={t("flow.editor.workflowIdHint")}
+                  label={t("flow.editor.workflowId")}
                   onChange={(event) =>
                     onChangeFlow({ flowId: event.target.value })
                   }
                   value={flowId}
                 />
                 <TextField
-                  label="所有者"
+                  label={t("flow.editor.owner")}
                   onChange={(event) =>
                     onChangeFlow({ owner: event.target.value })
                   }
                   value={owner}
                 />
                 <SelectField<FlowSpec["riskClass"]>
-                  hint="高风险 Flow 会在运行边界采用更严格的人工控制。"
-                  label="风险级别"
+                  hint={t("flow.editor.riskHint")}
+                  label={t("flow.editor.risk")}
                   onChange={(riskClass) =>
                     onChangeRuntimeConfiguration({
                       ...runtimeConfiguration,
@@ -216,19 +232,23 @@ export function FlowEditorInspector({
                     })
                   }
                   options={[
-                    { value: "low", label: "低" },
-                    { value: "medium", label: "中" },
-                    { value: "high", label: "高" },
-                    { value: "critical", label: "关键" },
+                    { value: "low", label: t("flow.editor.riskLow") },
+                    { value: "medium", label: t("flow.editor.riskMedium") },
+                    { value: "high", label: t("flow.editor.riskHigh") },
+                    {
+                      value: "critical",
+                      label: t("flow.editor.riskCritical"),
+                    },
                   ]}
                   value={runtimeConfiguration.riskClass}
                 />
                 <fieldset className="flow-editor-budget">
                   <legend>
-                    <Gauge aria-hidden="true" size={14} /> 运行预算
+                    <Gauge aria-hidden="true" size={14} />{" "}
+                    {t("flow.editor.budget")}
                   </legend>
                   <TextField
-                    label="最多节点执行次数"
+                    label={t("flow.editor.maxNodes")}
                     min={1}
                     onChange={(event) =>
                       onChangeRuntimeConfiguration({
@@ -246,7 +266,7 @@ export function FlowEditorInspector({
                     value={runtimeConfiguration.budget.maxNodeExecutions}
                   />
                   <TextField
-                    label="最多工具调用次数"
+                    label={t("flow.editor.maxTools")}
                     min={1}
                     onChange={(event) =>
                       onChangeRuntimeConfiguration({
@@ -264,8 +284,8 @@ export function FlowEditorInspector({
                     value={runtimeConfiguration.budget.maxToolCalls}
                   />
                   <TextField
-                    hint="单位：秒"
-                    label="最长运行时间"
+                    hint={t("flow.editor.secondsHint")}
+                    label={t("flow.editor.maxDuration")}
                     min={1}
                     onChange={(event) =>
                       onChangeRuntimeConfiguration({
@@ -283,7 +303,7 @@ export function FlowEditorInspector({
                     value={runtimeConfiguration.budget.maxDurationSeconds}
                   />
                   <TextField
-                    label="最多循环次数"
+                    label={t("flow.editor.maxLoops")}
                     min={1}
                     onChange={(event) =>
                       onChangeRuntimeConfiguration({
@@ -303,9 +323,11 @@ export function FlowEditorInspector({
                 </fieldset>
                 {draft ? (
                   <details className="flow-editor-inspector__json">
-                    <summary>
-                      <FileJson2 aria-hidden="true" size={14} /> 查看草稿 JSON
-                    </summary>
+                    <DisclosureSummary
+                      icon={<FileJson2 aria-hidden="true" size={14} />}
+                    >
+                      {t("flow.editor.draftJson")}
+                    </DisclosureSummary>
                     <pre>{JSON.stringify(draft.draft.spec, null, 2)}</pre>
                   </details>
                 ) : null}
@@ -375,14 +397,18 @@ function WorkflowProgress({
   draft: FlowDraftView | null;
   successfulTestRun: boolean;
 }) {
+  const { t } = useApplicationLanguage();
   const steps = [
-    ["保存草稿", Boolean(draft)],
-    ["通过校验", Boolean(draft?.draft.lastValidation?.valid)],
-    ["完成 Test Run", successfulTestRun],
-    ["激活 Flow", draft?.draft.status === "published"],
+    [t("flow.editor.progressSave"), Boolean(draft)],
+    [t("flow.editor.progressValidate"), Boolean(draft?.draft.lastValidation?.valid)],
+    [t("flow.editor.progressTest"), successfulTestRun],
+    [t("flow.editor.progressActivate"), draft?.draft.status === "published"],
   ] as const;
   return (
-    <ol className="flow-editor-progress" aria-label="Flow 激活进度">
+    <ol
+      className="flow-editor-progress"
+      aria-label={t("flow.editor.progressAria")}
+    >
       {steps.map(([label, done]) => (
         <li className={done ? "is-done" : undefined} key={label}>
           <CheckCircle2 aria-hidden="true" size={14} />

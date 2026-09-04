@@ -1,6 +1,12 @@
 import type { FlowRunStatus, WorkflowCheckpointStatus } from "../../types";
 import type { BadgeVariant } from "../ui/Badge";
 import { humanizeIdentifier } from "./enterpriseSidebarPresentation.ts";
+import {
+  defaultApplicationLanguage,
+  interfaceMessage,
+  type ApplicationLanguage,
+  type InterfaceMessageKey,
+} from "../../applicationLanguage.ts";
 
 export type RunStatusPresentation = {
   description: string;
@@ -8,60 +14,67 @@ export type RunStatusPresentation = {
   variant: BadgeVariant;
 };
 
-const RUN_STATUS_PRESENTATION: Record<FlowRunStatus, RunStatusPresentation> = {
+const RUN_STATUS_PRESENTATION: Record<
+  FlowRunStatus,
+  {
+    description: InterfaceMessageKey;
+    label: InterfaceMessageKey;
+    variant: BadgeVariant;
+  }
+> = {
   queued: {
-    description: "已进入队列，正在等待可用的执行资源。",
-    label: "排队中",
+    description: "flow.runStatus.queued.description",
+    label: "flow.runStatus.queued.label",
     variant: "neutral",
   },
   running: {
-    description: "流程正在执行，页面会持续记录节点进度。",
-    label: "运行中",
+    description: "flow.runStatus.running.description",
+    label: "flow.runStatus.running.label",
     variant: "info",
   },
   pause_requested: {
-    description: "已请求暂停，当前步骤安全结束后会保存状态。",
-    label: "暂停中",
+    description: "flow.runStatus.pauseRequested.description",
+    label: "flow.runStatus.pauseRequested.label",
     variant: "warning",
   },
   paused: {
-    description: "运行状态已保存，可以从当前检查点继续。",
-    label: "已暂停",
+    description: "flow.runStatus.paused.description",
+    label: "flow.runStatus.paused.label",
     variant: "warning",
   },
   waiting_approval: {
-    description: "流程已停在审批点，等待人工确认后继续。",
-    label: "等待审批",
+    description: "flow.runStatus.waitingApproval.description",
+    label: "flow.runStatus.waitingApproval.label",
     variant: "warning",
   },
   waiting_human: {
-    description: "流程需要补充信息或人工处理后才能继续。",
-    label: "等待处理",
+    description: "flow.runStatus.waitingHuman.description",
+    label: "flow.runStatus.waitingHuman.label",
     variant: "warning",
   },
   resuming: {
-    description: "正在从最近的检查点恢复执行。",
-    label: "恢复中",
+    description: "flow.runStatus.resuming.description",
+    label: "flow.runStatus.resuming.label",
     variant: "info",
   },
   succeeded: {
-    description: "所有必要步骤均已完成，最终结果已经生成。",
-    label: "运行成功",
+    description: "flow.runStatus.succeeded.description",
+    label: "flow.runStatus.succeeded.label",
     variant: "success",
   },
   failed: {
-    description: "运行未能完成，请查看失败节点和错误信息。",
-    label: "运行失败",
+    description: "flow.runStatus.failed.description",
+    label: "flow.runStatus.failed.label",
     variant: "danger",
   },
   cancel_requested: {
-    description: "已请求取消，当前步骤安全结束后会停止运行。",
-    label: "取消中",
+    description: "flow.runStatus.cancelRequested.description",
+    label: "flow.runStatus.cancelRequested.label",
     variant: "warning",
   },
   cancelled: {
-    description: "运行已取消，已完成的检查点仍然保留。",
-    label: "已取消",
+    description: "flow.runStatus.cancelled.description",
+    label: "flow.runStatus.cancelled.label",
     variant: "danger",
   },
 };
@@ -76,22 +89,33 @@ export type PayloadFieldPresentation = {
 
 export function runStatusPresentation(
   status: FlowRunStatus,
+  language: ApplicationLanguage = defaultApplicationLanguage,
 ): RunStatusPresentation {
-  return RUN_STATUS_PRESENTATION[status];
+  const presentation = RUN_STATUS_PRESENTATION[status];
+  return {
+    description: interfaceMessage(language, presentation.description),
+    label: interfaceMessage(language, presentation.label),
+    variant: presentation.variant,
+  };
 }
 
 export function checkpointStatusLabel(
   status: WorkflowCheckpointStatus,
+  language: ApplicationLanguage = defaultApplicationLanguage,
 ): string {
-  if (status === "running") return "保存中";
-  if (status === "committed") return "已保存";
-  if (status === "failed") return "保存失败";
-  return "已取消";
+  if (status === "running")
+    return interfaceMessage(language, "flow.checkpoint.saving");
+  if (status === "committed")
+    return interfaceMessage(language, "flow.checkpoint.saved");
+  if (status === "failed")
+    return interfaceMessage(language, "flow.checkpoint.failed");
+  return interfaceMessage(language, "flow.checkpoint.cancelled");
 }
 
 export function payloadFields(
   payload: Record<string, unknown>,
   schema: unknown,
+  language: ApplicationLanguage = defaultApplicationLanguage,
 ): PayloadFieldPresentation[] {
   const properties = schemaProperties(schema);
   const schemaKeys = Object.keys(properties).filter((key) =>
@@ -106,11 +130,31 @@ export function payloadFields(
     return {
       description: schemaText(fieldSchema, "description"),
       key,
-      label: schemaText(fieldSchema, "title") ?? humanizeIdentifier(key),
+      label:
+        schemaText(fieldSchema, "title") ??
+        platformPayloadFieldLabel(key, language) ??
+        humanizeIdentifier(key),
       schema: fieldSchema,
       value: payload[key],
     };
   });
+}
+
+const PLATFORM_PAYLOAD_FIELD_LABELS: Record<string, InterfaceMessageKey> = {
+  caseid: "flow.payload.field.caseId",
+  eventkind: "flow.payload.field.eventKind",
+  payloadref: "flow.payload.field.payloadRef",
+  summary: "flow.payload.field.summary",
+  synthetic: "flow.payload.field.synthetic",
+};
+
+function platformPayloadFieldLabel(
+  key: string,
+  language: ApplicationLanguage,
+): string | null {
+  const normalized = key.replace(/[^a-z0-9]/gi, "").toLocaleLowerCase();
+  const messageKey = PLATFORM_PAYLOAD_FIELD_LABELS[normalized];
+  return messageKey ? interfaceMessage(language, messageKey) : null;
 }
 
 export function payloadItemSchema(schema: unknown): unknown {
@@ -120,6 +164,7 @@ export function payloadItemSchema(schema: unknown): unknown {
 export function formatDuration(
   startedAt: string | null,
   endedAt: string | null,
+  language: ApplicationLanguage = defaultApplicationLanguage,
 ): string {
   if (!startedAt || !endedAt) return "—";
   const start = new Date(startedAt).getTime();
@@ -129,23 +174,34 @@ export function formatDuration(
   }
 
   const totalSeconds = Math.round((end - start) / 1_000);
-  if (totalSeconds < 1) return "少于 1 秒";
-  if (totalSeconds < 60) return `${totalSeconds} 秒`;
+  if (totalSeconds < 1)
+    return interfaceMessage(language, "flow.duration.lessThanSecond");
+  if (totalSeconds < 60)
+    return `${totalSeconds} ${interfaceMessage(language, "flow.duration.second")}`;
 
   const hours = Math.floor(totalSeconds / 3_600);
   const minutes = Math.floor((totalSeconds % 3_600) / 60);
   const seconds = totalSeconds % 60;
   if (hours > 0) {
-    return minutes > 0 ? `${hours} 小时 ${minutes} 分钟` : `${hours} 小时`;
+    const hourLabel = interfaceMessage(language, "flow.duration.hour");
+    const minuteLabel = interfaceMessage(language, "flow.duration.minute");
+    return minutes > 0
+      ? `${hours} ${hourLabel} ${minutes} ${minuteLabel}`
+      : `${hours} ${hourLabel}`;
   }
-  return seconds > 0 ? `${minutes} 分 ${seconds} 秒` : `${minutes} 分钟`;
+  return seconds > 0
+    ? `${minutes} ${interfaceMessage(language, "flow.duration.shortMinute")} ${seconds} ${interfaceMessage(language, "flow.duration.second")}`
+    : `${minutes} ${interfaceMessage(language, "flow.duration.minute")}`;
 }
 
-export function formatDateTime(value: string | null): string {
+export function formatDateTime(
+  value: string | null,
+  language: ApplicationLanguage = defaultApplicationLanguage,
+): string {
   if (!value) return "—";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "—";
-  return new Intl.DateTimeFormat(undefined, {
+  return new Intl.DateTimeFormat(language, {
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -155,9 +211,17 @@ export function formatDateTime(value: string | null): string {
   }).format(date);
 }
 
-export function formatScalarValue(value: unknown): string | null {
+export function formatScalarValue(
+  value: unknown,
+  language: ApplicationLanguage = defaultApplicationLanguage,
+): string | null {
   if (value === null) return "—";
-  if (typeof value === "boolean") return value ? "是" : "否";
+  if (typeof value === "boolean") {
+    return interfaceMessage(
+      language,
+      value ? "flow.value.yes" : "flow.value.no",
+    );
+  }
   if (typeof value === "string" || typeof value === "number") {
     return String(value);
   }

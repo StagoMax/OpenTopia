@@ -6,6 +6,10 @@ export {
   type ButtonVariant,
 } from "./Button";
 export { ColorField, type ColorFieldProps } from "./ColorField";
+export {
+  DisclosureSummary,
+  type DisclosureSummaryProps,
+} from "./DisclosureSummary";
 export { EditableTextContextMenu } from "./EditableTextContextMenu";
 export { IconButton, type IconButtonProps } from "./IconButton";
 export {

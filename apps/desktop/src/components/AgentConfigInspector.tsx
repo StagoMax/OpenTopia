@@ -7,6 +7,8 @@ import {
   Wrench,
 } from "lucide-react";
 import { Badge } from "./ui";
+import { useApplicationLanguage } from "../ApplicationLanguageProvider";
+import { agentRiskLabel } from "./agentAuthoring/agentPresentation";
 import "../styles/agent-studio.css";
 
 export type AgentConfigPreview = {
@@ -26,55 +28,57 @@ export function AgentConfigInspector({
   generating: boolean;
   preview: AgentConfigPreview;
 }) {
+  const { language, t } = useApplicationLanguage();
   return (
-    <aside className="agent-config-inspector" aria-label="Agent 实时配置">
+    <aside
+      className="agent-config-inspector"
+      aria-label={t("flow.agentInspector.aria")}
+    >
       <header>
         <span>
           <Bot aria-hidden="true" size={16} />
-          <strong>Live configuration / 实时配置</strong>
+          <strong>{t("flow.agentInspector.title")}</strong>
         </span>
         <Badge variant={generating ? "warning" : "neutral"}>
-          {generating ? "模型生成中" : "Draft"}
+          {generating
+            ? t("flow.agentInspector.modelGenerating")
+            : t("flow.agents.draft")}
         </Badge>
       </header>
       <section>
-        <strong>{preview.name || "Untitled Agent"}</strong>
-        <p>
-          {preview.instructions ||
-            "在左侧描述 Agent 需求，模型生成后这里会立即显示可审核配置。"}
-        </p>
+        <strong>{preview.name || t("flow.agentInspector.untitled")}</strong>
+        <p>{preview.instructions || t("flow.agentInspector.emptyHint")}</p>
       </section>
       <dl>
         <InspectorRow
           icon={Cable}
-          label="Connections"
-          value={`${preview.connectionCount} 个绑定`}
+          label={t("flow.agentEditor.connections")}
+          value={`${preview.connectionCount} ${t("flow.agentInspector.bindings")}`}
         />
         <InspectorRow
           icon={Database}
-          label="Knowledge"
+          label={t("flow.agentEditor.knowledge")}
           value={preview.knowledge}
         />
         <InspectorRow
           icon={Wrench}
-          label="Tools"
-          value={preview.tools.join(", ") || "未授权"}
+          label={t("flow.agentEditor.tools")}
+          value={
+            preview.tools.join(", ") || t("flow.agentInspector.notAuthorized")
+          }
         />
         <InspectorRow
           icon={ShieldCheck}
-          label="Permissions"
-          value={`${preview.riskClass} risk`}
+          label={t("flow.agentInspector.permissions")}
+          value={agentRiskLabel(preview.riskClass, language)}
         />
         <InspectorRow
           icon={FileJson2}
-          label="Final schema"
-          value={schemaLabel(preview.outputSchema)}
+          label={t("flow.agentInspector.finalSchema")}
+          value={schemaLabel(preview.outputSchema, t)}
         />
       </dl>
-      <footer>
-        模型只能从已配置的 Connection、Knowledge 和当前 ExecutionContext
-        中选择能力；发布后版本与权限会被冻结。
-      </footer>
+      <footer>{t("flow.agentInspector.boundary")}</footer>
     </aside>
   );
 }
@@ -98,12 +102,15 @@ function InspectorRow({
   );
 }
 
-function schemaLabel(value: string): string {
+function schemaLabel(
+  value: string,
+  t: ReturnType<typeof useApplicationLanguage>["t"],
+): string {
   try {
     const schema = JSON.parse(value) as { type?: string; properties?: object };
     const propertyCount = Object.keys(schema.properties ?? {}).length;
-    return `${schema.type ?? "schema"}${propertyCount ? ` · ${propertyCount} fields` : ""}`;
+    return `${schema.type ?? "schema"}${propertyCount ? ` · ${propertyCount} ${t("flow.agentInspector.fields")}` : ""}`;
   } catch {
-    return "Schema 待修正";
+    return t("flow.agentInspector.schemaInvalid");
   }
 }

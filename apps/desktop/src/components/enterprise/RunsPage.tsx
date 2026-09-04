@@ -23,8 +23,10 @@ import {
 } from "./runPresentation";
 import { useEnterpriseStore } from "./store";
 import "./runs-page.css";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
 
 export function RunsPage({ client }: { client: ApiClient }) {
+  const { language, t } = useApplicationLanguage();
   const { snapshot, store } = useEnterpriseStore(client);
   const selection = useFlowWorkspaceSelection();
   const selected =
@@ -34,7 +36,8 @@ export function RunsPage({ client }: { client: ApiClient }) {
   const selectedFlow = selected
     ? snapshot.flows.find((flow) => flow.flowId === selected.flowId)
     : null;
-  const flowName = selectedFlow?.name ?? selected?.flowId ?? "Workflow Run";
+  const flowName =
+    selectedFlow?.name ?? selected?.flowId ?? t("flow.runs.fallbackName");
   const [busy, setBusy] = useState<"pause" | "resume" | "cancel" | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -45,7 +48,9 @@ export function RunsPage({ client }: { client: ApiClient }) {
   }, [selected, selection]);
 
   useFlowWorkspaceTitle(
-    selected ? `${flowName} · 运行记录` : "Runs / 运行追踪",
+    selected
+      ? `${flowName} · ${t("flow.nav.runs")}`
+      : t("flow.runs.workspaceTitle"),
   );
 
   async function runAction(
@@ -69,8 +74,8 @@ export function RunsPage({ client }: { client: ApiClient }) {
     return (
       <div className="enterprise-agent-prompt-empty" role="status">
         <Activity aria-hidden="true" size={20} />
-        <strong>尚无 Workflow Run</strong>
-        <p>Flow 开始运行后会在左侧显示。</p>
+        <strong>{t("flow.runs.none")}</strong>
+        <p>{t("flow.runs.noneHint")}</p>
       </div>
     );
   }
@@ -85,7 +90,7 @@ export function RunsPage({ client }: { client: ApiClient }) {
     "cancel_requested",
     "cancelled",
   ].includes(selected.status);
-  const status = runStatusPresentation(selected.status);
+  const status = runStatusPresentation(selected.status, language);
   const endedAt = selected.completedAt ?? selected.updatedAt;
 
   return (
@@ -95,7 +100,7 @@ export function RunsPage({ client }: { client: ApiClient }) {
           actions={
             <>
               <IconButton
-                aria-label="刷新 Workflow Run"
+                aria-label={t("flow.runs.refresh")}
                 disabled={Boolean(busy)}
                 onClick={() => void store.load(true)}
                 size="compact"
@@ -114,7 +119,9 @@ export function RunsPage({ client }: { client: ApiClient }) {
                   variant="primary"
                 >
                   <PauseCircle aria-hidden="true" size={14} />
-                  {busy === "pause" ? "暂停中…" : "暂停"}
+                  {busy === "pause"
+                    ? t("flow.runs.pausing")
+                    : t("flow.runs.pause")}
                 </Button>
               ) : canResume ? (
                 <Button
@@ -128,7 +135,9 @@ export function RunsPage({ client }: { client: ApiClient }) {
                   variant="primary"
                 >
                   <PlayCircle aria-hidden="true" size={14} />
-                  {busy === "resume" ? "恢复中…" : "恢复"}
+                  {busy === "resume"
+                    ? t("flow.runs.resuming")
+                    : t("flow.runs.resume")}
                 </Button>
               ) : null}
             </>
@@ -136,63 +145,69 @@ export function RunsPage({ client }: { client: ApiClient }) {
           status={status.label}
           statusVariant={status.variant}
           subtitle={`${flowName} · v${selected.flowVersion}`}
-          title="运行概览"
+          title={t("flow.runs.overview")}
         >
           {snapshot.error || error ? (
             <p className="enterprise-page__message is-error" role="alert">
               {snapshot.error ?? error}
             </p>
           ) : null}
-          <FlowInspectorSection title="时间">
+          <FlowInspectorSection title={t("flow.runs.time")}>
             <dl className="enterprise-facts flow-inspector-facts">
               <div>
-                <dt>开始</dt>
-                <dd>{formatDateTime(selected.startedAt)}</dd>
+                <dt>{t("flow.runs.started")}</dt>
+                <dd>{formatDateTime(selected.startedAt, language)}</dd>
               </div>
               <div>
-                <dt>{selected.completedAt ? "完成" : "更新"}</dt>
-                <dd>{formatDateTime(endedAt)}</dd>
+                <dt>
+                  {selected.completedAt
+                    ? t("flow.runs.completed")
+                    : t("flow.runs.updated")}
+                </dt>
+                <dd>{formatDateTime(endedAt, language)}</dd>
               </div>
               <div>
-                <dt>耗时</dt>
-                <dd>{formatDuration(selected.startedAt, endedAt)}</dd>
+                <dt>{t("flow.runs.duration")}</dt>
+                <dd>{formatDuration(selected.startedAt, endedAt, language)}</dd>
               </div>
             </dl>
           </FlowInspectorSection>
-          <FlowInspectorSection title="用量与预算">
+          <FlowInspectorSection title={t("flow.runs.usageBudget")}>
             <dl className="enterprise-facts flow-inspector-facts">
               <div>
-                <dt>节点执行</dt>
+                <dt>{t("flow.runs.nodeExecutions")}</dt>
                 <dd>
                   {selected.nodeExecutions}/{selected.budget.maxNodeExecutions}
                 </dd>
               </div>
               <div>
-                <dt>工具调用</dt>
+                <dt>{t("flow.runs.toolCalls")}</dt>
                 <dd>
                   {selected.toolCalls}/{selected.budget.maxToolCalls}
                 </dd>
               </div>
               <div>
-                <dt>检查点</dt>
+                <dt>{t("flow.runs.checkpoints")}</dt>
                 <dd>{selected.checkpointHistory.length}</dd>
               </div>
               <div>
-                <dt>最长运行</dt>
-                <dd>{selected.budget.maxDurationSeconds} 秒</dd>
+                <dt>{t("flow.runs.maxDuration")}</dt>
+                <dd>
+                  {selected.budget.maxDurationSeconds} {t("flow.runs.seconds")}
+                </dd>
               </div>
             </dl>
           </FlowInspectorSection>
-          <FlowInspectorSection title="技术标识">
+          <FlowInspectorSection title={t("flow.runs.identifiers")}>
             <dl className="enterprise-facts flow-inspector-facts">
               <div>
-                <dt>Run ID</dt>
+                <dt>{t("flow.runs.runId")}</dt>
                 <dd>
                   <code>{selected.id}</code>
                 </dd>
               </div>
               <div>
-                <dt>Thread</dt>
+                <dt>{t("flow.runs.thread")}</dt>
                 <dd>
                   <code>{selected.threadId}</code>
                 </dd>
@@ -200,7 +215,7 @@ export function RunsPage({ client }: { client: ApiClient }) {
             </dl>
           </FlowInspectorSection>
           {canCancel ? (
-            <FlowInspectorSection title="运行控制">
+            <FlowInspectorSection title={t("flow.runs.controls")}>
               <Button
                 disabled={Boolean(busy)}
                 onClick={() =>
@@ -212,7 +227,9 @@ export function RunsPage({ client }: { client: ApiClient }) {
                 variant="danger"
               >
                 <XCircle aria-hidden="true" size={14} />
-                {busy === "cancel" ? "取消中…" : "取消运行"}
+                {busy === "cancel"
+                  ? t("flow.runs.cancelling")
+                  : t("flow.runs.cancel")}
               </Button>
             </FlowInspectorSection>
           ) : null}

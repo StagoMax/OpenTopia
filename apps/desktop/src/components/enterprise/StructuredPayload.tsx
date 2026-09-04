@@ -3,6 +3,7 @@ import {
   payloadFields,
   payloadItemSchema,
 } from "./runPresentation";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
 
 export function StructuredPayload({
   emptyLabel,
@@ -13,6 +14,7 @@ export function StructuredPayload({
   schema?: unknown;
   value: unknown;
 }) {
+  const { language } = useApplicationLanguage();
   if (value === null || value === undefined) {
     return <p className="run-detail__empty">{emptyLabel}</p>;
   }
@@ -25,7 +27,11 @@ export function StructuredPayload({
       <ol className="run-payload-list">
         {value.map((item, index) => (
           <li key={index}>
-            <PayloadValue schema={payloadItemSchema(schema)} value={item} />
+            <PayloadValue
+              language={language}
+              schema={payloadItemSchema(schema)}
+              value={item}
+            />
           </li>
         ))}
       </ol>
@@ -33,7 +39,11 @@ export function StructuredPayload({
   }
 
   if (typeof value === "object") {
-    const fields = payloadFields(value as Record<string, unknown>, schema);
+    const fields = payloadFields(
+      value as Record<string, unknown>,
+      schema,
+      language,
+    );
     if (fields.length === 0) {
       return <p className="run-detail__empty">{emptyLabel}</p>;
     }
@@ -46,7 +56,11 @@ export function StructuredPayload({
               {field.description ? <small>{field.description}</small> : null}
             </dt>
             <dd>
-              <PayloadValue schema={field.schema} value={field.value} />
+              <PayloadValue
+                language={language}
+                schema={field.schema}
+                value={field.value}
+              />
             </dd>
           </div>
         ))}
@@ -56,24 +70,41 @@ export function StructuredPayload({
 
   return (
     <p className="run-payload__text">
-      {formatScalarValue(value) ?? String(value)}
+      {formatScalarValue(value, language) ?? String(value)}
     </p>
   );
 }
 
-function PayloadValue({ schema, value }: { schema?: unknown; value: unknown }) {
-  const scalar = formatScalarValue(value);
+function PayloadValue({
+  language,
+  schema,
+  value,
+}: {
+  language: import("../../applicationLanguage").ApplicationLanguage;
+  schema?: unknown;
+  value: unknown;
+}) {
+  const { t } = useApplicationLanguage();
+  const scalar = formatScalarValue(value, language);
   if (scalar !== null) {
     return <span className="run-payload__text">{scalar}</span>;
   }
 
   const count = Array.isArray(value)
-    ? `${value.length} 项`
-    : `${Object.keys(value as Record<string, unknown>).length} 个字段`;
+    ? `${value.length} ${t("flow.payload.items")}`
+    : `${Object.keys(value as Record<string, unknown>).length} ${t("flow.payload.fields")}`;
   return (
     <details className="run-payload__structured">
-      <summary>{count}，查看详情</summary>
-      <StructuredPayload emptyLabel="无数据" schema={schema} value={value} />
+      <summary>
+        {count}
+        {language === "zh-CN" ? "，" : "; "}
+        {t("flow.payload.showDetails")}
+      </summary>
+      <StructuredPayload
+        emptyLabel={t("flow.payload.noData")}
+        schema={schema}
+        value={value}
+      />
     </details>
   );
 }

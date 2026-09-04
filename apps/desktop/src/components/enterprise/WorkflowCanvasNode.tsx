@@ -21,6 +21,11 @@ import {
 } from "lucide-react";
 import { IconButton } from "../ui";
 import type { FlowNodeKind, FlowNodeRun } from "../../types";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
+import {
+  interfaceMessage,
+  type ApplicationLanguage,
+} from "../../applicationLanguage";
 
 export type WorkflowCanvasRunStatus = FlowNodeRun["status"] | "ready";
 
@@ -47,6 +52,7 @@ export const WorkflowCanvasNode = memo(function WorkflowCanvasNode({
   id,
   selected,
 }: NodeProps<WorkflowCanvasNodeType>) {
+  const { t } = useApplicationLanguage();
   const {
     activationText,
     disabled,
@@ -64,13 +70,13 @@ export const WorkflowCanvasNode = memo(function WorkflowCanvasNode({
 
   return (
     <article
-      aria-label={`${label}，${kind} node`}
+      aria-label={`${label}，${kind} ${t("flow.canvas.node")}`}
       className={`workflow-node workflow-node--${kind}${
         selected ? " is-selected" : ""
       }${runStatus ? ` is-run-${runStatus}` : ""}`}
     >
       <Handle
-        aria-label={`连接到 ${label}`}
+        aria-label={`${t("flow.canvas.connectTo")} ${label}`}
         className="workflow-node__handle workflow-node__handle--target"
         id="input"
         isConnectable={canConnect}
@@ -81,7 +87,7 @@ export const WorkflowCanvasNode = memo(function WorkflowCanvasNode({
         <div className="workflow-node__trigger">
           <RadioTower aria-hidden="true" size={14} />
           <span>
-            <small>Input / 输入</small>
+            <small>{t("flow.canvas.input")}</small>
             <strong title={activationText}>{activationText}</strong>
           </span>
         </div>
@@ -94,7 +100,7 @@ export const WorkflowCanvasNode = memo(function WorkflowCanvasNode({
         >
           <RadioTower aria-hidden="true" size={14} />
           <span>
-            <small>Trigger / 触发器</small>
+            <small>{t("flow.canvas.trigger")}</small>
             <strong title={activationText}>{activationText}</strong>
           </span>
         </button>
@@ -119,11 +125,13 @@ export const WorkflowCanvasNode = memo(function WorkflowCanvasNode({
       <footer className="workflow-node__final">
         <CircleDot aria-hidden="true" size={12} />
         <span>
-          {kind === "output" ? "Terminal / 流程输出" : "Final / 完成通知"}
+          {kind === "output"
+            ? t("flow.canvas.output")
+            : t("flow.canvas.final")}
         </span>
         {!readOnly && kind !== "output" ? (
           <IconButton
-            aria-label={`移除 ${label}`}
+            aria-label={`${t("flow.canvas.remove")} ${label}`}
             className="nodrag nopan"
             disabled={disabled}
             onClick={(event) => {
@@ -139,7 +147,7 @@ export const WorkflowCanvasNode = memo(function WorkflowCanvasNode({
       </footer>
       {kind !== "output" ? (
         <Handle
-          aria-label={`从 ${label} 的 Final 连线`}
+          aria-label={`${t("flow.canvas.connectFrom")} ${label}`}
           className="workflow-node__handle workflow-node__handle--source"
           id="final"
           isConnectable={canConnect}
@@ -152,6 +160,7 @@ export const WorkflowCanvasNode = memo(function WorkflowCanvasNode({
 }, workflowCanvasNodePropsEqual);
 
 function NodeRunStatus({ status }: { status: WorkflowCanvasRunStatus }) {
+  const { language } = useApplicationLanguage();
   const Icon =
     status === "succeeded"
       ? CheckCircle2
@@ -160,7 +169,7 @@ function NodeRunStatus({ status }: { status: WorkflowCanvasRunStatus }) {
         : status === "waiting_approval" || status === "waiting_human"
           ? PauseCircle
           : LoaderCircle;
-  const label = runStatusLabel(status);
+  const label = runStatusLabel(status, language);
   return (
     <span className="workflow-node__run-status" title={label}>
       <Icon aria-hidden="true" size={14} />
@@ -169,15 +178,23 @@ function NodeRunStatus({ status }: { status: WorkflowCanvasRunStatus }) {
   );
 }
 
-function runStatusLabel(status: WorkflowCanvasRunStatus) {
-  if (status === "ready") return "就绪";
-  if (status === "succeeded") return "成功";
-  if (status === "failed") return "失败";
-  if (status === "cancelled") return "取消";
+function runStatusLabel(
+  status: WorkflowCanvasRunStatus,
+  language: ApplicationLanguage,
+) {
+  if (status === "ready")
+    return interfaceMessage(language, "flow.nodeTest.ready");
+  if (status === "succeeded")
+    return interfaceMessage(language, "flow.nodeStatus.succeeded");
+  if (status === "failed")
+    return interfaceMessage(language, "flow.nodeStatus.failed");
+  if (status === "cancelled")
+    return interfaceMessage(language, "flow.canvas.statusCancelled");
   if (status === "waiting_approval" || status === "waiting_human")
-    return "等待人工";
-  if (status === "resuming") return "恢复中";
-  return "运行中";
+    return interfaceMessage(language, "flow.nodeTest.waitingHuman");
+  if (status === "resuming")
+    return interfaceMessage(language, "flow.nodeStatus.resuming");
+  return interfaceMessage(language, "flow.nodeStatus.running");
 }
 
 function workflowCanvasNodePropsEqual(

@@ -1,5 +1,6 @@
 import { Cable, Search } from "lucide-react";
 import { memo, useEffect, useState } from "react";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
 import type { Connection, IntegrationDefinition } from "../../types";
 import { Badge, Button, TextField } from "../ui";
 import {
@@ -31,6 +32,7 @@ export const ConnectionGrantCatalog = memo(function ConnectionGrantCatalog({
   selectedConnectionId: string | null;
   structuredConnectionIds: ReadonlySet<string>;
 }) {
+  const { language, t } = useApplicationLanguage();
   const [visibleConnections, setVisibleConnections] =
     useState(CONNECTION_PAGE_SIZE);
   useEffect(() => setVisibleConnections(CONNECTION_PAGE_SIZE), [query]);
@@ -42,10 +44,11 @@ export const ConnectionGrantCatalog = memo(function ConnectionGrantCatalog({
         <TextField
           label={
             <span className="agent-connection-grants__search-label">
-              <Search aria-hidden="true" size={14} /> 搜索 Connection
+              <Search aria-hidden="true" size={14} />{" "}
+              {t("flow.connectionGrants.searchConnection")}
             </span>
           }
-          placeholder="名称、Provider、账号或环境"
+          placeholder={t("flow.connection.collection.searchPlaceholder")}
           value={query}
           onChange={(event) => onQueryChange(event.target.value)}
         />
@@ -56,6 +59,8 @@ export const ConnectionGrantCatalog = memo(function ConnectionGrantCatalog({
           const eligibility = connectionGrantEligibility(
             connection,
             definition ?? null,
+            Date.now(),
+            language,
           );
           const active = connection.id === selectedConnectionId;
           const bound = structuredConnectionIds.has(connection.id);
@@ -71,17 +76,22 @@ export const ConnectionGrantCatalog = memo(function ConnectionGrantCatalog({
               <span>
                 <strong>{connection.name}</strong>
                 <small>
-                  {definition?.name ?? "Unknown Provider"} ·{" "}
-                  {connectionAccountLabel(connection)}
+                  {definition?.name ??
+                    t("flow.connectionGrants.unknownProvider")}{" "}
+                  · {connectionAccountLabel(connection, language)}
                 </small>
                 {!eligibility.selectable ? (
                   <small className="is-blocked">{eligibility.reason}</small>
                 ) : null}
               </span>
               <span className="agent-connection-grants__connection-badges">
-                {bound ? <Badge variant="info">已授权</Badge> : null}
+                {bound ? (
+                  <Badge variant="info">
+                    {t("flow.connectionGrants.authorized")}
+                  </Badge>
+                ) : null}
                 <Badge variant={connectionStatusVariant(connection.status)}>
-                  {connectionStatusLabel(connection.status)}
+                  {connectionStatusLabel(connection.status, language)}
                 </Badge>
               </span>
             </button>
@@ -91,8 +101,8 @@ export const ConnectionGrantCatalog = memo(function ConnectionGrantCatalog({
       {filteredConnections.length === 0 ? (
         <p className="agent-connection-grants__empty">
           {allConnections.length === 0
-            ? "尚未创建 Connection，请先前往 Connections 配置。"
-            : "没有匹配的 Connection，请调整搜索条件。"}
+            ? t("flow.connectionGrants.noConnections")
+            : t("flow.connectionGrants.noConnectionMatch")}
         </p>
       ) : null}
       {visibleConnections < filteredConnections.length ? (
@@ -102,8 +112,9 @@ export const ConnectionGrantCatalog = memo(function ConnectionGrantCatalog({
           }
           variant="quiet"
         >
-          显示更多 Connections（剩余
-          {filteredConnections.length - visibleConnections}）
+          {t("flow.connectionGrants.moreConnections")}
+          {filteredConnections.length - visibleConnections}
+          {language === "zh-CN" ? "）" : ")"}
         </Button>
       ) : null}
     </div>

@@ -1,8 +1,9 @@
 import { BookOpenCheck, LockKeyhole } from "lucide-react";
 import {
-  AGENT_KNOWLEDGE_PROVIDER_OPTIONS,
+  agentKnowledgeProviderOptions,
   type AgentKnowledgeProviderSelection,
 } from "../agentKnowledgeBinding";
+import { useApplicationLanguage } from "../ApplicationLanguageProvider";
 import { SelectField, TextField } from "./ui";
 
 type AgentTemplateKnowledgeBindingFieldProps = {
@@ -20,6 +21,7 @@ export function AgentTemplateKnowledgeBindingField({
   onProviderChange,
   onNamespacesChange,
 }: AgentTemplateKnowledgeBindingFieldProps) {
+  const { language, t } = useApplicationLanguage();
   return (
     <section
       className="agent-template-panel__knowledge-binding"
@@ -28,34 +30,38 @@ export function AgentTemplateKnowledgeBindingField({
       <header>
         <BookOpenCheck size={16} aria-hidden="true" />
         <span>
-          <strong id="agent-template-knowledge-title">Agent 知识库</strong>
-          <small>知识库随 Agent 版本冻结，Flow 只继承这个选择。</small>
+          <strong id="agent-template-knowledge-title">
+            {t("flow.agentKnowledge.title")}
+          </strong>
+          <small>{t("flow.agentKnowledge.detail")}</small>
         </span>
       </header>
       <SelectField<AgentKnowledgeProviderSelection>
         disabled={disabled}
-        hint="选择后会自动授予 library_search 权限；不需要在 Flow Revision 再配置。"
-        label="知识库"
+        hint={t("flow.agentKnowledge.autoGrantHint")}
+        label={t("flow.agentEditor.knowledge")}
         onChange={onProviderChange}
-        options={AGENT_KNOWLEDGE_PROVIDER_OPTIONS}
+        options={agentKnowledgeProviderOptions(language)}
         value={provider}
       />
       {provider === "sag" ? (
         <TextField
-          label="Namespaces"
+          label={t("flow.agentKnowledge.namespaces")}
           value={namespaces}
           disabled={disabled}
           placeholder="opentopia.audit.work-injury.v1"
-          hint="多个 namespace 用逗号或换行分隔；运行时不允许 Agent 自行扩大范围。"
+          hint={t("flow.agentKnowledge.namespacesHint")}
           onChange={(event) => onNamespacesChange(event.target.value)}
         />
       ) : null}
       {provider ? (
         <p>
           <LockKeyhole size={14} aria-hidden="true" />
-          发布后，知识库后端
-          {provider === "sag" ? " 与 namespace" : ""}
-          的变更会作为 Agent 权限变更进入审核。
+          {t("flow.agentKnowledge.reviewPrefix")}
+          {provider === "sag"
+            ? ` ${t("flow.agentKnowledge.reviewNamespace")} `
+            : " "}
+          {t("flow.agentKnowledge.reviewSuffix")}
         </p>
       ) : null}
     </section>

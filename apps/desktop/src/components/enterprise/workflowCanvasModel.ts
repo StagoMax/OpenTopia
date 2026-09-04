@@ -5,6 +5,11 @@ import type {
   FlowSpec,
 } from "../../types";
 import {
+  defaultApplicationLanguage,
+  interfaceMessage,
+  type ApplicationLanguage,
+} from "../../applicationLanguage.ts";
+import {
   activationLabel,
   graphActivationLabel,
   readNodeActivation,
@@ -34,6 +39,7 @@ export type WorkflowCanvasGraphModel = {
 export function editableWorkflowCanvasModel(
   selections: readonly WorkflowNodeSelection[],
   templates: readonly AgentTemplateVersionView[],
+  language: ApplicationLanguage = defaultApplicationLanguage,
 ): WorkflowCanvasGraphModel {
   return {
     connections: workflowConnections(selections),
@@ -48,19 +54,24 @@ export function editableWorkflowCanvasModel(
           : null;
       return {
         id: selection.id,
-        inputText: activationLabel(selection.activation, selections, templates),
+        inputText: activationLabel(
+          selection.activation,
+          selections,
+          templates,
+          language,
+        ),
         kind: selection.kind,
         label: workflowNodeLabel(selection, templates),
         subtitle:
           selection.kind === "agent" && template
             ? `${template.template.templateId}@${template.template.version}`
             : selection.kind === "agent"
-              ? "未关联 Agent"
+              ? interfaceMessage(language, "flow.canvas.unlinkedAgent")
               : selection.kind === "tool"
-                ? "deterministic action"
+                ? interfaceMessage(language, "flow.canvas.action")
                 : selection.kind === "output"
-                  ? "系统管理的固定终点"
-                  : `${selection.kind} node`,
+                  ? interfaceMessage(language, "flow.canvas.managedEndpoint")
+                  : `${selection.kind} ${interfaceMessage(language, "flow.canvas.nodeSuffix")}`,
       };
     }),
   };
@@ -68,6 +79,7 @@ export function editableWorkflowCanvasModel(
 
 export function compiledWorkflowCanvasModel(
   graph: FlowSpec["graph"],
+  language: ApplicationLanguage = defaultApplicationLanguage,
 ): WorkflowCanvasGraphModel {
   return {
     connections: graph.edges.map((edge, index) => ({
@@ -83,10 +95,10 @@ export function compiledWorkflowCanvasModel(
     })),
     nodes: graph.nodes.map((node) => ({
       id: node.id,
-      inputText: workflowGraphNodeInputLabel(node, graph),
+      inputText: workflowGraphNodeInputLabel(node, graph, language),
       kind: node.kind,
       label: node.label,
-      subtitle: compiledNodeSubtitle(node),
+      subtitle: compiledNodeSubtitle(node, language),
     })),
   };
 }
@@ -94,9 +106,11 @@ export function compiledWorkflowCanvasModel(
 export function workflowGraphNodeInputLabel(
   node: FlowGraphNode,
   graph: FlowSpec["graph"],
+  language: ApplicationLanguage = defaultApplicationLanguage,
 ): string {
   const activation = readNodeActivation(node);
-  if (activation) return graphActivationLabel(activation, graph.nodes);
+  if (activation)
+    return graphActivationLabel(activation, graph.nodes, language);
 
   const sourceLabels = graph.edges
     .filter((edge) => edge.to === node.id)
@@ -109,16 +123,23 @@ export function workflowGraphNodeInputLabel(
   if (sourceLabels.length > 0) {
     return sourceLabels.join(node.kind === "join" ? " AND " : " OR ");
   }
-  return node.id === graph.entryNodeId ? "Flow.input" : "未配置";
+  return node.id === graph.entryNodeId
+    ? "Flow.input"
+    : interfaceMessage(language, "flow.activation.notConfigured");
 }
 
-function compiledNodeSubtitle(node: FlowGraphNode): string {
+function compiledNodeSubtitle(
+  node: FlowGraphNode,
+  language: ApplicationLanguage,
+): string {
   const reference = node.config.reference;
   const version = node.config.templateVersion;
   if (typeof reference === "string") {
     return typeof version === "number" ? `${reference}@${version}` : reference;
   }
-  if (node.kind === "tool") return "deterministic action";
-  if (node.kind === "output") return "系统管理的固定终点";
-  return `${node.kind} node`;
+  if (node.kind === "tool")
+    return interfaceMessage(language, "flow.canvas.action");
+  if (node.kind === "output")
+    return interfaceMessage(language, "flow.canvas.managedEndpoint");
+  return `${node.kind} ${interfaceMessage(language, "flow.canvas.nodeSuffix")}`;
 }

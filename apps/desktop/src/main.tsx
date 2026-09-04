@@ -1,6 +1,7 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+import { ApplicationLanguageProvider } from "./ApplicationLanguageProvider";
 import { FlowAgentSelectionProvider } from "./components/enterprise/flowAgentSelection";
 import { EditableTextContextMenu } from "./components/ui";
 import { applyAppearance, readAppearanceSettings } from "./appearance";
@@ -21,8 +22,10 @@ if (!root) throw new Error("Root element not found");
 createRoot(root).render(
   <React.StrictMode>
     <EditableTextContextMenu />
-    <FlowAgentSelectionProvider>
-      <App />
-    </FlowAgentSelectionProvider>
+    <ApplicationLanguageProvider>
+      <FlowAgentSelectionProvider>
+        <App />
+      </FlowAgentSelectionProvider>
+    </ApplicationLanguageProvider>
   </React.StrictMode>,
 );

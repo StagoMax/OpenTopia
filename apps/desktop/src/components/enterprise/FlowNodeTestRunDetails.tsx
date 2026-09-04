@@ -1,6 +1,8 @@
 import { Clock3, FlaskConical } from "lucide-react";
 import type { FlowNodeRun, FlowRun } from "../../types";
-import { Badge } from "../ui";
+import { Badge, DisclosureSummary } from "../ui";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
+import { interfaceMessage } from "../../applicationLanguage";
 
 export function FlowNodeTestRunDetails({
   nodeId,
@@ -9,6 +11,7 @@ export function FlowNodeTestRunDetails({
   nodeId: string;
   run: FlowRun | null;
 }) {
+  const { language, t } = useApplicationLanguage();
   if (!run) return null;
   const nodeRun = latestNodeRun(run.nodeRuns, nodeId);
   const ready = run.readyNodes.includes(nodeId);
@@ -17,17 +20,21 @@ export function FlowNodeTestRunDetails({
     <section className="flow-editor-inspector__section flow-node-test-result">
       <header>
         <span>
-          <strong>最近一次 Test Run</strong>
+          <strong>{t("flow.nodeTest.latest")}</strong>
           <small>
-            {nodeRun ? `第 ${nodeRun.attempt} 次执行` : "本次运行轨迹"}
+            {nodeRun
+              ? language === "zh-CN"
+                ? `第 ${nodeRun.attempt} ${t("flow.nodeTest.attempt")}`
+                : `${t("flow.nodeTest.attempt")} ${nodeRun.attempt}`
+              : t("flow.nodeTest.trace")}
           </small>
         </span>
         <Badge variant={statusVariant(nodeRun?.status, ready)}>
           {nodeRun
-            ? nodeRunStatusLabel(nodeRun.status)
+            ? nodeRunStatusLabel(nodeRun.status, language)
             : ready
-              ? "就绪"
-              : "未经过"}
+              ? t("flow.nodeTest.ready")
+              : t("flow.nodeTest.notVisited")}
         </Badge>
       </header>
 
@@ -36,11 +43,13 @@ export function FlowNodeTestRunDetails({
           <div className="flow-node-test-result__timing">
             <Clock3 aria-hidden="true" size={14} />
             <span>{durationLabel(nodeRun)}</span>
-            <span>{nodeRun.toolCalls} 次 Tool 调用</span>
+            <span>
+              {nodeRun.toolCalls} {t("flow.nodeTest.toolCalls")}
+            </span>
           </div>
-          <JsonResult label="输入" value={nodeRun.input} />
+          <JsonResult label={t("flow.nodeTest.input")} value={nodeRun.input} />
           {nodeRun.output !== null ? (
-            <JsonResult label="输出" value={nodeRun.output} />
+            <JsonResult label={t("flow.nodeTest.output")} value={nodeRun.output} />
           ) : null}
           {nodeRun.error ? (
             <p className="flow-node-test-result__error" role="alert">
@@ -52,8 +61,8 @@ export function FlowNodeTestRunDetails({
         <p className="flow-editor-inspector__note">
           <FlaskConical aria-hidden="true" size={13} />
           {ready
-            ? "节点已经进入待执行队列。"
-            : "最近一次测试没有经过这个节点，可能是分支条件未满足。"}
+            ? t("flow.nodeTest.queued")
+            : t("flow.nodeTest.skipped")}
         </p>
       )}
     </section>
@@ -63,7 +72,7 @@ export function FlowNodeTestRunDetails({
 function JsonResult({ label, value }: { label: string; value: unknown }) {
   return (
     <details className="flow-node-test-result__json">
-      <summary>{label}</summary>
+      <DisclosureSummary>{label}</DisclosureSummary>
       <pre>{formatJson(value)}</pre>
     </details>
   );
@@ -81,24 +90,31 @@ function formatJson(value: unknown) {
 }
 
 function durationLabel(nodeRun: FlowNodeRun) {
-  if (!nodeRun.completedAt) return "执行中";
+  if (!nodeRun.completedAt) return "…";
   const duration =
     new Date(nodeRun.completedAt).getTime() -
     new Date(nodeRun.startedAt).getTime();
-  if (!Number.isFinite(duration) || duration < 0) return "已完成";
+  if (!Number.isFinite(duration) || duration < 0) return "—";
   return duration < 1_000
     ? `${duration} ms`
     : `${(duration / 1_000).toFixed(1)} s`;
 }
 
-function nodeRunStatusLabel(status: FlowNodeRun["status"]) {
-  if (status === "succeeded") return "成功";
-  if (status === "failed") return "失败";
-  if (status === "cancelled") return "已取消";
+function nodeRunStatusLabel(
+  status: FlowNodeRun["status"],
+  language: import("../../applicationLanguage").ApplicationLanguage,
+) {
+  if (status === "succeeded")
+    return interfaceMessage(language, "flow.nodeStatus.succeeded");
+  if (status === "failed")
+    return interfaceMessage(language, "flow.nodeStatus.failed");
+  if (status === "cancelled")
+    return interfaceMessage(language, "flow.nodeStatus.cancelled");
   if (status === "waiting_approval" || status === "waiting_human")
-    return "等待人工";
-  if (status === "resuming") return "恢复中";
-  return "运行中";
+    return interfaceMessage(language, "flow.nodeTest.waitingHuman");
+  if (status === "resuming")
+    return interfaceMessage(language, "flow.nodeStatus.resuming");
+  return interfaceMessage(language, "flow.nodeStatus.running");
 }
 
 function statusVariant(

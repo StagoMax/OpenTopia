@@ -256,6 +256,11 @@ import {
   NewTaskState,
   OfflineState,
 } from "./features/conversation/ConversationEmptyStates";
+import { useApplicationLanguage } from "./ApplicationLanguageProvider";
+import {
+  interfaceMessage,
+  type ApplicationLanguage,
+} from "./applicationLanguage";
 
 type ServerStatus = "checking" | "online" | "offline";
 
@@ -366,6 +371,7 @@ function emptyContextUsage(): ContextStatus["usage"] {
 }
 
 export function App() {
+  const { language } = useApplicationLanguage();
   const [platform, setPlatform] = useState<PlatformInfo | null>(null);
   const [client, setClient] = useState<ApiClient | null>(null);
   const threadActivityStore = useMemo(() => new ThreadActivityStore(), []);
@@ -4036,7 +4042,7 @@ export function App() {
               onDrop={conversationFileDrop.onDrop}
             >
               <FlowWorkspaceTitle
-                fallback={flowPrimaryHeadingTitle(flowPrimaryView)}
+                fallback={flowPrimaryHeadingTitle(flowPrimaryView, language)}
               >
                 {(workspaceTitle) => (
                   <ThreadHeader
@@ -4930,15 +4936,22 @@ function flowPrimaryHeadingIcon(view: FlowPrimaryView) {
   return undefined;
 }
 
-function flowPrimaryHeadingTitle(view: FlowPrimaryView): string | undefined {
-  if (view === "overview") return "Overview / 运行总览";
-  if (view === "agents") return "Agents / Agent 配置";
-  if (view === "workflow-templates") return "Flows / 工作流";
-  if (view === "inbox") return "Inbox / 待处理";
-  if (view === "runs") return "Runs / 运行追踪";
-  if (view === "connections") return "Connections / 连接";
-  if (view === "trust") return "Trust / 信任中心";
-  if (view === "knowledge") return "Knowledge / 知识库";
+function flowPrimaryHeadingTitle(
+  view: FlowPrimaryView,
+  language: ApplicationLanguage,
+): string | undefined {
+  if (view === "overview")
+    return interfaceMessage(language, "flow.nav.overview");
+  if (view === "agents") return interfaceMessage(language, "flow.nav.agents");
+  if (view === "workflow-templates")
+    return interfaceMessage(language, "flow.nav.flows");
+  if (view === "inbox") return interfaceMessage(language, "flow.nav.inbox");
+  if (view === "runs") return interfaceMessage(language, "flow.nav.runs");
+  if (view === "connections")
+    return interfaceMessage(language, "flow.nav.connections");
+  if (view === "trust") return interfaceMessage(language, "flow.nav.trust");
+  if (view === "knowledge")
+    return interfaceMessage(language, "flow.nav.knowledge");
   return undefined;
 }
 

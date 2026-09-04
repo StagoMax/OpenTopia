@@ -5,6 +5,12 @@ import type {
   ConnectionCapabilityRevision,
   IntegrationDefinition,
 } from "../../types";
+import {
+  defaultApplicationLanguage,
+  interfaceMessage,
+  type ApplicationLanguage,
+  type InterfaceMessageKey,
+} from "../../applicationLanguage.ts";
 
 export type ConnectionGrantEligibility = {
   selectable: boolean;
@@ -35,34 +41,47 @@ export function connectionGrantEligibility(
   connection: Connection,
   definition?: IntegrationDefinition | null,
   nowMs = Date.now(),
+  language: ApplicationLanguage = defaultApplicationLanguage,
 ): ConnectionGrantEligibility {
   if (definition === null) {
     return {
       selectable: false,
       warning: false,
-      reason: "Connection 的 Provider 定义不存在",
+      reason: message(
+        language,
+        "flow.connectionGrants.eligibility.definitionMissing",
+      ),
     };
   }
   if (definition && !definition.enabled) {
     return {
       selectable: false,
       warning: false,
-      reason: "Connection 的 Provider 定义已停用",
+      reason: message(
+        language,
+        "flow.connectionGrants.eligibility.definitionDisabled",
+      ),
     };
   }
   if (!connection.enabled || connection.status === "disabled") {
     return {
       selectable: false,
       warning: false,
-      reason: "Connection 已停用，请先在 Connections 中启用并测试",
+      reason: message(language, "flow.connectionGrants.eligibility.disabled"),
     };
   }
   if (connection.status !== "ready") {
     const reason = {
-      configured: "Connection 尚未通过测试",
-      degraded: "Connection 运行异常，请先修复健康检查",
-      reauth_required: "Connection 需要重新授权",
-      disabled: "Connection 已停用",
+      configured: message(
+        language,
+        "flow.connectionGrants.eligibility.configured",
+      ),
+      degraded: message(language, "flow.connectionGrants.eligibility.degraded"),
+      reauth_required: message(
+        language,
+        "flow.connectionGrants.eligibility.reauth",
+      ),
+      disabled: message(language, "flow.connectionGrants.eligibility.disabled"),
       ready: null,
     }[connection.status];
     return { selectable: false, warning: false, reason };
@@ -71,7 +90,7 @@ export function connectionGrantEligibility(
     return {
       selectable: false,
       warning: false,
-      reason: "尚无能力快照，请先在 Connections 中刷新能力",
+      reason: message(language, "flow.connectionGrants.eligibility.noSnapshot"),
     };
   }
   if (
@@ -81,7 +100,7 @@ export function connectionGrantEligibility(
     return {
       selectable: false,
       warning: false,
-      reason: "Connection 登录已过期，请先重新授权",
+      reason: message(language, "flow.connectionGrants.eligibility.expired"),
     };
   }
   if (connection.authContext.verification === "legacy_unverified") {
@@ -92,13 +111,19 @@ export function connectionGrantEligibility(
       return {
         selectable: false,
         warning: false,
-        reason: "Connection 使用未验证凭据，必须先重新授权",
+        reason: message(
+          language,
+          "flow.connectionGrants.eligibility.unverified",
+        ),
       };
     }
     return {
       selectable: true,
       warning: true,
-      reason: "Legacy 凭据未验证；发布前请确认账号与权限范围",
+      reason: message(
+        language,
+        "flow.connectionGrants.eligibility.legacyWarning",
+      ),
     };
   }
   if (
@@ -108,7 +133,10 @@ export function connectionGrantEligibility(
     return {
       selectable: false,
       warning: false,
-      reason: "Connection 账号尚未验证",
+      reason: message(
+        language,
+        "flow.connectionGrants.eligibility.accountUnverified",
+      ),
     };
   }
   return { selectable: true, warning: false, reason: null };
@@ -254,4 +282,11 @@ function operationFingerprint(capability: ConnectionCapability): string {
     providerMetadata: capability.providerMetadata,
     permissionLabels: [...capability.permissionLabels].sort(),
   });
+}
+
+function message(
+  language: ApplicationLanguage,
+  key: InterfaceMessageKey,
+): string {
+  return interfaceMessage(language, key);
 }

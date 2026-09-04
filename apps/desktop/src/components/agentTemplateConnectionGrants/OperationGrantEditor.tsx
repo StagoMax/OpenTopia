@@ -1,4 +1,5 @@
 import { memo } from "react";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
 import {
   CircleAlert,
   RefreshCw,
@@ -69,16 +70,17 @@ export function OperationGrantEditor({
   shownRevision?: ConnectionCapabilityRevision;
   visibleOperations: number;
 }) {
+  const { language, t } = useApplicationLanguage();
   if (!selectedConnection) {
     return (
       <section
         className="agent-connection-grants__operations"
-        aria-label="Connection 操作权限"
+        aria-label={t("flow.connectionGrants.operationAria")}
       >
         <div className="agent-connection-grants__empty-state">
           <Wrench aria-hidden="true" size={18} />
-          <strong>选择一个 Connection</strong>
-          <span>查看其固定能力修订并授予具体操作。</span>
+          <strong>{t("flow.connectionGrants.selectConnection")}</strong>
+          <span>{t("flow.connectionGrants.selectConnectionHint")}</span>
         </div>
       </section>
     );
@@ -93,25 +95,31 @@ export function OperationGrantEditor({
   return (
     <section
       className="agent-connection-grants__operations"
-      aria-label="Connection 操作权限"
+      aria-label={t("flow.connectionGrants.operationAria")}
     >
       <header className="agent-connection-grants__operations-header">
         <span>
           <strong>{selectedConnection.name}</strong>
           <small>
-            认证：
-            {authVerificationLabel(selectedConnection.authContext.verification)}
-            {shownRevision ? ` · 能力修订 r${shownRevision.revision}` : ""}
+            {t("flow.connectionGrants.authentication")}
+            {authVerificationLabel(
+              selectedConnection.authContext.verification,
+              language,
+            )}
+            {shownRevision
+              ? ` · ${t("flow.connectionGrants.capabilityRevision")} r${shownRevision.revision}`
+              : ""}
           </small>
         </span>
         {selectedBinding ? (
           <Button
-            aria-label={`移除 ${selectedConnection.name} 的全部操作权限`}
+            aria-label={`${t("flow.connectionGrants.removeAllAria")} ${selectedConnection.name}`}
             onClick={onRemove}
             size="compact"
             variant="quiet"
           >
-            <Trash2 aria-hidden="true" size={14} /> 移除
+            <Trash2 aria-hidden="true" size={14} />{" "}
+            {t("flow.connectionGrants.remove")}
           </Button>
         ) : null}
       </header>
@@ -128,7 +136,7 @@ export function OperationGrantEditor({
 
       {revisionsState?.status === "loading" || !revisionsState ? (
         <div className="agent-connection-grants__state" role="status">
-          正在读取能力修订…
+          {t("flow.connectionGrants.loadingRevisions")}
         </div>
       ) : null}
       {revisionsState?.status === "error" ? (
@@ -136,7 +144,7 @@ export function OperationGrantEditor({
           <CircleAlert aria-hidden="true" size={16} />
           <span>{revisionsState.error}</span>
           <Button onClick={onRetryRevisions} size="compact" variant="quiet">
-            重试
+            {t("flow.connectionGrants.retry")}
           </Button>
         </div>
       ) : null}
@@ -148,16 +156,18 @@ export function OperationGrantEditor({
         >
           <RefreshCw aria-hidden="true" size={16} />
           <span>
-            <strong>授权快照已过期</strong>
+            <strong>{t("flow.connectionGrants.staleTitle")}</strong>
             <small>
-              {freshness.changedOperationIds.length} 项描述已变更，
+              {freshness.changedOperationIds.length}{" "}
+              {t("flow.connectionGrants.changedItems")}
+              {language === "zh-CN" ? "，" : ", "}
               {freshness.removedOperationIds.length}{" "}
-              项已移除。新增操作未自动授权。
+              {t("flow.connectionGrants.removedItems")}
             </small>
           </span>
           {activeRevision ? (
             <Button onClick={onRebase} size="compact" variant="secondary">
-              更新并重新审阅 r{activeRevision.revision}
+              {t("flow.connectionGrants.rebase")} r{activeRevision.revision}
             </Button>
           ) : null}
         </div>
@@ -166,20 +176,19 @@ export function OperationGrantEditor({
         <div className="agent-connection-grants__notice" role="note">
           <RefreshCw aria-hidden="true" size={16} />
           <span>
-            <strong>发现新的能力修订</strong>
-            <small>
-              当前授权仍然有效；新增操作不会自动授权。更新后可查看并选择新操作。
-            </small>
+            <strong>{t("flow.connectionGrants.newRevisionTitle")}</strong>
+            <small>{t("flow.connectionGrants.newRevisionDetail")}</small>
           </span>
           <Button onClick={onRebase} size="compact" variant="secondary">
-            查看 r{activeRevision?.revision}
+            {t("flow.connectionGrants.viewRevision")} r
+            {activeRevision?.revision}
           </Button>
         </div>
       ) : null}
       {freshness?.state === "unavailable" ? (
         <div className="agent-connection-grants__notice is-error" role="alert">
           <CircleAlert aria-hidden="true" size={16} />
-          <span>固定的能力修订不可用；该授权将 fail closed。</span>
+          <span>{t("flow.connectionGrants.unavailableRevision")}</span>
         </div>
       ) : null}
 
@@ -189,10 +198,13 @@ export function OperationGrantEditor({
             <TextField
               label={
                 <span className="agent-connection-grants__search-label">
-                  <Search aria-hidden="true" size={14} /> 搜索操作
+                  <Search aria-hidden="true" size={14} />{" "}
+                  {t("flow.connectionGrants.searchOperations")}
                 </span>
               }
-              placeholder="名称、说明、权限标签或 operation ID"
+              placeholder={t(
+                "flow.connectionGrants.searchOperationsPlaceholder",
+              )}
               value={operationQuery}
               onChange={(event) => onOperationQueryChange(event.target.value)}
             />
@@ -200,8 +212,8 @@ export function OperationGrantEditor({
           <div className="agent-connection-grants__operation-summary">
             <span>
               <ShieldCheck aria-hidden="true" size={14} />
-              已授权 {selectedOperationIds.size} /{" "}
-              {shownRevision.capabilities.length}
+              {t("flow.connectionGrants.authorizedCount")}{" "}
+              {selectedOperationIds.size} / {shownRevision.capabilities.length}
             </span>
             <code>{shownRevision.contentHash.slice(0, 12)}</code>
           </div>
@@ -228,18 +240,20 @@ export function OperationGrantEditor({
           </div>
           {filteredOperationCount === 0 ? (
             <p className="agent-connection-grants__empty">
-              没有匹配的操作，请调整搜索条件。
+              {t("flow.connectionGrants.noOperationMatch")}
             </p>
           ) : null}
           {visibleOperations < filteredOperationCount ? (
             <Button onClick={onShowMore} variant="quiet">
-              显示更多（剩余{filteredOperationCount - visibleOperations}）
+              {t("flow.connectionGrants.moreOperations")}
+              {filteredOperationCount - visibleOperations}
+              {language === "zh-CN" ? "）" : ")"}
             </Button>
           ) : null}
         </>
       ) : revisionsState?.status === "ready" ? (
         <p className="agent-connection-grants__empty">
-          没有可用能力修订，请先在 Connections 中刷新能力。
+          {t("flow.connectionGrants.noRevisions")}
         </p>
       ) : null}
     </section>
@@ -259,6 +273,7 @@ const OperationGrantRow = memo(function OperationGrantRow({
   stale: boolean;
   onToggle(operationId: string): void;
 }) {
+  const { t } = useApplicationLanguage();
   return (
     <label
       className={`agent-connection-grants__operation${stale ? " is-stale" : ""}`}
@@ -276,7 +291,11 @@ const OperationGrantRow = memo(function OperationGrantRow({
         {operation.description ? <small>{operation.description}</small> : null}
       </span>
       <span className="agent-connection-grants__permission-labels">
-        {stale ? <Badge variant="warning">描述已变更</Badge> : null}
+        {stale ? (
+          <Badge variant="warning">
+            {t("flow.connectionGrants.descriptionChanged")}
+          </Badge>
+        ) : null}
         {operation.permissionLabels.map((label) => (
           <Badge key={label}>{label}</Badge>
         ))}

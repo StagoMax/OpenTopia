@@ -1,5 +1,6 @@
 import { AlertTriangle, Cable, Save } from "lucide-react";
 import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
 import type { Connection, McpServerView } from "../../types";
 import { Button, SelectField, Switch, TextField } from "../ui";
 import {
@@ -26,6 +27,7 @@ export function ConnectionEditor({
   store,
   submitAction = "inline",
 }: ConnectionEditorProps) {
+  const { language, t } = useApplicationLanguage();
   const editing = snapshot.connections.find(
     (connection) => connection.id === snapshot.selectedConnectionId,
   );
@@ -59,7 +61,11 @@ export function ConnectionEditor({
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const nextErrors = validateConnectionForm(values, reservedServerIds);
+    const nextErrors = validateConnectionForm(
+      values,
+      reservedServerIds,
+      language,
+    );
     setErrors(nextErrors);
     if (Object.keys(nextErrors).length > 0) return;
     await store.save(connectionInputFromForm(values));
@@ -76,8 +82,8 @@ export function ConnectionEditor({
           <Cable aria-hidden="true" size={18} />
         </span>
         <span>
-          <h2>Account & runtime / 账号与运行时</h2>
-          <p>配置账号上下文并绑定一个独立的 MCP runtime。凭据只保存引用。</p>
+          <h2>{t("flow.connection.editor.heading")}</h2>
+          <p>{t("flow.connection.editor.headingDetail")}</p>
         </span>
       </header>
 
@@ -96,8 +102,10 @@ export function ConnectionEditor({
         aria-labelledby="connection-provider-title"
       >
         <header>
-          <h3 id="connection-provider-title">Provider 与 runtime</h3>
-          <p>Provider 描述集成能力；runtime 是当前账号专用的 MCP 进程配置。</p>
+          <h3 id="connection-provider-title">
+            {t("flow.connection.editor.providerRuntime")}
+          </h3>
+          <p>{t("flow.connection.editor.providerRuntimeDetail")}</p>
         </header>
         <div className="connections-form-grid">
           <LabeledSelect
@@ -105,15 +113,15 @@ export function ConnectionEditor({
             error={errors.definition}
             label={
               snapshot.editorMode === "edit"
-                ? "Provider 定义（创建后不可更改）"
-                : "Provider 定义"
+                ? t("flow.connection.editor.providerDefinitionLocked")
+                : t("flow.connection.editor.providerDefinition")
             }
             options={snapshot.definitions.map((definition) => ({
               value: definition.id,
               label:
                 definition.kind === "mcp"
                   ? definition.name
-                  : `${definition.name}（后续支持）`,
+                  : `${definition.name}（${t("flow.connection.editor.later")}）`,
               disabled: definition.kind !== "mcp" || !definition.enabled,
             }))}
             value={values.integrationDefinitionId}
@@ -123,11 +131,12 @@ export function ConnectionEditor({
           />
           <LabeledSelect
             error={errors.server}
-            label="MCP runtime"
+            label={t("flow.connection.editor.mcpRuntime")}
             options={runtimeOptions(
               snapshot.mcpServers,
               reservedServerIds,
               editing,
+              t("flow.connection.editor.bound"),
             )}
             value={values.serverId}
             onChange={(serverId) =>
@@ -136,8 +145,8 @@ export function ConnectionEditor({
           />
           <TextField
             error={errors.name}
-            label="Connection 名称"
-            placeholder="例如：Salesforce · 张三"
+            label={t("flow.connection.editor.name")}
+            placeholder={t("flow.connection.editor.namePlaceholder")}
             value={values.name}
             onChange={(event) =>
               setValues((current) => ({ ...current, name: event.target.value }))
@@ -145,8 +154,8 @@ export function ConnectionEditor({
           />
           <TextField
             error={errors.environment}
-            hint="例如 production、staging 或 cn-prod"
-            label="Environment / 环境"
+            hint={t("flow.connection.editor.environmentHint")}
+            label={t("flow.connection.editor.environment")}
             value={values.environment}
             onChange={(event) =>
               setValues((current) => ({
@@ -157,8 +166,7 @@ export function ConnectionEditor({
           />
         </div>
         <p className="connections-form-note">
-          每个 Connection 必须使用独立的 MCP runtime；legacy envKeys
-          只是尚未验证的凭据来源，runtime ready 不代表账号认证健康。
+          {t("flow.connection.editor.runtimeNote")}
         </p>
       </section>
 
@@ -167,17 +175,19 @@ export function ConnectionEditor({
         aria-labelledby="connection-account-title"
       >
         <header>
-          <h3 id="connection-account-title">账号与租户</h3>
-          <p>这些字段帮助审批人确认外部操作实际使用的身份和数据范围。</p>
+          <h3 id="connection-account-title">
+            {t("flow.connection.editor.accountTenant")}
+          </h3>
+          <p>{t("flow.connection.editor.accountTenantDetail")}</p>
         </header>
         <div className="connections-form-grid">
           <LabeledSelect
-            label="账号类型"
+            label={t("flow.connection.editor.accountType")}
             options={(
               ["personal", "org_shared", "service_account"] as const
             ).map((ownerType) => ({
               value: ownerType,
-              label: ownerTypeLabel(ownerType),
+              label: ownerTypeLabel(ownerType, language),
             }))}
             value={values.ownerType}
             onChange={(ownerType) =>
@@ -185,8 +195,10 @@ export function ConnectionEditor({
             }
           />
           <TextField
-            label="账号显示名"
-            placeholder="例如 张三 / sales-bot"
+            label={t("flow.connection.editor.accountDisplayName")}
+            placeholder={t(
+              "flow.connection.editor.accountDisplayNamePlaceholder",
+            )}
             value={values.accountDisplayName}
             onChange={(event) =>
               setValues((current) => ({
@@ -196,7 +208,7 @@ export function ConnectionEditor({
             }
           />
           <TextField
-            label="外部账号 ID"
+            label={t("flow.connection.editor.externalAccountId")}
             value={values.externalAccountId}
             onChange={(event) =>
               setValues((current) => ({
@@ -206,9 +218,9 @@ export function ConnectionEditor({
             }
           />
           <TextField
-            label="Credential reference / 凭据引用"
-            hint="只填写 Secret Store 的引用，不要粘贴 API Key 或 Token"
-            placeholder="例如 vault://connections/sales"
+            label={t("flow.connection.editor.credentialReference")}
+            hint={t("flow.connection.editor.credentialHint")}
+            placeholder={t("flow.connection.editor.credentialPlaceholder")}
             value={values.credentialRef}
             onChange={(event) =>
               setValues((current) => ({
@@ -218,7 +230,7 @@ export function ConnectionEditor({
             }
           />
           <TextField
-            label="Tenant 名称"
+            label={t("flow.connection.editor.tenantName")}
             value={values.tenantName}
             onChange={(event) =>
               setValues((current) => ({
@@ -228,7 +240,7 @@ export function ConnectionEditor({
             }
           />
           <TextField
-            label="Tenant ID"
+            label={t("flow.connection.editor.tenantId")}
             value={values.tenantId}
             onChange={(event) =>
               setValues((current) => ({
@@ -238,7 +250,7 @@ export function ConnectionEditor({
             }
           />
           <TextField
-            label="Workspace 名称"
+            label={t("flow.connection.editor.workspaceName")}
             value={values.workspaceName}
             onChange={(event) =>
               setValues((current) => ({
@@ -248,7 +260,7 @@ export function ConnectionEditor({
             }
           />
           <TextField
-            label="Workspace ID"
+            label={t("flow.connection.editor.workspaceId")}
             value={values.workspaceId}
             onChange={(event) =>
               setValues((current) => ({
@@ -259,8 +271,8 @@ export function ConnectionEditor({
           />
         </div>
         <TextField
-          hint="使用英文逗号分隔；发布模板时仍需显式收窄操作授权"
-          label="Granted scopes / 已授予范围"
+          hint={t("flow.connection.editor.grantedScopesHint")}
+          label={t("flow.connection.editor.grantedScopes")}
           placeholder="crm.read, deals.write"
           value={values.grantedScopes}
           onChange={(event) =>
@@ -276,20 +288,22 @@ export function ConnectionEditor({
         <label className="connections-switch-field">
           <Switch
             checked={values.enabled}
-            label="启用 Connection"
+            label={t("flow.connection.editor.enabled")}
             onChange={(enabled) =>
               setValues((current) => ({ ...current, enabled }))
             }
           />
           <span>
-            <strong>启用 Connection</strong>
-            <small>停用后 Agent 和 Workflow 不得调用该账号。</small>
+            <strong>{t("flow.connection.editor.enabled")}</strong>
+            <small>{t("flow.connection.editor.enabledDetail")}</small>
           </span>
         </label>
         {submitAction === "inline" ? (
           <Button disabled={Boolean(saving)} type="submit" variant="primary">
             <Save aria-hidden="true" size={14} />
-            {saving ? "保存中…" : "保存 Connection"}
+            {saving
+              ? t("flow.connection.saving")
+              : t("flow.connection.editor.saveConnection")}
           </Button>
         ) : null}
       </footer>
@@ -312,6 +326,7 @@ function LabeledSelect<T extends string>({
   options: ReadonlyArray<{ value: T; label: string; disabled?: boolean }>;
   value: T;
 }) {
+  const { t } = useApplicationLanguage();
   return (
     <SelectField
       fieldClassName="connections-select-field"
@@ -323,7 +338,13 @@ function LabeledSelect<T extends string>({
       options={
         options.length > 0
           ? options
-          : [{ value: "" as T, label: "暂无可选项", disabled: true }]
+          : [
+              {
+                value: "" as T,
+                label: t("flow.connection.editor.noOptions"),
+                disabled: true,
+              },
+            ]
       }
       value={value}
     />
@@ -334,6 +355,7 @@ function runtimeOptions(
   servers: readonly McpServerView[],
   reservedServerIds: ReadonlySet<string>,
   editing: Connection | undefined,
+  boundLabel: string,
 ) {
   return servers.map(({ server, status }) => {
     const reserved =
@@ -341,7 +363,7 @@ function runtimeOptions(
       server.serverId !== editing?.runtimeBinding.serverId;
     return {
       value: server.serverId,
-      label: `${server.name} · ${status.status}${reserved ? " · 已绑定" : ""}`,
+      label: `${server.name} · ${status.status}${reserved ? ` · ${boundLabel}` : ""}`,
       disabled: reserved,
     };
   });

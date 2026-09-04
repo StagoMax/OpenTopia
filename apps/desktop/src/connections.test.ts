@@ -77,8 +77,14 @@ test("validateConnectionForm rejects a runtime already owned by another connecti
     serverId: "mcp-sales",
   };
   assert.deepEqual(validateConnectionForm(values, new Set(["mcp-sales"])), {
-    server: "该 MCP runtime 已绑定其他 Connection",
+    server: "该 MCP 运行时已绑定其他连接",
   });
+  assert.deepEqual(
+    validateConnectionForm(values, new Set(["mcp-sales"]), "en-US"),
+    {
+      server: "This MCP runtime is already bound to another connection",
+    },
+  );
 });
 
 test("connectionInputFromForm normalizes account fields and granted scopes", () => {

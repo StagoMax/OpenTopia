@@ -6,6 +6,7 @@ import {
   Wrench,
 } from "lucide-react";
 import type { AgentTemplateConnectionAccessView } from "../../api/generated/desktop-http-v1.generated";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
 import { Badge, Button } from "../ui";
 
 const MAX_EFFECTIVE_TOOL_NAMES = 12;
@@ -21,24 +22,27 @@ export function AgentTemplateConnectionAccessSummary({
   loading: boolean;
   onRetry(): void;
 }) {
+  const { t } = useApplicationLanguage();
   return (
     <section className="agent-template-panel__connection-access">
       <header className="agent-template-panel__section-title">
         <ShieldCheck aria-hidden="true" size={14} />
-        Connection 执行边界
+        {t("flow.connectionAccess.boundary")}
         {access ? (
           <Badge variant={access.valid ? "success" : "danger"}>
-            {access.valid ? "有效" : "已阻断"}
+            {access.valid
+              ? t("flow.connectionAccess.valid")
+              : t("flow.connectionAccess.blocked")}
           </Badge>
         ) : null}
         {access?.mode === "legacy" ? (
-          <Badge variant="warning">Legacy</Badge>
+          <Badge variant="warning">{t("flow.connectionAccess.legacy")}</Badge>
         ) : null}
       </header>
 
       {loading ? (
         <p className="agent-template-panel__empty" role="status">
-          正在解析 Connection 访问边界…
+          {t("flow.connectionAccess.loading")}
         </p>
       ) : null}
       {error ? (
@@ -49,14 +53,15 @@ export function AgentTemplateConnectionAccessSummary({
           <CircleAlert aria-hidden="true" size={16} />
           <span>{error}</span>
           <Button onClick={onRetry} size="compact" variant="quiet">
-            <RefreshCw aria-hidden="true" size={14} /> 重试
+            <RefreshCw aria-hidden="true" size={14} />{" "}
+            {t("flow.connectionGrants.retry")}
           </Button>
         </div>
       ) : null}
 
       {access?.mode === "none" ? (
         <p className="agent-template-panel__empty">
-          此模板没有外部 Connection 权限。
+          {t("flow.connectionAccess.none")}
         </p>
       ) : null}
       {access?.mode === "legacy" ? (
@@ -65,10 +70,7 @@ export function AgentTemplateConnectionAccessSummary({
           role="note"
         >
           <CircleAlert aria-hidden="true" size={16} />
-          <span>
-            Legacy MCP 绑定没有固定到 operation
-            revision。运行继续兼容，但新版本应显式迁移。
-          </span>
+          <span>{t("flow.connectionAccess.legacyDetail")}</span>
         </div>
       ) : null}
 
@@ -84,11 +86,13 @@ export function AgentTemplateConnectionAccessSummary({
                   </strong>
                   <small>
                     r{binding.capabilityRevision} · {binding.operations.length}{" "}
-                    operations
+                    {t("flow.connectionAccess.operations")}
                   </small>
                 </span>
                 <Badge variant={binding.valid ? "success" : "danger"}>
-                  {binding.valid ? "可执行" : "Fail closed"}
+                  {binding.valid
+                    ? t("flow.connectionAccess.executable")
+                    : t("flow.connectionAccess.failClosed")}
                 </Badge>
               </header>
               {binding.operations.length ? (
@@ -104,7 +108,10 @@ export function AgentTemplateConnectionAccessSummary({
                         </strong>
                         <code>{operation.operationId}</code>
                         {operation.modelToolName ? (
-                          <small>模型工具：{operation.modelToolName}</small>
+                          <small>
+                            {t("flow.connectionAccess.modelTool")}
+                            {operation.modelToolName}
+                          </small>
                         ) : null}
                       </span>
                       <span>
@@ -130,7 +137,7 @@ export function AgentTemplateConnectionAccessSummary({
 
       {access?.effectiveModelToolNames.length ? (
         <div className="agent-template-panel__effective-tools">
-          <strong>有效模型工具</strong>
+          <strong>{t("flow.connectionAccess.effectiveTools")}</strong>
           <span>
             {access.effectiveModelToolNames
               .slice(0, MAX_EFFECTIVE_TOOL_NAMES)
@@ -143,7 +150,7 @@ export function AgentTemplateConnectionAccessSummary({
                 +
                 {access.effectiveModelToolNames.length -
                   MAX_EFFECTIVE_TOOL_NAMES}{" "}
-                项
+                {t("flow.connectionAccess.items")}
               </small>
             ) : null}
           </span>
@@ -158,6 +165,7 @@ function IssueList({
 }: {
   issues: AgentTemplateConnectionAccessView["issues"];
 }) {
+  const { t } = useApplicationLanguage();
   return (
     <ul className="agent-template-panel__connection-issues">
       {issues.map((issue, index) => (
@@ -166,7 +174,7 @@ function IssueList({
           key={`${issue.code}:${issue.connectionId ?? ""}:${issue.operationId ?? ""}:${index}`}
         >
           <CircleAlert aria-hidden="true" size={14} />
-          <span>{issueMessage(issue.code, issue.message)}</span>
+          <span>{issueMessage(issue.code, issue.message, t)}</span>
           <code>{issue.code}</code>
         </li>
       ))}
@@ -174,26 +182,45 @@ function IssueList({
   );
 }
 
-function issueMessage(code: string, fallback: string): string {
+function issueMessage(
+  code: string,
+  fallback: string,
+  t: ReturnType<typeof useApplicationLanguage>["t"],
+): string {
   return (
     {
-      legacy_mcp_server_grants:
-        "Legacy MCP 绑定没有 operation 级授权，新版本应显式迁移。",
-      connection_not_found: "Connection 已不存在。",
-      integration_definition_not_found: "Connection 的 Provider 定义已不存在。",
-      integration_definition_disabled: "Connection 的 Provider 定义已停用。",
-      connection_disabled: "Connection 已停用。",
-      connection_not_ready: "Connection 必须先通过健康测试。",
-      legacy_auth_unverified: "迁移的 Legacy MCP 凭据无法独立验证。",
-      connection_auth_unverified: "Connection 账号尚未验证。",
-      capability_revision_not_found: "授权固定的能力修订已不存在。",
-      active_capability_revision_not_found: "Connection 没有活动能力修订。",
-      operation_not_in_pinned_revision: "授权操作不在固定能力修订中。",
-      operation_removed: "授权操作已从活动能力修订中移除。",
-      operation_descriptor_changed: "授权操作描述已变更，必须重新审阅。",
-      operation_runtime_mismatch: "授权操作不属于当前 Connection runtime。",
-      mcp_runtime_not_found: "Connection 的 MCP runtime 已不存在。",
-      mcp_runtime_disabled: "Connection 的 MCP runtime 已停用。",
+      legacy_mcp_server_grants: t("flow.connectionAccess.issue.legacyGrants"),
+      connection_not_found: t("flow.connectionAccess.issue.connectionNotFound"),
+      integration_definition_not_found: t(
+        "flow.connectionAccess.issue.definitionNotFound",
+      ),
+      integration_definition_disabled: t(
+        "flow.connectionAccess.issue.definitionDisabled",
+      ),
+      connection_disabled: t("flow.connectionAccess.issue.connectionDisabled"),
+      connection_not_ready: t("flow.connectionAccess.issue.connectionNotReady"),
+      legacy_auth_unverified: t("flow.connectionAccess.issue.legacyAuth"),
+      connection_auth_unverified: t(
+        "flow.connectionAccess.issue.authUnverified",
+      ),
+      capability_revision_not_found: t(
+        "flow.connectionAccess.issue.revisionNotFound",
+      ),
+      active_capability_revision_not_found: t(
+        "flow.connectionAccess.issue.activeRevisionNotFound",
+      ),
+      operation_not_in_pinned_revision: t(
+        "flow.connectionAccess.issue.operationNotPinned",
+      ),
+      operation_removed: t("flow.connectionAccess.issue.operationRemoved"),
+      operation_descriptor_changed: t(
+        "flow.connectionAccess.issue.operationChanged",
+      ),
+      operation_runtime_mismatch: t(
+        "flow.connectionAccess.issue.runtimeMismatch",
+      ),
+      mcp_runtime_not_found: t("flow.connectionAccess.issue.runtimeNotFound"),
+      mcp_runtime_disabled: t("flow.connectionAccess.issue.runtimeDisabled"),
     }[code] ?? fallback
   );
 }

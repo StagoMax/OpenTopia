@@ -1,8 +1,14 @@
-import { Copy, PauseCircle, PlayCircle, Workflow } from "lucide-react";
+import {
+  Copy,
+  PauseCircle,
+  PlayCircle,
+  Settings2,
+  Workflow,
+} from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ApiClient } from "../../api/client";
 import type { ActiveFlow, FlowDraftView } from "../../types";
-import { Button } from "../ui";
+import { Button, DisclosureSummary } from "../ui";
 import {
   FlowEditorInspector,
   type FlowRuntimeConfiguration,
@@ -44,6 +50,11 @@ import {
   type WorkflowEdgeConfiguration,
 } from "./workflowNodeSelection";
 import "./workflow-editor.css";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
+import {
+  interfaceMessage,
+  type ApplicationLanguage,
+} from "../../applicationLanguage";
 
 export function WorkflowTemplatesPage({
   client,
@@ -54,6 +65,7 @@ export function WorkflowTemplatesPage({
   onPageHeaderChange?: EnterprisePageHeaderChange;
   threadId: string | null;
 }) {
+  const { language, t } = useApplicationLanguage();
   const { snapshot, store } = useEnterpriseStore(client);
   const selection = useFlowAgentSelection();
   const publishedTemplates = useMemo(
@@ -67,7 +79,7 @@ export function WorkflowTemplatesPage({
       : "guided-workflow",
   );
   const [name, setName] = useState(() =>
-    selection?.creatingFlow ? "Untitled Flow / 未命名 Flow" : "Guided workflow",
+    selection?.creatingFlow ? t("flow.flows.untitled") : t("flow.flows.guided"),
   );
   const [owner, setOwner] = useState("local_operator");
   const [outcome, setOutcome] = useState("");
@@ -153,11 +165,15 @@ export function WorkflowTemplatesPage({
     ? (nodes.find((item) => item.id === detailPage.nodeId) ?? null)
     : null;
   useFlowWorkspaceTitle(
-    createDialogOpen ? "创建 Flow" : creating ? name : selectedFlow?.name,
+    createDialogOpen
+      ? t("flow.flows.createTitle")
+      : creating
+        ? name
+        : selectedFlow?.name,
   );
   useEnterpriseSubpageHeader(onPageHeaderChange, Boolean(detailPage), {
-    title: `Flows / ${name} / 配置 Trigger`,
-    backLabel: "返回 Flow 图",
+    title: `${t("flow.nav.flows")} / ${name} / ${t("flow.flows.configureTrigger")}`,
+    backLabel: t("flow.flows.backToGraph"),
     onBack: () => {
       setDetailPage(null);
     },
@@ -204,9 +220,9 @@ export function WorkflowTemplatesPage({
         .filter((node) => node.kind === "agent" || node.kind === "tool")
         .map(
           (node) =>
-            `${node.kind === "agent" ? "Agent" : "Action"}：${workflowNodeLabel(node, publishedTemplates)}`,
+            `${node.kind === "agent" ? t("flow.flows.agentStep") : t("flow.flows.actionStep")}：${workflowNodeLabel(node, publishedTemplates)}`,
         ),
-    [nodes, publishedTemplates],
+    [nodes, publishedTemplates, t],
   );
 
   useEffect(() => {
@@ -249,8 +265,8 @@ export function WorkflowTemplatesPage({
     setDetailPage(null);
     setSelectedConnection(null);
     setSelectedNodeId(failedNode.nodeId);
-    setNotice("Test Run 失败，已定位到出错节点。右侧可查看输入、输出和错误。");
-  }, [currentTestRun]);
+    setNotice(t("flow.flows.testFailed"));
+  }, [currentTestRun, t]);
 
   async function execute(name: string, action: () => Promise<void>) {
     if (busy) return;
@@ -288,7 +304,7 @@ export function WorkflowTemplatesPage({
     setRuntimeConfiguration(defaultRuntimeConfiguration());
     setDraft(null);
     setError(null);
-    setNotice("Flow 已创建。请从空画布添加第一个节点。");
+    setNotice(t("flow.flows.created"));
     setSelectedNodeId(null);
     setSelectedConnection(null);
     setEditorLayoutId(`draft:${crypto.randomUUID()}`);
@@ -324,9 +340,7 @@ export function WorkflowTemplatesPage({
         }),
       );
       setDraft(created);
-      setNotice(
-        "Workflow 草稿已创建；Node 与 Agent 模板版本已固定。下一步先验证。 ",
-      );
+      setNotice(t("flow.flows.draftCreated"));
     });
   }
 
@@ -356,9 +370,9 @@ export function WorkflowTemplatesPage({
         ? current
         : null,
     );
-    if (hadDraft) setNotice("节点配置已修改，请重新创建草稿并验证。");
+    if (hadDraft) setNotice(t("flow.flows.nodesChanged"));
     else if (addedOutput && addedBusinessNode)
-      setNotice("已添加第一个步骤，并自动创建 Flow 的固定 Output 终点。");
+      setNotice(t("flow.flows.firstStep"));
   }
 
   function changeFlowConfiguration(
@@ -375,7 +389,7 @@ export function WorkflowTemplatesPage({
     if (change.owner !== undefined) setOwner(change.owner);
     if (change.outcome !== undefined) setOutcome(change.outcome);
     setDraft(null);
-    if (hadDraft) setNotice("Flow 配置已修改，请重新创建草稿并验证。");
+    if (hadDraft) setNotice(t("flow.flows.configurationChanged"));
   }
 
   function changeNode(next: WorkflowNodeSelection) {
@@ -386,7 +400,7 @@ export function WorkflowTemplatesPage({
     const hadDraft = Boolean(draft);
     setRuntimeConfiguration(next);
     setDraft(null);
-    if (hadDraft) setNotice("运行设置已修改，请重新创建草稿并验证。");
+    if (hadDraft) setNotice(t("flow.flows.runtimeChanged"));
   }
 
   function changeConnection(
@@ -413,7 +427,7 @@ export function WorkflowTemplatesPage({
     if (!draft) return;
     void execute("validate", async () => {
       setDraft(await client.validateFlowDraft(draft.draft.id));
-      setNotice("验证完成。下一步使用一份测试输入执行 Test Run。 ");
+      setNotice(t("flow.flows.validated"));
     });
   }
 
@@ -431,9 +445,7 @@ export function WorkflowTemplatesPage({
           : current,
       );
       setTestRunDialogOpen(false);
-      setNotice(
-        "Test Run 已启动；可在画布查看实际执行路径，并点击节点检查输入和输出。 ",
-      );
+      setNotice(t("flow.flows.testStarted"));
     });
   }
 
@@ -461,9 +473,7 @@ export function WorkflowTemplatesPage({
       });
       await store.load(true);
       selection?.setSelectedFlowId(activatedFlowId);
-      setNotice(
-        "Flow 已激活；Trigger 现在会直接创建 Case，并按入口策略进入待处理或立即运行。 ",
-      );
+      setNotice(t("flow.flows.activated"));
       setCreating(false);
     });
   }
@@ -473,7 +483,7 @@ export function WorkflowTemplatesPage({
     void execute(`copy:${selectedFlow.flowId}`, async () => {
       const suffix = crypto.randomUUID().slice(0, 8);
       const copyId = `${selectedFlow.flowId}-copy-${suffix}`;
-      const copyName = `${selectedFlow.name} Copy`;
+      const copyName = `${selectedFlow.name} ${t("flow.flows.copySuffix")}`;
       const copied = await client.copyFlow(selectedFlow.flowId, {
         flowId: copyId,
         name: copyName,
@@ -497,9 +507,7 @@ export function WorkflowTemplatesPage({
       setCreateDialogOpen(false);
       selection?.beginFlowDraft();
       setCreating(true);
-      setNotice(
-        "已创建副本草稿；自动 Trigger 已改为人工确认，请复核后再激活。",
-      );
+      setNotice(t("flow.flows.copyCreated"));
     });
   }
 
@@ -533,8 +541,8 @@ export function WorkflowTemplatesPage({
           {createDialog}
           <div className="enterprise-agent-prompt-empty" role="status">
             <Workflow aria-hidden="true" size={20} />
-            <strong>尚未创建 Flow</strong>
-            <p>使用左侧新建按钮创建一个 Flow。</p>
+            <strong>{t("flow.flows.none")}</strong>
+            <p>{t("flow.flows.noneHint")}</p>
           </div>
         </>
       );
@@ -576,10 +584,12 @@ export function WorkflowTemplatesPage({
                   ) : (
                     <PlayCircle aria-hidden="true" size={14} />
                   )}
-                  {selectedFlow.status === "active" ? "暂停" : "恢复"}
+                  {selectedFlow.status === "active"
+                    ? t("flow.flows.pause")
+                    : t("flow.flows.resume")}
                 </Button>
                 <Button
-                  aria-label={`复制 ${selectedFlow.name}`}
+                  aria-label={`${t("flow.flows.copy")} ${selectedFlow.name}`}
                   disabled={Boolean(busy)}
                   onClick={copySelectedFlow}
                   size="compact"
@@ -589,7 +599,11 @@ export function WorkflowTemplatesPage({
                 </Button>
               </>
             }
-            status={selectedActiveNode?.kind ?? selectedFlow.status}
+            status={
+              selectedActiveNode
+                ? activeNodeKindLabel(selectedActiveNode.kind, language)
+                : selectedFlow.status
+            }
             statusVariant={
               selectedActiveNode?.kind === "approval"
                 ? "warning"
@@ -605,61 +619,82 @@ export function WorkflowTemplatesPage({
                 ? selectedActiveNode.label
                 : `${selectedFlow.flowId}@${selectedFlow.activeRevision.compiledWorkflow.flowVersion}`
             }
-            title={selectedActiveNode ? "Node 配置" : "Flow 配置"}
+            title={
+              selectedActiveNode
+                ? t("flow.flows.nodeConfiguration")
+                : t("flow.flows.flowConfiguration")
+            }
           >
             {selectedActiveNode ? (
-              <FlowInspectorSection title="Node">
+              <FlowInspectorSection title={t("flow.flows.node")}>
                 <dl className="enterprise-facts flow-inspector-facts">
                   <div>
-                    <dt>名称</dt>
+                    <dt>{t("flow.editor.name")}</dt>
                     <dd>{selectedActiveNode.label}</dd>
                   </div>
                   <div>
-                    <dt>Kind</dt>
-                    <dd>{selectedActiveNode.kind}</dd>
+                    <dt>{t("flow.flows.kind")}</dt>
+                    <dd>
+                      {activeNodeKindLabel(selectedActiveNode.kind, language)}
+                    </dd>
                   </div>
                   <div>
-                    <dt>Input</dt>
+                    <dt>{t("flow.flows.input")}</dt>
                     <dd>
                       {workflowGraphNodeInputLabel(
                         selectedActiveNode,
                         activeGraph,
+                        language,
                       )}
                     </dd>
                   </div>
                 </dl>
                 <details className="flow-editor-inspector__advanced">
-                  <summary>节点高级信息</summary>
+                  <DisclosureSummary
+                    icon={<Settings2 aria-hidden="true" size={14} />}
+                  >
+                    {t("flow.node.advanced")}
+                  </DisclosureSummary>
                   <dl className="enterprise-facts flow-inspector-facts">
                     <div>
-                      <dt>Node ID</dt>
+                      <dt>{t("flow.node.id")}</dt>
                       <dd>{selectedActiveNode.id}</dd>
                     </div>
                   </dl>
                 </details>
               </FlowInspectorSection>
             ) : (
-              <FlowInspectorSection title="Revision">
+              <FlowInspectorSection title={t("flow.flows.revision")}>
                 <dl className="enterprise-facts flow-inspector-facts">
                   <div>
-                    <dt>所有者</dt>
+                    <dt>{t("flow.editor.owner")}</dt>
                     <dd>{selectedFlow.createdBy}</dd>
                   </div>
                   <div>
-                    <dt>触发方式</dt>
-                    <dd>{triggerLabel(selectedFlow.activeRevision.trigger)}</dd>
-                  </div>
-                  <div>
-                    <dt>入口策略</dt>
+                    <dt>{t("flow.inbox.trigger")}</dt>
                     <dd>
-                      {selectedFlow.activeRevision.ingressPolicy === "immediate"
-                        ? "自动执行"
-                        : "人工确认"}
+                      {triggerLabel(
+                        selectedFlow.activeRevision.trigger,
+                        language,
+                      )}
                     </dd>
                   </div>
                   <div>
-                    <dt>输出</dt>
-                    <dd>{outputLabel(selectedFlow.activeRevision.output)}</dd>
+                    <dt>{t("flow.flows.ingressPolicy")}</dt>
+                    <dd>
+                      {selectedFlow.activeRevision.ingressPolicy === "immediate"
+                        ? t("flow.flows.automatic")
+                        : t("flow.flows.humanConfirmation")}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>{t("flow.flows.output")}</dt>
+                    <dd>
+                      {outputLabel(
+                        selectedFlow.activeRevision.output,
+                        language,
+                      )}
+                    </dd>
                   </div>
                 </dl>
               </FlowInspectorSection>
@@ -696,7 +731,7 @@ export function WorkflowTemplatesPage({
       <FlowInspectorPortal>
         <section
           className="flow-workspace-inspector workflow-editor-inspector-shell"
-          aria-label="Flow 配置"
+          aria-label={t("flow.flows.flowConfiguration")}
         >
           <FlowEditorToolbar
             activeTestRun={Boolean(activeTestRun)}
@@ -770,7 +805,7 @@ export function WorkflowTemplatesPage({
       <div className="enterprise-page enterprise-workflow-editor-page">
         <section
           className="workflow-editor workflow-editor--canvas-only"
-          aria-label="Flow 编辑器"
+          aria-label={t("flow.flows.editor")}
         >
           <div className="workflow-editor__body">
             <WorkflowGraphEditor
@@ -827,18 +862,42 @@ function nodeConfigurationReady(node: WorkflowNodeSelection) {
 
 function triggerLabel(
   trigger: ActiveFlow["activeRevision"]["trigger"],
+  language: ApplicationLanguage,
 ): string {
-  if (trigger.kind === "manual") return "手动触发";
+  if (trigger.kind === "manual")
+    return interfaceMessage(language, "flow.trigger.manual");
   if (trigger.kind === "webhook") return `API / Webhook · ${trigger.triggerId}`;
   if (trigger.kind === "schedule") {
-    return `定时触发 · 每 ${trigger.intervalSeconds} 秒`;
+    return `${interfaceMessage(language, "flow.trigger.schedule")} · ${interfaceMessage(language, "flow.flows.every")} ${trigger.intervalSeconds} ${interfaceMessage(language, "flow.runs.seconds")}`;
   }
-  return `连接事件 · ${trigger.source} / ${trigger.eventType}`;
+  return `${interfaceMessage(language, "flow.flows.connectionEvent")} · ${trigger.source} / ${trigger.eventType}`;
 }
 
-function outputLabel(output: ActiveFlow["activeRevision"]["output"]): string {
-  if (output.kind === "inbox") return "Inbox";
+function outputLabel(
+  output: ActiveFlow["activeRevision"]["output"],
+  language: ApplicationLanguage,
+): string {
+  if (output.kind === "inbox")
+    return interfaceMessage(language, "flow.nav.inbox");
   if (output.kind === "webhook") return `Webhook · ${output.endpoint}`;
-  if (output.kind === "human_task") return `人工任务 · ${output.title}`;
-  return `Connection · ${output.operation.operationId}`;
+  if (output.kind === "human_task")
+    return `${interfaceMessage(language, "flow.flows.humanTask")} · ${output.title}`;
+  return `${interfaceMessage(language, "flow.flows.connection")} · ${output.operation.operationId}`;
+}
+
+function activeNodeKindLabel(
+  kind: ActiveFlow["activeRevision"]["compiledWorkflow"]["graph"]["nodes"][number]["kind"],
+  language: ApplicationLanguage,
+): string {
+  const key =
+    kind === "tool"
+      ? "flow.node.kind.action"
+      : kind === "skill"
+        ? "flow.node.kind.legacySkill"
+        : kind === "condition"
+          ? "flow.node.kind.legacyCondition"
+          : kind === "loop"
+            ? "flow.node.kind.legacyLoop"
+            : (`flow.node.kind.${kind}` as const);
+  return interfaceMessage(language, key);
 }

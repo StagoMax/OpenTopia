@@ -278,7 +278,17 @@
 }
 
 .connection-details--core {
+  inline-size: 100%;
+  max-inline-size: calc(var(--space-16) * 30);
   min-block-size: 100%;
+  margin-inline: var(--space-0);
+  padding: var(--space-8);
+}
+
+.connection-details--core .connection-operation-summary,
+.connection-details--core .connection-operation-facts {
+  max-inline-size: none;
+  margin-inline: var(--space-0);
 }
 
 .connection-attention {

@@ -12,6 +12,18 @@ import { connectionUpdateFromInput, sortConnections } from "./model.ts";
 
 export type ConnectionEditorMode = "create" | "edit" | null;
 
+export type ConnectionNotice =
+  | { kind: "created" }
+  | { kind: "updated" }
+  | { kind: "test_passed" }
+  | {
+      kind: "capabilities_changed";
+      added: number;
+      removed: number;
+      changed: number;
+    }
+  | { kind: "capabilities_unchanged"; count: number };
+
 export type ConnectionsSnapshot = {
   status: "idle" | "loading" | "ready" | "error";
   definitions: readonly IntegrationDefinition[];
@@ -24,7 +36,7 @@ export type ConnectionsSnapshot = {
   >;
   busyAction: string | null;
   error: string | null;
-  notice: string | null;
+  notice: ConnectionNotice | null;
   lastHealth: {
     connectionId: string;
     health: ConnectionTestResult["health"];
@@ -181,7 +193,7 @@ export class ConnectionsStore {
       this.update({
         selectedConnectionId: saved.id,
         editorMode: null,
-        notice: editing ? "Connection 配置已更新" : "Connection 已创建",
+        notice: { kind: editing ? "updated" : "created" },
         lastHealth: null,
       });
       await this.loadCapabilities(saved.id, true);
@@ -208,7 +220,7 @@ export class ConnectionsStore {
       if (this.snapshot.selectedConnectionId === connectionId) {
         this.update({
           lastHealth: { connectionId, health: result.health },
-          notice: result.health.ok ? "连接测试通过" : null,
+          notice: result.health.ok ? { kind: "test_passed" } : null,
           error: result.health.ok ? null : result.health.message,
         });
       }
@@ -245,8 +257,16 @@ export class ConnectionsStore {
         this.snapshot.selectedConnectionId === connectionId
           ? {
               notice: result.changed
-                ? `能力快照已更新：新增 ${result.diff.addedCapabilityIds.length}、移除 ${result.diff.removedCapabilityIds.length}、变更 ${result.diff.changedCapabilityIds.length}`
-                : `能力未变化，仍为 ${result.capabilityRevision.capabilities.length} 项`,
+                ? {
+                    kind: "capabilities_changed" as const,
+                    added: result.diff.addedCapabilityIds.length,
+                    removed: result.diff.removedCapabilityIds.length,
+                    changed: result.diff.changedCapabilityIds.length,
+                  }
+                : {
+                    kind: "capabilities_unchanged" as const,
+                    count: result.capabilityRevision.capabilities.length,
+                  },
             }
           : {};
       this.update({

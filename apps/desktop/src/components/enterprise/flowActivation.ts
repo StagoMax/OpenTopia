@@ -4,6 +4,11 @@ import type {
   WorkflowIngressPolicy,
   WorkflowTrigger,
 } from "../../types";
+import {
+  defaultApplicationLanguage,
+  interfaceMessage,
+  type ApplicationLanguage,
+} from "../../applicationLanguage.ts";
 
 export type FlowTriggerSource =
   | { kind: "flow_input" }
@@ -145,35 +150,43 @@ export function activationLabel(
   activation: FlowNodeActivation,
   nodes: readonly import("./workflowNodeSelection").WorkflowNodeSelection[],
   templates: readonly AgentTemplateVersionView[],
+  language: ApplicationLanguage = defaultApplicationLanguage,
 ): string {
-  return activationLabelWithAgentResolver(activation, (nodeId) => {
-    const node = nodes.find((item) => item.id === nodeId);
-    const template =
-      node?.kind === "agent"
-        ? templates.find((item) => templateKey(item) === node.templateKey)
-        : null;
-    return (
-      template?.template.name ??
-      (node?.kind === "approval" || node?.kind === "output"
-        ? node.label
-        : nodeId)
-    );
-  });
+  return activationLabelWithAgentResolver(
+    activation,
+    (nodeId) => {
+      const node = nodes.find((item) => item.id === nodeId);
+      const template =
+        node?.kind === "agent"
+          ? templates.find((item) => templateKey(item) === node.templateKey)
+          : null;
+      return (
+        template?.template.name ??
+        (node?.kind === "approval" || node?.kind === "output"
+          ? node.label
+          : nodeId)
+      );
+    },
+    language,
+  );
 }
 
 export function graphActivationLabel(
   activation: FlowNodeActivation,
   nodes: readonly Pick<FlowGraphNode, "id" | "label">[],
+  language: ApplicationLanguage = defaultApplicationLanguage,
 ): string {
   return activationLabelWithAgentResolver(
     activation,
     (nodeId) => nodes.find((item) => item.id === nodeId)?.label ?? nodeId,
+    language,
   );
 }
 
 function activationLabelWithAgentResolver(
   activation: FlowNodeActivation,
   resolveAgentLabel: (nodeId: string) => string,
+  language: ApplicationLanguage,
 ): string {
   const labels: string[] = [];
   visitExpression(activation.expression, (source, negated) => {
@@ -185,16 +198,19 @@ function activationLabelWithAgentResolver(
     } else if (source.kind === "webhook") {
       label = "API / Webhook";
     } else if (source.kind === "schedule") {
-      label = "Schedule";
+      label = interfaceMessage(language, "flow.activation.schedule");
     } else if (source.kind === "flow_input") {
       label = "Flow.input";
     } else {
-      label = "Manual";
+      label = interfaceMessage(language, "flow.activation.manual");
     }
     labels.push(negated ? `NOT ${label}` : label);
   });
   const operator = activation.expression.operator === "and" ? " AND " : " OR ";
-  return labels.join(operator) || "未配置";
+  return (
+    labels.join(operator) ||
+    interfaceMessage(language, "flow.activation.notConfigured")
+  );
 }
 
 export function readNodeActivation(

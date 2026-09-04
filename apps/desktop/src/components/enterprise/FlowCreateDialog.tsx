@@ -2,6 +2,7 @@ import { Workflow, X } from "lucide-react";
 import { useEffect, useId, useRef } from "react";
 import { createPortal } from "react-dom";
 import { Button, IconButton, TextField } from "../ui";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
 
 export type FlowCreateValues = {
   name: string;
@@ -21,6 +22,7 @@ export function FlowCreateDialog({
   open: boolean;
   values: FlowCreateValues;
 }) {
+  const { t } = useApplicationLanguage();
   const onCancelRef = useRef(onCancel);
   const dialogRef = useRef<HTMLElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
@@ -86,12 +88,12 @@ export function FlowCreateDialog({
               <Workflow aria-hidden="true" size={18} />
             </span>
             <span>
-              <strong id={titleId}>创建 Flow</strong>
-              <small>先建立流程，Agent 和运行规则进入画布后再设置。</small>
+              <strong id={titleId}>{t("flow.create.title")}</strong>
+              <small>{t("flow.create.intro")}</small>
             </span>
           </span>
           <IconButton
-            aria-label="关闭创建 Flow 窗口"
+            aria-label={t("flow.create.close")}
             onClick={onCancel}
             size="compact"
             variant="quiet"
@@ -109,33 +111,33 @@ export function FlowCreateDialog({
           <div className="flow-create-dialog__grid">
             <TextField
               autoFocus
-              label="名称"
+              label={t("flow.create.name")}
               onChange={(event) =>
                 onChange({ ...values, name: event.target.value })
               }
-              placeholder="例如：新客户资料审核"
+              placeholder={t("flow.create.namePlaceholder")}
               required
               value={values.name}
               wrapperClassName="flow-create-dialog__wide"
             />
             <label className="flow-create-dialog__outcome">
-              <span>这个 Flow 要完成什么？</span>
+              <span>{t("flow.create.outcome")}</span>
               <textarea
                 onChange={(event) =>
                   onChange({ ...values, outcome: event.target.value })
                 }
-                placeholder="例如：读取新客户资料，检查必填字段并生成一份可供销售复核的摘要。"
+                placeholder={t("flow.create.outcomePlaceholder")}
                 required
                 rows={4}
                 value={values.outcome}
               />
-              <small>用业务语言描述最终结果，节点细节进入画布后再配置。</small>
+              <small>{t("flow.create.outcomeHint")}</small>
             </label>
           </div>
         </form>
         <footer>
           <Button onClick={onCancel} variant="quiet">
-            取消
+            {t("flow.create.cancel")}
           </Button>
           <Button
             disabled={!complete}
@@ -143,7 +145,7 @@ export function FlowCreateDialog({
             type="submit"
             variant="primary"
           >
-            创建 Flow 并进入画布
+            {t("flow.create.submit")}
           </Button>
         </footer>
       </section>

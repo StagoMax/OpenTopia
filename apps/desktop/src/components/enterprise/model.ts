@@ -8,6 +8,11 @@ import {
   connectionProblems,
   type ConnectionProblem,
 } from "../connections/model.ts";
+import {
+  defaultApplicationLanguage,
+  interfaceMessage,
+  type ApplicationLanguage,
+} from "../../applicationLanguage.ts";
 
 export type TrustSignalFinding = {
   id: string;
@@ -63,16 +68,19 @@ export function latestPublishedTemplateVersions(
   return [...latest.values()];
 }
 
-export function trustSignals(snapshot: EnterpriseSnapshot): TrustSignal[] {
+export function trustSignals(
+  snapshot: EnterpriseSnapshot,
+  language: ApplicationLanguage = defaultApplicationLanguage,
+): TrustSignal[] {
   const signals: TrustSignal[] = [];
   const connectionFindings = snapshot.connections.flatMap((connection) => {
-    const problems = connectionProblems(connection);
+    const problems = connectionProblems(connection, language);
     return problems.length > 0
       ? [
           {
             id: `connection:${connection.id}`,
             label: connection.name,
-            context: `${connectionAccountLabel(connection)} · ${connection.environment} · ${shortId(connection.id)}`,
+            context: `${connectionAccountLabel(connection, language)} · ${connection.environment} · ${shortId(connection.id)}`,
             problems,
             target: {
               kind: "connection" as const,
@@ -86,16 +94,22 @@ export function trustSignals(snapshot: EnterpriseSnapshot): TrustSignal[] {
     signals.push({
       id: "connections",
       level: "warning",
-      title: `${connectionFindings.length} 个 Connection 需要处理`,
-      detail: "停用、降级或认证失效的 Connection 会在调用边界 fail closed。",
+      title: `${connectionFindings.length} ${interfaceMessage(language, "flow.trustSignals.connectionsNeedAction")}`,
+      detail: interfaceMessage(
+        language,
+        "flow.trustSignals.connectionsNeedActionDetail",
+      ),
       findings: connectionFindings,
     });
   } else {
     signals.push({
       id: "connections",
       level: "healthy",
-      title: "Connection 运行许可正常",
-      detail: "已启用 Connection 均处于 ready，认证状态可执行。",
+      title: interfaceMessage(language, "flow.trustSignals.connectionsHealthy"),
+      detail: interfaceMessage(
+        language,
+        "flow.trustSignals.connectionsHealthyDetail",
+      ),
       findings: [],
     });
   }
@@ -105,8 +119,8 @@ export function trustSignals(snapshot: EnterpriseSnapshot): TrustSignal[] {
     signals.push({
       id: "failed-runs",
       level: "warning",
-      title: `${failedRuns.length} 个 Run 失败`,
-      detail: "检查 Node Trace 和 Activity Receipt 后再决定是否恢复。",
+      title: `${failedRuns.length} ${interfaceMessage(language, "flow.trustSignals.failedRuns")}`,
+      detail: interfaceMessage(language, "flow.trustSignals.failedRunsDetail"),
       findings: [],
     });
   }
@@ -115,16 +129,16 @@ export function trustSignals(snapshot: EnterpriseSnapshot): TrustSignal[] {
     signals.push({
       id: "human-tasks",
       level: "attention",
-      title: `${snapshot.tasks.length} 个 HumanTask 等待人工处理`,
-      detail: "审批、输入、重连、核对和输出审查统一由 Inbox 处理。",
+      title: `${snapshot.tasks.length} ${interfaceMessage(language, "flow.trustSignals.humanTasks")}`,
+      detail: interfaceMessage(language, "flow.trustSignals.humanTasksDetail"),
       findings: [],
     });
   } else {
     signals.push({
       id: "human-tasks",
       level: "healthy",
-      title: "Inbox 已清空",
-      detail: "当前没有待处理的人工控制点。",
+      title: interfaceMessage(language, "flow.trustSignals.inboxClear"),
+      detail: interfaceMessage(language, "flow.trustSignals.inboxClearDetail"),
       findings: [],
     });
   }
@@ -136,9 +150,8 @@ export function trustSignals(snapshot: EnterpriseSnapshot): TrustSignal[] {
     signals.push({
       id: "draft-templates",
       level: "attention",
-      title: `${draftTemplates} 个 Agent 模板版本尚未发布`,
-      detail:
-        "只有已发布且固定 content hash 的 Agent 版本能进入 Flow Revision。",
+      title: `${draftTemplates} ${interfaceMessage(language, "flow.trustSignals.draftAgents")}`,
+      detail: interfaceMessage(language, "flow.trustSignals.draftAgentsDetail"),
       findings: [],
     });
   }

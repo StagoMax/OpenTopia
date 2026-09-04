@@ -4,6 +4,11 @@ import type {
   WorkflowStateReducer,
   WorkflowStateWrite,
 } from "./workflowNodeSelection";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
+import {
+  interfaceMessage,
+  type ApplicationLanguage,
+} from "../../applicationLanguage";
 
 export function WorkflowStateWritesEditor({
   onChange,
@@ -12,6 +17,7 @@ export function WorkflowStateWritesEditor({
   onChange(writes: WorkflowStateWrite[]): void;
   writes: WorkflowStateWrite[];
 }) {
+  const { language, t } = useApplicationLanguage();
   function update(index: number, change: Partial<WorkflowStateWrite>) {
     onChange(
       writes.map((write, candidateIndex) =>
@@ -24,8 +30,8 @@ export function WorkflowStateWritesEditor({
     <section className="flow-editor-inspector__section">
       <header>
         <span>
-          <strong>共享状态写入</strong>
-          <small>节点完成后，在 superstep 提交时写入 channel</small>
+          <strong>{t("flow.stateWrites.title")}</strong>
+          <small>{t("flow.stateWrites.description")}</small>
         </span>
         <Button
           onClick={() =>
@@ -37,21 +43,24 @@ export function WorkflowStateWritesEditor({
           size="compact"
           variant="quiet"
         >
-          <Plus aria-hidden="true" size={14} /> 添加
+          <Plus aria-hidden="true" size={14} />
+          {t("flow.stateWrites.add")}
         </Button>
       </header>
       {writes.length === 0 ? (
         <p className="flow-editor-inspector__note">
-          当前节点只传递输出，不更新 Flow 共享状态。
+          {t("flow.stateWrites.empty")}
         </p>
       ) : (
         <ol className="flow-state-writes">
           {writes.map((write, index) => (
             <li key={index}>
               <div className="flow-state-writes__heading">
-                <strong>Write {index + 1}</strong>
+                <strong>
+                  {t("flow.stateWrites.write")} {index + 1}
+                </strong>
                 <IconButton
-                  aria-label={`移除状态写入 ${index + 1}`}
+                  aria-label={`${t("flow.stateWrites.remove")} ${index + 1}`}
                   onClick={() =>
                     onChange(
                       writes.filter((_, itemIndex) => itemIndex !== index),
@@ -64,8 +73,8 @@ export function WorkflowStateWritesEditor({
                 </IconButton>
               </div>
               <TextField
-                error={channelError(write.channel)}
-                label="Channel"
+                error={channelError(write.channel, language)}
+                label={t("flow.stateWrites.channel")}
                 onChange={(event) =>
                   update(index, { channel: event.target.value })
                 }
@@ -73,19 +82,19 @@ export function WorkflowStateWritesEditor({
                 value={write.channel}
               />
               <SelectField<WorkflowStateReducer>
-                label="Reducer"
-                hint={reducerHint(write.reducer)}
+                label={t("flow.stateWrites.reducer")}
+                hint={reducerHint(write.reducer, language)}
                 onChange={(reducer) => update(index, { reducer })}
                 options={[
-                  { value: "replace", label: "Replace / 替换" },
-                  { value: "append", label: "Append / 追加数组" },
-                  { value: "merge_object", label: "Merge object / 合并对象" },
+                  { value: "replace", label: t("flow.stateWrites.replace") },
+                  { value: "append", label: t("flow.stateWrites.append") },
+                  { value: "merge_object", label: t("flow.stateWrites.merge") },
                 ]}
                 value={write.reducer}
               />
               <TextField
-                hint="留空时写入完整节点输出；支持 $.result.value 形式"
-                label="Value path（可选）"
+                hint={t("flow.stateWrites.valuePathHint")}
+                label={t("flow.stateWrites.valuePath")}
                 onChange={(event) =>
                   update(index, {
                     valuePath: event.target.value || undefined,
@@ -102,13 +111,18 @@ export function WorkflowStateWritesEditor({
   );
 }
 
-function channelError(channel: string) {
+function channelError(channel: string, language: ApplicationLanguage) {
   if (/^[A-Za-z0-9_.-]{1,128}$/.test(channel)) return undefined;
-  return "使用字母、数字、点、下划线或连字符，最长 128 个字符";
+  return interfaceMessage(language, "flow.stateWrites.invalidChannel");
 }
 
-function reducerHint(reducer: WorkflowStateReducer) {
-  if (reducer === "append") return "并行写入按稳定节点顺序追加";
-  if (reducer === "merge_object") return "输出必须是 object";
-  return "同一 channel 只能有一个 Replace writer";
+function reducerHint(
+  reducer: WorkflowStateReducer,
+  language: ApplicationLanguage,
+) {
+  if (reducer === "append")
+    return interfaceMessage(language, "flow.stateWrites.appendHint");
+  if (reducer === "merge_object")
+    return interfaceMessage(language, "flow.stateWrites.mergeHint");
+  return interfaceMessage(language, "flow.stateWrites.replaceHint");
 }

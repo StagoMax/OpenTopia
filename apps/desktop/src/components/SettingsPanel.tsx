@@ -44,6 +44,7 @@ import {
 import { ProviderImportDialog } from "./settings/ProviderImportDialog";
 import { ProviderSettingsView } from "./settings/ProviderSettingsView";
 import {
+  completedModelDiscoveryState,
   createProviderSettings,
   hasCachedProviderModelCatalog,
   providerAllowedAdapters,
@@ -57,6 +58,7 @@ import {
 } from "./settings/providerSettingsModel";
 import { AppearanceSettingsView } from "./AppearanceSettings";
 import { PersonalizationSettingsView } from "./PersonalizationSettings";
+import { InterfaceLanguageSettings } from "./settings/InterfaceLanguageSettings";
 import type { AppearanceSettings, ResolvedTheme } from "../appearance";
 import type { PersonalizationSettings } from "../personalization";
 import type { EditorPreferences } from "../editorPreferences";
@@ -698,10 +700,10 @@ export function SettingsPanel({
           modelDiscoveryAttemptsRef.current[providerId] = completedSignature;
         }
       }
-      setModelDiscoveryState(providerId, {
-        status: "success",
-        modelCount: result.models.length,
-      });
+      setModelDiscoveryState(
+        providerId,
+        completedModelDiscoveryState(result),
+      );
     } catch (error) {
       setModelDiscoveryState(providerId, {
         status: "error",
@@ -1191,6 +1193,7 @@ function GeneralSettings({
 
   return (
     <SettingsPage title="常规" description="编辑器、通知和应用信息。">
+      <InterfaceLanguageSettings />
       <SettingsGroup title="编辑器">
         <SettingsRow
           title="显示上下文窗口使用情况"

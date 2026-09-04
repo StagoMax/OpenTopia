@@ -69,3 +69,22 @@ test("payload fields use the frozen workflow schema without industry guesses", (
     ],
   );
 });
+
+test("platform event payload fields follow the selected interface language", () => {
+  const payload = {
+    caseId: "case-7",
+    payload_ref: "connection://demo/case-7",
+    synthetic: true,
+    eventKind: "case_submitted",
+    summary: {},
+  };
+
+  assert.deepEqual(
+    payloadFields(payload, undefined).map((field) => field.label),
+    ["案件 ID", "载荷引用", "合成数据", "事件类型", "摘要"],
+  );
+  assert.deepEqual(
+    payloadFields(payload, undefined, "en-US").map((field) => field.label),
+    ["Case ID", "Payload reference", "Synthetic data", "Event kind", "Summary"],
+  );
+});

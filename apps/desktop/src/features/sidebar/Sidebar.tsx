@@ -52,6 +52,7 @@ import type { FlowPrimaryView } from "../../workspaceNavigation";
 import { useDismissiblePopover } from "../../hooks/useDismissiblePopover";
 import { Button, IconButton } from "../../components/ui";
 import { SidebarThreadRow } from "./SidebarThreadRow";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
 
 type ProjectHoverState = {
   id: string;
@@ -68,56 +69,56 @@ const PROJECT_THREAD_PREVIEW_LIMIT = 10;
 const FLOW_NAVIGATION_ITEMS = [
   {
     view: "overview",
-    label: "Overview",
-    description: "运行态势",
+    labelKey: "flow.nav.overview",
+    descriptionKey: "flow.nav.overview.description",
     icon: LayoutDashboard,
   },
   {
     view: "inbox",
-    label: "Inbox",
-    description: "审批 / 恢复",
+    labelKey: "flow.nav.inbox",
+    descriptionKey: "flow.nav.inbox.description",
     icon: Inbox,
   },
   {
     view: "agents",
-    label: "Agents",
-    description: "创建 / 配置",
+    labelKey: "flow.nav.agents",
+    descriptionKey: "flow.nav.agents.description",
     icon: Bot,
   },
   {
     view: "workflow-templates",
-    label: "Flows",
-    description: "创建 / 触发 / 运行",
+    labelKey: "flow.nav.flows",
+    descriptionKey: "flow.nav.flows.description",
     icon: Workflow,
   },
   {
     view: "runs",
-    label: "Runs",
-    description: "追踪 / 恢复",
+    labelKey: "flow.nav.runs",
+    descriptionKey: "flow.nav.runs.description",
     icon: Activity,
   },
   {
     view: "connections",
-    label: "Connections",
-    description: "MCP / CRM / ERP",
+    labelKey: "flow.nav.connections",
+    descriptionKey: "flow.nav.connections.description",
     icon: Cable,
   },
   {
     view: "trust",
-    label: "Trust",
-    description: "权限 / 风险",
+    labelKey: "flow.nav.trust",
+    descriptionKey: "flow.nav.trust.description",
     icon: ShieldCheck,
   },
   {
     view: "knowledge",
-    label: "Knowledge",
-    description: "RAG / 资料库",
+    labelKey: "flow.nav.knowledge",
+    descriptionKey: "flow.nav.knowledge.description",
     icon: Library,
   },
 ] as const satisfies ReadonlyArray<{
   view: Exclude<FlowPrimaryView, "conversation">;
-  label: string;
-  description: string;
+  labelKey: `flow.nav.${string}`;
+  descriptionKey: `flow.nav.${string}.description`;
   icon: typeof Workflow;
 }>;
 
@@ -188,6 +189,7 @@ export function Sidebar({
   onOpenTaskSearch(): void;
   onSettings(): void;
 }) {
+  const { t } = useApplicationLanguage();
   const initialNavigationState = useMemo(readSidebarNavigationState, []);
   const [experienceMenuOpen, setExperienceMenuOpen] = useState(false);
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
@@ -392,8 +394,8 @@ export function Sidebar({
                     onClick={() => onOpenFlowPrimaryView(item.view)}
                   >
                     <Icon aria-hidden="true" size={15} />
-                    <span>{item.label}</span>
-                    <small>{item.description}</small>
+                    <span>{t(item.labelKey)}</span>
+                    <small>{t(item.descriptionKey)}</small>
                   </button>
                 );
               })}

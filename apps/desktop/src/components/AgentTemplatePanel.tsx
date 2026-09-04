@@ -10,6 +10,7 @@ import {
   UserRoundCog,
 } from "lucide-react";
 import type { ApiClient } from "../api/client";
+import { useApplicationLanguage } from "../ApplicationLanguageProvider";
 import type {
   AgentInstance,
   AgentTemplateVersionView,
@@ -73,6 +74,7 @@ export function AgentTemplatePanel({
   showTemplateCollection = true,
   variant = "default",
 }: AgentTemplatePanelProps) {
+  const { language, t } = useApplicationLanguage();
   const selection = useFlowAgentSelection();
   const [templates, setTemplates] = useState<AgentTemplateVersionView[]>([]);
   const [instances, setInstances] = useState<AgentInstance[]>([]);
@@ -81,7 +83,7 @@ export function AgentTemplatePanel({
   );
   const [localSelectedKey, setLocalSelectedKey] = useState<string | null>(null);
   const [form, setForm] = useState<AgentDraftForm>(() =>
-    blankAgentDraft(workspaceRoot, settings),
+    blankAgentDraft(workspaceRoot, settings, language),
   );
   const [requirement, setRequirement] = useState("");
   const [editing, setEditing] = useState(Boolean(selection?.creatingAgent));
@@ -108,8 +110,8 @@ export function AgentTemplatePanel({
     cancelCreateAgent?.();
   }, [cancelCreateAgent]);
   useEnterpriseSubpageHeader(onPageHeaderChange, editing, {
-    title: "Agents / 创建 Agent",
-    backLabel: "返回 Agents",
+    title: t("flow.agentEditor.subpageTitle"),
+    backLabel: t("flow.agentEditor.back"),
     onBack: closeEditor,
   });
 
@@ -220,8 +222,8 @@ export function AgentTemplatePanel({
   }, [client, connectionAccessRefresh, selected]);
 
   useEffect(() => {
-    if (!editing) setForm(blankAgentDraft(workspaceRoot, settings));
-  }, [editing, settings, workspaceRoot]);
+    if (!editing) setForm(blankAgentDraft(workspaceRoot, settings, language));
+  }, [editing, language, settings, workspaceRoot]);
 
   async function createVersion() {
     if (!client || busy) return;
@@ -231,25 +233,28 @@ export function AgentTemplatePanel({
     try {
       const resourceGrants = parseAgentDraftJson<ExecutionResourceGrant[]>(
         form.resourceGrants,
-        "资源绑定",
+        t("flow.agentEditor.resourceBindings"),
+        language,
       );
       if (!Array.isArray(resourceGrants)) {
-        throw new Error("资源绑定必须是 JSON 数组");
+        throw new Error(t("flow.agentEditor.resourceBindingsArray"));
       }
       const stateSchema = parseAgentDraftJson<unknown>(
         form.stateSchema,
-        "状态 Schema",
+        t("flow.agentEditor.stateSchema"),
+        language,
       );
       const outputSchema = parseAgentDraftJson<unknown>(
         form.outputSchema,
-        "输出 Schema",
+        t("flow.agentEditor.outputSchema"),
+        language,
       );
       const knowledgeNamespaces = parseAgentDraftList(form.knowledgeNamespaces);
       if (
         form.knowledgeProvider === "sag" &&
         knowledgeNamespaces.length === 0
       ) {
-        throw new Error("选择 SAG 后，至少需要一个 namespace");
+        throw new Error(t("flow.agentEditor.sagNamespaceRequired"));
       }
       const tools = parseAgentDraftList(form.tools);
       const created = await client.createAgentTemplateVersion({
@@ -282,7 +287,7 @@ export function AgentTemplatePanel({
           resourceGrants,
           modelPolicy: {
             allowAllModels: false,
-            allowedModels: parseAgentModelBindings(form.models),
+            allowedModels: parseAgentModelBindings(form.models, language),
           },
           stateSchema,
           outputSchema,
@@ -298,7 +303,7 @@ export function AgentTemplatePanel({
       });
       setEditing(false);
       setNotice(
-        `已创建 ${created.template.templateId}@${created.template.version}`,
+        `${t("flow.agentEditor.created")} ${created.template.templateId}@${created.template.version}`,
       );
       await refreshAfterMutation();
       setSelectedKey(templateKey(created));
@@ -322,10 +327,12 @@ export function AgentTemplatePanel({
         existingTemplates: templates,
         settings,
       });
-      setForm(agentDraftFromTemplate(generated, workspaceRoot, settings));
+      setForm(
+        agentDraftFromTemplate(generated, workspaceRoot, settings, language),
+      );
       setSelectedKey(templateKey(generated));
       setNotice(
-        `模型已生成 ${generated.template.name} 的实时配置；请在右侧审核后保存或直接返回列表发布。`,
+        `${t("flow.agentEditor.generatedPrefix")} ${generated.template.name}${t("flow.agentEditor.generatedSuffix")}`,
       );
       await refreshAfterMutation();
       setSelectedKey(templateKey(generated));
@@ -350,7 +357,7 @@ export function AgentTemplatePanel({
           approveCapabilityExpansion: selected.diff.widensCapabilities,
         },
       );
-      setNotice("版本已发布并锁定");
+      setNotice(t("flow.agentEditor.publishedNotice"));
       await refreshAfterMutation();
     } catch (publishError) {
       setError(readableError(publishError));
@@ -369,7 +376,7 @@ export function AgentTemplatePanel({
         selected.template.templateId,
         selected.template.version,
       );
-      setNotice("草稿版本已删除");
+      setNotice(t("flow.agentEditor.deletedNotice"));
       await refreshAfterMutation();
     } catch (deleteError) {
       setError(readableError(deleteError));
@@ -385,7 +392,7 @@ export function AgentTemplatePanel({
     setNotice(null);
     try {
       await client.archiveAgentTemplate(selected.template.templateId);
-      setNotice("模板已归档；现有实例不会被自动扩权或重建");
+      setNotice(t("flow.agentEditor.archivedNotice"));
       await refreshAfterMutation();
     } catch (archiveError) {
       setError(readableError(archiveError));
@@ -400,7 +407,11 @@ export function AgentTemplatePanel({
     setError(null);
     setNotice(null);
     try {
-      const state = parseAgentDraftJson<unknown>(initialState, "实例状态");
+      const state = parseAgentDraftJson<unknown>(
+        initialState,
+        t("flow.agentEditor.instanceState"),
+        language,
+      );
       const response = await client.createAgentInstance({
         templateId: selected.template.templateId,
         templateVersion: selected.template.version,
@@ -408,7 +419,9 @@ export function AgentTemplatePanel({
         initialState: state,
         bindToThread: true,
       });
-      setNotice(`已创建并绑定 Agent ${shortId(response.instance.id)}`);
+      setNotice(
+        `${t("flow.agentEditor.createdBound")} ${shortId(response.instance.id)}`,
+      );
       await refreshAfterMutation();
     } catch (instantiateError) {
       setError(readableError(instantiateError));
@@ -423,7 +436,7 @@ export function AgentTemplatePanel({
     setError(null);
     try {
       await client.bindThreadAgentInstance(threadId, instanceId);
-      setNotice(`已切换有效 Agent 为 ${shortId(instanceId)}`);
+      setNotice(`${t("flow.agentEditor.switched")} ${shortId(instanceId)}`);
       await refreshAfterMutation();
     } catch (bindError) {
       setError(readableError(bindError));
@@ -438,7 +451,7 @@ export function AgentTemplatePanel({
     setError(null);
     try {
       await client.updateAgentInstance(instanceId, { status: "revoked" });
-      setNotice(`已撤销 Agent ${shortId(instanceId)}`);
+      setNotice(`${t("flow.agentEditor.revoked")} ${shortId(instanceId)}`);
       await refreshAfterMutation();
     } catch (revokeError) {
       setError(readableError(revokeError));
@@ -452,8 +465,8 @@ export function AgentTemplatePanel({
     setNotice(null);
     setForm(
       source
-        ? agentDraftFromTemplate(source, workspaceRoot, settings)
-        : blankAgentDraft(workspaceRoot, settings),
+        ? agentDraftFromTemplate(source, workspaceRoot, settings, language)
+        : blankAgentDraft(workspaceRoot, settings, language),
     );
     setRequirement(source?.template.spec.description ?? "");
     setEditing(true);
@@ -462,18 +475,18 @@ export function AgentTemplatePanel({
   return (
     <div
       className={`agent-template-panel agent-template-panel--${variant}`}
-      aria-label="Agent 配置与运行实例"
+      aria-label={t("flow.agentEditor.aria")}
     >
       {!editing && showTemplateCollection ? (
         <Panel
-          title="Agents / Agent 配置"
+          title={t("flow.agentEditor.configTitle")}
           actions={
             <div className="agent-template-panel__header-actions">
-              <Badge variant="warning">Draft</Badge>
+              <Badge variant="warning">{t("flow.agents.draft")}</Badge>
               <Button
                 size="compact"
                 variant="quiet"
-                aria-label="刷新 Agents"
+                aria-label={t("flow.agentEditor.refreshAria")}
                 disabled={!client || Boolean(busy)}
                 onClick={() => void refresh()}
               >
@@ -486,7 +499,7 @@ export function AgentTemplatePanel({
                 onClick={() => startNewVersion()}
               >
                 <Plus size={14} aria-hidden="true" />
-                新建
+                {t("flow.agentEditor.new")}
               </Button>
             </div>
           }
@@ -517,21 +530,25 @@ export function AgentTemplatePanel({
                           : "warning"
                       }
                     >
-                      {view.template.status === "published" ? "已发布" : "草稿"}
+                      {view.template.status === "published"
+                        ? t("flow.agents.published")
+                        : t("flow.agents.draft")}
                     </Badge>
                   </button>
                 );
               })}
             </div>
           ) : (
-            <p className="agent-template-panel__empty">尚未创建 Agent。</p>
+            <p className="agent-template-panel__empty">
+              {t("flow.agentEditor.none")}
+            </p>
           )}
         </Panel>
       ) : null}
 
       {editing ? (
         <Panel
-          title="Create Agent / 创建 Agent"
+          title={t("flow.agentEditor.createTitle")}
           actions={
             <div className="agent-template-panel__header-actions">
               <Button
@@ -540,7 +557,7 @@ export function AgentTemplatePanel({
                 size="compact"
                 variant="quiet"
               >
-                取消
+                {t("flow.agentEditor.cancel")}
               </Button>
               <Button
                 disabled={!client || busy === "create"}
@@ -548,7 +565,9 @@ export function AgentTemplatePanel({
                 size="compact"
                 variant="primary"
               >
-                {busy === "create" ? "保存中…" : "保存版本"}
+                {busy === "create"
+                  ? t("flow.agentEditor.saving")
+                  : t("flow.agentEditor.saveVersion")}
               </Button>
             </div>
           }
@@ -557,60 +576,59 @@ export function AgentTemplatePanel({
             <main className="agent-studio__main">
               <section className="agent-studio__composer">
                 <span>
-                  <strong>Describe the Agent / 描述你需要的 Agent</strong>
-                  <small>描述职责、可用数据和需要人工介入的边界。</small>
+                  <strong>{t("flow.agentEditor.describeTitle")}</strong>
+                  <small>{t("flow.agentEditor.describeDetail")}</small>
                 </span>
                 <textarea
                   onChange={(event) => setRequirement(event.target.value)}
-                  placeholder="例如：接收业务请求后，查询指定系统与知识库，输出结构化结果；遇到高风险或信息不足时请求人工确认。"
+                  placeholder={t("flow.agentEditor.describePlaceholder")}
                   value={requirement}
                 />
                 <div className="agent-studio__composer-actions">
-                  <small>
-                    生成过程运行在当前 Flow 会话中；如果权限策略要求审批，请在
-                    Inbox 处理后继续。
-                  </small>
+                  <small>{t("flow.agentEditor.generateHint")}</small>
                   <Button
                     disabled={!threadId || !requirement.trim() || Boolean(busy)}
                     onClick={() => void generateWithModel()}
                     variant="primary"
                   >
                     <Sparkles aria-hidden="true" size={14} />
-                    {busy === "generate" ? "生成中…" : "生成 Agent 配置"}
+                    {busy === "generate"
+                      ? t("flow.agentEditor.generating")
+                      : t("flow.agentEditor.generate")}
                   </Button>
                 </div>
               </section>
               <div className="agent-template-panel__form">
                 <TextField
-                  label="Agent ID"
+                  label={t("flow.agentEditor.agentId")}
                   value={form.templateId}
                   onChange={(event) =>
                     setFormValue(setForm, "templateId", event.target.value)
                   }
                 />
                 <TextField
-                  label="名称"
+                  label={t("flow.agentEditor.name")}
                   value={form.name}
                   onChange={(event) =>
                     setFormValue(setForm, "name", event.target.value)
                   }
                 />
                 <TextField
-                  label="所有者"
+                  label={t("flow.agentEditor.owner")}
                   value={form.owner}
                   onChange={(event) =>
                     setFormValue(setForm, "owner", event.target.value)
                   }
                 />
                 <TextField
-                  label="说明"
+                  label={t("flow.agentEditor.description")}
                   value={form.description}
                   onChange={(event) =>
                     setFormValue(setForm, "description", event.target.value)
                   }
                 />
                 <TextAreaField
-                  label="Instructions / Agent 提示词"
+                  label={t("flow.agentEditor.instructions")}
                   value={form.instructions}
                   onChange={(value) =>
                     setFormValue(setForm, "instructions", value)
@@ -658,7 +676,7 @@ export function AgentTemplatePanel({
                 />
                 <SelectField
                   fieldClassName="agent-template-panel__field"
-                  label="风险等级"
+                  label={t("flow.agentEditor.risk")}
                   value={form.riskClass}
                   onChange={(value) =>
                     setFormValue(
@@ -668,38 +686,44 @@ export function AgentTemplatePanel({
                     )
                   }
                   options={[
-                    { value: "low", label: "低" },
-                    { value: "medium", label: "中" },
-                    { value: "high", label: "高" },
-                    { value: "critical", label: "关键" },
+                    { value: "low", label: t("flow.agentEditor.riskLow") },
+                    {
+                      value: "medium",
+                      label: t("flow.agentEditor.riskMedium"),
+                    },
+                    { value: "high", label: t("flow.agentEditor.riskHigh") },
+                    {
+                      value: "critical",
+                      label: t("flow.agentEditor.riskCritical"),
+                    },
                   ]}
                 />
                 <details className="agent-template-panel__advanced">
-                  <summary>Advanced / 高级能力与 JSON Schema</summary>
+                  <summary>{t("flow.agentEditor.advanced")}</summary>
                   <div className="agent-template-panel__advanced-fields">
                     <TextField
-                      label="工具（逗号分隔）"
+                      label={t("flow.agentEditor.toolsCsv")}
                       value={form.tools}
                       onChange={(event) =>
                         setFormValue(setForm, "tools", event.target.value)
                       }
                     />
                     <TextField
-                      label="Skill（逗号分隔）"
+                      label={t("flow.agentEditor.skillsCsv")}
                       value={form.skills}
                       onChange={(event) =>
                         setFormValue(setForm, "skills", event.target.value)
                       }
                     />
                     <TextField
-                      label="插件（逗号分隔）"
+                      label={t("flow.agentEditor.pluginsCsv")}
                       value={form.plugins}
                       onChange={(event) =>
                         setFormValue(setForm, "plugins", event.target.value)
                       }
                     />
                     <TextField
-                      label="工作目录（逗号分隔）"
+                      label={t("flow.agentEditor.workspaceRootsCsv")}
                       value={form.workspaceRoots}
                       onChange={(event) =>
                         setFormValue(
@@ -710,14 +734,14 @@ export function AgentTemplatePanel({
                       }
                     />
                     <TextField
-                      label="模型（provider:model）"
+                      label={t("flow.agentEditor.models")}
                       value={form.models}
                       onChange={(event) =>
                         setFormValue(setForm, "models", event.target.value)
                       }
                     />
                     <TextAreaField
-                      label="资源绑定 JSON"
+                      label={t("flow.agentEditor.resourceBindingsJson")}
                       value={form.resourceGrants}
                       onChange={(value) =>
                         setFormValue(setForm, "resourceGrants", value)
@@ -725,7 +749,7 @@ export function AgentTemplatePanel({
                       mono
                     />
                     <TextAreaField
-                      label="状态 Schema"
+                      label={t("flow.agentEditor.stateSchema")}
                       value={form.stateSchema}
                       onChange={(value) =>
                         setFormValue(setForm, "stateSchema", value)
@@ -733,7 +757,7 @@ export function AgentTemplatePanel({
                       mono
                     />
                     <TextAreaField
-                      label="输出 Schema"
+                      label={t("flow.agentEditor.outputSchema")}
                       value={form.outputSchema}
                       onChange={(value) =>
                         setFormValue(setForm, "outputSchema", value)
@@ -741,7 +765,7 @@ export function AgentTemplatePanel({
                       mono
                     />
                     <TextField
-                      label="可委派 Agent（逗号分隔）"
+                      label={t("flow.agentEditor.delegatesCsv")}
                       value={form.delegates}
                       onChange={(event) =>
                         setFormValue(setForm, "delegates", event.target.value)
@@ -767,6 +791,7 @@ export function AgentTemplatePanel({
                             : [],
                       }
                     : undefined,
+                  language,
                 ),
                 riskClass: form.riskClass,
                 tools: agentToolsWithKnowledgeAccess(
@@ -793,11 +818,11 @@ export function AgentTemplatePanel({
                 }
               >
                 {selected.template.status === "published"
-                  ? "Published"
-                  : "Draft"}
+                  ? t("flow.agents.published")
+                  : t("flow.agents.draft")}
               </Badge>
               <Badge variant={riskBadge(selected.template.spec.riskClass)}>
-                {riskLabel(selected.template.spec.riskClass)}
+                {riskLabel(selected.template.spec.riskClass, language)}
               </Badge>
               {selected.template.status === "draft" ? (
                 <Button
@@ -809,7 +834,7 @@ export function AgentTemplatePanel({
                   {selected.diff.widensCapabilities ? (
                     <ShieldAlert size={14} aria-hidden="true" />
                   ) : null}
-                  发布
+                  {t("flow.agentEditor.publish")}
                 </Button>
               ) : (
                 <Button
@@ -818,7 +843,7 @@ export function AgentTemplatePanel({
                   size="compact"
                   variant="quiet"
                 >
-                  归档
+                  {t("flow.agentEditor.archive")}
                 </Button>
               )}
             </div>
@@ -826,62 +851,68 @@ export function AgentTemplatePanel({
         >
           <dl className="agent-template-panel__facts">
             <div>
-              <dt>所有者</dt>
+              <dt>{t("flow.agentEditor.owner")}</dt>
               <dd>{selected.template.owner}</dd>
             </div>
             <div>
-              <dt>Connections</dt>
+              <dt>{t("flow.agentEditor.connections")}</dt>
               <dd>
                 {selected.template.spec.connectionBindings?.length
-                  ? `${selected.template.spec.connectionBindings.length} 个结构化绑定`
+                  ? `${selected.template.spec.connectionBindings.length} ${t("flow.agentEditor.structuredBindings")}`
                   : selected.template.spec.capabilities.mcpServers.length
-                    ? `${selected.template.spec.capabilities.mcpServers.length} 个 Legacy MCP 绑定`
-                    : "无"}
+                    ? `${selected.template.spec.capabilities.mcpServers.length} ${t("flow.agentEditor.legacyBindings")}`
+                    : t("flow.agentEditor.noneValue")}
               </dd>
             </div>
             <div>
-              <dt>知识库</dt>
+              <dt>{t("flow.agentEditor.knowledge")}</dt>
               <dd>
                 {agentKnowledgeBindingSummary(
                   selected.template.spec.knowledgeBinding,
+                  language,
                 )}
               </dd>
             </div>
             <div>
-              <dt>模型</dt>
+              <dt>{t("flow.agentEditor.model")}</dt>
               <dd>
                 {selected.template.spec.modelPolicy.allowedModels
                   .map((model) => `${model.providerId}:${model.modelId}`)
-                  .join(", ") || "无"}
+                  .join(", ") || t("flow.agentEditor.noneValue")}
               </dd>
             </div>
           </dl>
           <details className="agent-template-panel__technical">
-            <summary>权限与技术配置</summary>
+            <summary>{t("flow.agentEditor.technical")}</summary>
             <dl className="agent-template-panel__facts">
               <div>
-                <dt>内容哈希</dt>
+                <dt>{t("flow.agentEditor.contentHash")}</dt>
                 <dd className="is-mono">{selected.template.contentHash}</dd>
               </div>
               <div>
-                <dt>工具</dt>
-                <dd>
-                  {capabilitySummary(selected.template.spec.capabilities.tools)}
-                </dd>
-              </div>
-              <div>
-                <dt>Skill</dt>
+                <dt>{t("flow.agentEditor.tools")}</dt>
                 <dd>
                   {capabilitySummary(
-                    selected.template.spec.capabilities.skills,
+                    selected.template.spec.capabilities.tools,
+                    language,
                   )}
                 </dd>
               </div>
               <div>
-                <dt>目录</dt>
+                <dt>{t("flow.agentEditor.skills")}</dt>
+                <dd>
+                  {capabilitySummary(
+                    selected.template.spec.capabilities.skills,
+                    language,
+                  )}
+                </dd>
+              </div>
+              <div>
+                <dt>{t("flow.agentEditor.directories")}</dt>
                 <dd>
                   {capabilitySummary(
                     selected.template.spec.capabilities.workspaceRoots,
+                    language,
                   )}
                 </dd>
               </div>
@@ -900,11 +931,15 @@ export function AgentTemplatePanel({
             <div className="agent-template-panel__diff">
               <div className="agent-template-panel__section-title">
                 <GitCompareArrows size={14} aria-hidden="true" />
-                权限差异
+                {t("flow.agentEditor.permissionDiff")}
                 {selected.diff.widensCapabilities ? (
-                  <Badge variant="warning">包含扩权</Badge>
+                  <Badge variant="warning">
+                    {t("flow.agentEditor.widens")}
+                  </Badge>
                 ) : (
-                  <Badge variant="success">未扩权</Badge>
+                  <Badge variant="success">
+                    {t("flow.agentEditor.noWidens")}
+                  </Badge>
                 )}
               </div>
               {selected.diff.changes.length ? (
@@ -920,7 +955,7 @@ export function AgentTemplatePanel({
                             : "neutral"
                         }
                       >
-                        {changeKindLabel(change.kind)}
+                        {changeKindLabel(change.kind, language)}
                       </Badge>
                       <span>{change.scope}</span>
                       <code>{change.value}</code>
@@ -929,7 +964,7 @@ export function AgentTemplatePanel({
                 </ul>
               ) : (
                 <p className="agent-template-panel__empty">
-                  与上一发布版本没有权限变化。
+                  {t("flow.agentEditor.noPermissionChanges")}
                 </p>
               )}
             </div>
@@ -940,7 +975,7 @@ export function AgentTemplatePanel({
               disabled={Boolean(busy)}
               onClick={() => startNewVersion(selected)}
             >
-              基于此版本新建
+              {t("flow.agentEditor.newFrom")}
             </Button>
             {selected.template.status === "draft" ? (
               <Button
@@ -949,7 +984,7 @@ export function AgentTemplatePanel({
                 onClick={() => void deleteSelected()}
               >
                 <Trash2 size={14} aria-hidden="true" />
-                删除草稿
+                {t("flow.agentEditor.deleteDraft")}
               </Button>
             ) : null}
           </div>
@@ -958,21 +993,21 @@ export function AgentTemplatePanel({
 
       {!editing ? (
         <Panel
-          title="当前会话 Agent"
+          title={t("flow.agentEditor.currentSession")}
           actions={
             boundInstance ? (
-              <Badge variant="success">已绑定</Badge>
+              <Badge variant="success">{t("flow.agentEditor.bound")}</Badge>
             ) : (
-              <Badge>未绑定</Badge>
+              <Badge>{t("flow.agentEditor.unbound")}</Badge>
             )
           }
         >
           {selected?.template.status === "published" ? (
             <div className="agent-template-panel__instantiate">
               <details className="agent-template-panel__technical">
-                <summary>初始状态（可选）</summary>
+                <summary>{t("flow.agentEditor.initialState")}</summary>
                 <TextAreaField
-                  label="初始状态 JSON"
+                  label={t("flow.agentEditor.initialStateJson")}
                   value={initialState}
                   onChange={setInitialState}
                   mono
@@ -984,17 +1019,19 @@ export function AgentTemplatePanel({
                 onClick={() => void instantiateSelected()}
               >
                 <UserRoundCog size={14} aria-hidden="true" />
-                实例化并绑定
+                {t("flow.agentEditor.instantiate")}
               </Button>
             </div>
           ) : (
             <p className="agent-template-panel__empty">
-              选择一个已发布版本后可实例化。
+              {t("flow.agentEditor.selectPublished")}
             </p>
           )}
           {instances.length ? (
             <details className="agent-template-panel__technical">
-              <summary>{instances.length} 个实例</summary>
+              <summary>
+                {instances.length} {t("flow.agentEditor.instances")}
+              </summary>
               <div className="agent-template-panel__instances">
                 {instances.map((instance) => (
                   <article
@@ -1006,7 +1043,8 @@ export function AgentTemplatePanel({
                         {instance.templateId}@{instance.templateVersion}
                       </strong>
                       <small>
-                        {shortId(instance.id)} · 状态修订{" "}
+                        {shortId(instance.id)} ·{" "}
+                        {t("flow.agentEditor.stateRevision")}{" "}
                         {instance.stateRevision}
                       </small>
                     </div>
@@ -1019,7 +1057,7 @@ export function AgentTemplatePanel({
                             : "neutral"
                       }
                     >
-                      {instanceStatusLabel(instance.status)}
+                      {instanceStatusLabel(instance.status, language)}
                     </Badge>
                     <div className="agent-template-panel__instance-actions">
                       {instance.status === "active" &&
@@ -1031,7 +1069,7 @@ export function AgentTemplatePanel({
                           disabled={Boolean(busy)}
                           onClick={() => void bindInstance(instance.id)}
                         >
-                          绑定
+                          {t("flow.agentEditor.bind")}
                         </Button>
                       ) : null}
                       {instance.status === "active" ? (
@@ -1041,7 +1079,7 @@ export function AgentTemplatePanel({
                           disabled={Boolean(busy)}
                           onClick={() => void revokeInstance(instance.id)}
                         >
-                          撤销
+                          {t("flow.agentEditor.revoke")}
                         </Button>
                       ) : null}
                     </div>

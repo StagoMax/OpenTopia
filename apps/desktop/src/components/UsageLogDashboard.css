@@ -3,6 +3,7 @@
   height: 100%;
   min-width: 0;
   min-height: 0;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto minmax(0, 1fr);
   overflow: hidden;
   background: var(--app-bg);
@@ -11,6 +12,7 @@
 
 .usage-log-header {
   display: flex;
+  min-width: 0;
   align-items: flex-start;
   justify-content: flex-start;
   gap: var(--space-6);
@@ -26,9 +28,14 @@
 }
 
 .usage-log-heading {
+  flex: 1 1 auto;
   min-width: 0;
   align-items: flex-start;
   gap: var(--space-4);
+}
+
+.usage-log-heading > div {
+  min-width: 0;
 }
 
 .usage-log-title-row {
@@ -52,6 +59,7 @@
 
 .usage-log-scroll {
   height: 100%;
+  min-width: 0;
   min-height: 0;
   overflow: auto;
   padding: var(--space-4);

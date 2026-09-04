@@ -17,6 +17,11 @@ import {
   useFlowAgentSelection,
 } from "./flowAgentSelection";
 import { useEnterpriseStore } from "./store";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
+import {
+  interfaceMessage,
+  type ApplicationLanguage,
+} from "../../applicationLanguage";
 
 export function EnterpriseSidebarCollection({
   client,
@@ -25,6 +30,7 @@ export function EnterpriseSidebarCollection({
   client: ApiClient;
   view: FlowPrimaryView;
 }) {
+  const { language, t } = useApplicationLanguage();
   const { snapshot, store } = useEnterpriseStore(client);
   const selection = useFlowAgentSelection();
   const agentDataRevision = selection?.agentDataRevision ?? 0;
@@ -86,7 +92,7 @@ export function EnterpriseSidebarCollection({
               title: enterpriseSidebarTitle({
                 id: flow.flowId,
                 label: flow.name,
-                qualifier: `v${flow.activeRevision.compiledWorkflow.flowVersion} · ${workflowTriggerLabel(flow.activeRevision.trigger)}`,
+                qualifier: `v${flow.activeRevision.compiledWorkflow.flowVersion} · ${workflowTriggerLabel(flow.activeRevision.trigger, language)}`,
               }),
               detail: `${flow.flowId}@${flow.activeRevision.compiledWorkflow.flowVersion}`,
               status: flow.status,
@@ -108,7 +114,7 @@ export function EnterpriseSidebarCollection({
                 };
               })
             : view === "trust"
-              ? trustSignals(snapshot).map((signal) => ({
+              ? trustSignals(snapshot, language).map((signal) => ({
                   id: signal.id,
                   title: signal.title,
                   detail: signal.detail,
@@ -118,8 +124,8 @@ export function EnterpriseSidebarCollection({
                 ? [
                     {
                       id: "knowledge",
-                      title: "Knowledge catalog",
-                      detail: "Libraries · RAG sources",
+                      title: t("flow.sidebar.knowledgeCatalog"),
+                      detail: t("flow.sidebar.knowledgeDetail"),
                       status: "ready",
                     },
                   ]
@@ -127,13 +133,17 @@ export function EnterpriseSidebarCollection({
   return (
     <section
       className="enterprise-sidebar-collection"
-      aria-label={`${view} collection`}
+      aria-label={`${sidebarTitle(view, language)} ${t("flow.sidebar.collection")}`}
     >
       <header>
-        <strong>{sidebarTitle(view)}</strong>
+        <strong>{sidebarTitle(view, language)}</strong>
         {view === "agents" || view === "workflow-templates" ? (
           <IconButton
-            aria-label={view === "agents" ? "新建 Agent" : "新建 Flow"}
+            aria-label={
+              view === "agents"
+                ? t("flow.sidebar.newAgent")
+                : t("flow.sidebar.newFlow")
+            }
             className="enterprise-sidebar-collection__create"
             onClick={() => {
               if (view === "agents") {
@@ -144,7 +154,11 @@ export function EnterpriseSidebarCollection({
               }
             }}
             size="compact"
-            title={view === "agents" ? "新建 Agent" : "新建 Flow"}
+            title={
+              view === "agents"
+                ? t("flow.sidebar.newAgent")
+                : t("flow.sidebar.newFlow")
+            }
           >
             <Plus aria-hidden="true" size={14} />
           </IconButton>
@@ -190,7 +204,7 @@ export function EnterpriseSidebarCollection({
                             ? () => selection?.setSelectedTrustSignalId(row.id)
                             : undefined
                 }
-                status={enterpriseSidebarStatus(view, row.status)}
+                status={enterpriseSidebarStatus(view, row.status, language)}
                 title={row.title}
               />
             </li>
@@ -198,7 +212,9 @@ export function EnterpriseSidebarCollection({
         })}
         {rows.length === 0 ? (
           <li className="enterprise-list__empty">
-            {view === "agents" ? "尚未创建 Agent" : "暂无条目"}
+            {view === "agents"
+              ? t("flow.sidebar.noAgents")
+              : t("flow.sidebar.noItems")}
           </li>
         ) : null}
       </ol>
@@ -206,7 +222,21 @@ export function EnterpriseSidebarCollection({
   );
 }
 
-function sidebarTitle(view: FlowPrimaryView): string {
-  if (view === "workflow-templates") return "Flows";
-  return view.charAt(0).toUpperCase() + view.slice(1);
+function sidebarTitle(
+  view: FlowPrimaryView,
+  language: ApplicationLanguage,
+): string {
+  if (view === "overview")
+    return interfaceMessage(language, "flow.nav.overview");
+  if (view === "inbox") return interfaceMessage(language, "flow.nav.inbox");
+  if (view === "agents") return interfaceMessage(language, "flow.nav.agents");
+  if (view === "workflow-templates")
+    return interfaceMessage(language, "flow.nav.flows");
+  if (view === "runs") return interfaceMessage(language, "flow.nav.runs");
+  if (view === "connections")
+    return interfaceMessage(language, "flow.nav.connections");
+  if (view === "trust") return interfaceMessage(language, "flow.nav.trust");
+  if (view === "knowledge")
+    return interfaceMessage(language, "flow.nav.knowledge");
+  return "Flow";
 }

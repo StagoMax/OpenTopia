@@ -4,6 +4,7 @@ import type { AgentTemplateVersionView } from "../../types";
 import { Badge, SelectField } from "../ui";
 import { templateKey } from "./flowActivation";
 import type { WorkflowAgentSelection } from "./workflowNodeSelection";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
 
 export function FlowAgentReferencePage({
   node,
@@ -14,6 +15,7 @@ export function FlowAgentReferencePage({
   onChange(templateKey: string): void;
   templates: AgentTemplateVersionView[];
 }) {
+  const { language, t } = useApplicationLanguage();
   const selected = templates.find(
     (item) => templateKey(item) === node.templateKey,
   );
@@ -24,15 +26,12 @@ export function FlowAgentReferencePage({
           <Bot aria-hidden="true" size={18} />
         </span>
         <span>
-          <strong>Agent reference / Agent 引用</strong>
-          <small>
-            Flow 节点只固定 Agent 版本和节点 Trigger；Agent 配置本身可在 Flow
-            之外独立复用。
-          </small>
+          <strong>{t("flow.agentReference.title")}</strong>
+          <small>{t("flow.agentReference.description")}</small>
         </span>
       </header>
       <SelectField
-        label="Agent"
+        label={t("flow.agentReference.agent")}
         onChange={onChange}
         options={templates.map((item) => ({
           value: templateKey(item),
@@ -52,34 +51,44 @@ export function FlowAgentReferencePage({
                     : "warning"
                 }
               >
-                {selected.template.status === "published" ? "已发布" : "草稿"}
+                {selected.template.status === "published"
+                  ? t("flow.agents.published")
+                  : t("flow.agents.draft")}
               </Badge>
             </header>
-            <p>{selected.template.spec.description || "暂无说明"}</p>
+            <p>
+              {selected.template.spec.description ||
+                t("flow.agentReference.noDescription")}
+            </p>
             <pre>{selected.template.spec.instructions}</pre>
           </section>
           <dl>
             <div>
               <dt>
-                <Cable aria-hidden="true" size={14} /> Connections
+                <Cable aria-hidden="true" size={14} />{" "}
+                {t("flow.agentReference.connections")}
               </dt>
               <dd>
-                {selected.template.spec.connectionBindings?.length ?? 0} 个绑定
+                {selected.template.spec.connectionBindings?.length ?? 0}{" "}
+                {t("flow.agentReference.bindings")}
               </dd>
             </div>
             <div>
               <dt>
-                <Database aria-hidden="true" size={14} /> Knowledge
+                <Database aria-hidden="true" size={14} />{" "}
+                {t("flow.agentReference.knowledge")}
               </dt>
               <dd>
                 {agentKnowledgeBindingSummary(
                   selected.template.spec.knowledgeBinding,
+                  language,
                 )}
               </dd>
             </div>
             <div>
               <dt>
-                <ShieldCheck aria-hidden="true" size={14} /> Permissions
+                <ShieldCheck aria-hidden="true" size={14} />{" "}
+                {t("flow.agentReference.permissions")}
               </dt>
               <dd>{selected.template.spec.riskClass}</dd>
             </div>

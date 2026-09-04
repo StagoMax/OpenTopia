@@ -24,12 +24,18 @@ import {
 import { workflowTriggerLabel } from "./enterpriseSidebarPresentation";
 import { useEnterpriseStore } from "./store";
 import { StructuredPayload } from "./StructuredPayload";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
+import {
+  interfaceMessage,
+  type ApplicationLanguage,
+} from "../../applicationLanguage";
 
 type InboxItem =
   | { id: string; kind: "task"; task: HumanTask }
   | { id: string; kind: "case"; flowCase: FlowCase };
 
 export function FlowInboxPage({ client }: { client: ApiClient }) {
+  const { language, t } = useApplicationLanguage();
   const { snapshot, store } = useEnterpriseStore(client);
   const workspace = useFlowWorkspaceSelection();
   const [busy, setBusy] = useState<string | null>(null);
@@ -83,7 +89,7 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
       ? selected.task.title
       : selected?.kind === "case"
         ? (selectedFlow?.name ?? selected.flowCase.flowId)
-        : "Inbox / 待处理";
+        : t("flow.inbox.workspaceTitle");
   useFlowWorkspaceTitle(title);
 
   async function runAction(
@@ -106,7 +112,7 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
       });
       await store.load(true);
     } catch (cause) {
-      setError(readableError(cause));
+      setError(readableError(cause, language));
     } finally {
       setBusy(null);
     }
@@ -120,7 +126,7 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
       await client.startPendingFlowCase(selected.flowCase.id);
       await store.load(true);
     } catch (cause) {
-      setError(readableError(cause));
+      setError(readableError(cause, language));
     } finally {
       setBusy(null);
     }
@@ -134,7 +140,7 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
       await client.claimHumanTask(selected.task.id, selected.task.revision);
       await store.load(true);
     } catch (cause) {
-      setError(readableError(cause));
+      setError(readableError(cause, language));
     } finally {
       setBusy(null);
     }
@@ -144,13 +150,13 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
     return (
       <div className="enterprise-page enterprise-page--empty">
         <CheckCircle2 aria-hidden="true" size={28} />
-        <strong>Inbox 已清空</strong>
-        <span>当前没有待确认事件或人工任务。</span>
+        <strong>{t("flow.inbox.emptyTitle")}</strong>
+        <span>{t("flow.inbox.emptyDescription")}</span>
         <FlowInspectorPortal>
           <FlowInspectorPanel
             actions={
               <IconButton
-                aria-label="刷新 Inbox"
+                aria-label={t("flow.inbox.refresh")}
                 onClick={() => void store.load(true)}
                 size="compact"
               >
@@ -159,9 +165,11 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
             }
             status="clear"
             statusVariant="success"
-            title="Inbox"
+            title={t("flow.nav.inbox")}
           >
-            <p className="enterprise-page__lede">没有需要人工处理的项目。</p>
+            <p className="enterprise-page__lede">
+              {t("flow.inbox.emptyInspector")}
+            </p>
           </FlowInspectorPanel>
         </FlowInspectorPortal>
       </div>
@@ -195,28 +203,31 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
         <div>
           <small>
             {selected.kind === "task"
-              ? humanTaskTypeLabel(selected.task.taskType)
-              : "待确认 Flow 事件"}
+              ? humanTaskTypeLabel(selected.task.taskType, language)
+              : t("flow.inbox.pendingEvent")}
           </small>
           <h2>{title}</h2>
           <p>
             {selected.kind === "task"
               ? selected.task.description
-              : "事件已通过认证和幂等检查；批准后将使用接收时冻结的 Flow Revision 启动运行。"}
+              : t("flow.inbox.pendingEventDescription")}
           </p>
         </div>
       </section>
       <section className="enterprise-core-detail__payload">
         <header>
-          <h3>需要确认的信息</h3>
+          <h3>{t("flow.inbox.confirmationInfo")}</h3>
           <Badge variant="neutral">
             {selected.kind === "task"
-              ? humanTaskSourceLabel(selected.task.sourceKind)
-              : workflowTriggerLabel(selected.flowCase.flowRevision.trigger)}
+              ? humanTaskSourceLabel(selected.task.sourceKind, language)
+              : workflowTriggerLabel(
+                  selected.flowCase.flowRevision.trigger,
+                  language,
+                )}
           </Badge>
         </header>
         <StructuredPayload
-          emptyLabel="此事项没有附加信息。"
+          emptyLabel={t("flow.inbox.noAdditionalInfo")}
           schema={payloadSchema}
           value={payload}
         />
@@ -233,11 +244,16 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
                 variant="primary"
               >
                 <Play aria-hidden="true" size={14} />
-                {busy === "start" ? "启动中…" : "批准并运行"}
+                {busy === "start"
+                  ? t("flow.inbox.starting")
+                  : t("flow.inbox.approveAndRun")}
               </Button>
             ) : inputRequest ? null : (
               actions.map((action) => {
-                const presentation = humanTaskActionPresentation(action);
+                const presentation = humanTaskActionPresentation(
+                  action,
+                  language,
+                );
                 return (
                   <Button
                     disabled={
@@ -261,41 +277,48 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
               })
             )
           }
-          status="待处理"
+          status={t("flow.inbox.pending")}
           statusVariant="warning"
           subtitle={
             selected.kind === "task"
-              ? humanTaskTypeLabel(selected.task.taskType)
+              ? humanTaskTypeLabel(selected.task.taskType, language)
               : selectedFlow?.name
           }
-          title="处理事项"
+          title={t("flow.inbox.item")}
         >
           {snapshot.error || error ? (
             <p className="enterprise-page__message is-error" role="alert">
               {snapshot.error ?? error}
             </p>
           ) : null}
-          <FlowInspectorSection title="处理信息">
+          <FlowInspectorSection title={t("flow.inbox.details")}>
             {selected.kind === "task" ? (
               <>
                 <dl className="flow-inspector-facts">
                   <div>
-                    <dt>负责人</dt>
-                    <dd>{selected.task.assignedTo ?? "尚未分配"}</dd>
-                  </div>
-                  <div>
-                    <dt>领取状态</dt>
+                    <dt>{t("flow.inbox.owner")}</dt>
                     <dd>
-                      {selected.task.claimedBy
-                        ? `${selected.task.claimedBy} 已领取`
-                        : "待领取"}
+                      {selected.task.assignedTo ?? t("flow.inbox.unassigned")}
                     </dd>
                   </div>
                   <div>
-                    <dt>{selected.task.dueAt ? "截止时间" : "收到时间"}</dt>
+                    <dt>{t("flow.inbox.claimStatus")}</dt>
+                    <dd>
+                      {selected.task.claimedBy
+                        ? `${selected.task.claimedBy} ${t("flow.inbox.claimed")}`
+                        : t("flow.inbox.unclaimed")}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>
+                      {selected.task.dueAt
+                        ? t("flow.inbox.dueAt")
+                        : t("flow.inbox.receivedAt")}
+                    </dt>
                     <dd>
                       {formatTime(
                         selected.task.dueAt ?? selected.task.createdAt,
+                        language,
                       )}
                     </dd>
                   </div>
@@ -307,33 +330,36 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
                     size="compact"
                     variant="secondary"
                   >
-                    {busy === "claim" ? "领取中…" : "领取任务"}
+                    {busy === "claim"
+                      ? t("flow.inbox.claiming")
+                      : t("flow.inbox.claim")}
                   </Button>
                 ) : null}
               </>
             ) : (
               <dl className="flow-inspector-facts">
                 <div>
-                  <dt>Flow</dt>
+                  <dt>{t("flow.inbox.flow")}</dt>
                   <dd>{selectedFlow?.name ?? selected.flowCase.flowId}</dd>
                 </div>
                 <div>
-                  <dt>触发方式</dt>
+                  <dt>{t("flow.inbox.trigger")}</dt>
                   <dd>
                     {workflowTriggerLabel(
                       selected.flowCase.flowRevision.trigger,
+                      language,
                     )}
                   </dd>
                 </div>
                 <div>
-                  <dt>收到时间</dt>
-                  <dd>{formatTime(selected.flowCase.createdAt)}</dd>
+                  <dt>{t("flow.inbox.receivedAt")}</dt>
+                  <dd>{formatTime(selected.flowCase.createdAt, language)}</dd>
                 </div>
               </dl>
             )}
           </FlowInspectorSection>
           {selected.kind === "task" ? (
-            <FlowInspectorSection title="处理说明">
+            <FlowInspectorSection title={t("flow.inbox.instructions")}>
               {inputRequest ? (
                 <PlanChoiceCard
                   error={null}
@@ -352,13 +378,13 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
                 <TextField
                   hint={
                     requiresObservation
-                      ? "请记录外部系统中的真实状态或已完成的人工动作"
+                      ? t("flow.inbox.observationHint")
                       : undefined
                   }
                   label={
                     requiresObservation
-                      ? "Observation / 核对结果"
-                      : "Note / 备注"
+                      ? t("flow.inbox.observation")
+                      : t("flow.inbox.note")
                   }
                   onChange={(event) => setNote(event.currentTarget.value)}
                   value={note}
@@ -366,9 +392,9 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
               )}
               {!inputRequest && selected.task.actionSchema ? (
                 <details className="enterprise-technical-details">
-                  <summary>高级响应（JSON）</summary>
+                  <summary>{t("flow.inbox.advancedResponse")}</summary>
                   <label className="flow-workspace-inspector__textarea">
-                    <span>结构化响应</span>
+                    <span>{t("flow.inbox.structuredResponse")}</span>
                     <textarea
                       onChange={(event) =>
                         setResponse(event.currentTarget.value)
@@ -382,12 +408,12 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
               ) : null}
             </FlowInspectorSection>
           ) : null}
-          <FlowInspectorSection title="技术信息">
+          <FlowInspectorSection title={t("flow.inbox.technical")}>
             <details className="enterprise-technical-details">
-              <summary>查看技术标识</summary>
+              <summary>{t("flow.inbox.showTechnicalIds")}</summary>
               <dl className="flow-inspector-facts">
                 <div>
-                  <dt>事项 ID</dt>
+                  <dt>{t("flow.inbox.itemId")}</dt>
                   <dd>
                     <code>{selected.id.replace(/^(task|case):/, "")}</code>
                   </dd>
@@ -395,13 +421,13 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
                 {selected.kind === "case" ? (
                   <>
                     <div>
-                      <dt>Flow Revision ID</dt>
+                      <dt>{t("flow.inbox.revisionId")}</dt>
                       <dd>
                         <code>{selected.flowCase.flowRevisionId}</code>
                       </dd>
                     </div>
                     <div>
-                      <dt>触发器 ID</dt>
+                      <dt>{t("flow.inbox.triggerId")}</dt>
                       <dd>
                         <code>{selected.flowCase.triggerId}</code>
                       </dd>
@@ -417,17 +443,27 @@ export function FlowInboxPage({ client }: { client: ApiClient }) {
   );
 }
 
-function readableError(error: unknown): string {
-  if (error instanceof SyntaxError) return "Response 必须是有效 JSON。";
+function readableError(error: unknown, language: ApplicationLanguage): string {
+  if (error instanceof SyntaxError) {
+    return interfaceMessage(language, "flow.inbox.invalidJson");
+  }
   return error instanceof Error ? error.message : String(error);
 }
 
-function formatTime(value: string): string {
-  return new Date(value).toLocaleString();
+function formatTime(value: string, language: ApplicationLanguage): string {
+  return new Date(value).toLocaleString(language);
 }
 
-function humanTaskSourceLabel(source: HumanTask["sourceKind"]): string {
-  return source === "flow_run" ? "流程运行" : "外部交付";
+function humanTaskSourceLabel(
+  source: HumanTask["sourceKind"],
+  language: ApplicationLanguage,
+): string {
+  return interfaceMessage(
+    language,
+    source === "flow_run"
+      ? "flow.inbox.sourceRun"
+      : "flow.inbox.sourceExternal",
+  );
 }
 
 function inboxTime(item: InboxItem): number {

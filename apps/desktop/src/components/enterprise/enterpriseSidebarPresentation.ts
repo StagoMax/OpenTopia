@@ -1,4 +1,9 @@
 import type { FlowCase, WorkflowTrigger } from "../../types";
+import {
+  defaultApplicationLanguage,
+  interfaceMessage,
+  type ApplicationLanguage,
+} from "../../applicationLanguage.ts";
 
 const preferredInputKeys = [
   "title",
@@ -73,25 +78,32 @@ export function compactSidebarTime(value: string): string {
   }).format(date);
 }
 
-export function workflowTriggerLabel(trigger: WorkflowTrigger): string {
+export function workflowTriggerLabel(
+  trigger: WorkflowTrigger,
+  language: ApplicationLanguage = defaultApplicationLanguage,
+): string {
   switch (trigger.kind) {
     case "event_subscription":
       return `${humanizeIdentifier(trigger.source)} · ${humanizeIdentifier(trigger.eventType)}`;
     case "schedule":
-      return "Schedule";
+      return interfaceMessage(language, "flow.trigger.schedule");
     case "webhook":
-      return "Webhook";
+      return interfaceMessage(language, "flow.trigger.webhook");
     case "manual":
-      return "Manual";
+      return interfaceMessage(language, "flow.trigger.manual");
   }
 }
 
 function summarizeInput(value: unknown): string | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
+  for (const key of ["title", "subject", "name"] as const) {
+    const label = scalarLabel(record[key]);
+    if (label) return label;
+  }
   const values: string[] = [];
 
-  for (const key of preferredInputKeys) {
+  for (const key of preferredInputKeys.slice(3)) {
     const label = scalarLabel(record[key]);
     if (label && !values.includes(label)) values.push(label);
     if (values.length === 2) break;

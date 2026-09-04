@@ -204,6 +204,84 @@
   padding: var(--space-4);
 }
 
+.ot-disclosure-summary {
+  display: flex;
+  min-block-size: var(--control-height-sm);
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-3);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  line-height: var(--line-height-body);
+  list-style: none;
+  transition:
+    background-color var(--motion-fast) var(--ease-standard),
+    color var(--motion-fast) var(--ease-standard);
+}
+
+.ot-disclosure-summary::-webkit-details-marker {
+  display: none;
+}
+
+.ot-disclosure-summary::marker {
+  content: "";
+}
+
+.ot-disclosure-summary:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.ot-disclosure-summary__label,
+.ot-disclosure-summary__state {
+  display: inline-flex;
+  min-inline-size: 0;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.ot-disclosure-summary__label > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ot-disclosure-summary__label > svg,
+.ot-disclosure-summary__state > svg {
+  flex: 0 0 auto;
+}
+
+.ot-disclosure-summary__state {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-regular);
+}
+
+.ot-disclosure-summary__state-expanded {
+  display: none;
+}
+
+details[open] > .ot-disclosure-summary .ot-disclosure-summary__state-collapsed {
+  display: none;
+}
+
+details[open] > .ot-disclosure-summary .ot-disclosure-summary__state-expanded {
+  display: inline;
+}
+
+.ot-disclosure-summary__chevron {
+  transition: transform var(--motion-standard) var(--ease-standard);
+}
+
+details[open] > .ot-disclosure-summary .ot-disclosure-summary__chevron {
+  transform: rotate(90deg);
+}
+
 .ot-badge {
   display: inline-flex;
   min-height: 20px;
@@ -663,6 +741,7 @@
 }
 
 .ot-button:focus-visible,
+.ot-disclosure-summary:focus-visible,
 .ot-text-field__input:focus-visible,
 .ot-switch:focus-visible,
 .ot-segmented__option:focus-visible,
@@ -759,6 +838,8 @@
 
 @media (prefers-reduced-motion: reduce) {
   .ot-button,
+  .ot-disclosure-summary,
+  .ot-disclosure-summary__chevron,
   .ot-switch,
   .ot-switch__knob,
   .ot-segmented__option {
@@ -772,6 +853,8 @@
 
 /* The explicit "reduce motion" setting overrides the OS preference. */
 [data-reduce-motion="on"] .ot-button,
+[data-reduce-motion="on"] .ot-disclosure-summary,
+[data-reduce-motion="on"] .ot-disclosure-summary__chevron,
 [data-reduce-motion="on"] .ot-switch,
 [data-reduce-motion="on"] .ot-switch__knob,
 [data-reduce-motion="on"] .ot-segmented__option {

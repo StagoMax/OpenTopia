@@ -8,6 +8,7 @@ import {
 } from "react";
 import { CircleAlert, Trash2 } from "lucide-react";
 import type { ApiClient } from "../../api/client";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
 import type {
   AgentConnectionBinding,
   Connection,
@@ -64,6 +65,7 @@ export function AgentTemplateConnectionGrantsField({
   onChange,
   onClearLegacyMcpServers,
 }: AgentTemplateConnectionGrantsFieldProps) {
+  const { language, t } = useApplicationLanguage();
   const [catalog, setCatalog] = useState<CatalogState>({
     status: "loading",
     connections: [],
@@ -95,7 +97,7 @@ export function AgentTemplateConnectionGrantsField({
         status: "error",
         connections: [],
         definitions: [],
-        error: "后端未连接，无法读取 Connections",
+        error: t("flow.connectionGrants.backendUnavailable"),
       });
       return;
     }
@@ -131,7 +133,7 @@ export function AgentTemplateConnectionGrantsField({
         });
       });
     return () => controller.abort();
-  }, [client]);
+  }, [client, t]);
 
   useEffect(() => {
     if (!client || !selectedConnectionId) return;
@@ -193,11 +195,16 @@ export function AgentTemplateConnectionGrantsField({
       return [
         connection.name,
         connection.environment,
-        connectionAccountLabel(connection),
+        connectionAccountLabel(connection, language),
         definition?.name ?? "",
       ].some((part) => part.toLocaleLowerCase().includes(query));
     });
-  }, [catalog.connections, catalog.definitions, deferredConnectionQuery]);
+  }, [
+    catalog.connections,
+    catalog.definitions,
+    deferredConnectionQuery,
+    language,
+  ]);
 
   const selectedConnection = catalog.connections.find(
     (connection) => connection.id === selectedConnectionId,
@@ -227,7 +234,12 @@ export function AgentTemplateConnectionGrantsField({
     ? bindingFreshness(selectedBinding, pinnedRevision, activeRevision)
     : null;
   const eligibility = selectedConnection
-    ? connectionGrantEligibility(selectedConnection, selectedDefinition)
+    ? connectionGrantEligibility(
+        selectedConnection,
+        selectedDefinition,
+        Date.now(),
+        language,
+      )
     : null;
   const filteredOperations = useMemo(
     () =>
@@ -347,19 +359,17 @@ export function AgentTemplateConnectionGrantsField({
 
   return (
     <fieldset className="agent-connection-grants" disabled={disabled}>
-      <legend>Connections 与操作权限</legend>
+      <legend>{t("flow.connectionGrants.title")}</legend>
       <p className="agent-connection-grants__hint">
-        权限固定到不可变能力修订；新增工具不会自动扩权，已授权工具变更或移除会标记为失效。
+        {t("flow.connectionGrants.hint")}
       </p>
 
       {hasLegacyProjection ? (
         <div className="agent-connection-grants__legacy" role="note">
           <CircleAlert aria-hidden="true" size={16} />
           <span>
-            <strong>Legacy MCP 绑定（只读）</strong>
-            <small>
-              旧模板没有操作级快照。保留兼容执行，但需新建版本后重新选择操作。
-            </small>
+            <strong>{t("flow.connectionGrants.legacyTitle")}</strong>
+            <small>{t("flow.connectionGrants.legacyDetail")}</small>
             <code>
               {legacyAllowAllMcpServers
                 ? "allowAllMcpServers = true"
@@ -372,10 +382,10 @@ export function AgentTemplateConnectionGrantsField({
             size="compact"
             variant="secondary"
           >
-            开始迁移
+            {t("flow.connectionGrants.startMigration")}
           </Button>
           <small className="agent-connection-grants__legacy-action-hint">
-            此操作会从当前草稿移除 Legacy MCP 绑定；随后必须重新选择所需操作。
+            {t("flow.connectionGrants.migrationHint")}
           </small>
         </div>
       ) : null}
@@ -384,18 +394,15 @@ export function AgentTemplateConnectionGrantsField({
         <div className="agent-connection-grants__missing" role="alert">
           <CircleAlert aria-hidden="true" size={16} />
           <span>
-            <strong>Connection 不可用</strong>
-            <small>
-              下列结构化授权找不到对应 Connection，将在发布与运行时 fail
-              closed。
-            </small>
+            <strong>{t("flow.connectionGrants.missingTitle")}</strong>
+            <small>{t("flow.connectionGrants.missingDetail")}</small>
           </span>
           <div>
             {missingStructuredBindings.map((binding) => (
               <span key={binding.connectionId}>
                 <code>{binding.connectionId}</code>
                 <Button
-                  aria-label={`移除不可用 Connection ${binding.connectionId}`}
+                  aria-label={`${t("flow.connectionGrants.removeUnavailableAria")} ${binding.connectionId}`}
                   onClick={() =>
                     onChange(
                       removeConnectionBinding(value, binding.connectionId),
@@ -404,7 +411,8 @@ export function AgentTemplateConnectionGrantsField({
                   size="compact"
                   variant="quiet"
                 >
-                  <Trash2 aria-hidden="true" size={14} /> 移除
+                  <Trash2 aria-hidden="true" size={14} />{" "}
+                  {t("flow.connectionGrants.remove")}
                 </Button>
               </span>
             ))}
@@ -414,7 +422,7 @@ export function AgentTemplateConnectionGrantsField({
 
       {catalog.status === "loading" ? (
         <div className="agent-connection-grants__state" role="status">
-          正在加载 Connections…
+          {t("flow.connectionGrants.loading")}
         </div>
       ) : null}
       {catalog.status === "error" ? (
@@ -422,7 +430,7 @@ export function AgentTemplateConnectionGrantsField({
           <CircleAlert aria-hidden="true" size={16} />
           <span>{catalog.error}</span>
           <Button size="compact" variant="quiet" onClick={retryCatalog}>
-            重试
+            {t("flow.connectionGrants.retry")}
           </Button>
         </div>
       ) : null}

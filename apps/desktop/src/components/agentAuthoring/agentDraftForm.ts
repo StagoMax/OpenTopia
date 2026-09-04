@@ -7,6 +7,11 @@ import type {
   LibraryProviderId,
 } from "../../types";
 import { normalizeConnectionBindings } from "../agentTemplateConnectionGrants";
+import {
+  defaultApplicationLanguage,
+  interfaceMessage,
+  type ApplicationLanguage,
+} from "../../applicationLanguage.ts";
 
 export type AgentDraftForm = {
   templateId: string;
@@ -34,6 +39,7 @@ export type AgentDraftForm = {
 export function blankAgentDraft(
   workspaceRoot: string | null,
   settings: AppSettings | null,
+  language: ApplicationLanguage = defaultApplicationLanguage,
 ): AgentDraftForm {
   const provider = settings?.providers.find(
     (item) => item.id === settings.activeProviderId,
@@ -43,8 +49,10 @@ export function blankAgentDraft(
     name: "",
     owner: "enterprise-admin",
     description: "",
-    instructions:
-      "只在当前 ExecutionContext 投影的能力范围内完成任务；无法确定时明确标记 unknown。",
+    instructions: interfaceMessage(
+      language,
+      "flow.agentEditor.defaultInstructions",
+    ),
     tools: "filesystem, shell, list_skills, read_skill",
     skills: "",
     plugins: "",
@@ -68,9 +76,10 @@ export function agentDraftFromTemplate(
   view: AgentTemplateVersionView,
   workspaceRoot: string | null,
   settings: AppSettings | null,
+  language: ApplicationLanguage = defaultApplicationLanguage,
 ): AgentDraftForm {
   const template = view.template;
-  const fallback = blankAgentDraft(workspaceRoot, settings);
+  const fallback = blankAgentDraft(workspaceRoot, settings, language);
   return {
     ...fallback,
     templateId: template.templateId,
@@ -122,11 +131,16 @@ export function parseAgentDraftList(value: string): string[] {
   ];
 }
 
-export function parseAgentModelBindings(value: string) {
+export function parseAgentModelBindings(
+  value: string,
+  language: ApplicationLanguage = defaultApplicationLanguage,
+) {
   return parseAgentDraftList(value).map((binding) => {
     const separator = binding.indexOf(":");
     if (separator <= 0 || separator === binding.length - 1) {
-      throw new Error(`模型绑定格式无效：${binding}`);
+      throw new Error(
+        `${interfaceMessage(language, "flow.agentEditor.invalidModelBinding")}${binding}`,
+      );
     }
     return {
       providerId: binding.slice(0, separator),
@@ -135,10 +149,16 @@ export function parseAgentModelBindings(value: string) {
   });
 }
 
-export function parseAgentDraftJson<T>(value: string, label: string): T {
+export function parseAgentDraftJson<T>(
+  value: string,
+  label: string,
+  language: ApplicationLanguage = defaultApplicationLanguage,
+): T {
   try {
     return JSON.parse(value) as T;
   } catch {
-    throw new Error(`${label} 不是有效 JSON`);
+    throw new Error(
+      `${label} ${interfaceMessage(language, "flow.agentEditor.invalidJson")}`,
+    );
   }
 }

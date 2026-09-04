@@ -9,6 +9,7 @@ import {
   Save,
 } from "lucide-react";
 import type { ApiClient } from "../../api/client";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
 import { Button, IconButton } from "../ui";
 import {
   FlowInspectorPanel,
@@ -43,6 +44,7 @@ export function ConnectionsWorkspacePanel({
   client: ApiClient;
   onPageHeaderChange?: EnterprisePageHeaderChange;
 }) {
+  const { language, t } = useApplicationLanguage();
   const { snapshot, store } = useConnectionsStore(client);
   const { snapshot: enterpriseSnapshot } = useEnterpriseStore(client);
   const selected = snapshot.connections.find(
@@ -50,8 +52,8 @@ export function ConnectionsWorkspacePanel({
   );
   const editorTitle =
     snapshot.editorMode === "edit"
-      ? `Edit ${selected?.name ?? "Connection"}`
-      : "New Connection / 新建 Connection";
+      ? `${t("flow.connection.workspace.editPrefix")} ${selected?.name ?? t("flow.connection.singular")}`
+      : t("flow.connection.new");
   const selectedUsage = selected
     ? connectionUsage(enterpriseSnapshot, selected.id)
     : undefined;
@@ -59,9 +61,9 @@ export function ConnectionsWorkspacePanel({
   useEnterpriseSubpageHeader(onPageHeaderChange, Boolean(snapshot.editorMode), {
     title:
       snapshot.editorMode === "edit"
-        ? "Connections / 编辑 Connection"
-        : "Connections / 创建 Connection",
-    backLabel: "返回 Connections",
+        ? t("flow.connection.workspace.subpageEdit")
+        : t("flow.connection.workspace.subpageCreate"),
+    backLabel: t("flow.connection.workspace.back"),
     onBack: () => store.cancelEdit(),
   });
 
@@ -73,8 +75,8 @@ export function ConnectionsWorkspacePanel({
           aria-hidden="true"
           size={18}
         />
-        <strong>正在加载 Connections</strong>
-        <span>读取 Provider、账号连接和 capability revision…</span>
+        <strong>{t("flow.connection.workspace.loading")}</strong>
+        <span>{t("flow.connection.workspace.loadingDetail")}</span>
       </div>
     );
   }
@@ -83,10 +85,11 @@ export function ConnectionsWorkspacePanel({
     return (
       <div className="connections-page-state" role="alert">
         <AlertTriangle aria-hidden="true" size={18} />
-        <strong>Connections 加载失败</strong>
+        <strong>{t("flow.connection.workspace.loadFailed")}</strong>
         <span>{snapshot.error}</span>
         <Button onClick={() => void store.load(true)} variant="primary">
-          <RefreshCw aria-hidden="true" size={14} /> 重试
+          <RefreshCw aria-hidden="true" size={14} />{" "}
+          {t("flow.connection.retry")}
         </Button>
       </div>
     );
@@ -101,10 +104,7 @@ export function ConnectionsWorkspacePanel({
         <div className="connections-editor-stage">
           <Cable aria-hidden="true" size={28} />
           <strong>{editorTitle}</strong>
-          <span>
-            在右侧配置账号、租户、认证上下文与独立
-            runtime。保存后会在左侧列表中选中该 Connection。
-          </span>
+          <span>{t("flow.connection.workspace.stageDetail")}</span>
         </div>
         <FlowInspectorPortal>
           <FlowInspectorPanel
@@ -116,7 +116,7 @@ export function ConnectionsWorkspacePanel({
                   size="compact"
                   variant="quiet"
                 >
-                  取消
+                  {t("flow.connection.cancel")}
                 </Button>
                 <Button
                   disabled={Boolean(saving)}
@@ -126,16 +126,18 @@ export function ConnectionsWorkspacePanel({
                   variant="primary"
                 >
                   <Save aria-hidden="true" size={14} />
-                  {saving ? "保存中…" : "保存"}
+                  {saving
+                    ? t("flow.connection.saving")
+                    : t("flow.connection.save")}
                 </Button>
               </>
             }
-            status="draft"
+            status={t("flow.connection.draft")}
             statusVariant="warning"
             title={
               snapshot.editorMode === "edit"
-                ? "Edit connection"
-                : "New connection"
+                ? t("flow.connection.edit")
+                : t("flow.connection.new")
             }
           >
             <ConnectionEditor
@@ -165,11 +167,8 @@ export function ConnectionsWorkspacePanel({
         ) : (
           <div className="connections-empty-state">
             <Cable aria-hidden="true" size={20} />
-            <strong>创建第一个 Connection</strong>
-            <span>
-              一个 Connection 代表某个 Provider 下的具体账号、租户和独立
-              runtime。Agent Template 只引用它，不复制凭据。
-            </span>
+            <strong>{t("flow.connection.workspace.emptyTitle")}</strong>
+            <span>{t("flow.connection.workspace.emptyDetail")}</span>
           </div>
         )}
       </main>
@@ -180,7 +179,7 @@ export function ConnectionsWorkspacePanel({
             actions={
               <>
                 <IconButton
-                  aria-label="编辑 Connection"
+                  aria-label={t("flow.connection.workspace.editAria")}
                   disabled={Boolean(snapshot.busyAction)}
                   onClick={() => store.beginEdit()}
                   size="compact"
@@ -188,7 +187,7 @@ export function ConnectionsWorkspacePanel({
                   <Pencil aria-hidden="true" size={14} />
                 </IconButton>
                 <IconButton
-                  aria-label="测试 Connection"
+                  aria-label={t("flow.connection.workspace.testAria")}
                   disabled={Boolean(snapshot.busyAction) || !selected.enabled}
                   onClick={() => void store.test(selected.id)}
                   size="compact"
@@ -196,7 +195,7 @@ export function ConnectionsWorkspacePanel({
                   <RotateCw aria-hidden="true" size={14} />
                 </IconButton>
                 <IconButton
-                  aria-label="刷新 Connection 能力"
+                  aria-label={t("flow.connection.workspace.refreshAria")}
                   disabled={
                     Boolean(snapshot.busyAction) || selected.status !== "ready"
                   }
@@ -207,10 +206,10 @@ export function ConnectionsWorkspacePanel({
                 </IconButton>
               </>
             }
-            status={connectionStatusLabel(selected.status)}
+            status={connectionStatusLabel(selected.status, language)}
             statusVariant={connectionStatusVariant(selected.status)}
-            subtitle={connectionAccountLabel(selected)}
-            title="Connection"
+            subtitle={connectionAccountLabel(selected, language)}
+            title={t("flow.connection.singular")}
           >
             <ConnectionDetails
               connection={selected}
@@ -232,17 +231,16 @@ export function ConnectionsWorkspacePanel({
                 size="compact"
                 variant="primary"
               >
-                <Plus aria-hidden="true" size={14} /> 新建
+                <Plus aria-hidden="true" size={14} /> {t("flow.connection.new")}
               </Button>
             }
-            status="empty"
-            title="Connections"
+            status={t("flow.connection.empty")}
+            title={t("flow.connection.plural")}
           >
-            <FlowInspectorSection title="Configuration / 配置">
-              <p>
-                创建 Connection
-                后，可在这里管理账号、runtime、健康状态与能力快照。
-              </p>
+            <FlowInspectorSection
+              title={t("flow.connection.workspace.configuration")}
+            >
+              <p>{t("flow.connection.workspace.emptyInspector")}</p>
             </FlowInspectorSection>
           </FlowInspectorPanel>
         )}

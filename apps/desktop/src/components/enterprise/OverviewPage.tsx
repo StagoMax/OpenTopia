@@ -20,6 +20,7 @@ import {
 import { activeRunCount } from "./model";
 import { runStatusPresentation } from "./runPresentation";
 import { useEnterpriseStore } from "./store";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
 
 export function OverviewPage({
   client,
@@ -28,15 +29,16 @@ export function OverviewPage({
   client: ApiClient;
   onNavigate(view: Exclude<FlowPrimaryView, "conversation">): void;
 }) {
+  const { language, t } = useApplicationLanguage();
   const { snapshot, store } = useEnterpriseStore(client);
   const workspace = useFlowWorkspaceSelection();
-  useFlowWorkspaceTitle("Operations overview / 运行总览");
+  useFlowWorkspaceTitle(t("flow.overview.workspaceTitle"));
 
   const pendingEvents = snapshot.cases.filter(
     (item) => item.status === "accepted" && !item.flowRunId,
   );
   const unhealthyConnections = snapshot.connections.filter(
-    (connection) => connectionProblems(connection).length > 0,
+    (connection) => connectionProblems(connection, language).length > 0,
   );
   const recentRuns = snapshot.runs.slice(0, 6);
   const failedRuns = recentRuns.filter((run) => run.status === "failed");
@@ -45,26 +47,26 @@ export function OverviewPage({
     humanAttentionCount + unhealthyConnections.length + failedRuns.length;
   const activeCount = activeRunCount(snapshot);
   const headline = snapshot.error
-    ? "暂时无法读取运行状态"
+    ? t("flow.overview.unavailable")
     : attentionCount > 0
-      ? `${attentionCount} 项需要处理`
+      ? `${attentionCount} ${t("flow.overview.attention")}`
       : activeCount > 0
-        ? `${activeCount} 个流程正在运行`
-        : "当前运行正常";
+        ? `${activeCount} ${t("flow.overview.active")}`
+        : t("flow.overview.healthy");
   const summary = snapshot.error
-    ? "保留现有状态，刷新后可重新检查。"
+    ? t("flow.overview.errorSummary")
     : attentionCount > 0
-      ? "优先处理阻塞流程或外部连接的问题。"
-      : "没有阻塞事项或连接异常。";
+      ? t("flow.overview.attentionSummary")
+      : t("flow.overview.healthySummary");
 
   const attentionItems = [
     ...unhealthyConnections.map((connection) => {
-      const problem = connectionProblems(connection)[0];
+      const problem = connectionProblems(connection, language)[0];
       return {
         id: `connection:${connection.id}`,
         title: connection.name,
-        detail: problem?.title ?? "连接需要处理",
-        label: "连接",
+        detail: problem?.title ?? t("flow.overview.connectionNeedsAttention"),
+        label: t("flow.overview.connection"),
         variant: "danger" as const,
         activate: () => {
           getConnectionsStore(client).reveal(connection.id);
@@ -75,8 +77,10 @@ export function OverviewPage({
     ...snapshot.tasks.map((task) => ({
       id: `task:${task.id}`,
       title: task.title,
-      detail: task.dueAt ? `截止 ${formatTime(task.dueAt)}` : task.description,
-      label: "人工处理",
+      detail: task.dueAt
+        ? `${t("flow.overview.due")} ${formatTime(task.dueAt, language)}`
+        : task.description,
+      label: t("flow.overview.humanAction"),
       variant: "warning" as const,
       activate: () => {
         workspace?.setSelectedInboxItemId(`task:${task.id}`);
@@ -89,7 +93,7 @@ export function OverviewPage({
         id: `case:${event.id}`,
         title: flow?.name ?? event.flowId,
         detail: flowCaseCoreLabel(event),
-        label: "等待确认",
+        label: t("flow.overview.awaitingConfirmation"),
         variant: "warning" as const,
         activate: () => {
           workspace?.setSelectedInboxItemId(`case:${event.id}`);
@@ -102,8 +106,10 @@ export function OverviewPage({
       return {
         id: `run:${run.id}`,
         title: flow?.name ?? run.flowId,
-        detail: run.error || `失败于 ${formatTime(run.updatedAt)}`,
-        label: "运行失败",
+        detail:
+          run.error ||
+          `${t("flow.overview.failedAt")} ${formatTime(run.updatedAt, language)}`,
+        label: t("flow.overview.runFailed"),
         variant: "danger" as const,
         activate: () => {
           workspace?.setSelectedRunId(run.id);
@@ -126,11 +132,11 @@ export function OverviewPage({
           )}
         </span>
         <div>
-          <small>运行总览</small>
+          <small>{t("flow.overview.workspaceTitle")}</small>
           <span className="enterprise-overview__title-row">
             <h2>{headline}</h2>
             <IconButton
-              aria-label="刷新运行总览"
+              aria-label={t("flow.overview.refresh")}
               disabled={snapshot.status === "loading"}
               onClick={() => void store.load(true)}
               size="compact"
@@ -141,7 +147,7 @@ export function OverviewPage({
           <p>
             {summary}
             {snapshot.refreshedAt
-              ? ` 最近更新：${formatTime(snapshot.refreshedAt)}。`
+              ? ` ${t("flow.overview.lastUpdated")}：${formatTime(snapshot.refreshedAt, language)}。`
               : ""}
           </p>
         </div>
@@ -153,29 +159,32 @@ export function OverviewPage({
         </p>
       ) : null}
 
-      <nav className="enterprise-overview__signals" aria-label="关键运行状态">
+      <nav
+        className="enterprise-overview__signals"
+        aria-label={t("flow.overview.signals")}
+      >
         <SignalButton
           icon={<Inbox aria-hidden="true" size={16} />}
-          label="待人工处理"
+          label={t("flow.overview.humanPending")}
           onClick={() => onNavigate("inbox")}
           value={humanAttentionCount}
         />
         <SignalButton
           icon={<Activity aria-hidden="true" size={16} />}
-          label="运行中"
+          label={t("flow.overview.running")}
           onClick={() => onNavigate("runs")}
           value={activeCount}
         />
         <SignalButton
           icon={<Cable aria-hidden="true" size={16} />}
-          label="连接异常"
+          label={t("flow.overview.connectionIssues")}
           onClick={() => onNavigate("connections")}
           value={unhealthyConnections.length}
         />
       </nav>
 
       <div className="enterprise-page__columns">
-        <Panel title="需要处理">
+        <Panel title={t("flow.overview.needsAttention")}>
           <ol className="enterprise-action-list">
             {attentionItems.map((item) => (
               <li key={item.id}>
@@ -190,18 +199,20 @@ export function OverviewPage({
               </li>
             ))}
             {attentionItems.length === 0 ? (
-              <li className="enterprise-list__empty">当前没有待处理事项。</li>
+              <li className="enterprise-list__empty">
+                {t("flow.overview.noAttention")}
+              </li>
             ) : null}
           </ol>
         </Panel>
 
-        <Panel title="最近运行">
+        <Panel title={t("flow.overview.recentRuns")}>
           <ol className="enterprise-action-list">
             {recentRuns.map((run) => {
               const flow = snapshot.flows.find(
                 (item) => item.flowId === run.flowId,
               );
-              const status = runStatusPresentation(run.status);
+              const status = runStatusPresentation(run.status, language);
               return (
                 <li key={run.id}>
                   <button
@@ -213,7 +224,7 @@ export function OverviewPage({
                   >
                     <span>
                       <strong>{flow?.name ?? run.flowId}</strong>
-                      <small>{formatTime(run.updatedAt)}</small>
+                      <small>{formatTime(run.updatedAt, language)}</small>
                     </span>
                     <Badge variant={status.variant}>{status.label}</Badge>
                     <ArrowRight aria-hidden="true" size={14} />
@@ -222,7 +233,9 @@ export function OverviewPage({
               );
             })}
             {recentRuns.length === 0 ? (
-              <li className="enterprise-list__empty">尚无运行记录。</li>
+              <li className="enterprise-list__empty">
+                {t("flow.overview.noRuns")}
+              </li>
             ) : null}
           </ol>
         </Panel>
@@ -253,6 +266,9 @@ function SignalButton({
   );
 }
 
-function formatTime(value: string): string {
-  return new Date(value).toLocaleString();
+function formatTime(
+  value: string,
+  language: import("../../applicationLanguage").ApplicationLanguage,
+): string {
+  return new Date(value).toLocaleString(language);
 }

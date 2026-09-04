@@ -50,6 +50,7 @@ import {
   compiledWorkflowCanvasModel,
   editableWorkflowCanvasModel,
 } from "./workflowCanvasModel";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
 import {
   applyWorkflowNodePositions,
   committedWorkflowNodePositionChanges,
@@ -67,6 +68,8 @@ const nodeTypes: NodeTypes = { workflowNode: WorkflowCanvasNode };
 const HISTORY_LIMIT = 50;
 const DEFAULT_VIEWPORT = { x: 0, y: 0, zoom: 0.9 };
 const EMPTY_SELECTIONS: WorkflowNodeSelection[] = [];
+const NODE_CLICK_DISTANCE = 3;
+const NODE_DRAG_THRESHOLD = 4;
 
 type CanvasSnapshot = {
   layout: WorkflowCanvasLayout;
@@ -102,19 +105,21 @@ export function WorkflowGraphEditor({
   testRun?: FlowRun | null;
   templates: AgentTemplateVersionView[];
 }) {
+  const { language, t } = useApplicationLanguage();
   const canvasReadOnly = readOnly || Boolean(compiledGraph);
   const canvasModel = useMemo(
     () =>
       compiledGraph
-        ? compiledWorkflowCanvasModel(compiledGraph)
-        : editableWorkflowCanvasModel(selections, templates),
-    [compiledGraph, selections, templates],
+        ? compiledWorkflowCanvasModel(compiledGraph, language)
+        : editableWorkflowCanvasModel(selections, templates, language),
+    [compiledGraph, language, selections, templates],
   );
   const canvasRef = useRef<HTMLElement | null>(null);
   const instanceRef = useRef<ReactFlowInstance<WorkflowCanvasNodeType> | null>(
     null,
   );
   const dragStartPositions = useRef<Record<string, XYPosition> | null>(null);
+  const draggedNodeIdRef = useRef<string | null>(null);
   const syncedPositionsRef = useRef<WorkflowCanvasLayout["positions"] | null>(
     null,
   );
@@ -165,6 +170,7 @@ export function WorkflowGraphEditor({
     setNodePickerOpen(false);
     setQuickCreate(null);
     setSelectedEdgeId(null);
+    draggedNodeIdRef.current = null;
     syncedPositionsRef.current = null;
     history.current = { future: [], past: [] };
     setHistoryVersion((value) => value + 1);
@@ -220,6 +226,7 @@ export function WorkflowGraphEditor({
         onEditTrigger: (nodeId) => onEditTrigger?.(nodeId),
         onRemove: removeNode,
         onSelect: (nodeId) => {
+          if (draggedNodeIdRef.current === nodeId) return;
           setSelectedEdgeId(null);
           onSelectConnection?.(null);
           onSelectNode(nodeId);
@@ -586,7 +593,7 @@ export function WorkflowGraphEditor({
 
   return (
     <section
-      aria-label="Flow 交互画布"
+      aria-label={t("flow.canvas.interactiveAria")}
       className={`workflow-graph workflow-graph--${activeTool}`}
       ref={canvasRef}
       tabIndex={0}
@@ -608,6 +615,8 @@ export function WorkflowGraphEditor({
         }
         maxZoom={1.8}
         minZoom={0.3}
+        nodeClickDistance={NODE_CLICK_DISTANCE}
+        nodeDragThreshold={NODE_DRAG_THRESHOLD}
         nodeTypes={nodeTypes}
         defaultNodes={initialFlowNodesRef.current}
         nodesConnectable={!canvasReadOnly && !disabled}
@@ -638,16 +647,15 @@ export function WorkflowGraphEditor({
           setLayout((current) => ({ ...current, viewport }))
         }
         onNodeClick={(_event, node) => {
+          if (draggedNodeIdRef.current === node.id) return;
           setQuickCreate(null);
           setSelectedEdgeId(null);
           onSelectConnection?.(null);
           onSelectNode(node.id);
         }}
         onNodeDragStart={(_event, node) => {
+          draggedNodeIdRef.current = node.id;
           dragStartPositions.current = { ...layout.positions };
-          setSelectedEdgeId(null);
-          onSelectConnection?.(null);
-          onSelectNode(node.id);
         }}
         onNodeDragStop={(_event, node) => {
           const before = dragStartPositions.current;
@@ -663,6 +671,11 @@ export function WorkflowGraphEditor({
           ) {
             pushPast(snapshot({ ...layout, positions: before }));
           }
+          window.setTimeout(() => {
+            if (draggedNodeIdRef.current === node.id) {
+              draggedNodeIdRef.current = null;
+            }
+          }, 0);
         }}
         onNodesChange={handleNodesChange}
         onPaneClick={() => {
@@ -713,15 +726,15 @@ export function WorkflowGraphEditor({
           <span className="workflow-graph__empty-icon">
             <Bot aria-hidden="true" size={18} />
           </span>
-          <strong>从第一个节点开始</strong>
-          <p>添加 Agent 节点后，再在右侧选择具体 Agent 和版本。</p>
+          <strong>{t("flow.canvas.emptyTitle")}</strong>
+          <p>{t("flow.canvas.emptyDetail")}</p>
           <Button
             disabled={disabled}
             onClick={() => addNode("agent")}
             size="compact"
             variant="primary"
           >
-            <Bot aria-hidden="true" size={14} /> 添加 Agent 节点
+            <Bot aria-hidden="true" size={14} /> {t("flow.canvas.addAgent")}
           </Button>
         </div>
       ) : null}

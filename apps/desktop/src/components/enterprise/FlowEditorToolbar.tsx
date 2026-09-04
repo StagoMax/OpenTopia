@@ -1,6 +1,7 @@
 import { FlaskConical, Plus, RefreshCw, Send, ShieldCheck } from "lucide-react";
 import { Badge, Button } from "../ui";
 import { nextFlowEditorStage } from "./flowEditorProgress";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
 
 export function FlowEditorToolbar({
   activeTestRun,
@@ -39,6 +40,7 @@ export function FlowEditorToolbar({
   threadReady: boolean;
   validated: boolean;
 }) {
+  const { t } = useApplicationLanguage();
   const stage = nextFlowEditorStage({
     draftExists,
     successfulTestRun,
@@ -49,27 +51,39 @@ export function FlowEditorToolbar({
       ? {
           disabled: !canCreateDraft,
           icon: Plus,
-          label: busy === "create" ? "创建中…" : "保存草稿",
+          label:
+            busy === "create"
+              ? t("flow.toolbar.creating")
+              : t("flow.toolbar.saveDraft"),
           onClick: onCreateDraft,
         }
       : stage === "validate"
         ? {
             disabled: false,
             icon: ShieldCheck,
-            label: busy === "validate" ? "验证中…" : "验证",
+            label:
+              busy === "validate"
+                ? t("flow.toolbar.validating")
+                : t("flow.toolbar.validate"),
             onClick: onValidate,
           }
         : stage === "test"
           ? {
               disabled: !canTestRun || activeTestRun,
               icon: FlaskConical,
-              label: busy === "test-run" ? "启动中…" : "Test Run",
+              label:
+                busy === "test-run"
+                  ? t("flow.toolbar.starting")
+                  : t("flow.toolbar.testRun"),
               onClick: onTestRun,
             }
           : {
               disabled: !canActivate,
               icon: Send,
-              label: busy === "activate" ? "激活中…" : "激活 Flow",
+              label:
+                busy === "activate"
+                  ? t("flow.toolbar.activating")
+                  : t("flow.toolbar.activate"),
               onClick: onActivate,
             };
   const NextIcon = nextAction.icon;
@@ -81,19 +95,19 @@ export function FlowEditorToolbar({
           variant={validated ? "success" : draftExists ? "neutral" : "warning"}
         >
           {activeTestRun
-            ? "Testing"
+            ? t("flow.toolbar.testing")
             : validated
-              ? "Validated"
+              ? t("flow.toolbar.validated")
               : draftExists
-                ? "Draft"
-                : "Unsaved"}
+                ? t("flow.toolbar.draft")
+                : t("flow.toolbar.unsaved")}
         </Badge>
         <span>
-          <strong>{name || "Untitled Flow"}</strong>
+          <strong>{name || t("flow.toolbar.untitled")}</strong>
           <small>
             {threadReady
-              ? `${nodeCount} 个步骤 · ${flowId}`
-              : "请先新建或选择一个 Flow 任务以保存草稿"}
+              ? `${nodeCount} ${t("flow.toolbar.steps")} · ${flowId}`
+              : t("flow.toolbar.selectTask")}
           </small>
         </span>
       </span>
@@ -104,7 +118,8 @@ export function FlowEditorToolbar({
           size="compact"
           variant="quiet"
         >
-          <RefreshCw aria-hidden="true" size={14} /> 刷新
+          <RefreshCw aria-hidden="true" size={14} />
+          {t("flow.toolbar.refresh")}
         </Button>
         <Button
           disabled={nextAction.disabled || Boolean(busy) || activeTestRun}

@@ -24,6 +24,11 @@ import {
 } from "./flowAgentSelection";
 import { trustSignals } from "./model";
 import { useEnterpriseStore } from "./store";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
+import {
+  interfaceMessage,
+  type ApplicationLanguage,
+} from "../../applicationLanguage";
 
 export function TrustPage({
   client,
@@ -32,9 +37,10 @@ export function TrustPage({
   client: ApiClient;
   onNavigate(view: Exclude<FlowPrimaryView, "conversation">): void;
 }) {
+  const { language, t } = useApplicationLanguage();
   const { snapshot, store } = useEnterpriseStore(client);
   const workspace = useFlowWorkspaceSelection();
-  const signals = trustSignals(snapshot);
+  const signals = trustSignals(snapshot, language);
   const signal =
     signals.find((item) => item.id === workspace?.selectedTrustSignalId) ??
     signals[0] ??
@@ -46,7 +52,7 @@ export function TrustPage({
     }
   }, [signal, workspace]);
 
-  useFlowWorkspaceTitle(signal?.title ?? "Trust center / 信任中心");
+  useFlowWorkspaceTitle(signal?.title ?? t("flow.trust.workspaceTitle"));
   const SignalIcon =
     signal?.level === "healthy"
       ? CheckCircle2
@@ -69,7 +75,7 @@ export function TrustPage({
             <SignalIcon size={22} />
           </span>
           <div>
-            <small>Trust signal / 信任信号</small>
+            <small>{t("flow.trust.signal")}</small>
             <h2>{signal.title}</h2>
             <p>{signal.detail}</p>
           </div>
@@ -80,15 +86,15 @@ export function TrustPage({
         <section className="enterprise-core-detail__payload enterprise-trust-findings">
           <header>
             <span>
-              <h3>受影响的连接</h3>
-              <small>点击条目可直达对应 Connection 的问题详情。</small>
+              <h3>{t("flow.trust.affectedConnections")}</h3>
+              <small>{t("flow.trust.connectionsHint")}</small>
             </span>
           </header>
           <ol>
             {signal.findings.map((finding) => (
               <li key={finding.id}>
                 <button
-                  aria-label={`定位并处理 Connection：${finding.label}`}
+                  aria-label={`${t("flow.trust.locateAria")}：${finding.label}`}
                   onClick={() => openConnection(finding.target.connectionId)}
                   type="button"
                 >
@@ -102,7 +108,7 @@ export function TrustPage({
                       {finding.problems.map((problem) => (
                         <span key={problem.code}>
                           <small>
-                            {connectionProblemAreaLabel(problem.area)}
+                            {connectionProblemAreaLabel(problem.area, language)}
                           </small>
                           <span>
                             <strong>{problem.title}</strong>
@@ -113,7 +119,7 @@ export function TrustPage({
                     </span>
                   </span>
                   <span className="enterprise-trust-finding__action">
-                    定位问题
+                    {t("flow.trust.locate")}
                     <ArrowRight aria-hidden="true" size={14} />
                   </span>
                 </button>
@@ -127,7 +133,7 @@ export function TrustPage({
         <FlowInspectorPanel
           actions={
             <IconButton
-              aria-label="刷新信任状态"
+              aria-label={t("flow.trust.refresh")}
               disabled={snapshot.status === "loading"}
               onClick={() => void store.load(true)}
               size="compact"
@@ -135,26 +141,26 @@ export function TrustPage({
               <RefreshCw aria-hidden="true" size={14} />
             </IconButton>
           }
-          status={trustStatusLabel(signal?.level, snapshot.status)}
+          status={trustStatusLabel(signal?.level, snapshot.status, language)}
           statusVariant={trustVariant(signal?.level)}
-          title="信任状态"
+          title={t("flow.trust.status")}
         >
           {snapshot.error ? (
             <p className="enterprise-page__message is-error" role="alert">
               {snapshot.error}
             </p>
           ) : null}
-          <FlowInspectorSection title="当前信号">
-            <p>{signal?.detail ?? "当前没有信任信号。"}</p>
+          <FlowInspectorSection title={t("flow.trust.currentSignal")}>
+            <p>{signal?.detail ?? t("flow.trust.noSignal")}</p>
           </FlowInspectorSection>
-          <FlowInspectorSection title="更新时间">
+          <FlowInspectorSection title={t("flow.trust.updateTime")}>
             <dl className="flow-inspector-facts">
               <div>
-                <dt>最近刷新</dt>
+                <dt>{t("flow.trust.lastRefresh")}</dt>
                 <dd>
                   {snapshot.refreshedAt
-                    ? new Date(snapshot.refreshedAt).toLocaleString()
-                    : "尚未加载"}
+                    ? new Date(snapshot.refreshedAt).toLocaleString(language)
+                    : t("flow.trust.notLoaded")}
                 </dd>
               </div>
             </dl>
@@ -171,10 +177,18 @@ function trustVariant(level: string | undefined): FlowInspectorStatusVariant {
   return "warning";
 }
 
-function trustStatusLabel(level: string | undefined, fallback: string): string {
-  if (level === "healthy") return "正常";
-  if (level === "warning") return "需要处理";
-  if (level === "attention") return "需要关注";
-  if (fallback === "loading") return "刷新中";
-  return "待检查";
+function trustStatusLabel(
+  level: string | undefined,
+  fallback: string,
+  language: ApplicationLanguage,
+): string {
+  if (level === "healthy")
+    return interfaceMessage(language, "flow.trust.healthy");
+  if (level === "warning")
+    return interfaceMessage(language, "flow.trust.needsAction");
+  if (level === "attention")
+    return interfaceMessage(language, "flow.trust.attention");
+  if (fallback === "loading")
+    return interfaceMessage(language, "flow.trust.refreshing");
+  return interfaceMessage(language, "flow.trust.pendingCheck");
 }

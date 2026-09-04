@@ -14,6 +14,7 @@ import {
   workflowNodeLabel,
   type WorkflowNodeSelection,
 } from "./workflowNodeSelection";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
 
 export function FlowTriggerConfigPage({
   node,
@@ -26,6 +27,7 @@ export function FlowTriggerConfigPage({
   selections: WorkflowNodeSelection[];
   templates: AgentTemplateVersionView[];
 }) {
+  const { t } = useApplicationLanguage();
   const editable = useMemo(
     () => editableTriggerInputs(node.activation),
     [node.activation],
@@ -40,11 +42,17 @@ export function FlowTriggerConfigPage({
       ? templates.find((item) => templateKey(item) === node.templateKey)
       : null;
   const sourceOptions = [
-    { value: "manual", label: "Manual / 手动" },
-    { value: "webhook", label: "API / Webhook" },
-    { value: "event_subscription", label: "Connection event / 连接事件" },
-    { value: "schedule", label: "Schedule / 定时" },
-    { value: "flow_input", label: "Flow.input / 当前事件" },
+    { value: "manual", label: t("flow.trigger.manualSource") },
+    { value: "webhook", label: t("flow.trigger.webhookSource") },
+    {
+      value: "event_subscription",
+      label: t("flow.trigger.connectionEvent"),
+    },
+    { value: "schedule", label: t("flow.trigger.scheduleSource") },
+    {
+      value: "flow_input",
+      label: `Flow.input / ${t("flow.trigger.currentEvent")}`,
+    },
     ...selections
       .filter((item) => item.id !== node.id)
       .map((item) => ({
@@ -87,28 +95,25 @@ export function FlowTriggerConfigPage({
         <span>
           <strong>
             {template?.template.name ?? workflowNodeLabel(node, templates)} ·
-            Trigger
+            {t("flow.trigger.title")}
           </strong>
-          <small>
-            Trigger 决定这个节点何时被激活；Node Final
-            是完成通知订阅，不是新造的运行事件。
-          </small>
+          <small>{t("flow.trigger.description")}</small>
         </span>
       </header>
 
       <section className="flow-trigger-page__section">
         <header>
           <span>
-            <strong>Activation expression / 激活表达式</strong>
-            <small>多个来源可以使用 AND、OR，并可对单个来源取 NOT。</small>
+            <strong>{t("flow.trigger.activationExpression")}</strong>
+            <small>{t("flow.trigger.activationHint")}</small>
           </span>
           <SelectField
             disabled={inputs.length < 2}
-            label="Logic / 逻辑"
+            label={t("flow.trigger.logic")}
             onChange={(value) => updateLogic(value as "and" | "or")}
             options={[
-              { value: "and", label: "AND / 全部满足" },
-              { value: "or", label: "OR / 任一满足" },
+              { value: "and", label: t("flow.trigger.all") },
+              { value: "or", label: t("flow.trigger.any") },
             ]}
             value={logic}
           />
@@ -119,7 +124,7 @@ export function FlowTriggerConfigPage({
               <div className="flow-trigger-source-list__heading">
                 <Braces aria-hidden="true" size={14} />
                 <SelectField
-                  label={`Source ${index + 1} / 来源`}
+                  label={`${t("flow.trigger.source")} ${index + 1}`}
                   onChange={(value) =>
                     replaceSource(index, sourceFromOption(value))
                   }
@@ -142,7 +147,7 @@ export function FlowTriggerConfigPage({
                   />
                 </label>
                 <IconButton
-                  aria-label={`移除 Trigger 来源 ${index + 1}`}
+                  aria-label={`${t("flow.trigger.removeSource")} ${index + 1}`}
                   disabled={inputs.length === 1}
                   onClick={() =>
                     updateInputs(
@@ -176,28 +181,27 @@ export function FlowTriggerConfigPage({
           size="compact"
           variant="quiet"
         >
-          <Plus aria-hidden="true" size={14} /> 添加来源
+          <Plus aria-hidden="true" size={14} />
+          {t("flow.trigger.addSource")}
         </Button>
       </section>
 
       <section className="flow-trigger-page__section flow-trigger-page__policy">
         <span>
-          <strong>Event handling / 事件处理策略</strong>
-          <small>
-            外部事件可以自动运行，也可以先进入 Inbox，人工确认后再创建 FlowRun。
-          </small>
+          <strong>{t("flow.trigger.eventHandling")}</strong>
+          <small>{t("flow.trigger.eventHandlingHint")}</small>
         </span>
         <SelectField
-          label="Review policy / 审核策略"
+          label={t("flow.trigger.reviewPolicy")}
           onChange={(value) =>
             updateIngressPolicy(value as typeof ingressPolicy)
           }
           options={[
             {
               value: "require_review",
-              label: "人工确认后执行（推荐）",
+              label: t("flow.trigger.reviewFirst"),
             },
-            { value: "immediate", label: "通过检查后自动执行" },
+            { value: "immediate", label: t("flow.trigger.immediate") },
           ]}
           value={ingressPolicy}
         />
@@ -205,12 +209,7 @@ export function FlowTriggerConfigPage({
 
       <aside className="flow-trigger-page__note">
         <AlertCircle aria-hidden="true" size={15} />
-        <span>
-          Trigger 不要求统一事件 Schema。来源原始参数会保存在{" "}
-          <code>@Flow.input</code>
-          ；当前节点收到的激活数据通过 <code>@Trigger.input</code>{" "}
-          引用。参数只有 ID 时，Agent 再调用 Connection 工具读取完整业务记录。
-        </span>
+        <span>{t("flow.trigger.schemaHint")}</span>
       </aside>
     </div>
   );
@@ -223,18 +222,23 @@ function TriggerSourceFields({
   onChange(source: FlowTriggerSource): void;
   source: FlowTriggerSource;
 }) {
+  const { t } = useApplicationLanguage();
   if (source.kind === "webhook") {
     return (
       <div className="flow-trigger-source-list__fields">
         <TextField
-          hint="只保存凭据引用，不保存 Token"
-          label="Token ref / Token 引用"
+          hint={t("flow.trigger.tokenHint")}
+          label={t("flow.trigger.tokenRef")}
           onChange={(event) =>
             onChange({ ...source, tokenRef: event.target.value })
           }
           value={source.tokenRef}
         />
-        <TextField label="Trigger ID" readOnly value={source.triggerId} />
+        <TextField
+          label={t("flow.trigger.id")}
+          readOnly
+          value={source.triggerId}
+        />
       </div>
     );
   }
@@ -242,14 +246,14 @@ function TriggerSourceFields({
     return (
       <div className="flow-trigger-source-list__fields">
         <TextField
-          label="Connection source / 事件源"
+          label={t("flow.trigger.connectionSource")}
           onChange={(event) =>
             onChange({ ...source, source: event.target.value })
           }
           value={source.source}
         />
         <TextField
-          label="Event type / 事件类型"
+          label={t("flow.trigger.eventType")}
           onChange={(event) =>
             onChange({ ...source, eventType: event.target.value })
           }
@@ -262,7 +266,7 @@ function TriggerSourceFields({
     return (
       <div className="flow-trigger-source-list__fields">
         <TextField
-          label="Interval seconds / 间隔秒数"
+          label={t("flow.trigger.interval")}
           onChange={(event) =>
             onChange({
               ...source,
@@ -272,7 +276,7 @@ function TriggerSourceFields({
           value={String(source.intervalSeconds)}
         />
         <TextField
-          label="Next fire at / 下次触发"
+          label={t("flow.trigger.nextFire")}
           onChange={(event) =>
             onChange({ ...source, nextFireAt: event.target.value })
           }

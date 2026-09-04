@@ -11,6 +11,7 @@ import {
   useFlowAgentSelection,
   useFlowWorkspaceTitle,
 } from "./flowAgentSelection";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
 
 export function AgentsPage({
   client,
@@ -23,6 +24,7 @@ export function AgentsPage({
   threadId: string | null;
   workspaceRoot: string | null;
 }) {
+  const { t } = useApplicationLanguage();
   const { snapshot } = useEnterpriseStore(client);
   const selection = useFlowAgentSelection();
   const requestedTemplateKey = selection?.selectedTemplateKey ?? null;
@@ -57,7 +59,7 @@ export function AgentsPage({
 
   useFlowWorkspaceTitle(
     selection?.creatingAgent
-      ? "New Agent / 新建 Agent"
+      ? t("flow.agents.new")
       : selectedTemplate?.template.name,
   );
   const selectedAgent = selectedTemplate?.template;
@@ -109,7 +111,7 @@ export function AgentsPage({
               </span>
               <div>
                 <small>
-                  {selectedTemplate.template.owner} · 版本{" "}
+                  {selectedTemplate.template.owner} · {t("flow.agents.version")}{" "}
                   {selectedTemplate.template.version}
                 </small>
                 <span className="enterprise-agent-overview__title-row">
@@ -124,40 +126,40 @@ export function AgentsPage({
                     }
                   >
                     {selectedTemplate.template.status === "published"
-                      ? "已发布"
-                      : "草稿"}
+                      ? t("flow.agents.published")
+                      : t("flow.agents.draft")}
                   </Badge>
                 </span>
                 <p>
                   {selectedTemplate.template.spec.description ||
-                    "此 Agent 尚未填写用途说明。"}
+                    t("flow.agents.noDescription")}
                 </p>
               </div>
             </section>
 
             <dl
               className="enterprise-agent-overview__facts"
-              aria-label="Agent 使用摘要"
+              aria-label={t("flow.agents.usageSummary")}
             >
               <div>
                 <Workflow aria-hidden="true" size={16} />
                 <span>
                   <strong>{usedByFlows.length}</strong>
-                  <small>使用中的 Flow</small>
+                  <small>{t("flow.agents.usedByFlows")}</small>
                 </span>
               </div>
               <div>
                 <Bot aria-hidden="true" size={16} />
                 <span>
                   <strong>{activeInstances}</strong>
-                  <small>活跃实例</small>
+                  <small>{t("flow.agents.activeInstances")}</small>
                 </span>
               </div>
               <div>
                 <Cable aria-hidden="true" size={16} />
                 <span>
                   <strong>{connectionCount}</strong>
-                  <small>外部连接</small>
+                  <small>{t("flow.agents.connections")}</small>
                 </span>
               </div>
             </dl>
@@ -165,7 +167,7 @@ export function AgentsPage({
             {usedByFlows.length > 0 ? (
               <section className="enterprise-core-detail__payload enterprise-agent-overview__usage">
                 <header>
-                  <h3>用于这些 Flow</h3>
+                  <h3>{t("flow.agents.usedIn")}</h3>
                 </header>
                 <ul>
                   {usedByFlows.slice(0, 5).map((flow) => (
@@ -175,13 +177,18 @@ export function AgentsPage({
               </section>
             ) : null}
 
-            <details className="enterprise-agent-instructions">
+            <details
+              className="enterprise-agent-instructions"
+              key={selectedTemplateKey ?? undefined}
+              open
+            >
               <summary>
                 <FileText aria-hidden="true" size={14} />
-                查看完整职责说明
+                {t("flow.agents.showInstructions")}
               </summary>
               <pre>
-                {selectedTemplate.template.spec.instructions || "暂无职责说明"}
+                {selectedTemplate.template.spec.instructions ||
+                  t("flow.agents.noInstructions")}
               </pre>
             </details>
           </article>
@@ -192,19 +199,19 @@ export function AgentsPage({
             </span>
             <strong>
               {selection?.creatingAgent
-                ? "配置新的 Agent"
+                ? t("flow.agents.configure")
                 : snapshot.status === "loading"
-                  ? "正在加载 Agent"
+                  ? t("flow.agents.loading")
                   : requestedTemplateKey
-                    ? "正在同步 Agent"
-                    : "尚未配置 Agent"}
+                    ? t("flow.agents.syncing")
+                    : t("flow.agents.none")}
             </strong>
             <p>
               {selection?.creatingAgent
-                ? "在右侧填写 Agent 配置；保存后会自动出现在左侧列表。"
+                ? t("flow.agents.configureHint")
                 : snapshot.status === "error"
-                  ? snapshot.error || "Agent 加载失败，请稍后重试。"
-                  : "从左侧选择 Agent，或使用新建按钮创建一个 Agent。"}
+                  ? snapshot.error || t("flow.agents.loadFailed")
+                  : t("flow.agents.selectHint")}
             </p>
           </div>
         )}

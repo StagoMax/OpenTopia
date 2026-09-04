@@ -1,5 +1,6 @@
 import { Sparkles, Wrench } from "lucide-react";
 import type { AgentTemplateVersionView } from "../../types";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
 import { Badge } from "../ui";
 
 export function AgentCapabilitySummary({
@@ -7,15 +8,16 @@ export function AgentCapabilitySummary({
 }: {
   template: AgentTemplateVersionView | undefined;
 }) {
+  const { t } = useApplicationLanguage();
   const capabilities = template?.template.spec?.capabilities;
   if (!capabilities) {
     return (
       <section className="flow-editor-inspector__section">
         <header>
-          <strong>Agent 能力</strong>
+          <strong>{t("flow.agentCapabilities.title")}</strong>
         </header>
         <p className="flow-editor-inspector__note">
-          选择一个已发布 Agent 后，这里会显示它可以使用的 Skill 和 Tool。
+          {t("flow.agentCapabilities.selectHint")}
         </p>
       </section>
     );
@@ -25,29 +27,31 @@ export function AgentCapabilitySummary({
     <section className="flow-editor-inspector__section">
       <header>
         <span>
-          <strong>Agent 能力</strong>
-          <small>来自已发布模板，在 Flow 中只读</small>
+          <strong>{t("flow.agentCapabilities.title")}</strong>
+          <small>{t("flow.agentCapabilities.readOnlyHint")}</small>
         </span>
-        <Badge variant="neutral">Template</Badge>
+        <Badge variant="neutral">{t("flow.agentCapabilities.template")}</Badge>
       </header>
       <dl className="flow-agent-capabilities">
         <CapabilityRow
           all={capabilities.allowAllSkills}
-          emptyLabel="未配置 Skill"
+          allLabel={t("flow.agentCapabilities.all")}
+          emptyLabel={t("flow.agentCapabilities.noSkills")}
           icon={Sparkles}
-          label="Skills"
+          label={t("flow.agentCapabilities.skills")}
           values={capabilities.skills}
         />
         <CapabilityRow
           all={capabilities.allowAllTools}
-          emptyLabel="未配置 Tool"
+          allLabel={t("flow.agentCapabilities.all")}
+          emptyLabel={t("flow.agentCapabilities.noTools")}
           icon={Wrench}
-          label="Tools"
+          label={t("flow.agentCapabilities.tools")}
           values={capabilities.tools}
         />
       </dl>
       <p className="flow-editor-inspector__note">
-        如需增减能力，请在 Agents 中创建并发布新的模板版本，再回到这里选择。
+        {t("flow.agentCapabilities.updateHint")}
       </p>
     </section>
   );
@@ -55,12 +59,14 @@ export function AgentCapabilitySummary({
 
 function CapabilityRow({
   all,
+  allLabel,
   emptyLabel,
   icon: Icon,
   label,
   values,
 }: {
   all: boolean;
+  allLabel: string;
   emptyLabel: string;
   icon: typeof Sparkles;
   label: string;
@@ -73,11 +79,7 @@ function CapabilityRow({
         {label}
       </dt>
       <dd>
-        {all
-          ? "全部可见能力"
-          : values.length > 0
-            ? values.join(", ")
-            : emptyLabel}
+        {all ? allLabel : values.length > 0 ? values.join(", ") : emptyLabel}
       </dd>
     </div>
   );

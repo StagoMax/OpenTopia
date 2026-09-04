@@ -11,6 +11,8 @@ import {
   Wrench,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
+import type { ApplicationLanguage } from "../../applicationLanguage";
 import type {
   Connection,
   ConnectionCapabilityRevision,
@@ -28,7 +30,11 @@ import {
   integrationKindLabel,
   ownerTypeLabel,
 } from "./model";
-import type { ConnectionsSnapshot, ConnectionsStore } from "./store";
+import type {
+  ConnectionNotice,
+  ConnectionsSnapshot,
+  ConnectionsStore,
+} from "./store";
 
 export type ConnectionDetailsProps = {
   connection: Connection;
@@ -50,6 +56,7 @@ export function ConnectionDetails({
   usage,
   variant = "full",
 }: ConnectionDetailsProps) {
+  const { language, t } = useApplicationLanguage();
   const revisions = snapshot.capabilityRevisions[connection.id];
   const defaultRevision = useMemo(
     () =>
@@ -76,8 +83,8 @@ export function ConnectionDetails({
     snapshot.lastHealth?.connectionId === connection.id
       ? snapshot.lastHealth.health
       : null;
-  const problems = connectionProblems(connection);
-  const usageSummary = describeUsage(usage);
+  const problems = connectionProblems(connection, language);
+  const usageSummary = describeUsage(usage, t);
 
   return (
     <article className={`connection-details connection-details--${variant}`}>
@@ -90,12 +97,12 @@ export function ConnectionDetails({
             <span>
               <h2>{connection.name}</h2>
               <Badge variant={connectionStatusVariant(connection.status)}>
-                {connectionStatusLabel(connection.status)}
+                {connectionStatusLabel(connection.status, language)}
               </Badge>
             </span>
             <p>
-              {definition?.name ?? "未知服务"} ·{" "}
-              {connectionAccountLabel(connection)}
+              {definition?.name ?? t("flow.connection.details.unknownService")}{" "}
+              · {connectionAccountLabel(connection, language)}
             </p>
           </span>
         </header>
@@ -115,35 +122,41 @@ export function ConnectionDetails({
             </span>
             <div>
               <small>
-                {definition?.name ?? "未知服务"} ·{" "}
-                {connectionAccountLabel(connection)}
+                {definition?.name ??
+                  t("flow.connection.details.unknownService")}{" "}
+                · {connectionAccountLabel(connection, language)}
               </small>
               <span>
                 <h2>{connection.name}</h2>
                 <Badge variant={connectionStatusVariant(connection.status)}>
-                  {connectionStatusLabel(connection.status)}
+                  {connectionStatusLabel(connection.status, language)}
                 </Badge>
               </span>
               <p>
                 {problems[0]?.detail ??
-                  `${usageSummary}，当前可以供已授权的流程使用。`}
+                  `${usageSummary}${t("flow.connection.details.availableSuffix")}`}
               </p>
             </div>
           </section>
 
-          <dl className="connection-operation-facts" aria-label="连接摘要">
+          <dl
+            className="connection-operation-facts"
+            aria-label={t("flow.connection.details.summaryAria")}
+          >
             <div>
-              <dt>使用范围</dt>
+              <dt>{t("flow.connection.details.usageScope")}</dt>
               <dd>{usageSummary}</dd>
             </div>
             <div>
-              <dt>最近检查</dt>
-              <dd>{formatDate(connection.lastTestedAt)}</dd>
+              <dt>{t("flow.connection.details.lastCheck")}</dt>
+              <dd>{formatDate(connection.lastTestedAt, language)}</dd>
             </div>
             <div>
-              <dt>可用能力</dt>
+              <dt>{t("flow.connection.details.availableCapabilities")}</dt>
               <dd>
-                {revision ? `${revision.capabilities.length} 项` : "尚未发现"}
+                {revision
+                  ? `${revision.capabilities.length} ${t("flow.connection.details.items")}`
+                  : t("flow.connection.details.notDiscovered")}
               </dd>
             </div>
           </dl>
@@ -151,10 +164,10 @@ export function ConnectionDetails({
           {problems.length > 0 ? (
             <section
               className="connection-attention"
-              aria-label="需要处理的问题"
+              aria-label={t("flow.connection.details.attentionAria")}
             >
               <header>
-                <strong>需要处理</strong>
+                <strong>{t("flow.connection.details.attention")}</strong>
                 <span className="connection-attention__actions">
                   <Button
                     disabled={busy}
@@ -163,7 +176,7 @@ export function ConnectionDetails({
                     variant="quiet"
                   >
                     <Pencil aria-hidden="true" size={14} />
-                    编辑配置
+                    {t("flow.connection.details.editConfiguration")}
                   </Button>
                   <Button
                     disabled={busy || !connection.enabled}
@@ -172,7 +185,9 @@ export function ConnectionDetails({
                     variant="secondary"
                   >
                     <RotateCw aria-hidden="true" size={14} />
-                    {testing ? "测试中…" : "重新测试"}
+                    {testing
+                      ? t("flow.connection.details.testing")
+                      : t("flow.connection.details.retest")}
                   </Button>
                 </span>
               </header>
@@ -184,7 +199,9 @@ export function ConnectionDetails({
                   >
                     <AlertTriangle aria-hidden="true" size={16} />
                     <span>
-                      <small>{connectionProblemAreaLabel(problem.area)}</small>
+                      <small>
+                        {connectionProblemAreaLabel(problem.area, language)}
+                      </small>
                       <strong>{problem.title}</strong>
                       <span>{problem.detail}</span>
                     </span>
@@ -210,7 +227,7 @@ export function ConnectionDetails({
                 size="compact"
                 variant="quiet"
               >
-                关闭
+                {t("flow.connection.close")}
               </Button>
             </div>
           ) : snapshot.notice ? (
@@ -219,33 +236,33 @@ export function ConnectionDetails({
               role="status"
             >
               <CheckCircle2 aria-hidden="true" size={16} />
-              <span>{snapshot.notice}</span>
+              <span>{connectionNoticeLabel(snapshot.notice, t)}</span>
               <Button
                 onClick={() => store.clearFeedback()}
                 size="compact"
                 variant="quiet"
               >
-                关闭
+                {t("flow.connection.close")}
               </Button>
             </div>
           ) : null}
 
           <dl className="connection-detail-list connection-detail-list--summary">
             <div>
-              <dt>账号</dt>
-              <dd>{connectionAccountLabel(connection)}</dd>
+              <dt>{t("flow.connection.details.account")}</dt>
+              <dd>{connectionAccountLabel(connection, language)}</dd>
             </div>
             <div>
-              <dt>使用范围</dt>
+              <dt>{t("flow.connection.details.usageScope")}</dt>
               <dd>{usageSummary}</dd>
             </div>
             <div>
-              <dt>最近检查</dt>
-              <dd>{formatDate(connection.lastTestedAt)}</dd>
+              <dt>{t("flow.connection.details.lastCheck")}</dt>
+              <dd>{formatDate(connection.lastTestedAt, language)}</dd>
             </div>
             <div>
-              <dt>授权到期</dt>
-              <dd>{formatDate(connection.authContext.expiresAt)}</dd>
+              <dt>{t("flow.connection.details.authorizationExpires")}</dt>
+              <dd>{formatDate(connection.authContext.expiresAt, language)}</dd>
             </div>
           </dl>
 
@@ -254,51 +271,84 @@ export function ConnectionDetails({
               <ShieldCheck aria-hidden="true" size={16} />
               <span>
                 <strong>{health.message}</strong>
-                <small>{formatDate(health.checkedAt)}</small>
+                <small>{formatDate(health.checkedAt, language)}</small>
               </span>
             </div>
           ) : null}
 
           <details className="connection-technical-details">
-            <summary>技术配置与能力</summary>
+            <summary>{t("flow.connection.details.technical")}</summary>
             <section>
-              <h3>身份与授权</h3>
+              <h3>{t("flow.connection.details.identityAuthorization")}</h3>
               <DetailList
                 items={[
                   [
-                    "Provider",
+                    t("flow.connection.details.provider"),
                     definition?.name ?? connection.integrationDefinitionId,
                   ],
                   [
-                    "类型",
-                    definition ? integrationKindLabel(definition.kind) : "—",
+                    t("flow.connection.details.type"),
+                    definition
+                      ? integrationKindLabel(definition.kind, language)
+                      : "—",
                   ],
                   [
-                    "认证方式",
-                    definition ? authSchemeLabel(definition.authScheme) : "—",
+                    t("flow.connection.details.authMethod"),
+                    definition
+                      ? authSchemeLabel(definition.authScheme, language)
+                      : "—",
                   ],
-                  ["所有权", ownerTypeLabel(connection.ownerType)],
                   [
-                    "认证状态",
-                    authVerificationLabel(connection.authContext.verification),
+                    t("flow.connection.details.ownership"),
+                    ownerTypeLabel(connection.ownerType, language),
                   ],
-                  ["Tenant", accountValue(connection, "tenant")],
-                  ["Workspace", accountValue(connection, "workspace")],
+                  [
+                    t("flow.connection.details.authStatus"),
+                    authVerificationLabel(
+                      connection.authContext.verification,
+                      language,
+                    ),
+                  ],
+                  [
+                    t("flow.connection.details.tenant"),
+                    accountValue(
+                      connection,
+                      "tenant",
+                      t("flow.connection.details.undeclared"),
+                    ),
+                  ],
+                  [
+                    t("flow.connection.details.workspace"),
+                    accountValue(
+                      connection,
+                      "workspace",
+                      t("flow.connection.details.undeclared"),
+                    ),
+                  ],
                 ]}
               />
               <ScopeList scopes={connection.authContext.grantedScopes} />
             </section>
             <section>
-              <h3>Runtime</h3>
+              <h3>{t("flow.connection.details.runtime")}</h3>
               <DetailList
                 items={[
-                  ["环境", connection.environment],
                   [
-                    "Runtime",
+                    t("flow.connection.details.environment"),
+                    connection.environment,
+                  ],
+                  [
+                    t("flow.connection.details.runtime"),
                     server?.server.name ?? connection.runtimeBinding.serverId,
                   ],
-                  ["Runtime 状态", server?.status.status ?? "unavailable"],
-                  ["Connection revision", String(connection.revision)],
+                  [
+                    t("flow.connection.details.runtimeStatus"),
+                    server?.status.status ?? "unavailable",
+                  ],
+                  [
+                    t("flow.connection.details.connectionRevision"),
+                    String(connection.revision),
+                  ],
                 ]}
               />
               {connection.lastError ? (
@@ -310,20 +360,20 @@ export function ConnectionDetails({
               {server?.server.envKeys.length ? (
                 <div className="connection-details__runtime-note">
                   <Info aria-hidden="true" size={14} />
-                  <span>该 runtime 仍使用旧版环境变量凭据，来源尚未验证。</span>
+                  <span>{t("flow.connection.details.legacyRuntime")}</span>
                 </div>
               ) : null}
             </section>
             <section>
               <header className="connection-capabilities__header">
-                <h3>能力</h3>
+                <h3>{t("flow.connection.details.capabilities")}</h3>
                 {revisions && revisions.length > 0 ? (
                   <Select
-                    label="Capability revision"
+                    label={t("flow.connection.details.capabilityRevision")}
                     onChange={setSelectedRevision}
                     options={revisions.map((item) => ({
                       value: String(item.revision),
-                      label: `Revision ${item.revision}`,
+                      label: `${t("flow.connection.details.revision")} ${item.revision}`,
                     }))}
                     value={
                       selectedRevision ||
@@ -362,9 +412,10 @@ function DetailList({
 }
 
 function ScopeList({ scopes }: { scopes: readonly string[] }) {
+  const { t } = useApplicationLanguage();
   return (
     <div className="connection-scopes">
-      <strong>已授予范围</strong>
+      <strong>{t("flow.connection.details.grantedScopes")}</strong>
       {scopes.length > 0 ? (
         <span>
           {scopes.map((scope) => (
@@ -372,7 +423,7 @@ function ScopeList({ scopes }: { scopes: readonly string[] }) {
           ))}
         </span>
       ) : (
-        <small>Provider 未报告账号级 scope。</small>
+        <small>{t("flow.connection.details.noScopes")}</small>
       )}
     </div>
   );
@@ -385,10 +436,12 @@ function CapabilityRevisionView({
   revision?: ConnectionCapabilityRevision;
   revisions?: readonly ConnectionCapabilityRevision[];
 }) {
+  const { language, t } = useApplicationLanguage();
   if (!revisions) {
     return (
       <div className="connections-inline-state">
-        <Clock3 aria-hidden="true" size={16} /> 正在读取能力…
+        <Clock3 aria-hidden="true" size={16} />{" "}
+        {t("flow.connection.details.loadingCapabilities")}
       </div>
     );
   }
@@ -396,8 +449,8 @@ function CapabilityRevisionView({
     return (
       <div className="connections-empty-state connections-empty-state--compact">
         <Wrench aria-hidden="true" size={18} />
-        <strong>尚未发现能力</strong>
-        <span>测试连接后刷新能力，即可读取可用操作。</span>
+        <strong>{t("flow.connection.details.noCapabilities")}</strong>
+        <span>{t("flow.connection.details.noCapabilitiesDetail")}</span>
       </div>
     );
   }
@@ -406,14 +459,14 @@ function CapabilityRevisionView({
       <div className="connection-capabilities__summary">
         <span>
           <Wrench aria-hidden="true" size={14} /> {revision.capabilities.length}{" "}
-          项
+          {t("flow.connection.details.items")}
         </span>
         <span>
           <Server aria-hidden="true" size={14} /> {revision.source}
         </span>
         <span>
           <Clock3 aria-hidden="true" size={14} />{" "}
-          {formatDate(revision.discoveredAt)}
+          {formatDate(revision.discoveredAt, language)}
         </span>
       </div>
       <div className="connection-capabilities__list">
@@ -441,25 +494,55 @@ function CapabilityRevisionView({
   );
 }
 
-function accountValue(connection: Connection, kind: "tenant" | "workspace") {
+function accountValue(
+  connection: Connection,
+  kind: "tenant" | "workspace",
+  undeclared: string,
+) {
   const account = connection.authContext.account;
   if (kind === "tenant") {
-    return account.tenantName || account.tenantId || "未声明";
+    return account.tenantName || account.tenantId || undeclared;
   }
-  return account.workspaceName || account.workspaceId || "未声明";
+  return account.workspaceName || account.workspaceId || undeclared;
 }
 
-function describeUsage(usage: ConnectionDetailsProps["usage"]): string {
-  if (!usage) return "正在读取使用范围";
+function describeUsage(
+  usage: ConnectionDetailsProps["usage"],
+  t: ReturnType<typeof useApplicationLanguage>["t"],
+): string {
+  if (!usage) return t("flow.connection.details.loadingUsage");
   const parts = [];
-  if (usage.flowNames.length) parts.push(`${usage.flowNames.length} 个 Flow`);
+  if (usage.flowNames.length)
+    parts.push(
+      `${usage.flowNames.length} ${t("flow.connection.details.flowCount")}`,
+    );
   if (usage.agentNames.length)
-    parts.push(`${usage.agentNames.length} 个 Agent`);
-  return parts.join(" · ") || "尚未使用";
+    parts.push(
+      `${usage.agentNames.length} ${t("flow.connection.details.agentCount")}`,
+    );
+  return parts.join(" · ") || t("flow.connection.details.unused");
 }
 
-function formatDate(value?: string | null): string {
+function formatDate(
+  value: string | null | undefined,
+  language: ApplicationLanguage,
+): string {
   if (!value) return "—";
   const date = new Date(value);
-  return Number.isNaN(date.valueOf()) ? value : date.toLocaleString();
+  return Number.isNaN(date.valueOf()) ? value : date.toLocaleString(language);
+}
+
+function connectionNoticeLabel(
+  notice: ConnectionNotice,
+  t: ReturnType<typeof useApplicationLanguage>["t"],
+): string {
+  if (notice.kind === "created") return t("flow.connection.notice.created");
+  if (notice.kind === "updated") return t("flow.connection.notice.updated");
+  if (notice.kind === "test_passed") {
+    return t("flow.connection.notice.testPassed");
+  }
+  if (notice.kind === "capabilities_unchanged") {
+    return `${t("flow.connection.notice.unchanged")} ${notice.count} ${t("flow.connection.details.items")}`;
+  }
+  return `${t("flow.connection.notice.snapshotUpdated")} ${notice.added}, ${t("flow.connection.notice.removed")} ${notice.removed}, ${t("flow.connection.notice.changed")} ${notice.changed}`;
 }

@@ -27,6 +27,18 @@ test("pending cases prefer business input over persistence identifiers", () => {
   assert.equal(flowCaseCoreLabel(flowCase), "Case 30 Combo · medical review");
 });
 
+test("pending cases treat an explicit title as the complete display name", () => {
+  const flowCase = {
+    input: {
+      title: "信贷案件 30 · 组合风险",
+      caseId: "case_30_combo",
+    },
+    idempotencyKey: "demo-event:credit-review:case_30_combo:node-trigger-v3",
+  } as FlowCase;
+
+  assert.equal(flowCaseCoreLabel(flowCase), "信贷案件 30 · 组合风险");
+});
+
 test("event triggers expose source and event type", () => {
   assert.equal(
     workflowTriggerLabel({

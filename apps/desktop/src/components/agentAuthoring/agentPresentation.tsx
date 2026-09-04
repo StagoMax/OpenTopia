@@ -1,4 +1,9 @@
 import type { AgentInstance, AgentTemplateSpec } from "../../types";
+import {
+  defaultApplicationLanguage,
+  interfaceMessage,
+  type ApplicationLanguage,
+} from "../../applicationLanguage.ts";
 
 export function AgentTextAreaField({
   label,
@@ -27,16 +32,24 @@ export function shortAgentId(value: string): string {
   return value.slice(0, 8);
 }
 
-export function agentCapabilitySummary(values: string[]): string {
-  return values.length ? values.join(", ") : "无";
+export function agentCapabilitySummary(
+  values: string[],
+  language: ApplicationLanguage = defaultApplicationLanguage,
+): string {
+  return values.length
+    ? values.join(", ")
+    : interfaceMessage(language, "flow.agentEditor.noneValue");
 }
 
-export function agentRiskLabel(risk: AgentTemplateSpec["riskClass"]): string {
+export function agentRiskLabel(
+  risk: AgentTemplateSpec["riskClass"],
+  language: ApplicationLanguage = defaultApplicationLanguage,
+): string {
   return {
-    low: "低风险",
-    medium: "中风险",
-    high: "高风险",
-    critical: "关键风险",
+    low: interfaceMessage(language, "flow.agentEditor.riskLabel.low"),
+    medium: interfaceMessage(language, "flow.agentEditor.riskLabel.medium"),
+    high: interfaceMessage(language, "flow.agentEditor.riskLabel.high"),
+    critical: interfaceMessage(language, "flow.agentEditor.riskLabel.critical"),
   }[risk];
 }
 
@@ -50,19 +63,30 @@ export function agentRiskBadge(
 
 export function agentChangeKindLabel(
   kind: "added" | "removed" | "expanded" | "reduced",
+  language: ApplicationLanguage = defaultApplicationLanguage,
 ): string {
-  return { added: "新增", removed: "移除", expanded: "扩展", reduced: "收窄" }[
-    kind
-  ];
+  return {
+    added: interfaceMessage(language, "flow.agentEditor.change.added"),
+    removed: interfaceMessage(language, "flow.agentEditor.change.removed"),
+    expanded: interfaceMessage(language, "flow.agentEditor.change.expanded"),
+    reduced: interfaceMessage(language, "flow.agentEditor.change.reduced"),
+  }[kind];
 }
 
 export function agentInstanceStatusLabel(
   status: AgentInstance["status"],
+  language: ApplicationLanguage = defaultApplicationLanguage,
 ): string {
   return {
-    active: "运行中",
-    suspended: "已暂停",
-    completed: "已完成",
-    revoked: "已撤销",
+    active: interfaceMessage(language, "flow.agentEditor.instance.active"),
+    suspended: interfaceMessage(
+      language,
+      "flow.agentEditor.instance.suspended",
+    ),
+    completed: interfaceMessage(
+      language,
+      "flow.agentEditor.instance.completed",
+    ),
+    revoked: interfaceMessage(language, "flow.agentEditor.instance.revoked"),
   }[status];
 }

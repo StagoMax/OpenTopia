@@ -131,7 +131,7 @@ test("grant eligibility requires ready runtime and verified authentication", () 
     {
       selectable: true,
       warning: true,
-      reason: "Legacy 凭据未验证；发布前请确认账号与权限范围",
+      reason: "旧版凭据未验证；发布前请确认账号与权限范围",
     },
   );
   assert.equal(
@@ -171,8 +171,17 @@ test("grant eligibility requires ready runtime and verified authentication", () 
     {
       selectable: false,
       warning: false,
-      reason: "Connection 登录已过期，请先重新授权",
+      reason: "连接登录已过期，请先重新授权",
     },
+  );
+  assert.equal(
+    connectionGrantEligibility(
+      connection("degraded"),
+      definition(),
+      Date.now(),
+      "en-US",
+    ).reason,
+    "The connection is degraded. Fix its health check first",
   );
 });
 

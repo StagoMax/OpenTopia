@@ -1,4 +1,10 @@
 import type { BadgeVariant } from "../ui";
+import {
+  defaultApplicationLanguage,
+  interfaceMessage,
+  type ApplicationLanguage,
+  type InterfaceMessageKey,
+} from "../../applicationLanguage.ts";
 import type {
   Connection,
   ConnectionInput,
@@ -64,12 +70,19 @@ export function sortConnections(
   );
 }
 
-export function connectionStatusLabel(status: ConnectionStatus): string {
-  if (status === "ready") return "可用";
-  if (status === "configured") return "待测试";
-  if (status === "degraded") return "异常";
-  if (status === "reauth_required") return "需重新授权";
-  return "已停用";
+export function connectionStatusLabel(
+  status: ConnectionStatus,
+  language: ApplicationLanguage = defaultApplicationLanguage,
+): string {
+  if (status === "ready")
+    return message(language, "flow.connection.status.ready");
+  if (status === "configured")
+    return message(language, "flow.connection.status.configured");
+  if (status === "degraded")
+    return message(language, "flow.connection.status.degraded");
+  if (status === "reauth_required")
+    return message(language, "flow.connection.status.reauthRequired");
+  return message(language, "flow.connection.status.disabled");
 }
 
 export function connectionStatusVariant(
@@ -81,48 +94,69 @@ export function connectionStatusVariant(
   return "neutral";
 }
 
-export function integrationKindLabel(kind: IntegrationKind): string {
+export function integrationKindLabel(
+  kind: IntegrationKind,
+  language: ApplicationLanguage = defaultApplicationLanguage,
+): string {
   if (kind === "mcp") return "MCP";
   if (kind === "oauth_api") return "OAuth API";
-  if (kind === "database") return "Database";
-  return "Local App";
+  if (kind === "database")
+    return message(language, "flow.connection.kind.database");
+  return message(language, "flow.connection.kind.localApp");
 }
 
-export function authSchemeLabel(scheme: IntegrationAuthScheme): string {
+export function authSchemeLabel(
+  scheme: IntegrationAuthScheme,
+  language: ApplicationLanguage = defaultApplicationLanguage,
+): string {
   if (scheme === "api_key") return "API Key";
   if (scheme === "oauth2") return "OAuth 2.0";
-  if (scheme === "external") return "外部授权";
-  return "无需登录";
+  if (scheme === "external")
+    return message(language, "flow.connection.auth.external");
+  return message(language, "flow.connection.auth.none");
 }
 
 export function authVerificationLabel(
   verification: ConnectionAuthVerification,
+  language: ApplicationLanguage = defaultApplicationLanguage,
 ): string {
-  if (verification === "verified") return "已验证";
-  if (verification === "not_required") return "无需认证";
-  if (verification === "legacy_unverified") return "Legacy · 未验证";
-  return "未验证";
+  if (verification === "verified")
+    return message(language, "flow.connection.verification.verified");
+  if (verification === "not_required")
+    return message(language, "flow.connection.verification.notRequired");
+  if (verification === "legacy_unverified")
+    return message(language, "flow.connection.verification.legacyUnverified");
+  return message(language, "flow.connection.verification.unverified");
 }
 
-export function ownerTypeLabel(owner: ConnectionOwnerType): string {
-  if (owner === "org_shared") return "组织共享";
-  if (owner === "service_account") return "服务账号";
-  return "个人账号";
+export function ownerTypeLabel(
+  owner: ConnectionOwnerType,
+  language: ApplicationLanguage = defaultApplicationLanguage,
+): string {
+  if (owner === "org_shared")
+    return message(language, "flow.connection.owner.orgShared");
+  if (owner === "service_account")
+    return message(language, "flow.connection.owner.serviceAccount");
+  return message(language, "flow.connection.owner.personal");
 }
 
-export function connectionAccountLabel(connection: Connection): string {
+export function connectionAccountLabel(
+  connection: Connection,
+  language: ApplicationLanguage = defaultApplicationLanguage,
+): string {
   const account = connection.authContext.account;
   return (
     account.displayName ||
     account.externalAccountId ||
     account.workspaceName ||
     account.tenantName ||
-    "未声明账号"
+    message(language, "flow.connection.accountUndeclared")
   );
 }
 
 export function connectionProblems(
   connection: Connection,
+  language: ApplicationLanguage = defaultApplicationLanguage,
 ): ConnectionProblem[] {
   const problems: ConnectionProblem[] = [];
 
@@ -130,31 +164,31 @@ export function connectionProblems(
     problems.push({
       code: "disabled",
       area: "configuration",
-      title: "Connection 已停用",
-      detail: "启用此 Connection 后，外部调用才能通过执行边界。",
+      title: message(language, "flow.connection.problem.disabled.title"),
+      detail: message(language, "flow.connection.problem.disabled.detail"),
     });
   } else if (connection.status === "configured") {
     problems.push({
       code: "configured",
       area: "runtime",
-      title: "尚未完成连接测试",
-      detail: "当前仅完成配置；请测试 runtime 与账号后再刷新能力。",
+      title: message(language, "flow.connection.problem.configured.title"),
+      detail: message(language, "flow.connection.problem.configured.detail"),
     });
   } else if (connection.status === "degraded") {
     problems.push({
       code: "degraded",
       area: "runtime",
-      title: "运行状态异常",
+      title: message(language, "flow.connection.problem.degraded.title"),
       detail: connection.lastError
-        ? `最近错误：${connection.lastError}`
-        : "检查 runtime 与凭据配置，然后重新测试此 Connection。",
+        ? `${message(language, "flow.connection.problem.degraded.errorPrefix")}${connection.lastError}`
+        : message(language, "flow.connection.problem.degraded.detail"),
     });
   } else if (connection.status === "reauth_required") {
     problems.push({
       code: "reauth_required",
       area: "authentication",
-      title: "账号授权已失效",
-      detail: "更新凭据或重新授权后，再测试此 Connection。",
+      title: message(language, "flow.connection.problem.reauth.title"),
+      detail: message(language, "flow.connection.problem.reauth.detail"),
     });
   }
 
@@ -162,15 +196,15 @@ export function connectionProblems(
     problems.push({
       code: "unverified",
       area: "authentication",
-      title: "认证尚未验证",
-      detail: "当前凭据未通过账号验证，外部调用会被拒绝。",
+      title: message(language, "flow.connection.problem.unverified.title"),
+      detail: message(language, "flow.connection.problem.unverified.detail"),
     });
   } else if (connection.authContext.verification === "legacy_unverified") {
     problems.push({
       code: "legacy_unverified",
       area: "authentication",
-      title: "Legacy 认证来源未验证",
-      detail: "旧版环境变量凭据未验证来源，需要迁移或重新验证。",
+      title: message(language, "flow.connection.problem.legacy.title"),
+      detail: message(language, "flow.connection.problem.legacy.detail"),
     });
   }
 
@@ -179,10 +213,13 @@ export function connectionProblems(
 
 export function connectionProblemAreaLabel(
   area: ConnectionProblem["area"],
+  language: ApplicationLanguage = defaultApplicationLanguage,
 ): string {
-  if (area === "configuration") return "配置";
-  if (area === "runtime") return "运行";
-  return "认证";
+  if (area === "configuration")
+    return message(language, "flow.connection.problem.area.configuration");
+  if (area === "runtime")
+    return message(language, "flow.connection.problem.area.runtime");
+  return message(language, "flow.connection.problem.area.authentication");
 }
 
 export function definitionForConnection(
@@ -245,15 +282,28 @@ export function connectionFormFromConnection(
 export function validateConnectionForm(
   values: ConnectionFormValues,
   reservedServerIds: ReadonlySet<string>,
+  language: ApplicationLanguage = defaultApplicationLanguage,
 ): ConnectionFormErrors {
   const errors: ConnectionFormErrors = {};
   if (!values.integrationDefinitionId)
-    errors.definition = "请选择 Provider 定义";
-  if (!values.name.trim()) errors.name = "请输入 Connection 名称";
-  if (!values.environment.trim()) errors.environment = "请输入运行环境";
-  if (!values.serverId) errors.server = "请选择独立的 MCP runtime";
+    errors.definition = message(
+      language,
+      "flow.connection.validation.definition",
+    );
+  if (!values.name.trim())
+    errors.name = message(language, "flow.connection.validation.name");
+  if (!values.environment.trim())
+    errors.environment = message(
+      language,
+      "flow.connection.validation.environment",
+    );
+  if (!values.serverId)
+    errors.server = message(language, "flow.connection.validation.server");
   else if (reservedServerIds.has(values.serverId)) {
-    errors.server = "该 MCP runtime 已绑定其他 Connection";
+    errors.server = message(
+      language,
+      "flow.connection.validation.serverReserved",
+    );
   }
   return errors;
 }
@@ -337,4 +387,11 @@ function normalizedAccount(account: Connection["authContext"]["account"]) {
     workspaceId: account.workspaceId ?? null,
     workspaceName: account.workspaceName ?? null,
   };
+}
+
+function message(
+  language: ApplicationLanguage,
+  key: InterfaceMessageKey,
+): string {
+  return interfaceMessage(language, key);
 }

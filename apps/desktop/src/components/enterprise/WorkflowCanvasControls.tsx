@@ -9,6 +9,7 @@ import {
   Plus,
   Redo2,
   Scan,
+  Settings2,
   ShieldCheck,
   Undo2,
   Wrench,
@@ -17,6 +18,7 @@ import {
 import type { ReactNode } from "react";
 import {
   Button,
+  DisclosureSummary,
   IconButton,
   Tooltip,
   type TooltipPlacement,
@@ -27,6 +29,7 @@ import {
   workflowCanvasShortcutLabels,
 } from "./workflowCanvasShortcuts";
 import type { AddableWorkflowNodeKind } from "./workflowNodeSelection";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
 
 export type CanvasTool = "select" | "pan";
 
@@ -70,19 +73,20 @@ export function WorkflowCanvasToolbar({
   readOnly: boolean;
   tool: CanvasTool;
 }) {
+  const { t } = useApplicationLanguage();
   return (
     <>
       <Panel className="workflow-canvas-toolbar nopan" position="top-left">
-        <div aria-label="画布工具" role="toolbar">
+        <div aria-label={t("flow.canvas.tools")} role="toolbar">
           <CanvasActionTooltip
-            label="选择工具"
+            label={t("flow.canvas.selectTool")}
             shortcut={workflowCanvasShortcutLabels.selectTool}
           >
             {(props) => (
               <IconButton
                 {...props}
                 aria-keyshortcuts={workflowCanvasAriaShortcuts.selectTool}
-                aria-label="选择工具"
+                aria-label={t("flow.canvas.selectTool")}
                 aria-pressed={tool === "select"}
                 onClick={() => onToolChange("select")}
                 size="compact"
@@ -93,14 +97,14 @@ export function WorkflowCanvasToolbar({
             )}
           </CanvasActionTooltip>
           <CanvasActionTooltip
-            label="抓手工具（按住 Space 临时平移）"
+            label={t("flow.canvas.panTool")}
             shortcut={workflowCanvasShortcutLabels.panTool}
           >
             {(props) => (
               <IconButton
                 {...props}
                 aria-keyshortcuts={workflowCanvasAriaShortcuts.panTool}
-                aria-label="抓手工具"
+                aria-label={t("flow.canvas.panToolAria")}
                 aria-pressed={tool === "pan"}
                 onClick={() => onToolChange("pan")}
                 size="compact"
@@ -112,7 +116,7 @@ export function WorkflowCanvasToolbar({
           </CanvasActionTooltip>
           {!readOnly ? (
             <CanvasActionTooltip
-              label="新建节点"
+              label={t("flow.canvas.newNode")}
               placement="top"
               shortcut={workflowCanvasShortcutLabels.openNodePicker}
             >
@@ -123,14 +127,15 @@ export function WorkflowCanvasToolbar({
                   aria-expanded={nodePickerOpen}
                   aria-haspopup="dialog"
                   aria-keyshortcuts={workflowCanvasAriaShortcuts.openNodePicker}
-                  aria-label="新建节点"
+                  aria-label={t("flow.canvas.newNode")}
                   className="workflow-canvas-toolbar__add"
                   disabled={disabled}
                   onClick={() => onNodePickerOpenChange(!nodePickerOpen)}
                   size="compact"
                   variant="secondary"
                 >
-                  <Plus aria-hidden="true" size={14} /> 节点
+                  <Plus aria-hidden="true" size={14} />
+                  {t("flow.canvas.node")}
                 </Button>
               )}
             </CanvasActionTooltip>
@@ -142,14 +147,14 @@ export function WorkflowCanvasToolbar({
                 className="workflow-canvas-toolbar__divider"
               />
               <CanvasActionTooltip
-                label="撤销"
+                label={t("flow.canvas.undo")}
                 shortcut={workflowCanvasShortcutLabels.undo}
               >
                 {(props) => (
                   <IconButton
                     {...props}
                     aria-keyshortcuts={workflowCanvasAriaShortcuts.undo}
-                    aria-label="撤销"
+                    aria-label={t("flow.canvas.undo")}
                     disabled={!canUndo}
                     onClick={onUndo}
                     size="compact"
@@ -160,14 +165,14 @@ export function WorkflowCanvasToolbar({
                 )}
               </CanvasActionTooltip>
               <CanvasActionTooltip
-                label="重做"
+                label={t("flow.canvas.redo")}
                 shortcut={workflowCanvasShortcutLabels.redo}
               >
                 {(props) => (
                   <IconButton
                     {...props}
                     aria-keyshortcuts={workflowCanvasAriaShortcuts.redo}
-                    aria-label="重做"
+                    aria-label={t("flow.canvas.redo")}
                     disabled={!canRedo}
                     onClick={onRedo}
                     size="compact"
@@ -184,7 +189,7 @@ export function WorkflowCanvasToolbar({
       {nodePickerOpen && !readOnly ? (
         <Panel className="workflow-canvas-node-menu nopan" position="top-left">
           <div
-            aria-label="选择要添加的节点类型"
+            aria-label={t("flow.canvas.chooseNode")}
             id="workflow-canvas-node-menu"
             role="dialog"
           >
@@ -200,9 +205,9 @@ export function WorkflowCanvasToolbar({
         </Panel>
       ) : null}
       <Panel className="workflow-canvas-controls nopan" position="bottom-left">
-        <div aria-label="画布缩放" role="toolbar">
+        <div aria-label={t("flow.canvas.zoomTools")} role="toolbar">
           <CanvasActionTooltip
-            label="缩小画布"
+            label={t("flow.canvas.zoomOut")}
             placement="top"
             shortcut={workflowCanvasShortcutLabels.zoomOut}
           >
@@ -210,7 +215,7 @@ export function WorkflowCanvasToolbar({
               <IconButton
                 {...props}
                 aria-keyshortcuts={workflowCanvasAriaShortcuts.zoomOut}
-                aria-label="缩小画布"
+                aria-label={t("flow.canvas.zoomOut")}
                 onClick={onZoomOut}
                 size="compact"
                 variant="quiet"
@@ -220,7 +225,7 @@ export function WorkflowCanvasToolbar({
             )}
           </CanvasActionTooltip>
           <CanvasActionTooltip
-            label="适应全部节点"
+            label={t("flow.canvas.fit")}
             placement="top"
             shortcut={workflowCanvasShortcutLabels.fitView}
           >
@@ -228,7 +233,7 @@ export function WorkflowCanvasToolbar({
               <IconButton
                 {...props}
                 aria-keyshortcuts={workflowCanvasAriaShortcuts.fitView}
-                aria-label="适应全部节点"
+                aria-label={t("flow.canvas.fit")}
                 onClick={onFitView}
                 size="compact"
                 variant="quiet"
@@ -238,7 +243,7 @@ export function WorkflowCanvasToolbar({
             )}
           </CanvasActionTooltip>
           <CanvasActionTooltip
-            label="放大画布"
+            label={t("flow.canvas.zoomIn")}
             placement="top"
             shortcut={workflowCanvasShortcutLabels.zoomIn}
           >
@@ -246,7 +251,7 @@ export function WorkflowCanvasToolbar({
               <IconButton
                 {...props}
                 aria-keyshortcuts={workflowCanvasAriaShortcuts.zoomIn}
-                aria-label="放大画布"
+                aria-label={t("flow.canvas.zoomIn")}
                 onClick={onZoomIn}
                 size="compact"
                 variant="quiet"
@@ -300,16 +305,17 @@ export function WorkflowCanvasQuickCreate({
   ): void;
   state: QuickCreateState;
 }) {
+  const { t } = useApplicationLanguage();
   return (
     <div
-      aria-label="连接到新节点"
+      aria-label={t("flow.canvas.connectNew")}
       className="workflow-canvas-quick-create nodrag nopan"
       role="dialog"
       style={{ left: state.left, top: state.top }}
     >
       <header>
-        <strong>连接到新节点</strong>
-        <small>创建后会自动完成连线</small>
+        <strong>{t("flow.canvas.connectNew")}</strong>
+        <small>{t("flow.canvas.connectNewHint")}</small>
       </header>
       <WorkflowNodePicker
         disableAgent={disableAgent}
@@ -328,45 +334,48 @@ function WorkflowNodePicker({
   disableAgent: boolean;
   onAdd(kind: AddableWorkflowNodeKind): void;
 }) {
+  const { t } = useApplicationLanguage();
   const primaryItems: WorkflowNodePickerItem[] = [
     {
       kind: "agent",
-      label: "Agent",
-      description: "创建节点后，在右侧选择具体 Agent 和版本",
+      label: t("flow.node.kind.agent"),
+      description: t("flow.canvas.agentDescription"),
       icon: Bot,
       disabled: disableAgent,
     },
     {
       kind: "tool",
-      label: "Action",
-      description: "固定调用一个 Tool 或 API，不经过 Agent 推理",
+      label: t("flow.node.kind.action"),
+      description: t("flow.canvas.actionDescription"),
       icon: Wrench,
     },
     {
       kind: "approval",
-      label: "Human approval",
-      description: "暂停 Flow 并等待人工确认后继续",
+      label: t("flow.canvas.approval"),
+      description: t("flow.canvas.approvalDescription"),
       icon: ShieldCheck,
     },
   ];
   const advancedItems: WorkflowNodePickerItem[] = [
     {
       kind: "validator",
-      label: "Validator",
-      description: "执行独立、确定性的跨步骤业务校验",
+      label: t("flow.canvas.validator"),
+      description: t("flow.canvas.validatorDescription"),
       icon: BadgeCheck,
     },
     {
       kind: "join",
-      label: "Join",
-      description: "等待所有上游并行分支完成后汇合",
+      label: t("flow.canvas.join"),
+      description: t("flow.canvas.joinDescription"),
       icon: Merge,
     },
   ];
   return (
     <div className="workflow-node-picker">
       <section>
-        <small className="workflow-node-picker__group">主要节点</small>
+        <small className="workflow-node-picker__group">
+          {t("flow.canvas.primaryNodes")}
+        </small>
         {primaryItems.map((item) => (
           <WorkflowNodePickerButton
             autoFocus={
@@ -381,7 +390,9 @@ function WorkflowNodePicker({
         ))}
       </section>
       <details className="workflow-node-picker__advanced">
-        <summary>高级控制</summary>
+        <DisclosureSummary icon={<Settings2 aria-hidden="true" size={14} />}>
+          {t("flow.canvas.advancedControls")}
+        </DisclosureSummary>
         <section>
           {advancedItems.map((item) => (
             <WorkflowNodePickerButton
@@ -393,7 +404,7 @@ function WorkflowNodePicker({
         </section>
       </details>
       <p className="workflow-node-picker__hint">
-        分支条件配置在连线上；连接回上游会自动创建受限循环。
+        {t("flow.canvas.pickerHint")}
       </p>
     </div>
   );

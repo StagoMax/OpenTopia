@@ -1005,6 +1005,12 @@
   color: var(--success);
 }
 
+.settings-model-discovery--warning {
+  border-color: var(--warning);
+  background: var(--warning-subtle);
+  color: var(--warning);
+}
+
 .settings-model-discovery--error {
   border-color: var(--danger);
   background: var(--danger-subtle);

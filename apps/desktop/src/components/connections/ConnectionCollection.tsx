@@ -1,6 +1,7 @@
 import { Cable, CircleAlert, Plus, Search } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { ApiClient } from "../../api/client";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
 import type { ConnectionStatus } from "../../types";
 import {
   Badge,
@@ -34,6 +35,7 @@ export function ConnectionCollection({
   snapshot,
   store,
 }: ConnectionCollectionProps) {
+  const { language, t } = useApplicationLanguage();
   const [query, setQuery] = useState("");
   const filtered = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
@@ -46,28 +48,31 @@ export function ConnectionCollection({
       return [
         connection.name,
         connection.environment,
-        connectionAccountLabel(connection),
+        connectionAccountLabel(connection, language),
         definition?.name ?? "",
       ].some((value) => value.toLocaleLowerCase().includes(normalized));
     });
-  }, [query, snapshot.connections, snapshot.definitions]);
+  }, [language, query, snapshot.connections, snapshot.definitions]);
 
   return (
     <section
       className={`connection-collection${compact ? " connection-collection--compact" : ""}`}
-      aria-label="Connections"
+      aria-label={t("flow.connection.plural")}
     >
       <header className="connection-collection__header">
         <span>
-          <strong>Connections</strong>
-          <small>{snapshot.connections.length} 个账号连接</small>
+          <strong>{t("flow.connection.plural")}</strong>
+          <small>
+            {snapshot.connections.length}{" "}
+            {t("flow.connection.collection.accountCount")}
+          </small>
         </span>
         {compact ? (
           <IconButton
-            aria-label="新建 Connection"
+            aria-label={t("flow.connection.new")}
             onClick={() => store.beginCreate()}
             size="compact"
-            title="新建 Connection"
+            title={t("flow.connection.new")}
           >
             <Plus aria-hidden="true" size={14} />
           </IconButton>
@@ -77,19 +82,20 @@ export function ConnectionCollection({
             size="compact"
             variant="quiet"
           >
-            <Plus aria-hidden="true" size={14} /> 新建
+            <Plus aria-hidden="true" size={14} /> {t("flow.connection.new")}
           </Button>
         )}
       </header>
       {!compact && snapshot.connections.length > 4 ? (
         <TextField
-          aria-label="搜索 Connections"
+          aria-label={t("flow.connection.collection.searchAria")}
           label={
             <span className="connection-collection__search-label">
-              <Search aria-hidden="true" size={14} /> 搜索
+              <Search aria-hidden="true" size={14} />{" "}
+              {t("flow.connection.collection.search")}
             </span>
           }
-          placeholder="名称、Provider、账号或环境"
+          placeholder={t("flow.connection.collection.searchPlaceholder")}
           value={query}
           onChange={(event) => setQuery(event.target.value)}
         />
@@ -97,7 +103,7 @@ export function ConnectionCollection({
       <div className="connection-collection__list">
         {snapshot.status === "loading" ? (
           <div className="connections-inline-state" role="status">
-            正在加载账号连接…
+            {t("flow.connection.collection.loading")}
           </div>
         ) : null}
         {filtered.map((connection) => {
@@ -110,14 +116,14 @@ export function ConnectionCollection({
             <SidebarRow
               active={selected}
               className="connection-collection__sidebar-row"
-              description={`${definition ? integrationKindLabel(definition.kind) : "Unknown"} · ${connection.environment}`}
+              description={`${definition ? integrationKindLabel(definition.kind, language) : t("flow.connection.unknown")} · ${connection.environment}`}
               key={connection.id}
               onSelect={() => store.select(connection.id)}
               status={{
-                label: connectionStatusLabel(connection.status),
+                label: connectionStatusLabel(connection.status, language),
                 tone: connectionStatusTone(connection.status),
               }}
-              title={`${connection.name} · ${definition ? integrationKindLabel(definition.kind) : "Unknown"} · ${connection.environment}`}
+              title={`${connection.name} · ${definition ? integrationKindLabel(definition.kind, language) : t("flow.connection.unknown")} · ${connection.environment}`}
             />
           ) : (
             <button
@@ -134,16 +140,16 @@ export function ConnectionCollection({
                 <strong>{connection.name}</strong>
                 <small>
                   {definition
-                    ? integrationKindLabel(definition.kind)
-                    : "Unknown"}{" "}
+                    ? integrationKindLabel(definition.kind, language)
+                    : t("flow.connection.unknown")}{" "}
                   · {connection.environment}
                 </small>
                 {!compact ? (
-                  <small>{connectionAccountLabel(connection)}</small>
+                  <small>{connectionAccountLabel(connection, language)}</small>
                 ) : null}
               </span>
               <Badge variant={connectionStatusVariant(connection.status)}>
-                {connectionStatusLabel(connection.status)}
+                {connectionStatusLabel(connection.status, language)}
               </Badge>
             </button>
           );
@@ -154,8 +160,8 @@ export function ConnectionCollection({
           <CircleAlert aria-hidden="true" size={16} />
           <span>
             {snapshot.connections.length > 0
-              ? "没有匹配的 Connection"
-              : "尚未创建 Connection"}
+              ? t("flow.connection.collection.noMatch")
+              : t("flow.connection.collection.notCreated")}
           </span>
         </div>
       ) : null}
@@ -172,6 +178,7 @@ function connectionStatusTone(status: ConnectionStatus): SidebarRowStatusTone {
 }
 
 export function ConnectionSidebarCollection({ client }: { client: ApiClient }) {
+  const { t } = useApplicationLanguage();
   const { snapshot, store } = useConnectionsStore(client);
   return (
     <div className="connection-sidebar-collection">
@@ -182,7 +189,7 @@ export function ConnectionSidebarCollection({ client }: { client: ApiClient }) {
           size="compact"
           variant="quiet"
         >
-          重试加载
+          {t("flow.connection.collection.retry")}
         </Button>
       ) : null}
     </div>

@@ -7,6 +7,11 @@ import {
   type WorkflowNodeSelection,
 } from "./workflowNodeSelection";
 import type { AgentTemplateVersionView, DataClassification } from "../../types";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
+import {
+  interfaceMessage,
+  type ApplicationLanguage,
+} from "../../applicationLanguage";
 
 export function FlowConnectionConfiguration({
   connection,
@@ -19,6 +24,7 @@ export function FlowConnectionConfiguration({
   onChange(configuration: WorkflowEdgeConfiguration): void;
   templates: AgentTemplateVersionView[];
 }) {
+  const { language, t } = useApplicationLanguage();
   const source = nodes.find((node) => node.id === connection.sourceId);
   const target = nodes.find((node) => node.id === connection.targetId);
   const configuration = edgeConfiguration(connection);
@@ -31,12 +37,17 @@ export function FlowConnectionConfiguration({
     <>
       <section className="flow-editor-inspector__section">
         <header>
-          <strong>连线</strong>
+          <strong>{t("flow.connection.title")}</strong>
           <Badge variant={connection.loopPolicy ? "warning" : "neutral"}>
-            {connection.loopPolicy ? "feedback" : "edge"}
+            {connection.loopPolicy
+              ? t("flow.connection.feedback")
+              : t("flow.connection.edge")}
           </Badge>
         </header>
-        <div className="flow-connection-route" aria-label="连线路径">
+        <div
+          className="flow-connection-route"
+          aria-label={t("flow.connection.routeAria")}
+        >
           <span>
             {source
               ? workflowNodeLabel(source, templates)
@@ -54,22 +65,22 @@ export function FlowConnectionConfiguration({
       <section className="flow-editor-inspector__section">
         <header>
           <span>
-            <strong>路由条件</strong>
-            <small>基于上游节点输出决定是否进入下游</small>
+            <strong>{t("flow.connection.conditionTitle")}</strong>
+            <small>{t("flow.connection.conditionDescription")}</small>
           </span>
           <GitBranch aria-hidden="true" size={15} />
         </header>
         <TextField
-          error={conditionError(configuration.condition)}
-          hint="留空表示始终通过；支持 path、!path、==、!="
-          label="Condition（可选）"
+          error={conditionError(configuration.condition, language)}
+          hint={t("flow.connection.conditionHint")}
+          label={t("flow.connection.condition")}
           onChange={(event) => change({ condition: event.target.value })}
           placeholder="passed == true"
           value={configuration.condition}
         />
         <TextField
-          hint="用逗号分隔；留空传递完整输出"
-          label="允许传递的字段"
+          hint={t("flow.connection.fieldsHint")}
+          label={t("flow.connection.fields")}
           onChange={(event) =>
             change({ allowedFields: commaSeparatedValues(event.target.value) })
           }
@@ -77,22 +88,25 @@ export function FlowConnectionConfiguration({
           value={configuration.allowedFields.join(", ")}
         />
         <SelectField<DataClassification>
-          label="数据级别"
+          label={t("flow.connection.classification")}
           onChange={(dataClassification) => change({ dataClassification })}
           options={[
-            { value: "public", label: "Public" },
-            { value: "internal", label: "Internal" },
-            { value: "confidential", label: "Confidential" },
-            { value: "restricted", label: "Restricted" },
+            { value: "public", label: t("flow.connection.public") },
+            { value: "internal", label: t("flow.connection.internal") },
+            {
+              value: "confidential",
+              label: t("flow.connection.confidential"),
+            },
+            { value: "restricted", label: t("flow.connection.restricted") },
           ]}
           value={configuration.dataClassification}
         />
         <SelectField
-          hint="上游执行失败时跳转的节点；留空表示按默认错误策略终止"
-          label="错误路由"
+          hint={t("flow.connection.errorRouteHint")}
+          label={t("flow.connection.errorRoute")}
           onChange={(onError) => change({ onError: onError || null })}
           options={[
-            { value: "", label: "无 / 默认终止" },
+            { value: "", label: t("flow.connection.defaultTermination") },
             ...nodes
               .filter((node) => node.id !== connection.sourceId)
               .map((node) => ({
@@ -108,16 +122,16 @@ export function FlowConnectionConfiguration({
         <section className="flow-editor-inspector__section">
           <header>
             <span>
-              <strong>反馈循环</strong>
-              <small>回连线必须有终止条件和次数上限</small>
+              <strong>{t("flow.connection.loop")}</strong>
+              <small>{t("flow.connection.loopHint")}</small>
             </span>
             <Repeat2 aria-hidden="true" size={15} />
           </header>
           <div className="flow-loop-policy">
             <label>
-              <span>最大迭代次数</span>
+              <span>{t("flow.connection.maxIterations")}</span>
               <NumberField
-                label="最大迭代次数"
+                label={t("flow.connection.maxIterations")}
                 max={4}
                 min={1}
                 onChange={(maxIterations) =>
@@ -132,9 +146,12 @@ export function FlowConnectionConfiguration({
               />
             </label>
             <TextField
-              error={conditionError(configuration.loopPolicy.continueCondition)}
-              hint="条件为 true 且尚未到达上限时，沿此反馈边继续"
-              label="继续条件"
+              error={conditionError(
+                configuration.loopPolicy.continueCondition,
+                language,
+              )}
+              hint={t("flow.connection.continueHint")}
+              label={t("flow.connection.continue")}
               onChange={(event) =>
                 change({
                   loopPolicy: {
@@ -147,22 +164,28 @@ export function FlowConnectionConfiguration({
               value={configuration.loopPolicy.continueCondition}
             />
             <SelectField
-              label="达到上限后"
+              label={t("flow.connection.exhausted")}
               onChange={(onExhausted) =>
                 change({
                   loopPolicy: { ...configuration.loopPolicy!, onExhausted },
                 })
               }
               options={[
-                { value: "require_human", label: "暂停并要求人工处理" },
-                { value: "return_partial", label: "返回已有部分结果" },
-                { value: "fail", label: "标记 Flow 失败" },
+                {
+                  value: "require_human",
+                  label: t("flow.connection.requireHuman"),
+                },
+                {
+                  value: "return_partial",
+                  label: t("flow.connection.returnPartial"),
+                },
+                { value: "fail", label: t("flow.connection.fail") },
               ]}
               value={configuration.loopPolicy.onExhausted}
             />
             <p className="flow-editor-inspector__note">
-              <Repeat2 aria-hidden="true" size={13} /> 当前 Flow
-              的全局循环预算为 4 次。删除这条回连线即可移除循环。
+              <Repeat2 aria-hidden="true" size={13} />{" "}
+              {t("flow.connection.globalBudget")}
             </p>
           </div>
         </section>
@@ -190,15 +213,16 @@ function commaSeparatedValues(value: string) {
     .filter(Boolean);
 }
 
-function conditionError(value: string) {
+function conditionError(value: string, language: ApplicationLanguage) {
   if (!value.trim()) return undefined;
-  if (value.length > 512) return "条件表达式最长 512 个字符";
+  if (value.length > 512)
+    return interfaceMessage(language, "flow.connection.tooLong");
   if (
     [";", "{", "}", "=>", "function", "import", "eval", "exec("].some((token) =>
       value.includes(token),
     )
   ) {
-    return "仅支持受限字段比较，不能包含代码或函数调用";
+    return interfaceMessage(language, "flow.connection.invalidCode");
   }
   return undefined;
 }

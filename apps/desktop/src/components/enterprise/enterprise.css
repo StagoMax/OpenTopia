@@ -199,6 +199,13 @@
   padding-block: var(--space-12);
 }
 
+.enterprise-trust.enterprise-core-detail {
+  inline-size: 100%;
+  max-inline-size: calc(var(--space-16) * 30);
+  margin-inline: var(--space-0);
+  padding: var(--space-8);
+}
+
 .enterprise-core-detail__summary {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);

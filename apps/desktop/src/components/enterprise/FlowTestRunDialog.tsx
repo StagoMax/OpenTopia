@@ -1,9 +1,10 @@
 import { AlertTriangle, Braces, FlaskConical, X } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { Button, IconButton } from "../ui";
+import { Button, DisclosureSummary, IconButton } from "../ui";
 import { parseFlowTestInput } from "./flowTestInput";
 import "./flow-test-run-dialog.css";
+import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
 
 export function FlowTestRunDialog({
   busy,
@@ -26,6 +27,7 @@ export function FlowTestRunDialog({
   onSubmit(input: unknown): void;
   open: boolean;
 }) {
+  const { t } = useApplicationLanguage();
   const [localError, setLocalError] = useState<string | null>(null);
   const busyRef = useRef(busy);
   const dialogRef = useRef<HTMLElement>(null);
@@ -134,12 +136,12 @@ export function FlowTestRunDialog({
               <FlaskConical aria-hidden="true" size={18} />
             </span>
             <span>
-              <strong id={titleId}>Test Run</strong>
-              <small>用一份明确的输入真实执行当前 Flow 草稿。</small>
+              <strong id={titleId}>{t("flow.testDialog.title")}</strong>
+              <small>{t("flow.testDialog.description")}</small>
             </span>
           </span>
           <IconButton
-            aria-label="关闭 Test Run"
+            aria-label={t("flow.testDialog.close")}
             disabled={busy}
             onClick={onCancel}
             size="compact"
@@ -151,8 +153,8 @@ export function FlowTestRunDialog({
 
         <label className="flow-test-dialog__input" htmlFor={inputId}>
           <span>
-            <strong>测试输入</strong>
-            <small>该 JSON 会作为本次运行的 @Flow.input。</small>
+            <strong>{t("flow.testDialog.input")}</strong>
+            <small>{t("flow.testDialog.inputHint")}</small>
           </span>
           <textarea
             aria-describedby={error ? errorId : undefined}
@@ -177,7 +179,7 @@ export function FlowTestRunDialog({
             </small>
           ) : (
             <small>
-              可粘贴 Manual、Webhook 或 Connection Event 的样本参数。
+              {t("flow.testDialog.sampleHint")}
             </small>
           )}
         </label>
@@ -185,20 +187,16 @@ export function FlowTestRunDialog({
         <aside className="flow-test-dialog__warning">
           <AlertTriangle aria-hidden="true" size={16} />
           <span>
-            <strong>这是真实测试</strong>
-            <small>
-              Agent、Tool 和 Connection 会实际执行，可能访问或修改外部数据。
-            </small>
+            <strong>{t("flow.testDialog.real")}</strong>
+            <small>{t("flow.testDialog.realHint")}</small>
           </span>
         </aside>
 
         {executionSteps.length > 0 ? (
           <details className="flow-test-dialog__steps">
-            <summary>
-              <Braces aria-hidden="true" size={14} /> 可能执行的 Agent /
-              Action（
-              {executionSteps.length}）
-            </summary>
+            <DisclosureSummary icon={<Braces aria-hidden="true" size={14} />}>
+              {t("flow.testDialog.steps")}（{executionSteps.length}）
+            </DisclosureSummary>
             <ul>
               {executionSteps.map((step, index) => (
                 <li key={`${index}:${step}`}>{step}</li>
@@ -209,15 +207,15 @@ export function FlowTestRunDialog({
 
         <footer>
           <Button disabled={busy} onClick={formatInput} variant="quiet">
-            格式化 JSON
+            {t("flow.testDialog.format")}
           </Button>
           <span>
             <Button disabled={busy} onClick={onCancel} variant="quiet">
-              取消
+              {t("flow.testDialog.cancel")}
             </Button>
             <Button disabled={busy} onClick={submit} variant="primary">
               <FlaskConical aria-hidden="true" size={14} />
-              {busy ? "启动中…" : "开始 Test Run"}
+              {busy ? t("flow.testDialog.starting") : t("flow.testDialog.start")}
             </Button>
           </span>
         </footer>

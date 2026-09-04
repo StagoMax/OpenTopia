@@ -1,4 +1,5 @@
 import type { ApiClient } from "../api/client";
+import { useApplicationLanguage } from "../ApplicationLanguageProvider";
 import type { EnterprisePageHeaderChange } from "./enterprise/pageHeader";
 import { ConnectionsWorkspacePanel } from "./connections";
 
@@ -15,11 +16,12 @@ export function FlowLibraryPanel({
   client,
   onPageHeaderChange,
 }: FlowLibraryPanelProps) {
+  const { t } = useApplicationLanguage();
   if (!client) {
     return (
       <div className="connections-page-state" role="status">
-        <strong>Connections 尚未连接后端</strong>
-        <span>服务恢复后将自动加载 Provider 和账号连接。</span>
+        <strong>{t("flow.connection.workspace.backendUnavailable")}</strong>
+        <span>{t("flow.connection.workspace.backendRestore")}</span>
       </div>
     );
   }
