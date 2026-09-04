@@ -37,6 +37,13 @@ async fn sync_provider_models(
         .find(|provider| provider.id == provider_id)
         .ok_or_else(|| ApiError::not_found(format!("provider not found: {provider_id}")))?
         .clone();
+    let expected_transport = provider.effective_transport();
+    let expected_auth = provider.effective_auth();
+    let expected_allowed_adapters = provider.effective_allowed_adapters();
+    let expected_preferred_adapter = provider.preferred_adapter;
+    let expected_base_url = provider.base_url.clone();
+    let expected_model = provider.model.clone();
+    let expected_api_key_source = provider.api_key_source.clone();
 
     if provider.effective_transport() == ProviderTransportKind::Mock {
         return Err(ApiError::bad_request(
@@ -156,6 +163,7 @@ async fn sync_provider_models(
     })?;
 
     let catalog = extract_model_catalog(&payload);
+    let catalog_default_model = provider_model_catalog_default(&catalog);
     let mut models: Vec<String> = catalog.iter().map(|entry| entry.id.clone()).collect();
     models.sort();
     models.dedup();
@@ -204,48 +212,6 @@ async fn sync_provider_models(
             "provider not found: {provider_id}"
         )));
     };
-    let expected_transport = target.effective_transport();
-    let expected_auth = target.effective_auth();
-    let expected_allowed_adapters = target.effective_allowed_adapters();
-    let expected_preferred_adapter = target.preferred_adapter;
-    let expected_base_url = target.base_url.clone();
-    let expected_model = target.model.clone();
-    let expected_api_key_source = target.api_key_source.clone();
-    target.synced_models = models.clone();
-    target.model_context_windows = context_windows.clone();
-    target.model_capabilities = model_capabilities.clone();
-    if !models.iter().any(|model| model == target.model.trim()) {
-        // Setup begins with an empty model. Once the endpoint exposes a
-        // catalog, choose a valid default from that actual catalog.
-        target.model = models[0].clone();
-    }
-    let default_model = target.model.clone();
-    target.models_synced_at = Some(synced_at);
-    let provider_to_negotiate = target.clone();
-
-    // Model discovery proves only that credentials can read the catalog. A
-    // connection becomes conversation-ready only after its selected adapter
-    // has negotiated the concrete endpoint/model wire contract.
-    let negotiation = negotiate_provider_settings(&provider_to_negotiate).await?;
-    let health = &negotiation.health;
-    if !health.reachable || !health.model_available {
-        return Err(ApiError::bad_gateway(format!(
-            "provider adapter negotiation failed: {}",
-            health
-                .error
-                .clone()
-                .unwrap_or_else(|| "the selected model is not conversation-ready".to_string())
-        )));
-    }
-    // Negotiation performs network I/O. Re-read settings afterwards instead
-    // of committing the pre-await snapshot, otherwise a concurrent settings
-    // edit could be silently overwritten by model discovery.
-    let mut latest = current_settings(&state);
-    let target = latest
-        .providers
-        .iter_mut()
-        .find(|candidate| candidate.id == provider_id)
-        .ok_or_else(|| ApiError::not_found(format!("provider not found: {provider_id}")))?;
     if target.effective_transport() != expected_transport
         || target.effective_auth() != expected_auth
         || target.effective_allowed_adapters() != expected_allowed_adapters
@@ -255,32 +221,103 @@ async fn sync_provider_models(
         || target.api_key_source != expected_api_key_source
     {
         return Err(ApiError::conflict(
-            "provider settings changed while model discovery and adapter negotiation were running",
+            "provider settings changed while model discovery was running",
         ));
     }
     target.synced_models = models.clone();
     target.model_context_windows = context_windows.clone();
     target.model_capabilities = model_capabilities.clone();
-    target.model = default_model.clone();
-    target.models_synced_at = Some(synced_at);
-    if let Some(report) = health.openai_compatibility.as_ref() {
-        target.apply_openai_compatibility_report(report.clone());
-    } else if !negotiation.adapter_profiles.is_empty() {
-        for profile in negotiation.adapter_profiles {
-            target.apply_adapter_profile(profile);
-        }
-    } else {
-        return Err(ApiError::bad_gateway(
-            "provider negotiation returned no adapter profile",
-        ));
+    if !models.iter().any(|model| model == target.model.trim()) {
+        // Setup begins with an empty model. Once the endpoint exposes a
+        // catalog, respect the provider's advertised priority instead of
+        // accidentally choosing an internal alias by alphabetical order.
+        target.model = catalog_default_model
+            .clone()
+            .unwrap_or_else(|| models[0].clone());
     }
-    let negotiated_provider = latest
+    let default_model = target.model.clone();
+    target.models_synced_at = Some(synced_at);
+    let provider_to_negotiate = target.clone();
+    let catalog_settings = save_settings_and_refresh_runtime(&state, settings)?;
+    let catalog_provider = catalog_settings
         .providers
         .iter()
         .find(|candidate| candidate.id == provider_id)
         .cloned()
         .ok_or_else(|| ApiError::not_found(format!("provider not found: {provider_id}")))?;
-    save_settings_and_refresh_runtime(&state, latest)?;
+
+    // Catalog discovery and runtime capability negotiation have different
+    // availability boundaries. A relay may keep `/models` healthy while its
+    // inference account pool is temporarily rate-limited. Persist the catalog
+    // above so a transient generation failure cannot make the connection
+    // impossible to import; conversation routes still require a negotiated
+    // adapter profile before they can use the selected model.
+    let mut default_model_ready = false;
+    let mut capability_warning = None;
+    let mut synced_provider = catalog_provider;
+    match negotiate_provider_settings(&provider_to_negotiate).await {
+        Ok(negotiation) => {
+            let health = &negotiation.health;
+            if !health.reachable || !health.model_available {
+                capability_warning = Some(format!(
+                    "provider adapter negotiation failed: {}",
+                    health.error.clone().unwrap_or_else(|| {
+                        "the selected model is not conversation-ready".to_string()
+                    })
+                ));
+            } else if health.openai_compatibility.is_none()
+                && negotiation.adapter_profiles.is_empty()
+            {
+                capability_warning =
+                    Some("provider negotiation returned no adapter profile".to_string());
+            } else {
+                // Negotiation performs network I/O. Re-read settings afterwards
+                // instead of committing the pre-await snapshot, otherwise a
+                // concurrent settings edit could be silently overwritten.
+                let mut latest = current_settings(&state);
+                let target = latest
+                    .providers
+                    .iter_mut()
+                    .find(|candidate| candidate.id == provider_id)
+                    .ok_or_else(|| {
+                        ApiError::not_found(format!("provider not found: {provider_id}"))
+                    })?;
+                if target.effective_transport() != provider_to_negotiate.effective_transport()
+                    || target.effective_auth() != provider_to_negotiate.effective_auth()
+                    || target.effective_allowed_adapters()
+                        != provider_to_negotiate.effective_allowed_adapters()
+                    || target.preferred_adapter != provider_to_negotiate.preferred_adapter
+                    || target.base_url != provider_to_negotiate.base_url
+                    || target.model != provider_to_negotiate.model
+                    || target.api_key_source != provider_to_negotiate.api_key_source
+                {
+                    return Err(ApiError::conflict(
+                        "provider settings changed while adapter negotiation was running",
+                    ));
+                }
+                if let Some(report) = health.openai_compatibility.as_ref() {
+                    target.apply_openai_compatibility_report(report.clone());
+                } else {
+                    for profile in negotiation.adapter_profiles {
+                        target.apply_adapter_profile(profile);
+                    }
+                }
+                let negotiated_settings = save_settings_and_refresh_runtime(&state, latest)?;
+                synced_provider = negotiated_settings
+                    .providers
+                    .iter()
+                    .find(|candidate| candidate.id == provider_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ApiError::not_found(format!("provider not found: {provider_id}"))
+                    })?;
+                default_model_ready = true;
+            }
+        }
+        Err(error) => {
+            capability_warning = Some(format!("provider adapter negotiation failed: {error}"));
+        }
+    }
 
     info!(
         provider_id = %provider_id,
@@ -288,6 +325,9 @@ async fn sync_provider_models(
         auth = ?provider.effective_auth(),
         adapter = ?provider.resolved_adapter_for_model(&provider.model),
         model_count = models.len(),
+        default_model = %default_model,
+        default_model_ready,
+        has_capability_warning = capability_warning.is_some(),
         "model discovery completed"
     );
 
@@ -298,7 +338,9 @@ async fn sync_provider_models(
         model_capabilities,
         default_model,
         synced_at,
-        provider: negotiated_provider,
+        default_model_ready,
+        capability_warning,
+        provider: synced_provider,
     }))
 }
 
@@ -383,6 +425,10 @@ pub(crate) fn extract_model_catalog(payload: &Value) -> Vec<DiscoveredModel> {
         })
         .filter(|entry| !entry.id.is_empty())
         .collect()
+}
+
+pub(crate) fn provider_model_catalog_default(catalog: &[DiscoveredModel]) -> Option<String> {
+    catalog.first().map(|entry| entry.id.clone())
 }
 
 /// Reads common catalog modality shapes. OpenAI's own `/v1/models` endpoint
@@ -636,6 +682,9 @@ pub(crate) struct ProviderModelSyncResult {
     model_capabilities: BTreeMap<String, opentopia_core::ProviderModelCapabilities>,
     default_model: String,
     synced_at: DateTime<Utc>,
+    default_model_ready: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capability_warning: Option<String>,
     provider: ProviderSettings,
 }
 

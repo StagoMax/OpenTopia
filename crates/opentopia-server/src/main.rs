@@ -172,8 +172,8 @@ use plugins_api::PluginView;
 use provider_api::{current_settings, ProviderModelSyncResult};
 #[cfg(test)]
 use provider_api::{
-    extract_model_catalog, provider_model_catalog_rate_limit_delay, provider_model_catalog_url,
-    validate_provider_settings,
+    extract_model_catalog, provider_model_catalog_default, provider_model_catalog_rate_limit_delay,
+    provider_model_catalog_url, validate_provider_settings,
 };
 use provider_runtime_health::{provider_failure_is_quota_exhausted, QUOTA_EXHAUSTED_MESSAGE};
 use resource_api::ResourceReleaseResponse;

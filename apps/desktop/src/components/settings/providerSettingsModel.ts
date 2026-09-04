@@ -4,6 +4,7 @@ import type {
   ProviderAdapterKind,
   ProviderAuthKind,
   ProviderKind,
+  ProviderModelSyncResult,
   ProviderSettings,
   ProviderTransportKind,
 } from "../../types";
@@ -12,7 +13,26 @@ export type ModelDiscoveryState =
   | { status: "idle" }
   | { status: "discovering" }
   | { status: "success"; modelCount: number }
+  | { status: "warning"; modelCount: number; message: string }
   | { status: "error"; message: string };
+
+export function completedModelDiscoveryState(
+  result: Pick<
+    ProviderModelSyncResult,
+    "models" | "defaultModelReady" | "capabilityWarning"
+  >,
+): ModelDiscoveryState {
+  if (result.defaultModelReady) {
+    return { status: "success", modelCount: result.models.length };
+  }
+  return {
+    status: "warning",
+    modelCount: result.models.length,
+    message:
+      result.capabilityWarning ??
+      "默认模型的连接能力尚未验证，请稍后重试。",
+  };
+}
 
 const providerDiscoveryDependentFields = new Set<keyof ProviderSettings>([
   "baseUrl",

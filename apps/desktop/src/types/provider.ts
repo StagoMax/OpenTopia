@@ -7,8 +7,12 @@ export type ProviderModelSyncResult = {
   modelCapabilities: Record<string, ProviderModelCapabilities>;
   /** A valid default selected from the models returned by the endpoint. */
   defaultModel: string;
+  /** Whether the default model completed adapter capability negotiation. */
+  defaultModelReady: boolean;
+  /** Non-fatal negotiation failure; the model catalog was still persisted. */
+  capabilityWarning?: string;
   syncedAt: string;
-  /** Complete persisted connection, including negotiated per-model adapter profiles. */
+  /** Complete persisted connection; profiles may be pending when readiness is false. */
   provider: ProviderSettings;
 };
 

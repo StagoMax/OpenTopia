@@ -4002,7 +4002,9 @@ export interface AppViewSession {
   [k: string]: unknown;
 }
 export interface ProviderModelSyncResult {
+  capabilityWarning?: string | null;
   defaultModel: string;
+  defaultModelReady: boolean;
   modelCapabilities: {
     [k: string]: ProviderModelCapabilities;
   };

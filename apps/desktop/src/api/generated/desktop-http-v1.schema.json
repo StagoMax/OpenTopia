@@ -10937,8 +10937,17 @@
     },
     "ProviderModelSyncResult": {
       "properties": {
+        "capabilityWarning": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "defaultModel": {
           "type": "string"
+        },
+        "defaultModelReady": {
+          "type": "boolean"
         },
         "modelCapabilities": {
           "additionalProperties": {
@@ -10973,6 +10982,7 @@
       },
       "required": [
         "defaultModel",
+        "defaultModelReady",
         "modelCapabilities",
         "modelContextWindows",
         "models",

@@ -4,6 +4,7 @@ import test from "node:test";
 import type * as ProviderSettingsModelModule from "./providerSettingsModel";
 
 const {
+  completedModelDiscoveryState,
   contextWindowInputConstraints,
   contextWindowPresets,
   createProviderSettings,
@@ -12,6 +13,32 @@ const {
 } = (await import(
   "./providerSettingsModel" + ".ts"
 )) as typeof ProviderSettingsModelModule;
+
+test("keeps an imported catalog when capability negotiation is unavailable", () => {
+  assert.deepEqual(
+    completedModelDiscoveryState({
+      models: ["model-a", "model-b"],
+      defaultModelReady: false,
+      capabilityWarning: "HTTP 429",
+    }),
+    {
+      status: "warning",
+      modelCount: 2,
+      message: "HTTP 429",
+    },
+  );
+});
+
+test("reports full success only after the default model is ready", () => {
+  assert.deepEqual(
+    completedModelDiscoveryState({
+      models: ["model-a"],
+      defaultModelReady: true,
+      capabilityWarning: undefined,
+    }),
+    { status: "success", modelCount: 1 },
+  );
+});
 
 test("accepts every context-window preset in the manual input", () => {
   const { min, step } = contextWindowInputConstraints;

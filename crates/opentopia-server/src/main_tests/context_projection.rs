@@ -43,6 +43,23 @@ fn model_catalog_reads_ids_from_every_shape_relays_return() {
 }
 
 #[test]
+fn model_catalog_default_preserves_provider_priority() {
+    let payload = json!({
+        "data": [
+            {"id": "gpt-5.6-sol"},
+            {"id": "codex-auto-review"},
+            {"id": "gpt-5.6-terra"}
+        ]
+    });
+    let catalog = extract_model_catalog(&payload);
+
+    assert_eq!(
+        provider_model_catalog_default(&catalog).as_deref(),
+        Some("gpt-5.6-sol")
+    );
+}
+
+#[test]
 fn model_catalog_uses_anthropics_versioned_models_endpoint() {
     let provider = ProviderSettings {
         kind: ProviderKind::Anthropic,

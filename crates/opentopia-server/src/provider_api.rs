@@ -9,7 +9,8 @@ use axum::Router;
 pub(crate) use models::ProviderModelSyncResult;
 #[cfg(test)]
 pub(super) use models::{
-    extract_model_catalog, provider_model_catalog_rate_limit_delay, provider_model_catalog_url,
+    extract_model_catalog, provider_model_catalog_default, provider_model_catalog_rate_limit_delay,
+    provider_model_catalog_url,
 };
 #[cfg(test)]
 pub(super) use settings::validate_provider_settings;

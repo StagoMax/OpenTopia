@@ -36,6 +36,8 @@ export function ModelDiscoveryStatus({
       ? "正在识别模型与能力…"
       : state.status === "success"
         ? `已识别 ${state.modelCount} 个模型，模型能力和参数已更新。`
+        : state.status === "warning"
+          ? `已导入 ${state.modelCount} 个模型，但默认模型暂不可用：${state.message}`
         : `识别失败：${state.message}`;
 
   return (
@@ -45,7 +47,7 @@ export function ModelDiscoveryStatus({
       aria-live="polite"
     >
       <span>{message}</span>
-      {state.status === "error" ? (
+      {state.status === "error" || state.status === "warning" ? (
         <Button size="compact" variant="quiet" onClick={onRetry}>
           重试
         </Button>
