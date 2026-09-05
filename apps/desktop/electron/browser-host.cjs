@@ -947,7 +947,9 @@ function createDesktopBrowserHost(options) {
             webSecurity: true,
             allowRunningInsecureContent: false,
             spellcheck: false,
-            backgroundThrottling: false,
+            // Keep popup pages from consuming foreground-level animation and
+            // timer budgets while they are detached from the display slot.
+            backgroundThrottling: true,
           },
         });
         // Keep a provisional popup detached and hidden until it has a usable
@@ -1185,7 +1187,9 @@ function createDesktopBrowserHost(options) {
         webSecurity: true,
         allowRunningInsecureContent: false,
         spellcheck: false,
-        backgroundThrottling: false,
+        // Browser tabs remain alive while hidden so their session and login
+        // state can be restored, but Chromium must throttle background work.
+        backgroundThrottling: true,
       },
     });
     view.setBounds(DEFAULT_BACKGROUND_BOUNDS);

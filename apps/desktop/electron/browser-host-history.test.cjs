@@ -185,8 +185,9 @@ function createHarness() {
   const menus = [];
   const saveDialogs = [];
   class FakeWebContentsView {
-    constructor() {
+    constructor(options = {}) {
       this.webContents = new FakeWebContents();
+      this.webPreferences = options.webPreferences ?? {};
       this.visible = true;
       this.bounds = null;
       this.visibilityChanges = [];
@@ -609,6 +610,21 @@ test("only the most recently shown browser session is visible", async () => {
       (await invoke(IPC_CHANNELS.getState, "browser:tab:second")).visible,
       true,
     );
+  } finally {
+    await host.close();
+  }
+});
+
+test("browser views keep background throttling enabled for tabs and popups", async () => {
+  const { host, invoke, views } = createHarness();
+  const sessionId = "browser:background-throttling-test";
+  try {
+    await invoke(IPC_CHANNELS.create, { sessionId, visible: false });
+    assert.equal(views[0].webPreferences.backgroundThrottling, true);
+
+    views[0].webContents.openWindow("https://example.test/popup");
+    await waitFor(() => views.length === 2);
+    assert.equal(views[1].webPreferences.backgroundThrottling, true);
   } finally {
     await host.close();
   }

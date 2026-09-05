@@ -24,6 +24,7 @@ const {
   createBackendEventStreamManager,
 } = require("./backend-event-stream.cjs");
 const { createChromeBridge } = require("./chrome-bridge.cjs");
+const { publishExternalApiSession } = require("./external-api-session.cjs");
 const { createAppLogger } = require("./logging.cjs");
 const {
   DEFAULT_SAG_URL,
@@ -66,6 +67,7 @@ let defaultBackendUrl =
 // from an earlier build must not be reused merely because it is listening.
 const desktopBackendApiVersion = 2;
 const backendApiToken = crypto.randomBytes(32).toString("base64url");
+let externalApiSession = null;
 const openTopiaProtocol = "opentopia";
 const {
   backendEndpointInfo,
@@ -2675,9 +2677,20 @@ if (!singleInstance) {
     // Show the window immediately so the user sees something while cargo
     // builds the backend binary on first MSVC launch (~3 min cold build).
     createMainWindow();
-    startBackendIfNeeded({ waitForHealth: false }).catch((error) => {
-      logConsole("error", "backend.init.failed", { error });
-    });
+    startBackendIfNeeded({ waitForHealth: false })
+      .then(() => {
+        externalApiSession?.dispose();
+        externalApiSession = publishExternalApiSession({
+          apiToken: backendApiToken,
+          backendUrl: defaultBackendUrl,
+          directory:
+            process.env.OPENTOPIA_DESKTOP_SESSION_DIR ||
+            app.getPath("userData"),
+        });
+      })
+      .catch((error) => {
+        logConsole("error", "backend.init.failed", { error });
+      });
 
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
@@ -2698,6 +2711,8 @@ app.on("before-quit", (event) => {
   if (appQuitPreparation) return;
 
   appQuitPreparation = (async () => {
+    externalApiSession?.dispose();
+    externalApiSession = null;
     try {
       await stopManagedBackend();
     } catch (error) {
