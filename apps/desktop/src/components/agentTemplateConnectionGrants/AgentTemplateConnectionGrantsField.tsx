@@ -33,6 +33,7 @@ import {
   rebaseBinding,
   removeConnectionBinding,
   replaceConnectionBinding,
+  setOperationGrants,
   toggleOperationGrant,
 } from "./model";
 import "../../styles/agent-template-connection-grants.css";
@@ -347,6 +348,41 @@ export function AgentTemplateConnectionGrantsField({
     ],
   );
 
+  const handleSetOperationGrants = useCallback(
+    (operationIds: readonly string[], granted: boolean) => {
+      if (
+        disabled ||
+        !selectedConnection ||
+        !activeRevision ||
+        !eligibility?.selectable ||
+        hasLegacyProjection
+      ) {
+        return;
+      }
+      const binding = selectedBinding ?? {
+        connectionId: selectedConnection.id,
+        capabilityRevision: activeRevision.revision,
+        operationGrants: [],
+      };
+      const nextBinding = setOperationGrants(binding, operationIds, granted);
+      onChange(
+        nextBinding.operationGrants.length > 0
+          ? replaceConnectionBinding(value, nextBinding)
+          : removeConnectionBinding(value, selectedConnection.id),
+      );
+    },
+    [
+      activeRevision,
+      disabled,
+      eligibility?.selectable,
+      hasLegacyProjection,
+      onChange,
+      selectedBinding,
+      selectedConnection,
+      value,
+    ],
+  );
+
   function rebaseSelectedBinding() {
     if (!selectedBinding || !activeRevision || !selectedConnection) return;
     const rebased = rebaseBinding(selectedBinding, activeRevision);
@@ -453,6 +489,9 @@ export function AgentTemplateConnectionGrantsField({
             eligibility={eligibility}
             filteredOperationCount={filteredOperations.length}
             freshness={freshness}
+            grantableOperationIds={filteredOperations.map(
+              (operation) => operation.capabilityId,
+            )}
             hasLegacyProjection={hasLegacyProjection}
             onOperationQueryChange={setOperationQuery}
             onRebase={rebaseSelectedBinding}
@@ -466,6 +505,7 @@ export function AgentTemplateConnectionGrantsField({
             onShowMore={() =>
               setVisibleOperations((current) => current + OPERATION_PAGE_SIZE)
             }
+            onSetOperationGrants={handleSetOperationGrants}
             onToggleOperation={handleToggleOperation}
             operationQuery={operationQuery}
             renderedOperations={renderedOperations}

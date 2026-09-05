@@ -17,6 +17,7 @@ const {
   normalizeConnectionBindings,
   rebaseBinding,
   replaceConnectionBinding,
+  setOperationGrants,
   toggleOperationGrant,
 } = (await import(
   "./components/agentTemplateConnectionGrants/model" + ".ts"
@@ -234,6 +235,17 @@ test("operation toggles normalize duplicates and rebasing drops removed grants",
   const rebased = rebaseBinding(duplicate, revision(2, [operation(readId)]));
   assert.equal(rebased.capabilityRevision, 2);
   assert.deepEqual(rebased.operationGrants, [{ operationId: readId }]);
+});
+
+test("bulk operation grants preserve selections outside the requested set", () => {
+  const withWrite = setOperationGrants(binding(), [writeId], true);
+  assert.deepEqual(withWrite.operationGrants, [
+    { operationId: readId },
+    { operationId: writeId },
+  ]);
+
+  const withoutWrite = setOperationGrants(withWrite, [writeId], false);
+  assert.deepEqual(withoutWrite.operationGrants, [{ operationId: readId }]);
 });
 
 test("replaceConnectionBinding maintains one binding per connection", () => {

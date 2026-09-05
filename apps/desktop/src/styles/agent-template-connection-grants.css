@@ -2,7 +2,7 @@
   display: grid;
   min-inline-size: 0;
   gap: var(--space-4);
-  margin: var(--space-0);
+  margin: var(--space-0) var(--space-0) var(--space-4);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   padding: var(--space-6);
@@ -17,6 +17,7 @@
 }
 
 .agent-connection-grants__hint,
+.agent-connection-grants__catalog-hint,
 .agent-connection-grants__empty {
   margin: var(--space-0);
   color: var(--text-muted);
@@ -130,8 +131,7 @@
   gap: var(--space-2);
 }
 
-.agent-connection-grants__operations-header,
-.agent-connection-grants__operation-summary {
+.agent-connection-grants__operations-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -139,15 +139,58 @@
 }
 
 .agent-connection-grants__operation-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: var(--space-4);
+  row-gap: var(--space-1);
   color: var(--text-muted);
   font-size: var(--font-size-xs);
 }
 
-.agent-connection-grants__operation-summary > span,
+.agent-connection-grants__authorized-count,
 .agent-connection-grants__search-label {
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
+}
+
+.agent-connection-grants__authorized-count {
+  grid-column: 1;
+}
+
+.agent-connection-grants__operation-summary > code {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+}
+
+.agent-connection-grants__bulk-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-block-size: var(--control-height-sm);
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+}
+
+.agent-connection-grants__bulk-toggle:has(input:disabled) {
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+.agent-connection-grants__bulk-toggle input {
+  inline-size: var(--icon-size-sm);
+  block-size: var(--icon-size-sm);
+  margin: var(--space-0);
+  accent-color: var(--accent);
+}
+
+.agent-connection-grants__bulk-toggle:has(input:focus-visible) {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: var(--space-1);
+  border-radius: var(--radius-sm);
 }
 
 .agent-connection-grants__operation-summary code,

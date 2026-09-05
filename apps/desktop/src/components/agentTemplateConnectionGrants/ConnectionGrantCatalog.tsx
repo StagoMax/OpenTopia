@@ -40,6 +40,9 @@ export const ConnectionGrantCatalog = memo(function ConnectionGrantCatalog({
 
   return (
     <div className="agent-connection-grants__connections">
+      <p className="agent-connection-grants__catalog-hint">
+        {t("flow.connectionGrants.catalogHint")}
+      </p>
       {allConnections.length > 5 ? (
         <TextField
           label={
@@ -90,9 +93,11 @@ export const ConnectionGrantCatalog = memo(function ConnectionGrantCatalog({
                     {t("flow.connectionGrants.authorized")}
                   </Badge>
                 ) : null}
-                <Badge variant={connectionStatusVariant(connection.status)}>
-                  {connectionStatusLabel(connection.status, language)}
-                </Badge>
+                {connection.status !== "ready" ? (
+                  <Badge variant={connectionStatusVariant(connection.status)}>
+                    {connectionStatusLabel(connection.status, language)}
+                  </Badge>
+                ) : null}
               </span>
             </button>
           );

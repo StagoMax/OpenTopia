@@ -22,10 +22,8 @@ export type AgentConfigPreview = {
 };
 
 export function AgentConfigInspector({
-  generating,
   preview,
 }: {
-  generating: boolean;
   preview: AgentConfigPreview;
 }) {
   const { language, t } = useApplicationLanguage();
@@ -39,11 +37,7 @@ export function AgentConfigInspector({
           <Bot aria-hidden="true" size={16} />
           <strong>{t("flow.agentInspector.title")}</strong>
         </span>
-        <Badge variant={generating ? "warning" : "neutral"}>
-          {generating
-            ? t("flow.agentInspector.modelGenerating")
-            : t("flow.agents.draft")}
-        </Badge>
+        <Badge variant="neutral">{t("flow.agents.draft")}</Badge>
       </header>
       <section>
         <strong>{preview.name || t("flow.agentInspector.untitled")}</strong>

@@ -1,4 +1,4 @@
-import { memo } from "react";
+import { memo, useEffect, useRef } from "react";
 import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
 import {
   CircleAlert,
@@ -33,11 +33,13 @@ export function OperationGrantEditor({
   eligibility,
   filteredOperationCount,
   freshness,
+  grantableOperationIds,
   hasLegacyProjection,
   onOperationQueryChange,
   onRebase,
   onRemove,
   onRetryRevisions,
+  onSetOperationGrants,
   onShowMore,
   onToggleOperation,
   operationQuery,
@@ -54,11 +56,13 @@ export function OperationGrantEditor({
   eligibility: ConnectionGrantEligibility | null;
   filteredOperationCount: number;
   freshness: ConnectionBindingFreshness | null;
+  grantableOperationIds: readonly string[];
   hasLegacyProjection: boolean;
   onOperationQueryChange(value: string): void;
   onRebase(): void;
   onRemove(): void;
   onRetryRevisions(): void;
+  onSetOperationGrants(operationIds: readonly string[], granted: boolean): void;
   onShowMore(): void;
   onToggleOperation(operationId: string): void;
   operationQuery: string;
@@ -91,6 +95,19 @@ export function OperationGrantEditor({
     activeRevision &&
     selectedBinding.capabilityRevision !== activeRevision.revision,
   );
+  const selectedBulkOperationCount = grantableOperationIds.filter(
+    (operationId) => selectedOperationIds.has(operationId),
+  ).length;
+  const allBulkOperationsSelected =
+    grantableOperationIds.length > 0 &&
+    selectedBulkOperationCount === grantableOperationIds.length;
+  const someBulkOperationsSelected =
+    selectedBulkOperationCount > 0 && !allBulkOperationsSelected;
+  const operationSelectionDisabled =
+    disabled ||
+    !eligibility?.selectable ||
+    hasLegacyProjection ||
+    pinnedToOlderRevision;
 
   return (
     <section
@@ -210,7 +227,17 @@ export function OperationGrantEditor({
             />
           ) : null}
           <div className="agent-connection-grants__operation-summary">
-            <span>
+            <BulkOperationGrantToggle
+              allSelected={allBulkOperationsSelected}
+              disabled={
+                operationSelectionDisabled || grantableOperationIds.length === 0
+              }
+              onChange={(granted) =>
+                onSetOperationGrants(grantableOperationIds, granted)
+              }
+              partial={someBulkOperationsSelected}
+            />
+            <span className="agent-connection-grants__authorized-count">
               <ShieldCheck aria-hidden="true" size={14} />
               {t("flow.connectionGrants.authorizedCount")}{" "}
               {selectedOperationIds.size} / {shownRevision.capabilities.length}
@@ -221,12 +248,7 @@ export function OperationGrantEditor({
             {renderedOperations.map((operation) => (
               <OperationGrantRow
                 checked={selectedOperationIds.has(operation.capabilityId)}
-                disabled={
-                  disabled ||
-                  !eligibility?.selectable ||
-                  hasLegacyProjection ||
-                  pinnedToOlderRevision
-                }
+                disabled={operationSelectionDisabled}
                 key={operation.capabilityId}
                 operation={operation}
                 stale={
@@ -257,6 +279,37 @@ export function OperationGrantEditor({
         </p>
       ) : null}
     </section>
+  );
+}
+
+function BulkOperationGrantToggle({
+  allSelected,
+  disabled,
+  onChange,
+  partial,
+}: {
+  allSelected: boolean;
+  disabled: boolean;
+  onChange(granted: boolean): void;
+  partial: boolean;
+}) {
+  const { t } = useApplicationLanguage();
+  const inputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (inputRef.current) inputRef.current.indeterminate = partial;
+  }, [partial]);
+
+  return (
+    <label className="agent-connection-grants__bulk-toggle">
+      <input
+        checked={allSelected}
+        disabled={disabled}
+        onChange={(event) => onChange(event.target.checked)}
+        ref={inputRef}
+        type="checkbox"
+      />
+      <span>{t("flow.connectionGrants.selectAllMatching")}</span>
+    </label>
   );
 }
 

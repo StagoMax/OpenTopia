@@ -1,4 +1,9 @@
-import { useId, type InputHTMLAttributes, type ReactNode } from "react";
+import {
+  useId,
+  type InputHTMLAttributes,
+  type ReactNode,
+  type Ref,
+} from "react";
 
 export type TextFieldProps = Omit<
   InputHTMLAttributes<HTMLInputElement>,
@@ -7,6 +12,7 @@ export type TextFieldProps = Omit<
   error?: ReactNode;
   hint?: ReactNode;
   id?: string;
+  inputRef?: Ref<HTMLInputElement>;
   label: ReactNode;
   wrapperClassName?: string;
 };
@@ -16,6 +22,7 @@ export function TextField({
   error,
   hint,
   id,
+  inputRef,
   label,
   wrapperClassName,
   ...props
@@ -44,6 +51,7 @@ export function TextField({
         aria-invalid={error ? true : props["aria-invalid"]}
         className={classes}
         id={inputId}
+        ref={inputRef}
       />
       {hint ? (
         <span className="ot-text-field__hint" id={hintId}>

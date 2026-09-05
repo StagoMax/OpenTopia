@@ -104,11 +104,6 @@
   padding-left: 0;
 }
 
-.agent-template-panel--rail .agent-studio__composer-actions {
-  align-items: stretch;
-  flex-direction: column;
-}
-
 .agent-template-panel--rail .agent-template-panel__actions {
   align-items: stretch;
   flex-direction: column;
@@ -363,6 +358,99 @@
   align-items: center;
   gap: var(--space-2);
   margin: var(--space-0);
+}
+
+.agent-template-panel__namespace-picker {
+  display: grid;
+  min-width: var(--space-0);
+  gap: var(--space-3);
+  margin: var(--space-0);
+  border: 0;
+  padding: var(--space-0);
+}
+
+.agent-template-panel__namespace-picker > legend {
+  margin-bottom: var(--space-3);
+  padding: var(--space-0);
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+}
+
+.agent-template-panel__namespace-picker > small,
+.agent-template-panel__namespace-picker-state > small {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.agent-template-panel__namespace-picker-state {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.agent-template-panel__namespace-picker-state.is-error > small {
+  color: var(--danger);
+}
+
+.agent-template-panel__namespace-options {
+  display: grid;
+  max-height: var(--popover-max-height);
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.agent-template-panel__namespace-options > label {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  min-height: var(--control-height-md);
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-4);
+  cursor: pointer;
+}
+
+.agent-template-panel__namespace-options > label + label {
+  border-top: 1px solid var(--border-subtle);
+}
+
+.agent-template-panel__namespace-options > label:hover {
+  background: var(--surface-hover);
+}
+
+.agent-template-panel__namespace-options > label:has(input:focus-visible) {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+.agent-template-panel__namespace-options > label:has(input:disabled) {
+  cursor: not-allowed;
+  background: var(--surface-subtle);
+}
+
+.agent-template-panel__namespace-options > label:has(input:disabled) span,
+.agent-template-panel__namespace-options > label:has(input:disabled) small {
+  color: var(--text-muted);
+}
+
+.agent-template-panel__namespace-options input {
+  margin: var(--space-0);
+  accent-color: var(--accent);
+}
+
+.agent-template-panel__namespace-options span {
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+}
+
+.agent-template-panel__namespace-options small {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
 }
 
 .agent-template-panel__connection-bindings > article {

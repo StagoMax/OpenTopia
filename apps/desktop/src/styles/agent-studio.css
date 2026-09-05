@@ -11,51 +11,6 @@
   min-inline-size: 0;
 }
 
-.agent-studio__composer {
-  display: grid;
-  gap: var(--space-3);
-  border-bottom: 1px solid var(--border-subtle);
-  padding-bottom: var(--space-5);
-}
-
-.agent-studio__composer > span {
-  display: grid;
-  gap: var(--space-1);
-}
-
-.agent-studio__composer small {
-  color: var(--text-muted);
-  font-size: var(--font-size-xs);
-}
-
-.agent-studio__composer textarea {
-  resize: vertical;
-  min-block-size: calc(var(--control-height-lg) * 3);
-  border: 0;
-  border-bottom: 1px solid var(--border);
-  background: transparent;
-  padding: var(--space-4) 0;
-  color: var(--text);
-  font: inherit;
-  line-height: var(--line-height-relaxed);
-}
-
-.agent-studio__composer textarea:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: var(--space-1);
-}
-
-.agent-studio__composer-actions {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-3);
-}
-
-.agent-studio__composer-actions > small {
-  max-inline-size: 52ch;
-}
-
 .agent-config-inspector {
   position: sticky;
   top: 0;

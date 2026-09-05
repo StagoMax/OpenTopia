@@ -160,9 +160,6 @@ const zhMessages = {
   "flow.agentEditor.outputSchema": "输出 Schema",
   "flow.agentEditor.sagNamespaceRequired": "选择 SAG 后，至少需要一个命名空间",
   "flow.agentEditor.created": "已创建",
-  "flow.agentEditor.generatedPrefix": "模型已生成",
-  "flow.agentEditor.generatedSuffix":
-    "的实时配置；请在右侧审核后保存或直接返回列表发布。",
   "flow.agentEditor.publishedNotice": "版本已发布并锁定",
   "flow.agentEditor.deletedNotice": "草稿版本已删除",
   "flow.agentEditor.archivedNotice": "模板已归档；现有实例不会被自动扩权或重建",
@@ -178,16 +175,17 @@ const zhMessages = {
   "flow.agentEditor.createTitle": "创建智能体",
   "flow.agentEditor.cancel": "取消",
   "flow.agentEditor.saving": "保存中…",
+  "flow.agentEditor.saveDraft": "保存草稿",
+  "flow.agentEditor.draftSaved": "草稿已保存到本机",
+  "flow.agentEditor.draftRestored": "已恢复上次保存的本地草稿",
+  "flow.agentEditor.draftSaveFailed": "草稿保存失败，请检查本机存储权限后重试",
   "flow.agentEditor.saveVersion": "保存版本",
-  "flow.agentEditor.describeTitle": "描述你需要的智能体",
-  "flow.agentEditor.describeDetail": "描述职责、可用数据和需要人工介入的边界。",
-  "flow.agentEditor.describePlaceholder":
-    "例如：接收业务请求后，查询指定系统与知识库，输出结构化结果；遇到高风险或信息不足时请求人工确认。",
-  "flow.agentEditor.generateHint":
-    "生成过程运行在当前工作流会话中；如果权限策略要求审批，请在待处理页面处理后继续。",
-  "flow.agentEditor.generating": "生成中…",
-  "flow.agentEditor.generate": "生成智能体配置",
   "flow.agentEditor.agentId": "智能体 ID",
+  "flow.agentEditor.templateIdHint":
+    "使用小写英文字母、数字、点、下划线或连字符，最长 120 个字符。",
+  "flow.agentEditor.templateIdRequired": "请输入智能体 ID。",
+  "flow.agentEditor.templateIdInvalid":
+    "只能使用小写英文字母、数字、点（.）、下划线（_）或连字符（-），且不超过 120 个字符。",
   "flow.agentEditor.name": "名称",
   "flow.agentEditor.owner": "所有者",
   "flow.agentEditor.description": "说明",
@@ -258,7 +256,15 @@ const zhMessages = {
     "选择后会自动授予 library_search 权限；不需要在工作流版本中再次配置。",
   "flow.agentKnowledge.namespaces": "命名空间",
   "flow.agentKnowledge.namespacesHint":
-    "多个命名空间用逗号或换行分隔；运行时不允许智能体自行扩大范围。",
+    "可从上方选择，也可手工填写；多个命名空间用逗号或换行分隔。运行时不允许智能体自行扩大范围。",
+  "flow.agentKnowledge.availableNamespaces": "已导入的 SAG 命名空间",
+  "flow.agentKnowledge.namespacesLoading": "正在读取 SAG 命名空间…",
+  "flow.agentKnowledge.namespacesLoadFailed":
+    "未能读取 SAG 命名空间，仍可在下方手工填写。",
+  "flow.agentKnowledge.namespacesRetry": "重试",
+  "flow.agentKnowledge.namespacesEmpty":
+    "当前 SAG 中没有已导入的命名空间，仍可在下方手工填写。",
+  "flow.agentKnowledge.sources": "个来源",
   "flow.agentKnowledge.reviewPrefix": "发布后，知识库后端",
   "flow.agentKnowledge.reviewNamespace": "与命名空间",
   "flow.agentKnowledge.reviewSuffix": "的变更会作为智能体权限变更进入审核。",
@@ -267,10 +273,9 @@ const zhMessages = {
   "flow.agentKnowledge.namespaceMissing": "未配置命名空间",
   "flow.agentInspector.aria": "智能体实时配置",
   "flow.agentInspector.title": "实时配置",
-  "flow.agentInspector.modelGenerating": "模型生成中",
   "flow.agentInspector.untitled": "未命名智能体",
   "flow.agentInspector.emptyHint":
-    "在左侧描述智能体需求，模型生成后这里会立即显示可审核配置。",
+    "在左侧填写智能体配置，这里会同步显示可审核摘要。",
   "flow.agentInspector.bindings": "个绑定",
   "flow.agentInspector.notAuthorized": "未授权",
   "flow.agentInspector.permissions": "权限",
@@ -347,6 +352,8 @@ const zhMessages = {
   "flow.connectionGrants.loading": "正在加载连接…",
   "flow.connectionGrants.retry": "重试",
   "flow.connectionGrants.searchConnection": "搜索连接",
+  "flow.connectionGrants.catalogHint":
+    "这里列出当前作者可配置的连接；智能体只能调用标记为“已授权”的连接中已勾选的操作。",
   "flow.connectionGrants.unknownProvider": "未知服务提供方",
   "flow.connectionGrants.authorized": "已授权",
   "flow.connectionGrants.noConnections": "尚未创建连接，请先前往连接页面配置。",
@@ -374,6 +381,7 @@ const zhMessages = {
   "flow.connectionGrants.searchOperationsPlaceholder":
     "名称、说明、权限标签或操作 ID",
   "flow.connectionGrants.authorizedCount": "已授权",
+  "flow.connectionGrants.selectAllMatching": "全选全部匹配操作",
   "flow.connectionGrants.noOperationMatch": "没有匹配的操作，请调整搜索条件。",
   "flow.connectionGrants.moreOperations": "显示更多（剩余",
   "flow.connectionGrants.noRevisions":
@@ -1258,10 +1266,6 @@ const enMessages: Record<InterfaceMessageKey, string> = {
   "flow.agentEditor.sagNamespaceRequired":
     "Select at least one namespace when using SAG",
   "flow.agentEditor.created": "Created",
-  "flow.agentEditor.generatedPrefix":
-    "The model generated a live configuration for",
-  "flow.agentEditor.generatedSuffix":
-    ". Review and save it on the right, or return to the list and publish it directly.",
   "flow.agentEditor.publishedNotice": "The version was published and locked",
   "flow.agentEditor.deletedNotice": "The draft version was deleted",
   "flow.agentEditor.archivedNotice":
@@ -1278,17 +1282,18 @@ const enMessages: Record<InterfaceMessageKey, string> = {
   "flow.agentEditor.createTitle": "Create agent",
   "flow.agentEditor.cancel": "Cancel",
   "flow.agentEditor.saving": "Saving…",
+  "flow.agentEditor.saveDraft": "Save draft",
+  "flow.agentEditor.draftSaved": "Draft saved on this device",
+  "flow.agentEditor.draftRestored": "Restored the last locally saved draft",
+  "flow.agentEditor.draftSaveFailed":
+    "The draft could not be saved. Check local storage access and try again.",
   "flow.agentEditor.saveVersion": "Save version",
-  "flow.agentEditor.describeTitle": "Describe the agent you need",
-  "flow.agentEditor.describeDetail":
-    "Describe its responsibilities, available data, and boundaries that require human involvement.",
-  "flow.agentEditor.describePlaceholder":
-    "For example: Receive business requests, query the specified systems and knowledge bases, and return structured results; request human confirmation when risk is high or information is insufficient.",
-  "flow.agentEditor.generateHint":
-    "Generation runs in the current flow session. If the permission policy requires approval, continue after handling it in Inbox.",
-  "flow.agentEditor.generating": "Generating…",
-  "flow.agentEditor.generate": "Generate agent configuration",
   "flow.agentEditor.agentId": "Agent ID",
+  "flow.agentEditor.templateIdHint":
+    "Use lowercase letters, numbers, dots, underscores, or hyphens; maximum 120 characters.",
+  "flow.agentEditor.templateIdRequired": "Enter an Agent ID.",
+  "flow.agentEditor.templateIdInvalid":
+    "Use only lowercase letters, numbers, dots (.), underscores (_), or hyphens (-), with no more than 120 characters.",
   "flow.agentEditor.name": "Name",
   "flow.agentEditor.owner": "Owner",
   "flow.agentEditor.description": "Description",
@@ -1361,7 +1366,15 @@ const enMessages: Record<InterfaceMessageKey, string> = {
     "Selecting a library grants library_search automatically; no additional flow-revision configuration is required.",
   "flow.agentKnowledge.namespaces": "Namespaces",
   "flow.agentKnowledge.namespacesHint":
-    "Separate namespaces with commas or new lines. The agent cannot expand this scope at runtime.",
+    "Select namespaces above or enter them manually. Separate multiple namespaces with commas or new lines. The agent cannot expand this scope at runtime.",
+  "flow.agentKnowledge.availableNamespaces": "Imported SAG namespaces",
+  "flow.agentKnowledge.namespacesLoading": "Loading SAG namespaces…",
+  "flow.agentKnowledge.namespacesLoadFailed":
+    "SAG namespaces could not be loaded. You can still enter them manually below.",
+  "flow.agentKnowledge.namespacesRetry": "Retry",
+  "flow.agentKnowledge.namespacesEmpty":
+    "SAG has no imported namespaces. You can still enter one manually below.",
+  "flow.agentKnowledge.sources": "sources",
   "flow.agentKnowledge.reviewPrefix":
     "After publishing, changes to the knowledge backend",
   "flow.agentKnowledge.reviewNamespace": "and namespaces",
@@ -1372,10 +1385,9 @@ const enMessages: Record<InterfaceMessageKey, string> = {
   "flow.agentKnowledge.namespaceMissing": "No namespace configured",
   "flow.agentInspector.aria": "Live agent configuration",
   "flow.agentInspector.title": "Live configuration",
-  "flow.agentInspector.modelGenerating": "Model generating",
   "flow.agentInspector.untitled": "Untitled agent",
   "flow.agentInspector.emptyHint":
-    "Describe the agent on the left. Its reviewable configuration appears here as soon as the model generates it.",
+    "Configure the agent on the left. A reviewable summary appears here as you edit.",
   "flow.agentInspector.bindings": "bindings",
   "flow.agentInspector.notAuthorized": "Not authorized",
   "flow.agentInspector.permissions": "Permissions",
@@ -1457,6 +1469,8 @@ const enMessages: Record<InterfaceMessageKey, string> = {
   "flow.connectionGrants.loading": "Loading connections…",
   "flow.connectionGrants.retry": "Retry",
   "flow.connectionGrants.searchConnection": "Search connections",
+  "flow.connectionGrants.catalogHint":
+    "These are connections the current author can configure. The agent can only call checked operations in connections marked Authorized.",
   "flow.connectionGrants.unknownProvider": "Unknown provider",
   "flow.connectionGrants.authorized": "Authorized",
   "flow.connectionGrants.noConnections":
@@ -1488,6 +1502,7 @@ const enMessages: Record<InterfaceMessageKey, string> = {
   "flow.connectionGrants.searchOperationsPlaceholder":
     "Name, description, permission label, or operation ID",
   "flow.connectionGrants.authorizedCount": "Authorized",
+  "flow.connectionGrants.selectAllMatching": "Select all matching operations",
   "flow.connectionGrants.noOperationMatch":
     "No matching operations. Adjust the search filters.",
   "flow.connectionGrants.moreOperations": "Show more (remaining ",

@@ -4,8 +4,8 @@ import {
   GitCompareArrows,
   Plus,
   RefreshCw,
+  Save,
   ShieldAlert,
-  Sparkles,
   Trash2,
   UserRoundCog,
 } from "lucide-react";
@@ -34,7 +34,6 @@ import {
 } from "./agentTemplateConnectionGrants";
 import { AgentTemplateKnowledgeBindingField } from "./AgentTemplateKnowledgeBindingField";
 import { AgentConfigInspector } from "./AgentConfigInspector";
-import { generateAgentDraftWithModel } from "./agentAuthoring/generateAgentDraftWithModel";
 import {
   agentDraftFromTemplate,
   blankAgentDraft,
@@ -44,6 +43,15 @@ import {
   setAgentDraftValue as setFormValue,
   type AgentDraftForm,
 } from "./agentAuthoring/agentDraftForm";
+import {
+  clearAgentDraft,
+  readAgentDraft,
+  writeAgentDraft,
+} from "./agentAuthoring/agentDraftPersistence";
+import {
+  agentDraftFieldErrorFromCreateFailure,
+  validateAgentTemplateId,
+} from "./agentAuthoring/agentDraftValidation";
 import {
   AgentTextAreaField as TextAreaField,
   agentCapabilitySummary as capabilitySummary,
@@ -82,15 +90,26 @@ export function AgentTemplatePanel({
     null,
   );
   const [localSelectedKey, setLocalSelectedKey] = useState<string | null>(null);
-  const [form, setForm] = useState<AgentDraftForm>(() =>
-    blankAgentDraft(workspaceRoot, settings, language),
-  );
-  const [requirement, setRequirement] = useState("");
+  const [initialDraft] = useState(() => {
+    const fallback = blankAgentDraft(workspaceRoot, settings, language);
+    const stored = selection?.creatingAgent
+      ? readAgentDraft(workspaceRoot, fallback)
+      : null;
+    return { form: stored?.form ?? fallback, restored: Boolean(stored) };
+  });
+  const [form, setForm] = useState<AgentDraftForm>(initialDraft.form);
   const [editing, setEditing] = useState(Boolean(selection?.creatingAgent));
   const [initialState, setInitialState] = useState("{}");
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(() =>
+    initialDraft.restored ? t("flow.agentEditor.draftRestored") : null,
+  );
+  const [templateIdTouched, setTemplateIdTouched] = useState(false);
+  const [templateIdServerError, setTemplateIdServerError] = useState<
+    string | null
+  >(null);
+  const templateIdInputRef = useRef<HTMLInputElement>(null);
   const [connectionAccess, setConnectionAccess] =
     useState<AgentTemplateConnectionAccessView | null>(null);
   const [connectionAccessLoading, setConnectionAccessLoading] = useState(false);
@@ -130,6 +149,15 @@ export function AgentTemplatePanel({
     () => templates.find((view) => templateKey(view) === selectedKey) ?? null,
     [selectedKey, templates],
   );
+  const templateIdValidationError = validateAgentTemplateId(
+    form.templateId,
+    language,
+  );
+  const templateIdError =
+    templateIdServerError ??
+    (templateIdTouched || form.templateId.length > 0
+      ? templateIdValidationError
+      : null);
 
   useEffect(() => {
     if (createAgentRequest <= handledCreateAgentRequest.current) return;
@@ -227,6 +255,12 @@ export function AgentTemplatePanel({
 
   async function createVersion() {
     if (!client || busy) return;
+    setTemplateIdTouched(true);
+    setTemplateIdServerError(null);
+    if (templateIdValidationError) {
+      templateIdInputRef.current?.focus();
+      return;
+    }
     setBusy("create");
     setError(null);
     setNotice(null);
@@ -301,6 +335,7 @@ export function AgentTemplatePanel({
           riskClass: form.riskClass,
         },
       });
+      clearAgentDraft(workspaceRoot);
       setEditing(false);
       setNotice(
         `${t("flow.agentEditor.created")} ${created.template.templateId}@${created.template.version}`,
@@ -308,36 +343,16 @@ export function AgentTemplatePanel({
       await refreshAfterMutation();
       setSelectedKey(templateKey(created));
     } catch (createError) {
-      setError(readableError(createError));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function generateWithModel() {
-    if (!client || !threadId || busy || !requirement.trim()) return;
-    setBusy("generate");
-    setError(null);
-    setNotice(null);
-    try {
-      const generated = await generateAgentDraftWithModel({
-        client,
-        threadId,
-        requirement,
-        existingTemplates: templates,
-        settings,
-      });
-      setForm(
-        agentDraftFromTemplate(generated, workspaceRoot, settings, language),
+      const fieldError = agentDraftFieldErrorFromCreateFailure(
+        createError,
+        language,
       );
-      setSelectedKey(templateKey(generated));
-      setNotice(
-        `${t("flow.agentEditor.generatedPrefix")} ${generated.template.name}${t("flow.agentEditor.generatedSuffix")}`,
-      );
-      await refreshAfterMutation();
-      setSelectedKey(templateKey(generated));
-    } catch (generationError) {
-      setError(readableError(generationError));
+      if (fieldError?.field === "templateId") {
+        setTemplateIdServerError(fieldError.message);
+        templateIdInputRef.current?.focus();
+      } else {
+        setError(readableError(createError));
+      }
     } finally {
       setBusy(null);
     }
@@ -462,14 +477,25 @@ export function AgentTemplatePanel({
 
   function startNewVersion(source?: AgentTemplateVersionView) {
     setError(null);
-    setNotice(null);
-    setForm(
-      source
-        ? agentDraftFromTemplate(source, workspaceRoot, settings, language)
-        : blankAgentDraft(workspaceRoot, settings, language),
-    );
-    setRequirement(source?.template.spec.description ?? "");
+    setTemplateIdTouched(false);
+    setTemplateIdServerError(null);
+    const fallback = source
+      ? agentDraftFromTemplate(source, workspaceRoot, settings, language)
+      : blankAgentDraft(workspaceRoot, settings, language);
+    const stored = source ? null : readAgentDraft(workspaceRoot, fallback);
+    setForm(stored?.form ?? fallback);
+    setNotice(stored ? t("flow.agentEditor.draftRestored") : null);
     setEditing(true);
+  }
+
+  function saveDraftLocally() {
+    setError(null);
+    if (writeAgentDraft(workspaceRoot, form)) {
+      setNotice(t("flow.agentEditor.draftSaved"));
+    } else {
+      setNotice(null);
+      setError(t("flow.agentEditor.draftSaveFailed"));
+    }
   }
 
   return (
@@ -560,7 +586,20 @@ export function AgentTemplatePanel({
                 {t("flow.agentEditor.cancel")}
               </Button>
               <Button
-                disabled={!client || busy === "create"}
+                disabled={Boolean(busy)}
+                onClick={saveDraftLocally}
+                size="compact"
+                variant="secondary"
+              >
+                <Save aria-hidden="true" size={14} />
+                {t("flow.agentEditor.saveDraft")}
+              </Button>
+              <Button
+                disabled={
+                  !client ||
+                  busy === "create" ||
+                  Boolean(templateIdValidationError)
+                }
                 onClick={() => void createVersion()}
                 size="compact"
                 variant="primary"
@@ -574,37 +613,19 @@ export function AgentTemplatePanel({
         >
           <div className="agent-studio">
             <main className="agent-studio__main">
-              <section className="agent-studio__composer">
-                <span>
-                  <strong>{t("flow.agentEditor.describeTitle")}</strong>
-                  <small>{t("flow.agentEditor.describeDetail")}</small>
-                </span>
-                <textarea
-                  onChange={(event) => setRequirement(event.target.value)}
-                  placeholder={t("flow.agentEditor.describePlaceholder")}
-                  value={requirement}
-                />
-                <div className="agent-studio__composer-actions">
-                  <small>{t("flow.agentEditor.generateHint")}</small>
-                  <Button
-                    disabled={!threadId || !requirement.trim() || Boolean(busy)}
-                    onClick={() => void generateWithModel()}
-                    variant="primary"
-                  >
-                    <Sparkles aria-hidden="true" size={14} />
-                    {busy === "generate"
-                      ? t("flow.agentEditor.generating")
-                      : t("flow.agentEditor.generate")}
-                  </Button>
-                </div>
-              </section>
               <div className="agent-template-panel__form">
                 <TextField
+                  error={templateIdError}
+                  hint={t("flow.agentEditor.templateIdHint")}
+                  id="agent-template-id"
+                  inputRef={templateIdInputRef}
                   label={t("flow.agentEditor.agentId")}
                   value={form.templateId}
-                  onChange={(event) =>
-                    setFormValue(setForm, "templateId", event.target.value)
-                  }
+                  onChange={(event) => {
+                    setTemplateIdTouched(true);
+                    setTemplateIdServerError(null);
+                    setFormValue(setForm, "templateId", event.target.value);
+                  }}
                 />
                 <TextField
                   label={t("flow.agentEditor.name")}
@@ -656,6 +677,7 @@ export function AgentTemplatePanel({
                   }
                 />
                 <AgentTemplateKnowledgeBindingField
+                  client={client}
                   disabled={Boolean(busy)}
                   provider={form.knowledgeProvider}
                   namespaces={form.knowledgeNamespaces}
@@ -776,7 +798,6 @@ export function AgentTemplatePanel({
               </div>
             </main>
             <AgentConfigInspector
-              generating={busy === "generate"}
               preview={{
                 name: form.name,
                 instructions: form.instructions,

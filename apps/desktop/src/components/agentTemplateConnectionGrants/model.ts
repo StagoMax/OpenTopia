@@ -175,6 +175,24 @@ export function toggleOperationGrant(
   });
 }
 
+export function setOperationGrants(
+  binding: AgentConnectionBinding,
+  operationIds: readonly string[],
+  granted: boolean,
+): AgentConnectionBinding {
+  const current = new Set(
+    binding.operationGrants.map((grant) => grant.operationId),
+  );
+  for (const operationId of operationIds) {
+    if (granted) current.add(operationId);
+    else current.delete(operationId);
+  }
+  return normalizeBinding({
+    ...binding,
+    operationGrants: [...current].map((operationId) => ({ operationId })),
+  });
+}
+
 export function bindingFreshness(
   binding: AgentConnectionBinding,
   pinnedRevision: ConnectionCapabilityRevision | undefined,
