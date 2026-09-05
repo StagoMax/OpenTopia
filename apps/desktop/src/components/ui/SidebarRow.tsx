@@ -6,15 +6,7 @@ import {
   type MouseEventHandler,
   type ReactNode,
 } from "react";
-import {
-  CheckCircle2,
-  Circle,
-  CircleAlert,
-  CircleDot,
-  CircleX,
-  Loader2,
-  type LucideIcon,
-} from "lucide-react";
+import { Circle, CircleAlert, Loader2 } from "lucide-react";
 import { threadTitleScrollDurationMs } from "../../threadTitleScroll";
 
 export type SidebarRowStatusTone =
@@ -150,8 +142,6 @@ export function SidebarRow({
 }
 
 function SidebarRowStatusIndicator({ status }: { status: SidebarRowStatus }) {
-  const StatusIcon = sidebarStatusIcon(status.tone);
-
   return (
     <span
       aria-label={status.label}
@@ -166,17 +156,11 @@ function SidebarRowStatusIndicator({ status }: { status: SidebarRowStatus }) {
           size={14}
           strokeWidth={2.5}
         />
+      ) : status.tone === "danger" ? (
+        <CircleAlert aria-hidden="true" size={14} />
       ) : (
-        <StatusIcon aria-hidden="true" size={14} />
+        <Circle aria-hidden="true" fill="currentColor" size={9} />
       )}
     </span>
   );
-}
-
-function sidebarStatusIcon(tone: SidebarRowStatusTone): LucideIcon {
-  if (tone === "success") return CheckCircle2;
-  if (tone === "warning") return CircleAlert;
-  if (tone === "danger") return CircleX;
-  if (tone === "info") return CircleDot;
-  return Circle;
 }

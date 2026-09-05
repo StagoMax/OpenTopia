@@ -158,8 +158,8 @@ export function classifyToolCall(call: ToolCall): ToolActivityKind {
   if (call.name === "write_file" || call.name === "apply_patch") return "edit";
   if (call.name === "browser") return "browser";
   if (call.name === "computer") return "computer";
-  if (call.name === "document" || call.name === "pdf") return "attachment";
-  if (call.name === "spreadsheet") return "spreadsheet";
+  if (call.name === "word_document" || call.name === "pdf") return "attachment";
+  if (call.name.startsWith("spreadsheet_")) return "spreadsheet";
   if (call.name === "view_attachment" || call.name === "read_attachment") {
     return "attachment";
   }
@@ -279,7 +279,7 @@ function buildToolActivityView(
   }
 
   if (
-    call.name === "document" ||
+    call.name === "word_document" ||
     call.name === "pdf" ||
     call.name === "view_attachment" ||
     call.name === "read_attachment"
@@ -289,7 +289,7 @@ function buildToolActivityView(
       stringField(metadata, "contentType") ||
       (call.name === "pdf"
         ? "application/pdf"
-        : call.name === "document"
+        : call.name === "word_document"
           ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
           : "");
     const action = stringField(input, "action");
@@ -311,13 +311,13 @@ function buildToolActivityView(
       kind,
       iconKind: attachment.iconKind,
       title:
-        call.name === "pdf" || call.name === "document"
+        call.name === "pdf" || call.name === "word_document"
           ? officeActivityTitle(call.name, action, Boolean(result))
           : attachment.title,
       detail: name || undefined,
       chips,
       body: includeBody
-        ? bodyFromFields(input, output, result, ["attachmentId", "action"])
+        ? bodyFromFields(input, output, result, ["attachment_id", "action"])
         : { type: "pending" },
       failed,
     };
@@ -357,7 +357,7 @@ function buildToolActivityView(
         : operation === "list"
           ? `列出 ${displayPath(path) || "."}`
           : operation === "find"
-            ? `查找 ${stringField(input, "nameContains") || "文件"}`
+            ? `查找 ${stringField(input, "name_contains") || "文件"}`
             : operation === "stat"
               ? `检查 ${displayPath(path) || "路径"}`
               : operation === "write"
@@ -500,18 +500,18 @@ function buildToolActivityView(
     };
   }
 
-  if (call.name === "spreadsheet") {
-    const action = stringField(input, "action") || "操作";
+  if (call.name.startsWith("spreadsheet_")) {
+    const action = call.name.slice("spreadsheet_".length) || "操作";
     return {
       kind,
       title: action,
       detail:
         displayPath(
-          stringField(input, "path") || stringField(input, "outputPath"),
+          stringField(input, "path") || stringField(input, "destination"),
         ) || undefined,
       chips: [],
       body: includeBody
-        ? bodyFromFields(input, output, result, ["action"])
+        ? bodyFromFields(input, output, result)
         : { type: "pending" },
       failed,
     };
@@ -593,7 +593,7 @@ function buildToolActivityView(
 }
 
 function officeActivityTitle(
-  toolName: "pdf" | "document",
+  toolName: "pdf" | "word_document",
   action: string,
   complete: boolean,
 ) {

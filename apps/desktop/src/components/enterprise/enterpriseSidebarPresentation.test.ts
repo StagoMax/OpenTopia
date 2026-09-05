@@ -39,6 +39,19 @@ test("pending cases treat an explicit title as the complete display name", () =>
   assert.equal(flowCaseCoreLabel(flowCase), "信贷案件 30 · 组合风险");
 });
 
+test("pending cases prefer a localized business title over event metadata", () => {
+  const flowCase = {
+    input: {
+      "事件类型": "信贷材料审核",
+      "案件名称": "信贷案件 30 · 组合风险",
+      "案件编号": "case_30_combo",
+    },
+    idempotencyKey: "demo-event:credit-review:case_30_combo:node-trigger-v4",
+  } as FlowCase;
+
+  assert.equal(flowCaseCoreLabel(flowCase), "信贷案件 30 · 组合风险");
+});
+
 test("event triggers expose source and event type", () => {
   assert.equal(
     workflowTriggerLabel({

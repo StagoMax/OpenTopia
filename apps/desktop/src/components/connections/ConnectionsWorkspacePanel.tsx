@@ -10,7 +10,7 @@ import {
 } from "lucide-react";
 import type { ApiClient } from "../../api/client";
 import { useApplicationLanguage } from "../../ApplicationLanguageProvider";
-import { Button, IconButton } from "../ui";
+import { Button, IconButton, Tooltip } from "../ui";
 import {
   FlowInspectorPanel,
   FlowInspectorSection,
@@ -186,24 +186,45 @@ export function ConnectionsWorkspacePanel({
                 >
                   <Pencil aria-hidden="true" size={14} />
                 </IconButton>
-                <IconButton
-                  aria-label={t("flow.connection.workspace.testAria")}
-                  disabled={Boolean(snapshot.busyAction) || !selected.enabled}
-                  onClick={() => void store.test(selected.id)}
-                  size="compact"
+                <Tooltip
+                  content={t("flow.connection.workspace.testAria")}
+                  placement="bottom"
                 >
-                  <RotateCw aria-hidden="true" size={14} />
-                </IconButton>
-                <IconButton
-                  aria-label={t("flow.connection.workspace.refreshAria")}
-                  disabled={
-                    Boolean(snapshot.busyAction) || selected.status !== "ready"
-                  }
-                  onClick={() => void store.refreshCapabilities(selected.id)}
-                  size="compact"
+                  {(tooltipProps) => (
+                    <IconButton
+                      {...tooltipProps}
+                      aria-label={t("flow.connection.workspace.testAria")}
+                      disabled={
+                        Boolean(snapshot.busyAction) || !selected.enabled
+                      }
+                      onClick={() => void store.test(selected.id)}
+                      size="compact"
+                    >
+                      <RotateCw aria-hidden="true" size={14} />
+                    </IconButton>
+                  )}
+                </Tooltip>
+                <Tooltip
+                  content={t("flow.connection.workspace.refreshAria")}
+                  placement="bottom"
                 >
-                  <RefreshCw aria-hidden="true" size={14} />
-                </IconButton>
+                  {(tooltipProps) => (
+                    <IconButton
+                      {...tooltipProps}
+                      aria-label={t("flow.connection.workspace.refreshAria")}
+                      disabled={
+                        Boolean(snapshot.busyAction) ||
+                        selected.status !== "ready"
+                      }
+                      onClick={() =>
+                        void store.refreshCapabilities(selected.id)
+                      }
+                      size="compact"
+                    >
+                      <RefreshCw aria-hidden="true" size={14} />
+                    </IconButton>
+                  )}
+                </Tooltip>
               </>
             }
             status={connectionStatusLabel(selected.status, language)}

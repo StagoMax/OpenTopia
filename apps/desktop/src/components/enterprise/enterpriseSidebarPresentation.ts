@@ -5,12 +5,17 @@ import {
   type ApplicationLanguage,
 } from "../../applicationLanguage.ts";
 
-const preferredInputKeys = [
+const preferredTitleKeys = [
   "title",
   "subject",
   "name",
+  "案件名称",
+] as const;
+
+const preferredQualifierKeys = [
   "caseId",
   "case_id",
+  "案件编号",
   "orderId",
   "order_id",
   "requestId",
@@ -97,13 +102,13 @@ export function workflowTriggerLabel(
 function summarizeInput(value: unknown): string | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
-  for (const key of ["title", "subject", "name"] as const) {
+  for (const key of preferredTitleKeys) {
     const label = scalarLabel(record[key]);
     if (label) return label;
   }
   const values: string[] = [];
 
-  for (const key of preferredInputKeys.slice(3)) {
+  for (const key of preferredQualifierKeys) {
     const label = scalarLabel(record[key]);
     if (label && !values.includes(label)) values.push(label);
     if (values.length === 2) break;

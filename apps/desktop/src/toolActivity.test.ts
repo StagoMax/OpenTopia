@@ -204,10 +204,9 @@ test("builds collapsed tool summaries without reading large result bodies", () =
   );
 });
 
-test("uses the spreadsheet action as the activity title without a redundant type prefix", () => {
+test("uses the spreadsheet operation name as the activity title without a redundant type prefix", () => {
   const view = buildToolActivity(
-    call("spreadsheet", {
-      action: "inspect",
+    call("spreadsheet_inspect", {
       path: String.raw`C:\Users\Stargo\Downloads\orders.xlsx`,
     }),
   );
@@ -219,14 +218,14 @@ test("uses the spreadsheet action as the activity title without a redundant type
 
 test("presents image attachments with their file format and size", () => {
   const pending = buildToolActivity(
-    call("view_attachment", { attachmentId: "attachment-1" }),
+    call("view_attachment", { attachment_id: "attachment-1" }),
   );
   assert.equal(pending.kind, "attachment");
   assert.equal(pending.iconKind, "image");
   assert.equal(pending.title, "查看图片");
 
   const view = buildToolActivity(
-    call("view_attachment", { attachmentId: "attachment-1" }),
+    call("view_attachment", { attachment_id: "attachment-1" }),
     result("Image attachment follows as typed image data.", {
       success: true,
       name: "screenshot.png",
@@ -247,7 +246,7 @@ test("presents image attachments with their file format and size", () => {
 
 test("distinguishes common document attachment formats", () => {
   const pdf = buildToolActivity(
-    call("read_attachment", { attachmentId: "attachment-2" }),
+    call("read_attachment", { attachment_id: "attachment-2" }),
     result("document", {
       name: "requirements.pdf",
       contentType: "application/pdf",
@@ -263,7 +262,7 @@ test("distinguishes common document attachment formats", () => {
   );
 
   const spreadsheet = buildToolActivity(
-    call("read_attachment", { attachmentId: "attachment-3" }),
+    call("read_attachment", { attachment_id: "attachment-3" }),
     result("rows", {
       name: "orders.xlsx",
       contentType: "application/octet-stream",
@@ -277,7 +276,7 @@ test("distinguishes common document attachment formats", () => {
   );
 
   const unknown = buildToolActivity(
-    call("read_attachment", { attachmentId: "attachment-4" }),
+    call("read_attachment", { attachment_id: "attachment-4" }),
     result("resource", {
       name: "payload.bin",
       contentType: "application/octet-stream",
@@ -290,9 +289,9 @@ test("distinguishes common document attachment formats", () => {
 
 test("presents native Office observation tools as attachment activity", () => {
   const pending = buildToolActivity(
-    call("document", {
+    call("word_document", {
       action: "extract",
-      attachmentId: "attachment-docx",
+      attachment_id: "attachment-docx",
     }),
   );
   assert.equal(pending.kind, "attachment");
@@ -302,7 +301,7 @@ test("presents native Office observation tools as attachment activity", () => {
   const rendered = buildToolActivity(
     call("pdf", {
       action: "render",
-      attachmentId: "attachment-pdf",
+      attachment_id: "attachment-pdf",
     }),
     result("rendered", {
       success: true,
@@ -323,7 +322,7 @@ test("presents native Office observation tools as attachment activity", () => {
 
 test("hides the model-facing attachment boundary from the activity body", () => {
   const view = buildToolActivity(
-    call("view_attachment", { attachmentId: "attachment-5" }),
+    call("view_attachment", { attachment_id: "attachment-5" }),
     result("Attachment content:\nimage observation", {
       name: "photo.jpg",
       contentType: "image/jpeg",
@@ -420,7 +419,7 @@ test("renders canonical filesystem operations without legacy tool names", () => 
     call("filesystem", {
       operation: "find",
       path: "src",
-      nameContains: "app",
+      name_contains: "app",
     }),
     result('{"entries":[]}', { operation: "find", count: 0 }),
   );

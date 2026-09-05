@@ -91,8 +91,8 @@ export function OverviewPage({
       const flow = snapshot.flows.find((item) => item.flowId === event.flowId);
       return {
         id: `case:${event.id}`,
-        title: flow?.name ?? event.flowId,
-        detail: flowCaseCoreLabel(event),
+        title: flowCaseCoreLabel(event),
+        detail: flow?.name ?? event.flowId,
         label: t("flow.overview.awaitingConfirmation"),
         variant: "warning" as const,
         activate: () => {
