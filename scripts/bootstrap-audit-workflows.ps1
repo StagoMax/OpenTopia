@@ -81,17 +81,37 @@ function Wait-FlowRunStatus {
   throw "Flow Run $RunId did not reach $($Statuses -join ', ')"
 }
 
-function Resolve-FlowReviewTask {
-  param([object]$Run, [string]$TaskType, [string]$IdempotencyKey)
-  $task = @(Expand-TopiaItems (Invoke-TopiaApi GET "/api/human-tasks?status=pending&flowRunId=$($Run.id)")) |
-    Where-Object { $_.taskType -eq $TaskType } |
-    Select-Object -First 1
-  if (-not $task) { throw "Flow Run $($Run.id) is missing $TaskType HumanTask" }
-  Invoke-TopiaApi POST "/api/human-tasks/$($task.id)/resolve" @{
-    expectedRevision = $task.revision
-    action = "approve"
-    idempotencyKey = $IdempotencyKey
-  } | Out-Null
+function Complete-FlowRunReviews {
+  param(
+    [Parameter(Mandatory = $true)][object]$Run,
+    [Parameter(Mandatory = $true)][string]$IdempotencyPrefix,
+    [int]$TimeoutSeconds = 1200
+  )
+
+  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+  do {
+    $current = Invoke-TopiaApi GET "/api/flow-runs/$($Run.id)"
+    if ($current.status -in @("succeeded", "failed", "cancelled")) { return $current }
+
+    $pendingTasks = @(Expand-TopiaItems (Invoke-TopiaApi GET "/api/human-tasks?status=pending&flowRunId=$($Run.id)"))
+    $reviewTask = $pendingTasks |
+      Where-Object { $_.taskType -in @("approval", "output_review") } |
+      Select-Object -First 1
+    if ($reviewTask) {
+      Invoke-TopiaApi POST "/api/human-tasks/$($reviewTask.id)/resolve" @{
+        expectedRevision = $reviewTask.revision
+        action = "approve"
+        idempotencyKey = "$IdempotencyPrefix-$($reviewTask.id)"
+      } | Out-Null
+    }
+    elseif ($pendingTasks.Count -gt 0) {
+      $taskTypes = @($pendingTasks | ForEach-Object { [string]$_.taskType }) -join ", "
+      throw "Flow Run $($Run.id) requires unsupported HumanTask types: $taskTypes"
+    }
+    Start-Sleep -Milliseconds 250
+  } while ([DateTime]::UtcNow -lt $deadline)
+
+  throw "Flow Run $($Run.id) did not finish its review cycle before the timeout"
 }
 
 function Import-SagText {
@@ -372,20 +392,21 @@ function Get-WorkInjuryDemoEvents {
     $expenseLines = @($case.expense_lines)
     $expenseTotal = ($expenseLines | Measure-Object -Property amount -Sum).Sum
     [ordered]@{
-      idempotencyKey = "demo-event:work-injury:${caseId}:node-trigger-v2"
+      idempotencyKey = "demo-event:work-injury:${caseId}:chinese-contract-v1"
       caseId = $caseId
       payload = [ordered]@{
-        caseId = $caseId
-        eventKind = "work_injury_medical_expense_review"
-        payloadRef = "connection://$ConnectionId/demo-cases/$([Uri]::EscapeDataString($caseId))"
-        synthetic = $true
-        summary = [ordered]@{
-          region = [string]$case.region
-          accidentDate = [string]$case.accident_date
-          expenseTotal = [Math]::Round([double]$expenseTotal, 2)
-          expenseCount = $expenseLines.Count
-          materialCount = @($case.materials).Count
-          recognizedDiagnosisCount = @($case.recognized_diagnoses).Count
+        "案件名称" = "工伤案件 $caseId"
+        "案件编号" = $caseId
+        "事件类型" = "工伤医疗费用审核"
+        "载荷引用" = "connection://$ConnectionId/demo-cases/$([Uri]::EscapeDataString($caseId))"
+        "合成数据" = $true
+        "摘要" = [ordered]@{
+          "地区" = [string]$case.region
+          "事故日期" = [string]$case.accident_date
+          "费用总额" = [Math]::Round([double]$expenseTotal, 2)
+          "费用项目数" = $expenseLines.Count
+          "材料数量" = @($case.materials).Count
+          "已认定诊断数" = @($case.recognized_diagnoses).Count
         }
       }
     }
@@ -415,6 +436,19 @@ function Get-CreditDemoCaseTitle {
   "$caseLabel · $scenarioLabel"
 }
 
+function Get-CreditDocumentTypeLabel {
+  param([Parameter(Mandatory = $true)][string]$DocumentType)
+
+  switch ($DocumentType) {
+    "loan_application" { "贷款申请表" }
+    "income_proof" { "收入证明" }
+    "bank_statement" { "银行流水" }
+    "credit_summary" { "征信摘要" }
+    "external_verification" { "外部核验材料" }
+    default { throw "Unsupported credit review document type: $DocumentType" }
+  }
+}
+
 function Get-CreditDemoEvents {
   param([Parameter(Mandatory = $true)][string]$ConnectionId)
   $caseRoot = Join-Path $creditRoot "data\synthetic_cases"
@@ -428,24 +462,41 @@ function Get-CreditDemoEvents {
     $application = @($documents | Where-Object { $_.document_type -eq "loan_application" } | Select-Object -First 1)
     $applicationFields = if ($application.Count -gt 0) { $application[0].fields } else { $null }
     [ordered]@{
-      idempotencyKey = "demo-event:credit-review:${caseId}:node-trigger-v3"
+      idempotencyKey = "demo-event:credit-review:${caseId}:chinese-contract-v1"
       caseId = $caseId
       payload = [ordered]@{
-        title = Get-CreditDemoCaseTitle -CaseId $caseId
-        caseId = $caseId
-        eventKind = "credit_material_review"
-        payloadRef = "connection://$ConnectionId/demo-cases/$([Uri]::EscapeDataString($caseId))"
-        synthetic = $true
-        summary = [ordered]@{
-          loanAmount = if ($null -ne $applicationFields) { $applicationFields.loan_amount } else { $null }
-          loanTermMonths = if ($null -ne $applicationFields) { $applicationFields.loan_term_months } else { $null }
-          loanPurpose = if ($null -ne $applicationFields) { [string]$applicationFields.loan_purpose } else { "" }
-          documentCount = $documents.Count
-          documentTypes = @($documents | ForEach-Object { [string]$_.document_type } | Sort-Object -Unique)
+        "案件名称" = Get-CreditDemoCaseTitle -CaseId $caseId
+        "案件编号" = $caseId
+        "事件类型" = "信贷材料审核"
+        "载荷引用" = "connection://$ConnectionId/demo-cases/$([Uri]::EscapeDataString($caseId))"
+        "合成数据" = $true
+        "摘要" = [ordered]@{
+          "贷款金额" = if ($null -ne $applicationFields) { $applicationFields.loan_amount } else { $null }
+          "贷款期限（月）" = if ($null -ne $applicationFields) { $applicationFields.loan_term_months } else { $null }
+          "贷款用途" = if ($null -ne $applicationFields) { [string]$applicationFields.loan_purpose } else { "" }
+          "材料数量" = $documents.Count
+          "材料类型" = @(
+            $documents |
+              ForEach-Object { Get-CreditDocumentTypeLabel -DocumentType ([string]$_.document_type) } |
+              Sort-Object -Unique
+          )
         }
       }
     }
   }
+}
+
+function Get-DemoEventBusinessCaseId {
+  param([object]$InputPayload)
+
+  if ($null -eq $InputPayload) { return "" }
+  foreach ($field in @("案件编号", "caseId", "case_id")) {
+    $property = $InputPayload.PSObject.Properties[$field]
+    if ($null -ne $property -and ([string]$property.Value).Trim()) {
+      return ([string]$property.Value).Trim()
+    }
+  }
+  ""
 }
 
 function Seed-DemoEvents {
@@ -461,9 +512,12 @@ function Seed-DemoEvents {
   if (($idempotencyKeys | Sort-Object -Unique).Count -ne $idempotencyKeys.Count) {
     throw "Demo event idempotency keys must be unique for Flow $($Flow.flowId)"
   }
+  $existingCases = @(Expand-TopiaItems (Invoke-TopiaApi GET "/api/flow-cases?flowId=$([Uri]::EscapeDataString($Flow.flowId))"))
+  $supersededLegacyEventCount = 0
   $seeded = foreach ($event in $Events) {
+    $revisionScopedIdempotencyKey = "$($event.idempotencyKey):revision:$($Flow.activeRevision.id)"
     $result = Invoke-TopiaApi POST "/api/flows/$([Uri]::EscapeDataString($Flow.flowId))/invoke" @{
-      idempotencyKey = [string]$event.idempotencyKey
+      idempotencyKey = $revisionScopedIdempotencyKey
       input = $event.payload
     }
     if ($result.case.flowId -ne $Flow.flowId -or $result.case.flowRevisionId -ne $Flow.activeRevision.id) {
@@ -472,15 +526,33 @@ function Seed-DemoEvents {
     if ($result.case.status -ne "accepted" -or $result.case.flowRunId -or $result.run) {
       throw "Demo event '$($event.caseId)' did not remain pending for human trigger review"
     }
+    $supersededCases = @(
+      $existingCases | Where-Object {
+        $_.id -ne $result.case.id -and
+        $_.status -eq "accepted" -and
+        -not $_.flowRunId -and
+        ([string]$_.idempotencyKey).StartsWith("demo-event:") -and
+        (Get-DemoEventBusinessCaseId -InputPayload $_.input) -eq [string]$event.caseId
+      }
+    )
+    foreach ($supersededCase in $supersededCases) {
+      Invoke-TopiaApi POST "/api/flow-cases/$($supersededCase.id)/supersede" @{
+        replacementCaseId = [string]$result.case.id
+        note = "中文业务字段契约替代旧版演示事件"
+      } | Out-Null
+    }
+    $supersededLegacyEventCount += $supersededCases.Count
     [ordered]@{
       caseId = [string]$event.caseId
       caseIdRecord = [string]$result.case.id
       reused = [bool]$result.reused
+      supersededLegacyEvents = $supersededCases.Count
     }
   }
   [ordered]@{
     requested = $Events.Count
     accepted = @($seeded).Count
+    supersededLegacyEvents = $supersededLegacyEventCount
     events = @($seeded)
   }
 }
@@ -507,15 +579,7 @@ function Test-QueuedAuditCase {
   if ($started.case.status -ne "started" -or -not $started.run.id) {
     throw "Queued Demo event '$CaseId' did not start"
   }
-  $run = Wait-FlowRunStatus $started.run.id @("waiting_approval", "waiting_human", "succeeded", "failed", "cancelled")
-  if ($run.status -eq "waiting_approval") {
-    Resolve-FlowReviewTask $run "approval" "migration-case-approval-$($run.id)"
-    $run = Wait-FlowRunStatus $run.id @("waiting_human", "succeeded", "failed", "cancelled")
-  }
-  if ($run.status -eq "waiting_human") {
-    Resolve-FlowReviewTask $run "output_review" "migration-case-output-$($run.id)"
-    $run = Wait-FlowRunStatus $run.id @("succeeded", "failed", "cancelled")
-  }
+  $run = Complete-FlowRunReviews $started.run "migration-case-review-$($started.run.id)"
   if ($run.status -ne "succeeded") {
     throw "Queued Demo event '$CaseId' failed: $($run.status) $($run.error)"
   }
@@ -565,14 +629,14 @@ function New-AuditFlow {
   }
   $inputSchema = @{
     type = "object"
-    required = @("caseId")
-    properties = @{
-      title = @{ type = "string"; title = "案件名称" }
-      caseId = @{ type = "string"; title = "案件 ID" }
-      eventKind = @{ type = "string"; title = "事件类型" }
-      payloadRef = @{ type = "string"; title = "载荷引用" }
-      synthetic = @{ type = "boolean"; title = "合成数据" }
-      summary = $InputSummarySchema
+    required = @("案件编号")
+    properties = [ordered]@{
+      "案件名称" = @{ type = "string" }
+      "案件编号" = @{ type = "string" }
+      "事件类型" = @{ type = "string" }
+      "载荷引用" = @{ type = "string" }
+      "合成数据" = @{ type = "boolean" }
+      "摘要" = $InputSummarySchema
     }
     additionalProperties = $false
   }
@@ -618,8 +682,8 @@ function New-AuditFlow {
     }
   }
   $nodes = @(
-    (& $node "domain_audit" "结构化审核" $DomainTemplate "将 @Flow.input 作为不可变的案件事件，将 @Trigger.input 作为本智能体的触发载荷。调用已批准的外部 SAG 领域审核工具，不得调用旧版 RAG 工具。保留 caseId、runId、规则发现、依据 ID 和政策检索词；所有面向审核人员的说明使用简体中文。" $eventActivation),
-    (& $node "sag_evidence" "SAG 政策依据" $EvidenceTemplate "本智能体由 domain_audit 的 Agent Final 通知触发。处理 @Trigger.input 中的 domain_audit 产物，同时保留 @Flow.input 中的原始案件。对每个政策检索词调用 library_search；只使用模板冻结的命名空间，并返回标题、sourcePath、eventId/evidenceId 和简体中文摘要。" $domainFinalActivation),
+    (& $node "domain_audit" "结构化审核" $DomainTemplate "将 @Flow.input 作为不可变的案件事件，将 @Trigger.input 作为本智能体的触发载荷。从「案件编号」字段读取案件编号，调用已批准的外部 SAG 领域审核工具，不得调用旧版 RAG 工具。保留案件编号、运行编号、规则发现、依据编号和政策检索词；返回 JSON 的业务字段名和所有面向审核人员的说明均使用简体中文。" $eventActivation),
+    (& $node "sag_evidence" "SAG 政策依据" $EvidenceTemplate "本智能体由结构化审核节点的完成通知触发。处理 @Trigger.input 中的结构化审核产物，同时保留 @Flow.input 中的原始案件。对每个政策检索词调用 library_search；只使用模板冻结的命名空间，并以中文字段名返回依据标题、来源路径、事件编号、依据编号和简体中文摘要。" $domainFinalActivation),
     @{ id = "evidence_validator"; label = "依据完整性检查"; kind = "validator"; config = @{}; inputSchema = $objectSchema; outputSchema = $objectSchema },
     @{ id = "review_gate"; label = "人工复核关口"; kind = "approval"; config = @{}; inputSchema = $objectSchema; outputSchema = $objectSchema },
     @{ id = "review_context"; label = "汇总复核上下文"; kind = "join"; config = @{}; inputSchema = $objectSchema; outputSchema = $objectSchema },
@@ -657,21 +721,13 @@ function New-AuditFlow {
   if (-not $validated.draft.lastValidation.valid) {
     throw "Flow validation failed: $($validated.draft.lastValidation.issues | ConvertTo-Json -Depth 20 -Compress)"
   }
-  $trial = Invoke-TopiaApi POST "/api/flow-drafts/$($draft.draft.id)/simulate" @{ input = @{ caseId = $TestCaseId } }
+  $trial = Invoke-TopiaApi POST "/api/flow-drafts/$($draft.draft.id)/simulate" @{ input = @{ "案件编号" = $TestCaseId } }
   if ($trial.status -ne "passed") { throw "Flow simulation failed for $FlowId" }
   $testRun = Invoke-TopiaApi POST "/api/flow-drafts/$($draft.draft.id)/test-run" @{
-    input = @{ caseId = $TestCaseId }
+    input = @{ "案件编号" = $TestCaseId }
     startedBy = $Owner
   }
-  $testRun = Wait-FlowRunStatus $testRun.id @("waiting_approval", "waiting_human", "succeeded", "failed", "cancelled")
-  if ($testRun.status -eq "waiting_approval") {
-    Resolve-FlowReviewTask $testRun "approval" "bootstrap-test-approval-$($testRun.id)"
-    $testRun = Wait-FlowRunStatus $testRun.id @("waiting_human", "succeeded", "failed", "cancelled")
-  }
-  if ($testRun.status -eq "waiting_human") {
-    Resolve-FlowReviewTask $testRun "output_review" "bootstrap-test-output-$($testRun.id)"
-    $testRun = Wait-FlowRunStatus $testRun.id @("succeeded", "failed", "cancelled")
-  }
+  $testRun = Complete-FlowRunReviews $testRun "bootstrap-test-review-$($testRun.id)"
   if ($testRun.status -ne "succeeded") {
     throw "Flow Test Run failed for ${FlowId}: $($testRun.status) $($testRun.error)"
   }
@@ -714,9 +770,16 @@ if ($ValidateDataOnly) {
       throw "Demo event validation found duplicate idempotency keys"
     }
   }
-  $untitledCreditEvents = @($creditEvents | Where-Object { [string]$_.payload.title -notlike "信贷案件*" })
+  $untitledCreditEvents = @($creditEvents | Where-Object { [string]$_.payload."案件名称" -notlike "信贷案件*" })
   if ($untitledCreditEvents.Count -gt 0) {
     throw "Credit review demo events must define a Chinese business title"
+  }
+  $expectedPayloadFields = @("案件名称", "案件编号", "事件类型", "载荷引用", "合成数据", "摘要")
+  foreach ($event in @($workEvents + $creditEvents)) {
+    $actualFields = @($event.payload.Keys)
+    if ((Compare-Object $expectedPayloadFields $actualFields).Count -gt 0) {
+      throw "Demo event '$($event.caseId)' does not use the Chinese business payload contract"
+    }
   }
   [ordered]@{
     valid = $true
@@ -790,96 +853,102 @@ $creditDemoEvents = @(Get-CreditDemoEvents -ConnectionId $creditAccess.Connectio
 
 $workSummarySchema = @{
   type = "object"
-  title = "摘要"
   properties = [ordered]@{
-    region = @{ type = "string"; title = "地区" }
-    accidentDate = @{ type = "string"; title = "事故日期" }
-    expenseTotal = @{ type = "number"; title = "费用总额" }
-    expenseCount = @{ type = "integer"; title = "费用项目数" }
-    materialCount = @{ type = "integer"; title = "材料数量" }
-    recognizedDiagnosisCount = @{ type = "integer"; title = "已认定诊断数" }
+    "地区" = @{ type = "string" }
+    "事故日期" = @{ type = "string" }
+    "费用总额" = @{ type = "number" }
+    "费用项目数" = @{ type = "integer" }
+    "材料数量" = @{ type = "integer" }
+    "已认定诊断数" = @{ type = "integer" }
   }
   additionalProperties = $false
 }
 $workOutputSchema = @{
   type = "object"
+  required = @(
+    "权威性核验", "自动待遇决定", "案件编号", "决策边界", "审核发现", "需要人工复核",
+    "政策依据", "政策依据评估", "建议复核操作", "复核状态", "复核类型", "摘要"
+  )
   properties = [ordered]@{
-    authority_verification = @{ type = "object"; title = "权威性核验" }
-    automatic_benefit_decision = @{ type = @("string", "null"); title = "自动待遇决定" }
-    case_id = @{ type = "string"; title = "案件 ID" }
-    decision_boundary = @{ type = "string"; title = "决策边界" }
-    findings = @{ type = "array"; title = "审核发现"; items = @{} }
-    human_review_required = @{ type = "boolean"; title = "需要人工复核" }
-    policy_evidence = @{ type = "array"; title = "政策依据"; items = @{} }
-    policy_evidence_assessment = @{ type = "string"; title = "政策依据评估" }
-    recommended_review_actions = @{ type = "array"; title = "建议复核操作"; items = @{} }
-    review_status = @{ type = "string"; title = "复核状态" }
-    review_type = @{ type = "string"; title = "复核类型" }
-    summary = @{ type = "object"; title = "摘要" }
+    "权威性核验" = @{ type = "object" }
+    "自动待遇决定" = @{ type = @("string", "null") }
+    "案件编号" = @{ type = "string" }
+    "决策边界" = @{ type = "string" }
+    "审核发现" = @{ type = "array"; items = @{} }
+    "需要人工复核" = @{ type = "boolean" }
+    "政策依据" = @{ type = "array"; items = @{} }
+    "政策依据评估" = @{ type = "string" }
+    "建议复核操作" = @{ type = "array"; items = @{} }
+    "复核状态" = @{ type = "string" }
+    "复核类型" = @{ type = "string" }
+    "摘要" = @{ type = "object" }
   }
-  additionalProperties = $true
+  additionalProperties = $false
 }
 $creditSummarySchema = @{
   type = "object"
-  title = "摘要"
   properties = [ordered]@{
-    loanAmount = @{ type = @("number", "null"); title = "贷款金额" }
-    loanTermMonths = @{ type = @("integer", "null"); title = "贷款期限（月）" }
-    loanPurpose = @{ type = "string"; title = "贷款用途" }
-    documentCount = @{ type = "integer"; title = "材料数量" }
-    documentTypes = @{ type = "array"; title = "材料类型"; items = @{ type = "string" } }
+    "贷款金额" = @{ type = @("number", "null") }
+    "贷款期限（月）" = @{ type = @("integer", "null") }
+    "贷款用途" = @{ type = "string" }
+    "材料数量" = @{ type = "integer" }
+    "材料类型" = @{ type = "array"; items = @{ type = "string" } }
   }
   additionalProperties = $false
 }
 $creditOutputSchema = @{
   type = "object"
+  required = @(
+    "权威性核验", "自动授信决定", "案件编号", "现金流分析", "决策边界", "审核发现",
+    "需要人工复核", "政策依据", "政策依据评估", "建议复核操作", "复核状态", "复核类型", "摘要"
+  )
   properties = [ordered]@{
-    authority_verification = @{ type = "object"; title = "权威性核验" }
-    automatic_credit_decision = @{ type = @("string", "null"); title = "自动授信决定" }
-    case_id = @{ type = "string"; title = "案件 ID" }
-    cashflow_analysis = @{ type = @("object", "string"); title = "现金流分析" }
-    decision_boundary = @{ type = "string"; title = "决策边界" }
-    findings = @{ type = "array"; title = "审核发现"; items = @{} }
-    human_review_required = @{ type = "boolean"; title = "需要人工复核" }
-    policy_evidence = @{ type = "array"; title = "政策依据"; items = @{} }
-    policy_evidence_assessment = @{ type = "string"; title = "政策依据评估" }
-    recommended_review_actions = @{ type = "array"; title = "建议复核操作"; items = @{} }
-    review_status = @{ type = "string"; title = "复核状态" }
-    review_type = @{ type = "string"; title = "复核类型" }
-    summary = @{ type = "object"; title = "摘要" }
+    "权威性核验" = @{ type = "object" }
+    "自动授信决定" = @{ type = @("string", "null") }
+    "案件编号" = @{ type = "string" }
+    "现金流分析" = @{ type = @("object", "string") }
+    "决策边界" = @{ type = "string" }
+    "审核发现" = @{ type = "array"; items = @{} }
+    "需要人工复核" = @{ type = "boolean" }
+    "政策依据" = @{ type = "array"; items = @{} }
+    "政策依据评估" = @{ type = "string" }
+    "建议复核操作" = @{ type = "array"; items = @{} }
+    "复核状态" = @{ type = "string" }
+    "复核类型" = @{ type = "string" }
+    "摘要" = @{ type = "object" }
   }
-  additionalProperties = $true
+  additionalProperties = $false
 }
 
 $workDomain = New-AgentTemplate `
   -TemplateId "audit.work-injury.domain" `
   -Name "工伤领域审核智能体" `
-  -Instructions "只读取事件中的 caseId，并仅针对该案件调用 audit_demo_case_for_external_sag。返回领域事实、结构化目录匹配、规则发现和外部知识检索计划。目录工具只能用于核验工具已返回的费用匹配；不得枚举无关案件，不得调用或声称使用旧版项目 RAG。所有面向审核人员的说明使用简体中文。" `
+  -Instructions "只读取事件中的「案件编号」字段，并将其值传给 audit_demo_case_for_external_sag 的 case_id 参数；仅审核该案件。返回领域事实、结构化目录匹配、规则发现和外部知识检索计划。目录工具只能用于核验工具已返回的费用匹配；不得枚举无关案件，不得调用或声称使用旧版项目 RAG。工具参数名和工具原始返回值属于技术接口，可以保留英文；本智能体返回 JSON 的所有业务字段名及面向审核人员的说明必须直接使用简体中文。" `
   -ConnectionAccess $workAccess
 $workEvidence = New-AgentTemplate `
   -TemplateId "audit.work-injury.evidence" `
   -Name "工伤 SAG 依据检索智能体" `
-  -Instructions "使用 library_search 为每项工伤审核发现检索政策依据。只能引用工具实际返回的依据，不得检索模板冻结命名空间以外的内容；所有面向审核人员的摘要和说明使用简体中文。" `
+  -Instructions "使用 library_search 为每项工伤审核发现检索政策依据。只能引用工具实际返回的依据，不得检索模板冻结命名空间以外的内容。工具参数名和工具原始返回值属于技术接口，可以保留英文；本智能体返回 JSON 的所有业务字段名、摘要和说明必须直接使用简体中文。" `
   -KnowledgeNamespace $workInjuryNamespace
 $workReport = New-AgentTemplate `
   -TemplateId "audit.work-injury.report" `
   -Name "工伤复核报告智能体" `
-  -Instructions "将结构化发现和 SAG 政策依据整理为人工复核草案，并保留依据 ID 与来源。输出必须是 JSON 对象，固定使用 authority_verification、automatic_benefit_decision、case_id、decision_boundary、findings、human_review_required、policy_evidence、policy_evidence_assessment、recommended_review_actions、review_status、review_type、summary 字段。所有面向人员的结论、说明和行动建议直接使用简体中文；review_type 填写“工伤医疗费用审核”，review_status 填写“待人工复核”，automatic_benefit_decision 必须为 null。不得作出自动待遇决定。"
+  -Instructions "将结构化发现和 SAG 政策依据整理为人工复核草案，并保留依据编号与来源。输出必须是 JSON 对象，顶层固定且仅使用「权威性核验、自动待遇决定、案件编号、决策边界、审核发现、需要人工复核、政策依据、政策依据评估、建议复核操作、复核状态、复核类型、摘要」这些中文字段；所有嵌套业务字段名、结论、说明和行动建议也必须直接使用简体中文，不得输出英文业务字段名。「复核类型」填写「工伤医疗费用审核」，「复核状态」填写「待人工复核」，「自动待遇决定」必须为 null。不得作出自动待遇决定。"
 
 $creditDomain = New-AgentTemplate `
   -TemplateId "audit.credit.domain" `
   -Name "信贷领域审核智能体" `
-  -Instructions "只读取事件中的 caseId，并仅针对该案件调用 run_case_for_external_sag。返回材料事实、现金流分析、规则风险和政策检索计划。不得枚举无关案件，不得调用旧版 RAG，也不得使用只读 SQL；所有面向审核人员的说明使用简体中文。" `
+  -Instructions "只读取事件中的「案件编号」字段，并将其值传给 run_case_for_external_sag 的 case_id 参数；仅审核该案件。返回材料事实、现金流分析、规则风险和政策检索计划。不得枚举无关案件，不得调用旧版 RAG，也不得使用只读 SQL。工具参数名和工具原始返回值属于技术接口，可以保留英文；本智能体返回 JSON 的所有业务字段名及面向审核人员的说明必须直接使用简体中文。" `
   -ConnectionAccess $creditAccess
 $creditEvidence = New-AgentTemplate `
   -TemplateId "audit.credit.evidence" `
   -Name "信贷 SAG 依据检索智能体" `
-  -Instructions "针对每项信贷风险使用 library_search 检索依据。区分公开资料与 synthetic_internal_sop，不得检索模板冻结命名空间以外的内容；所有面向审核人员的摘要和说明使用简体中文。" `
+  -Instructions "针对每项信贷风险使用 library_search 检索依据。区分公开资料与内部模拟操作规范，不得检索模板冻结命名空间以外的内容。工具参数名和工具原始返回值属于技术接口，可以保留英文；本智能体返回 JSON 的所有业务字段名、摘要和说明必须直接使用简体中文。" `
   -KnowledgeNamespace $creditNamespace
 $creditReport = New-AgentTemplate `
   -TemplateId "audit.credit.report" `
   -Name "信贷复核报告智能体" `
-  -Instructions "根据事实、风险和 SAG 引用生成信贷人工复核草案。输出必须是 JSON 对象，固定使用 authority_verification、automatic_credit_decision、case_id、cashflow_analysis、decision_boundary、findings、human_review_required、policy_evidence、policy_evidence_assessment、recommended_review_actions、review_status、review_type、summary 字段。所有面向人员的结论、说明和行动建议直接使用简体中文；review_type 填写“信贷材料审核”，review_status 填写“待人工复核”，automatic_credit_decision 必须为 null。不得决定批准、拒绝、额度或定价。"
+  -Instructions "根据事实、风险和 SAG 引用生成信贷人工复核草案。输出必须是 JSON 对象，顶层固定且仅使用「权威性核验、自动授信决定、案件编号、现金流分析、决策边界、审核发现、需要人工复核、政策依据、政策依据评估、建议复核操作、复核状态、复核类型、摘要」这些中文字段；所有嵌套业务字段名、结论、说明和行动建议也必须直接使用简体中文，不得输出英文业务字段名。「复核类型」填写「信贷材料审核」，「复核状态」填写「待人工复核」，「自动授信决定」必须为 null。不得决定批准、拒绝、额度或定价。"
 
 $workFlow = New-AuditFlow `
   -FlowId "audit-work-injury" `
@@ -887,8 +956,8 @@ $workFlow = New-AuditFlow `
   -DomainTemplate $workDomain `
   -EvidenceTemplate $workEvidence `
   -ReportTemplate $workReport `
-  -EventSource "audit.work-injury" `
-  -EventType "case.submitted" `
+  -EventSource "工伤审核" `
+  -EventType "案件已提交" `
   -TestCaseId "SZ-GS-2026-0002" `
   -InputSummarySchema $workSummarySchema `
   -OutputSchema $workOutputSchema `
@@ -899,8 +968,8 @@ $creditFlow = New-AuditFlow `
   -DomainTemplate $creditDomain `
   -EvidenceTemplate $creditEvidence `
   -ReportTemplate $creditReport `
-  -EventSource "audit.credit-review" `
-  -EventType "case.submitted" `
+  -EventSource "信贷审核" `
+  -EventType "案件已提交" `
   -TestCaseId "case_income_mismatch" `
   -InputSummarySchema $creditSummarySchema `
   -OutputSchema $creditOutputSchema `
