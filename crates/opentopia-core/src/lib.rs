@@ -77,6 +77,7 @@ mod store_migrations;
 mod token_breakdown;
 mod tool_adapter;
 mod tool_error;
+mod tool_input_contracts;
 mod tool_output_truncation;
 mod tool_result_ingress;
 pub mod tool_runtime;
@@ -436,9 +437,13 @@ pub use tool_runtime::{
 pub use tool_state::ToolStateStore;
 pub use tools::{
     browser_handoff_for_node, browser_handoff_required, ApplyPatchTool, BrowserHandoffRequired,
-    BrowserTool, ComputerTool, DocumentExecuteTool, DocumentGetOperationSchemasTool,
-    DocumentOpenTool, DocumentTool, ListSkillsTool, McpToolWrapper, NativePatchOperation, PdfTool,
-    ReadArtifactTool, ReadSkillTool, RequestUserInputTool, ShellTool, Tool, ToolApprovalMode,
+    BrowserTool, ComputerTool, DocumentTool, ListSkillsTool, McpToolWrapper, NativePatchOperation,
+    PdfTool, ReadArtifactTool, ReadSkillTool, RequestUserInputTool, ShellTool,
+    SpreadsheetConvertRangesTool, SpreadsheetCopyRangesTool, SpreadsheetCopyRowsTool,
+    SpreadsheetCopySheetTool, SpreadsheetDeleteRowsTool, SpreadsheetDeleteSheetTool,
+    SpreadsheetExportDelimitedTool, SpreadsheetFillRangesTool, SpreadsheetFilterRowsTool,
+    SpreadsheetFindTool, SpreadsheetInspectTool, SpreadsheetReadRangesTool,
+    SpreadsheetValidateTool, SpreadsheetWriteRangeTool, Tool, ToolApprovalMode,
     ToolCapabilityDescriptor, ToolExecutionPolicy, ToolInvocationContext, ToolRegistry,
     ToolRiskLevel, ToolSource, UpdatePlanTool, WorkspaceSearchTool,
 };

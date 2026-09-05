@@ -617,7 +617,9 @@ impl AgentCore {
                             .context(
                                 "user input continuation does not contain the matching request",
                             )?;
-                        let response_value = serde_json::to_value(&response)?;
+                        let request =
+                            serde_json::from_value(result.metadata["userInputRequest"].clone())?;
+                        let response_value = model_user_input_response(&request, &response)?;
                         result.output = serde_json::to_string(&response_value)?;
                         result.content = vec![ModelContentPart::json(response_value.clone())];
                         result.is_error = false;
@@ -691,4 +693,71 @@ impl AgentCore {
             }
         }
     }
+}
+
+fn model_user_input_response(
+    request: &crate::model::UserInputRequest,
+    response: &crate::model::UserInputResponse,
+) -> anyhow::Result<Value> {
+    let status = if response.cancelled {
+        "cancelled"
+    } else if response.skipped {
+        "skipped"
+    } else {
+        "answered"
+    };
+    let mut seen_questions = std::collections::HashSet::new();
+    let answers = response
+        .answers
+        .iter()
+        .map(|answer| {
+            anyhow::ensure!(
+                seen_questions.insert(answer.question_id.as_str()),
+                "user input response contains a duplicate answer for {}",
+                answer.question_id
+            );
+            let question = request
+                .questions
+                .iter()
+                .find(|question| question.id == answer.question_id)
+                .with_context(|| {
+                    format!(
+                        "user input response references unknown question {}",
+                        answer.question_id
+                    )
+                })?;
+            let selected = answer
+                .option_id
+                .as_deref()
+                .map(|option_id| {
+                    question
+                        .options
+                        .iter()
+                        .find(|option| option.id == option_id)
+                        .map(|option| option.label.clone())
+                        .with_context(|| {
+                            format!(
+                                "user input response references unknown option {option_id} for {}",
+                                answer.question_id
+                            )
+                        })
+                })
+                .transpose()?;
+            let custom = answer
+                .custom_text
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            anyhow::ensure!(
+                selected.is_some() ^ custom.is_some(),
+                "user input answer for {} must contain exactly one selected option or custom answer",
+                answer.question_id
+            );
+            Ok(json!({
+                "question": question.question,
+                "answer": selected.as_deref().or(custom).expect("validated answer"),
+            }))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(json!({ "status": status, "answers": answers }))
 }

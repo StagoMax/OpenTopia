@@ -274,13 +274,13 @@ pub(super) fn attachment_preloaded_tools(messages: &[Message]) -> BTreeSet<&'sta
                 tools.insert("pdf");
             }
             (DOCX, _) | (_, "docx") => {
-                tools.insert("document");
+                tools.insert("word_document");
             }
             (content_type, extension)
                 if SpreadsheetFileFormat::from_content_type(content_type).is_some()
                     || SpreadsheetFileFormat::from_extension(extension).is_some() =>
             {
-                tools.insert("document_open");
+                tools.insert("spreadsheet_inspect");
             }
             _ => {}
         }

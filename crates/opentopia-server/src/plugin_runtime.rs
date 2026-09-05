@@ -262,7 +262,7 @@ fn host_capabilities() -> Vec<String> {
         "artifact.runtime.v1",
         "artifact.preview.v1",
         "nativeTool.pdf.v1",
-        "nativeTool.document.v1",
+        "nativeTool.word_document.v1",
         "nativeTool.spreadsheet.v1",
         "browser.runtime.v1",
         "policy.network.v1",

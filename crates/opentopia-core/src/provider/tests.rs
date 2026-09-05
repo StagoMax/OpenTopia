@@ -1,7 +1,7 @@
 use super::*;
 use crate::model_context::{content_fingerprint, TokenEstimateDetail};
 use crate::settings::{OpenAiProtocol, PromptCachePolicy};
-use crate::tools::{BackgroundOutputTool, DocumentExecuteTool, DocumentTool, PdfTool, Tool};
+use crate::tools::{BackgroundOutputTool, DocumentTool, PdfTool, SpreadsheetWriteRangeTool, Tool};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

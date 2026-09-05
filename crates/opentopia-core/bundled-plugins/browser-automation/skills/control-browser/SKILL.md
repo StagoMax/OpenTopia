@@ -12,9 +12,9 @@ Use OpenTopia's `browser` tool. Do not use Codex Desktop's Node REPL or
 
 1. Navigate to the requested URL when the task does not already have a page.
 2. Observe the page before every click, type, select, hover, or scroll.
-3. Use the exact `observationId` and `nodeRef` returned by the latest observation.
+3. Pass the exact observation ID and node reference returned by the latest observation as `observation_id` and `node_ref`.
 4. Observe again after an interaction that can change the page. If the runtime reports a stale observation, discard the old references and observe again.
-5. Use `switch_target` only with a `targetRef` returned by an observation.
+5. Use `switch_target` only with a `target_ref` returned by an observation.
 
 Use `screenshot` when visual layout matters. Prefer bounded waits for a selector,
 text, or document completion instead of repeatedly polling.

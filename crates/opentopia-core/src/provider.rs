@@ -1689,7 +1689,8 @@ pub use codex_app_server::{
 #[cfg(test)]
 use codex_app_server::{
     codex_developer_instructions, codex_dynamic_tool_call, codex_dynamic_tools, codex_item_text,
-    codex_turn_input, is_codex_builtin_action, is_isolated_codex_host_profile,
+    codex_thread_start_params, codex_turn_input, is_codex_builtin_action,
+    is_isolated_codex_host_profile,
 };
 
 #[derive(Debug, Default)]

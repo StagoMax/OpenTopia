@@ -1347,6 +1347,7 @@ mod tests {
                 cells: vec![CellUpdate {
                     address: CellAddress { row: 0, column: 0 },
                     value: SpreadsheetCellInput::String("OpenTopia".to_string()),
+                    style_from: None,
                 }],
             }],
         })

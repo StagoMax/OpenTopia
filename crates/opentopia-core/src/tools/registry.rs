@@ -1,9 +1,13 @@
 use super::{
-    ApplyPatchTool, BackgroundOutputTool, BrowserTool, ComputerTool, CreateSkillTool,
-    DocumentExecuteTool, DocumentGetOperationSchemasTool, DocumentOpenTool, DocumentTool,
+    ApplyPatchTool, BackgroundOutputTool, BrowserTool, ComputerTool, CreateSkillTool, DocumentTool,
     FilesystemTool, FollowupAgentTaskTool, InterruptAgentTool, ListAgentsTool, ListSkillsTool,
     PdfTool, ReadArtifactTool, ReadAttachmentTool, ReadSkillTool, RegisteredTool,
-    RequestUserInputTool, SendAgentMessageTool, ShellTool, SpawnAgentTool, Tool, ToolApprovalMode,
+    RequestUserInputTool, SendAgentMessageTool, ShellTool, SpawnAgentTool,
+    SpreadsheetConvertRangesTool, SpreadsheetCopyRangesTool, SpreadsheetCopyRowsTool,
+    SpreadsheetCopySheetTool, SpreadsheetDeleteRowsTool, SpreadsheetDeleteSheetTool,
+    SpreadsheetExportDelimitedTool, SpreadsheetFillRangesTool, SpreadsheetFilterRowsTool,
+    SpreadsheetFindTool, SpreadsheetInspectTool, SpreadsheetReadRangesTool,
+    SpreadsheetValidateTool, SpreadsheetWriteRangeTool, Tool, ToolApprovalMode,
     ToolCapabilityDescriptor, ToolClass, ToolExecutionPolicy, ToolGovernance, ToolRiskLevel,
     ToolSideEffect, ToolSource, UpdatePlanTool, ViewAttachmentTool, WaitAgentTool,
 };
@@ -213,7 +217,7 @@ impl ToolRegistry {
                             DataClassification::Public,
                         ),
                     ),
-                    "document" => (
+                    "word_document" => (
                         Arc::new(DocumentTool),
                         governed(
                             ToolRiskLevel::Medium,
@@ -231,17 +235,8 @@ impl ToolRegistry {
                             DataClassification::Restricted,
                         ),
                     ),
-                    "document_open" => (
-                        Arc::new(DocumentOpenTool),
-                        governed(
-                            ToolRiskLevel::Low,
-                            ToolSideEffect::SessionMutation,
-                            ToolApprovalMode::PolicyControlled,
-                            DataClassification::Restricted,
-                        ),
-                    ),
-                    "document_get_operation_schemas" => (
-                        Arc::new(DocumentGetOperationSchemasTool),
+                    "spreadsheet_inspect" => (
+                        Arc::new(SpreadsheetInspectTool),
                         governed(
                             ToolRiskLevel::Low,
                             ToolSideEffect::None,
@@ -249,8 +244,116 @@ impl ToolRegistry {
                             DataClassification::Restricted,
                         ),
                     ),
-                    "document_execute" => (
-                        Arc::new(DocumentExecuteTool),
+                    "spreadsheet_read_ranges" => (
+                        Arc::new(SpreadsheetReadRangesTool),
+                        governed(
+                            ToolRiskLevel::Low,
+                            ToolSideEffect::None,
+                            ToolApprovalMode::PolicyControlled,
+                            DataClassification::Restricted,
+                        ),
+                    ),
+                    "spreadsheet_find" => (
+                        Arc::new(SpreadsheetFindTool),
+                        governed(
+                            ToolRiskLevel::Low,
+                            ToolSideEffect::None,
+                            ToolApprovalMode::PolicyControlled,
+                            DataClassification::Restricted,
+                        ),
+                    ),
+                    "spreadsheet_filter_rows" => (
+                        Arc::new(SpreadsheetFilterRowsTool),
+                        governed(
+                            ToolRiskLevel::Low,
+                            ToolSideEffect::None,
+                            ToolApprovalMode::PolicyControlled,
+                            DataClassification::Restricted,
+                        ),
+                    ),
+                    "spreadsheet_validate" => (
+                        Arc::new(SpreadsheetValidateTool),
+                        governed(
+                            ToolRiskLevel::Low,
+                            ToolSideEffect::None,
+                            ToolApprovalMode::PolicyControlled,
+                            DataClassification::Restricted,
+                        ),
+                    ),
+                    "spreadsheet_write_range" => (
+                        Arc::new(SpreadsheetWriteRangeTool),
+                        governed(
+                            ToolRiskLevel::High,
+                            ToolSideEffect::WorkspaceWrite,
+                            ToolApprovalMode::PolicyControlled,
+                            DataClassification::Restricted,
+                        ),
+                    ),
+                    "spreadsheet_copy_ranges" => (
+                        Arc::new(SpreadsheetCopyRangesTool),
+                        governed(
+                            ToolRiskLevel::High,
+                            ToolSideEffect::WorkspaceWrite,
+                            ToolApprovalMode::PolicyControlled,
+                            DataClassification::Restricted,
+                        ),
+                    ),
+                    "spreadsheet_copy_rows" => (
+                        Arc::new(SpreadsheetCopyRowsTool),
+                        governed(
+                            ToolRiskLevel::High,
+                            ToolSideEffect::WorkspaceWrite,
+                            ToolApprovalMode::PolicyControlled,
+                            DataClassification::Restricted,
+                        ),
+                    ),
+                    "spreadsheet_fill_ranges" => (
+                        Arc::new(SpreadsheetFillRangesTool),
+                        governed(
+                            ToolRiskLevel::High,
+                            ToolSideEffect::WorkspaceWrite,
+                            ToolApprovalMode::PolicyControlled,
+                            DataClassification::Restricted,
+                        ),
+                    ),
+                    "spreadsheet_convert_ranges" => (
+                        Arc::new(SpreadsheetConvertRangesTool),
+                        governed(
+                            ToolRiskLevel::High,
+                            ToolSideEffect::WorkspaceWrite,
+                            ToolApprovalMode::PolicyControlled,
+                            DataClassification::Restricted,
+                        ),
+                    ),
+                    "spreadsheet_export_delimited" => (
+                        Arc::new(SpreadsheetExportDelimitedTool),
+                        governed(
+                            ToolRiskLevel::High,
+                            ToolSideEffect::WorkspaceWrite,
+                            ToolApprovalMode::PolicyControlled,
+                            DataClassification::Restricted,
+                        ),
+                    ),
+                    "spreadsheet_copy_sheet" => (
+                        Arc::new(SpreadsheetCopySheetTool),
+                        governed(
+                            ToolRiskLevel::High,
+                            ToolSideEffect::WorkspaceWrite,
+                            ToolApprovalMode::PolicyControlled,
+                            DataClassification::Restricted,
+                        ),
+                    ),
+                    "spreadsheet_delete_rows" => (
+                        Arc::new(SpreadsheetDeleteRowsTool),
+                        governed(
+                            ToolRiskLevel::High,
+                            ToolSideEffect::WorkspaceWrite,
+                            ToolApprovalMode::PolicyControlled,
+                            DataClassification::Restricted,
+                        ),
+                    ),
+                    "spreadsheet_delete_sheet" => (
+                        Arc::new(SpreadsheetDeleteSheetTool),
                         governed(
                             ToolRiskLevel::High,
                             ToolSideEffect::WorkspaceWrite,
@@ -422,22 +525,22 @@ mod tests {
     }
 
     #[test]
-    fn document_executor_is_loaded_progressively() {
+    fn spreadsheet_operations_are_independent_tools() {
         let registry = ToolRegistry::with_builtins();
 
         assert!(registry.get("spreadsheet").is_none());
         for name in [
-            "document_open",
-            "document_get_operation_schemas",
-            "document_execute",
+            "spreadsheet_inspect",
+            "spreadsheet_read_ranges",
+            "spreadsheet_copy_ranges",
+            "spreadsheet_convert_ranges",
         ] {
             assert!(registry.is_model_visible(name), "{name} should be visible");
+            assert_eq!(registry.provider_contract_loader(name), None);
         }
-        assert_eq!(
-            registry.provider_contract_loader("document_execute"),
-            Some("document_get_operation_schemas")
-        );
-        assert!(registry.is_provider_contract_loader("document_get_operation_schemas"));
+        assert!(registry.get("document_open").is_none());
+        assert!(registry.get("document_get_operation_schemas").is_none());
+        assert!(registry.get("document_execute").is_none());
         assert!(!registry.is_provider_contract_loader("filesystem"));
     }
 

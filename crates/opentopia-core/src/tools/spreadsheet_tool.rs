@@ -1,19 +1,21 @@
 use super::{
     decode_typed_tool_input, enforce_policy_decision, enforce_read_policy,
-    insert_attachment_provenance, normalize_workspace_path, read_stored_attachment_file,
-    required_typed_string, ToolInvocationContext,
+    normalize_workspace_path, required_typed_string, ToolInvocationContext,
 };
-use crate::execution::{FileReadRequest, FileWriteRequest};
-use crate::file_mutation::read_optional;
+use crate::execution::FileReadRequest;
+use crate::file_mutation::{read_optional, FileMutationBatch, PreparedFileMutation};
 use crate::model::{ModelContentPart, ToolResult};
 use crate::spreadsheet::{
-    execute_spreadsheet, CellAddress, CellRange, CellUpdate, DelimitedFormat, DelimitedFormulaMode,
-    ExportDelimitedRequest, FilterRowsRequest, FindCellsRequest, FormulaInput,
-    InspectDelimitedRequest, InspectWorkbookRequest, ListSheetsRequest, ReadRangeRequest,
-    ReadRangesRequest, SheetRangeRequest, SheetWriteRequest, SpreadsheetAction, SpreadsheetCell,
-    SpreadsheetCellInput, SpreadsheetCellValue, SpreadsheetFileFormat, SpreadsheetFilterCondition,
-    SpreadsheetFilterMatchMode, SpreadsheetRequest, SpreadsheetResult, SpreadsheetSheetValidation,
-    SpreadsheetTextMatchMode, ValidateWorkbookRequest, WriteWorkbookRequest,
+    edit_workbook_structure, execute_spreadsheet, format_a1_address, transform_cell_input,
+    transform_number_format, CellAddress, CellRange, CellUpdate, DelimitedFormat,
+    DelimitedFormulaMode, EditWorkbookStructureRequest, ExportDelimitedRequest, FilterRowsRequest,
+    FindCellsRequest, FormulaInput, InspectDelimitedRequest, InspectWorkbookRequest,
+    ListSheetsRequest, ReadRangeRequest, ReadRangesRequest, SheetRangeRequest, SheetWriteRequest,
+    SpreadsheetAction, SpreadsheetCell, SpreadsheetCellInput, SpreadsheetCellValue,
+    SpreadsheetFileFormat, SpreadsheetFilterCondition, SpreadsheetFilterMatchMode,
+    SpreadsheetFilterReturnMode, SpreadsheetRequest, SpreadsheetResult, SpreadsheetSheetValidation,
+    SpreadsheetStructureOperation, SpreadsheetTextMatchMode, SpreadsheetValueTransform,
+    ValidateWorkbookRequest, WriteWorkbookRequest, EXCEL_MAX_ROWS,
     MAX_INPUT_FILE_BYTES as MAX_SPREADSHEET_INPUT_BYTES,
 };
 use anyhow::Context;
@@ -42,8 +44,9 @@ enum SpreadsheetToolAction {
     Write,
     WriteRows,
     WriteColumns,
+    CopyRanges,
     CopyRows,
-    CopyColumns,
+    ConvertRanges,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
@@ -52,6 +55,60 @@ pub(super) enum SpreadsheetCopyContentMode {
     #[default]
     Values,
     ValuesAndFormulas,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct SpreadsheetRangeCopy {
+    pub(super) source_path: String,
+    pub(super) source_sheet: String,
+    pub(super) source_start: CellAddress,
+    #[schemars(range(min = 1))]
+    pub(super) row_count: u32,
+    #[schemars(range(min = 1))]
+    pub(super) column_count: u32,
+    pub(super) destination_sheet: String,
+    pub(super) destination_start: CellAddress,
+    #[serde(default)]
+    pub(super) content_mode: SpreadsheetCopyContentMode,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct SpreadsheetRangeConversion {
+    pub(super) sheet: String,
+    pub(super) range: CellRange,
+    #[schemars(length(min = 1, max = 8))]
+    pub(super) transforms: Vec<SpreadsheetValueTransform>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct SpreadsheetColumnCopy {
+    pub(super) source_column: u32,
+    pub(super) destination_column: u32,
+    #[serde(default)]
+    #[schemars(length(max = 8))]
+    pub(super) transforms: Vec<SpreadsheetValueTransform>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct SpreadsheetRowCopy {
+    pub(super) source_path: String,
+    pub(super) source_sheet: String,
+    pub(super) source_header_row: u32,
+    pub(super) source_data_row: u32,
+    pub(super) destination_sheet: String,
+    pub(super) destination_header_row: u32,
+    #[schemars(length(min = 1, max = 256))]
+    pub(super) columns: Vec<SpreadsheetColumnCopy>,
+    #[schemars(length(min = 1, max = 32))]
+    pub(super) conditions: Vec<SpreadsheetFilterCondition>,
+    #[serde(default)]
+    pub(super) match_mode: SpreadsheetFilterMatchMode,
+    #[serde(default)]
+    pub(super) content_mode: SpreadsheetCopyContentMode,
 }
 
 #[derive(Debug, Clone)]
@@ -66,7 +123,7 @@ enum SpreadsheetMutation {
         start: CellAddress,
         columns: Vec<Vec<SpreadsheetCellInput>>,
     },
-    CopyRows {
+    CopyRange {
         source_path: String,
         source_sheet: String,
         source_start: CellAddress,
@@ -76,15 +133,11 @@ enum SpreadsheetMutation {
         destination_start: CellAddress,
         content_mode: SpreadsheetCopyContentMode,
     },
-    CopyColumns {
-        source_path: String,
-        source_sheet: String,
-        source_start: CellAddress,
-        row_count: u32,
-        column_count: u32,
-        destination_sheet: String,
-        destination_start: CellAddress,
-        content_mode: SpreadsheetCopyContentMode,
+    CopyRows(SpreadsheetRowCopy),
+    ConvertRange {
+        sheet: String,
+        range: CellRange,
+        transforms: Vec<SpreadsheetValueTransform>,
     },
 }
 
@@ -98,11 +151,8 @@ enum SpreadsheetMutation {
 pub(super) enum SpreadsheetToolInput {
     #[schemars(rename_all = "camelCase")]
     InspectDelimited {
-        /// CSV/TSV path. Provide exactly one of path or attachmentId.
-        #[serde(default)]
-        path: Option<String>,
-        #[serde(default)]
-        attachment_id: Option<String>,
+        /// Real CSV/TSV path from the attachment manifest or filesystem.
+        path: String,
         #[serde(default)]
         format: Option<DelimitedFormat>,
         #[serde(default)]
@@ -115,44 +165,27 @@ pub(super) enum SpreadsheetToolInput {
     },
     #[schemars(rename_all = "camelCase")]
     Inspect {
-        /// Workbook path (.xls/.xlsx/.xlsm/.xlsb/.xltx/.xltm/.ods). Relative and absolute paths follow the active filesystem authority. Provide exactly one of path or attachmentId.
-        #[serde(default)]
-        path: Option<String>,
-        #[serde(default)]
-        attachment_id: Option<String>,
+        /// Real workbook path. Relative and absolute paths follow the active filesystem authority.
+        path: String,
     },
     #[schemars(rename_all = "camelCase")]
-    ListSheets {
-        #[serde(default)]
-        path: Option<String>,
-        #[serde(default)]
-        attachment_id: Option<String>,
-    },
+    ListSheets { path: String },
     #[schemars(rename_all = "camelCase")]
     ReadRange {
-        #[serde(default)]
-        path: Option<String>,
-        #[serde(default)]
-        attachment_id: Option<String>,
+        path: String,
         sheet: String,
         /// Inclusive zero-based range.
         range: CellRange,
     },
     #[schemars(rename_all = "camelCase")]
     ReadRanges {
-        #[serde(default)]
-        path: Option<String>,
-        #[serde(default)]
-        attachment_id: Option<String>,
+        path: String,
         #[schemars(length(min = 1, max = 64))]
         ranges: Vec<SheetRangeRequest>,
     },
     #[schemars(rename_all = "camelCase")]
     ReadRows {
-        #[serde(default)]
-        path: Option<String>,
-        #[serde(default)]
-        attachment_id: Option<String>,
+        path: String,
         sheet: String,
         start_row: u32,
         start_column: u32,
@@ -163,10 +196,7 @@ pub(super) enum SpreadsheetToolInput {
     },
     #[schemars(rename_all = "camelCase")]
     ReadColumns {
-        #[serde(default)]
-        path: Option<String>,
-        #[serde(default)]
-        attachment_id: Option<String>,
+        path: String,
         sheet: String,
         start_row: u32,
         start_column: u32,
@@ -177,10 +207,7 @@ pub(super) enum SpreadsheetToolInput {
     },
     #[schemars(rename_all = "camelCase")]
     Find {
-        #[serde(default)]
-        path: Option<String>,
-        #[serde(default)]
-        attachment_id: Option<String>,
+        path: String,
         #[serde(default)]
         sheet: Option<String>,
         #[serde(default)]
@@ -198,10 +225,7 @@ pub(super) enum SpreadsheetToolInput {
     },
     #[schemars(rename_all = "camelCase")]
     FilterRows {
-        #[serde(default)]
-        path: Option<String>,
-        #[serde(default)]
-        attachment_id: Option<String>,
+        path: String,
         sheet: String,
         range: CellRange,
         #[schemars(length(min = 1, max = 32))]
@@ -209,16 +233,15 @@ pub(super) enum SpreadsheetToolInput {
         #[serde(default)]
         filter_match_mode: Option<SpreadsheetFilterMatchMode>,
         #[serde(default)]
+        return_mode: SpreadsheetFilterReturnMode,
+        #[serde(default)]
         #[schemars(range(min = 1, max = 2000))]
         max_results: Option<usize>,
     },
     #[schemars(rename_all = "camelCase")]
     Validate {
-        /// Workbook path (.xls/.xlsx/.xlsm/.xlsb/.xltx/.xltm/.ods). Provide exactly one of path or attachmentId.
-        #[serde(default)]
-        path: Option<String>,
-        #[serde(default)]
-        attachment_id: Option<String>,
+        /// Real workbook path from the attachment manifest or filesystem.
+        path: String,
         #[serde(default)]
         expected_sheets: Vec<String>,
         #[serde(default)]
@@ -228,7 +251,7 @@ pub(super) enum SpreadsheetToolInput {
     },
     #[schemars(rename_all = "camelCase")]
     ExportDelimited {
-        /// Source workbook path.
+        /// Real source workbook path.
         path: String,
         /// Destination .csv or .tsv path.
         output_path: String,
@@ -242,15 +265,17 @@ pub(super) enum SpreadsheetToolInput {
     },
     #[schemars(rename_all = "camelCase")]
     Write {
+        path: String,
         #[serde(default)]
-        path: Option<String>,
+        template: Option<String>,
         #[schemars(length(max = 256))]
         sheets: Vec<SheetWriteRequest>,
     },
     #[schemars(rename_all = "camelCase")]
     WriteRows {
+        path: String,
         #[serde(default)]
-        path: Option<String>,
+        template: Option<String>,
         sheet: String,
         start: CellAddress,
         #[schemars(length(min = 1, max = 10000))]
@@ -258,44 +283,36 @@ pub(super) enum SpreadsheetToolInput {
     },
     #[schemars(rename_all = "camelCase")]
     WriteColumns {
+        path: String,
         #[serde(default)]
-        path: Option<String>,
+        template: Option<String>,
         sheet: String,
         start: CellAddress,
         #[schemars(length(min = 1, max = 256))]
         columns: Vec<Vec<SpreadsheetCellInput>>,
     },
     #[schemars(rename_all = "camelCase")]
-    CopyRows {
+    CopyRanges {
+        path: String,
         #[serde(default)]
-        path: Option<String>,
-        from: String,
-        source_sheet: String,
-        source_start: CellAddress,
-        #[schemars(range(min = 1))]
-        row_count: u32,
-        #[schemars(range(min = 1))]
-        column_count: u32,
-        destination_sheet: String,
-        destination_start: CellAddress,
-        #[serde(default)]
-        content_mode: SpreadsheetCopyContentMode,
+        template: Option<String>,
+        #[schemars(length(min = 1, max = 64))]
+        copies: Vec<SpreadsheetRangeCopy>,
     },
     #[schemars(rename_all = "camelCase")]
-    CopyColumns {
+    CopyRows {
+        path: String,
         #[serde(default)]
-        path: Option<String>,
-        from: String,
-        source_sheet: String,
-        source_start: CellAddress,
-        #[schemars(range(min = 1))]
-        row_count: u32,
-        #[schemars(range(min = 1))]
-        column_count: u32,
-        destination_sheet: String,
-        destination_start: CellAddress,
+        template: Option<String>,
+        copy: SpreadsheetRowCopy,
+    },
+    #[schemars(rename_all = "camelCase")]
+    ConvertRanges {
+        path: String,
         #[serde(default)]
-        content_mode: SpreadsheetCopyContentMode,
+        template: Option<String>,
+        #[schemars(length(min = 1, max = 64))]
+        conversions: Vec<SpreadsheetRangeConversion>,
     },
 }
 
@@ -316,8 +333,9 @@ impl SpreadsheetToolInput {
             Self::Write { .. } => SpreadsheetToolAction::Write,
             Self::WriteRows { .. } => SpreadsheetToolAction::WriteRows,
             Self::WriteColumns { .. } => SpreadsheetToolAction::WriteColumns,
+            Self::CopyRanges { .. } => SpreadsheetToolAction::CopyRanges,
             Self::CopyRows { .. } => SpreadsheetToolAction::CopyRows,
-            Self::CopyColumns { .. } => SpreadsheetToolAction::CopyColumns,
+            Self::ConvertRanges { .. } => SpreadsheetToolAction::ConvertRanges,
         }
     }
 
@@ -329,7 +347,6 @@ impl SpreadsheetToolInput {
 struct SpreadsheetExecutionInput {
     action: SpreadsheetToolAction,
     path: Option<String>,
-    attachment_id: Option<String>,
     format: Option<DelimitedFormat>,
     header_row: u32,
     sample_rows: Option<usize>,
@@ -347,16 +364,15 @@ struct SpreadsheetExecutionInput {
     include_formulas: bool,
     conditions: Vec<SpreadsheetFilterCondition>,
     filter_match_mode: Option<SpreadsheetFilterMatchMode>,
+    filter_return_mode: SpreadsheetFilterReturnMode,
     max_results: Option<usize>,
     start: Option<CellAddress>,
     rows: Vec<Vec<SpreadsheetCellInput>>,
     columns: Vec<Vec<SpreadsheetCellInput>>,
-    from: Option<String>,
-    source_sheet: Option<String>,
-    source_start: Option<CellAddress>,
-    destination_sheet: Option<String>,
-    destination_start: Option<CellAddress>,
-    content_mode: SpreadsheetCopyContentMode,
+    template: Option<String>,
+    copies: Vec<SpreadsheetRangeCopy>,
+    row_copies: Vec<SpreadsheetRowCopy>,
+    conversions: Vec<SpreadsheetRangeConversion>,
     output_path: Option<String>,
     formula_mode: DelimitedFormulaMode,
     expected_sheets: Vec<String>,
@@ -370,67 +386,60 @@ impl SpreadsheetExecutionInput {
         self.path.as_deref()
     }
 
-    fn direct_mutation(&self) -> anyhow::Result<SpreadsheetMutation> {
-        let operation = match self.action {
-            SpreadsheetToolAction::WriteRows => SpreadsheetMutation::WriteRows {
+    fn direct_mutations(&self) -> anyhow::Result<Vec<SpreadsheetMutation>> {
+        let operations = match self.action {
+            SpreadsheetToolAction::WriteRows => vec![SpreadsheetMutation::WriteRows {
                 sheet: required_typed_string(self.sheet.as_deref(), "sheet")?,
                 start: self
                     .start
                     .context("spreadsheet write_rows requires start")?,
                 rows: self.rows.clone(),
-            },
-            SpreadsheetToolAction::WriteColumns => SpreadsheetMutation::WriteColumns {
+            }],
+            SpreadsheetToolAction::WriteColumns => vec![SpreadsheetMutation::WriteColumns {
                 sheet: required_typed_string(self.sheet.as_deref(), "sheet")?,
                 start: self
                     .start
                     .context("spreadsheet write_columns requires start")?,
                 columns: self.columns.clone(),
-            },
-            SpreadsheetToolAction::CopyRows | SpreadsheetToolAction::CopyColumns => {
-                let source_path = required_typed_string(self.from.as_deref(), "from")?;
-                let source_sheet =
-                    required_typed_string(self.source_sheet.as_deref(), "sourceSheet")?;
-                let source_start = self
-                    .source_start
-                    .context("spreadsheet copy requires sourceStart")?;
-                let row_count = self
-                    .row_count
-                    .context("spreadsheet copy requires rowCount")?;
-                let column_count = self
-                    .column_count
-                    .context("spreadsheet copy requires columnCount")?;
-                let destination_sheet =
-                    required_typed_string(self.destination_sheet.as_deref(), "destinationSheet")?;
-                let destination_start = self
-                    .destination_start
-                    .context("spreadsheet copy requires destinationStart")?;
-                if self.action == SpreadsheetToolAction::CopyRows {
-                    SpreadsheetMutation::CopyRows {
-                        source_path,
-                        source_sheet,
-                        source_start,
-                        row_count,
-                        column_count,
-                        destination_sheet,
-                        destination_start,
-                        content_mode: self.content_mode,
-                    }
-                } else {
-                    SpreadsheetMutation::CopyColumns {
-                        source_path,
-                        source_sheet,
-                        source_start,
-                        row_count,
-                        column_count,
-                        destination_sheet,
-                        destination_start,
-                        content_mode: self.content_mode,
-                    }
-                }
-            }
+            }],
+            SpreadsheetToolAction::CopyRanges => self
+                .copies
+                .iter()
+                .cloned()
+                .map(|copy| SpreadsheetMutation::CopyRange {
+                    source_path: copy.source_path,
+                    source_sheet: copy.source_sheet,
+                    source_start: copy.source_start,
+                    row_count: copy.row_count,
+                    column_count: copy.column_count,
+                    destination_sheet: copy.destination_sheet,
+                    destination_start: copy.destination_start,
+                    content_mode: copy.content_mode,
+                })
+                .collect(),
+            SpreadsheetToolAction::CopyRows => self
+                .row_copies
+                .iter()
+                .cloned()
+                .map(SpreadsheetMutation::CopyRows)
+                .collect(),
+            SpreadsheetToolAction::ConvertRanges => self
+                .conversions
+                .iter()
+                .cloned()
+                .map(|conversion| SpreadsheetMutation::ConvertRange {
+                    sheet: conversion.sheet,
+                    range: conversion.range,
+                    transforms: conversion.transforms,
+                })
+                .collect(),
             _ => anyhow::bail!("spreadsheet action is not an atomic mutation"),
         };
-        Ok(operation)
+        anyhow::ensure!(
+            !operations.is_empty(),
+            "spreadsheet mutation list must not be empty"
+        );
+        Ok(operations)
     }
 }
 
@@ -439,7 +448,6 @@ impl From<SpreadsheetToolInput> for SpreadsheetExecutionInput {
         let mut execution = Self {
             action: input.action(),
             path: None,
-            attachment_id: None,
             format: None,
             header_row: 0,
             sample_rows: None,
@@ -457,16 +465,15 @@ impl From<SpreadsheetToolInput> for SpreadsheetExecutionInput {
             include_formulas: false,
             conditions: Vec::new(),
             filter_match_mode: None,
+            filter_return_mode: SpreadsheetFilterReturnMode::Summary,
             max_results: None,
             start: None,
             rows: Vec::new(),
             columns: Vec::new(),
-            from: None,
-            source_sheet: None,
-            source_start: None,
-            destination_sheet: None,
-            destination_start: None,
-            content_mode: SpreadsheetCopyContentMode::Values,
+            template: None,
+            copies: Vec::new(),
+            row_copies: Vec::new(),
+            conversions: Vec::new(),
             output_path: None,
             formula_mode: DelimitedFormulaMode::Values,
             expected_sheets: Vec::new(),
@@ -477,53 +484,31 @@ impl From<SpreadsheetToolInput> for SpreadsheetExecutionInput {
         match input {
             SpreadsheetToolInput::InspectDelimited {
                 path,
-                attachment_id,
                 format,
                 header_row,
                 sample_rows,
                 rstrip_tabs,
             } => {
-                execution.path = path;
-                execution.attachment_id = attachment_id;
+                execution.path = Some(path);
                 execution.format = format;
                 execution.header_row = header_row;
                 execution.sample_rows = sample_rows;
                 execution.rstrip_tabs = rstrip_tabs;
             }
-            SpreadsheetToolInput::Inspect {
-                path,
-                attachment_id,
+            SpreadsheetToolInput::Inspect { path } | SpreadsheetToolInput::ListSheets { path } => {
+                execution.path = Some(path);
             }
-            | SpreadsheetToolInput::ListSheets {
-                path,
-                attachment_id,
-            } => {
-                execution.path = path;
-                execution.attachment_id = attachment_id;
-            }
-            SpreadsheetToolInput::ReadRange {
-                path,
-                attachment_id,
-                sheet,
-                range,
-            } => {
-                execution.path = path;
-                execution.attachment_id = attachment_id;
+            SpreadsheetToolInput::ReadRange { path, sheet, range } => {
+                execution.path = Some(path);
                 execution.sheet = Some(sheet);
                 execution.range = Some(range);
             }
-            SpreadsheetToolInput::ReadRanges {
-                path,
-                attachment_id,
-                ranges,
-            } => {
-                execution.path = path;
-                execution.attachment_id = attachment_id;
+            SpreadsheetToolInput::ReadRanges { path, ranges } => {
+                execution.path = Some(path);
                 execution.ranges = ranges;
             }
             SpreadsheetToolInput::ReadRows {
                 path,
-                attachment_id,
                 sheet,
                 start_row,
                 start_column,
@@ -532,15 +517,13 @@ impl From<SpreadsheetToolInput> for SpreadsheetExecutionInput {
             }
             | SpreadsheetToolInput::ReadColumns {
                 path,
-                attachment_id,
                 sheet,
                 start_row,
                 start_column,
                 row_count,
                 column_count,
             } => {
-                execution.path = path;
-                execution.attachment_id = attachment_id;
+                execution.path = Some(path);
                 execution.sheet = Some(sheet);
                 execution.start_row = Some(start_row);
                 execution.start_column = Some(start_column);
@@ -549,7 +532,6 @@ impl From<SpreadsheetToolInput> for SpreadsheetExecutionInput {
             }
             SpreadsheetToolInput::Find {
                 path,
-                attachment_id,
                 sheet,
                 range,
                 query,
@@ -558,8 +540,7 @@ impl From<SpreadsheetToolInput> for SpreadsheetExecutionInput {
                 include_formulas,
                 max_results,
             } => {
-                execution.path = path;
-                execution.attachment_id = attachment_id;
+                execution.path = Some(path);
                 execution.sheet = sheet;
                 execution.range = range;
                 execution.query = Some(query);
@@ -570,30 +551,28 @@ impl From<SpreadsheetToolInput> for SpreadsheetExecutionInput {
             }
             SpreadsheetToolInput::FilterRows {
                 path,
-                attachment_id,
                 sheet,
                 range,
                 conditions,
                 filter_match_mode,
+                return_mode,
                 max_results,
             } => {
-                execution.path = path;
-                execution.attachment_id = attachment_id;
+                execution.path = Some(path);
                 execution.sheet = Some(sheet);
                 execution.range = Some(range);
                 execution.conditions = conditions;
                 execution.filter_match_mode = filter_match_mode;
+                execution.filter_return_mode = return_mode;
                 execution.max_results = max_results;
             }
             SpreadsheetToolInput::Validate {
                 path,
-                attachment_id,
                 expected_sheets,
                 expected_populated_cells,
                 sheets,
             } => {
-                execution.path = path;
-                execution.attachment_id = attachment_id;
+                execution.path = Some(path);
                 execution.expected_sheets = expected_sheets;
                 execution.expected_populated_cells = expected_populated_cells;
                 execution.sheet_validations = sheets;
@@ -613,63 +592,67 @@ impl From<SpreadsheetToolInput> for SpreadsheetExecutionInput {
                 execution.format = format;
                 execution.formula_mode = formula_mode;
             }
-            SpreadsheetToolInput::Write { path, sheets } => {
-                execution.path = path;
+            SpreadsheetToolInput::Write {
+                path,
+                template,
+                sheets,
+            } => {
+                execution.path = Some(path);
+                execution.template = template;
                 execution.sheets = sheets;
             }
             SpreadsheetToolInput::WriteRows {
                 path,
+                template,
                 sheet,
                 start,
                 rows,
             } => {
-                execution.path = path;
+                execution.path = Some(path);
+                execution.template = template;
                 execution.sheet = Some(sheet);
                 execution.start = Some(start);
                 execution.rows = rows;
             }
             SpreadsheetToolInput::WriteColumns {
                 path,
+                template,
                 sheet,
                 start,
                 columns,
             } => {
-                execution.path = path;
+                execution.path = Some(path);
+                execution.template = template;
                 execution.sheet = Some(sheet);
                 execution.start = Some(start);
                 execution.columns = columns;
             }
+            SpreadsheetToolInput::CopyRanges {
+                path,
+                template,
+                copies,
+            } => {
+                execution.path = Some(path);
+                execution.template = template;
+                execution.copies = copies;
+            }
             SpreadsheetToolInput::CopyRows {
                 path,
-                from,
-                source_sheet,
-                source_start,
-                row_count,
-                column_count,
-                destination_sheet,
-                destination_start,
-                content_mode,
-            }
-            | SpreadsheetToolInput::CopyColumns {
-                path,
-                from,
-                source_sheet,
-                source_start,
-                row_count,
-                column_count,
-                destination_sheet,
-                destination_start,
-                content_mode,
+                template,
+                copy,
             } => {
-                execution.path = path;
-                execution.from = Some(from);
-                execution.source_sheet = Some(source_sheet);
-                execution.source_start = Some(source_start);
-                execution.row_count = Some(row_count);
-                execution.column_count = Some(column_count);
-                execution.destination_sheet = Some(destination_sheet);
-                execution.destination_start = Some(destination_start);
-                execution.content_mode = content_mode;
+                execution.path = Some(path);
+                execution.template = template;
+                execution.row_copies.push(copy);
+            }
+            SpreadsheetToolInput::ConvertRanges {
+                path,
+                template,
+                conversions,
+            } => {
+                execution.path = Some(path);
+                execution.template = template;
+                execution.conversions = conversions;
             }
         }
         execution
@@ -701,8 +684,9 @@ pub(super) async fn execute_spreadsheet_backend(
         SpreadsheetToolAction::Write => execute_spreadsheet_write(call_id, input, ctx).await,
         SpreadsheetToolAction::WriteRows
         | SpreadsheetToolAction::WriteColumns
+        | SpreadsheetToolAction::CopyRanges
         | SpreadsheetToolAction::CopyRows
-        | SpreadsheetToolAction::CopyColumns => {
+        | SpreadsheetToolAction::ConvertRanges => {
             execute_spreadsheet_mutations(call_id, input, ctx).await
         }
     }
@@ -710,9 +694,11 @@ pub(super) async fn execute_spreadsheet_backend(
 
 fn spreadsheet_operation_source_path(operation: &SpreadsheetMutation) -> Option<&str> {
     match operation {
-        SpreadsheetMutation::CopyRows { source_path, .. }
-        | SpreadsheetMutation::CopyColumns { source_path, .. } => Some(source_path),
-        SpreadsheetMutation::WriteRows { .. } | SpreadsheetMutation::WriteColumns { .. } => None,
+        SpreadsheetMutation::CopyRange { source_path, .. } => Some(source_path),
+        SpreadsheetMutation::CopyRows(copy) => Some(&copy.source_path),
+        SpreadsheetMutation::WriteRows { .. }
+        | SpreadsheetMutation::WriteColumns { .. }
+        | SpreadsheetMutation::ConvertRange { .. } => None,
     }
 }
 
@@ -723,79 +709,29 @@ async fn execute_spreadsheet_read(
 ) -> anyhow::Result<ToolResult> {
     let mut action = input.action;
     let mut reads_delimited = action == SpreadsheetToolAction::InspectDelimited;
-    let path = input
-        .path
-        .as_deref()
-        .map(str::trim)
-        .filter(|path| !path.is_empty());
-    let attachment_id = input
-        .attachment_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|id| !id.is_empty());
-    anyhow::ensure!(
-        path.is_some() ^ attachment_id.is_some(),
-        "spreadsheet read action requires exactly one of path or attachmentId"
-    );
-    let (resolved_path, source_bytes, attachment_metadata, resolved_delimited_format) =
-        if let Some(relative) = path {
-            let logical_path = normalize_workspace_path(&ctx.workspace_root, relative)?;
-            enforce_read_policy(&ctx, &logical_path)?;
-            let resolved_path = ctx.environment.resolve_read_path(&logical_path)?;
-            if action == SpreadsheetToolAction::Inspect
-                && SpreadsheetFileFormat::from_path(&resolved_path)
-                    .is_some_and(SpreadsheetFileFormat::is_delimited)
-            {
-                action = SpreadsheetToolAction::InspectDelimited;
-                reads_delimited = true;
-            }
-            let resolved_format = if reads_delimited {
-                Some(resolve_delimited_format(&resolved_path, input.format)?)
-            } else {
-                ensure_workbook_path(&resolved_path)?;
-                None
-            };
-            let read = ctx
-                .environment
-                .read_file(
-                    FileReadRequest::new(&resolved_path)
-                        .with_max_bytes(MAX_SPREADSHEET_INPUT_BYTES),
-                )
-                .await?;
-            (read.path, read.bytes, None, resolved_format)
-        } else {
-            let attachment_id = Uuid::parse_str(attachment_id.expect("attachment id present"))
-                .context("attachmentId must be a UUID from the attachment manifest")?;
-            let attachment =
-                read_stored_attachment_file(&ctx, attachment_id, MAX_SPREADSHEET_INPUT_BYTES)
-                    .await?;
-            let fallback_extension = if reads_delimited {
-                input.format.unwrap_or_default().extension()
-            } else {
-                "xlsx"
-            };
-            let logical_path = attachment.original_logical_path(fallback_extension);
-            if action == SpreadsheetToolAction::Inspect
-                && SpreadsheetFileFormat::from_path(&logical_path)
-                    .is_some_and(SpreadsheetFileFormat::is_delimited)
-            {
-                action = SpreadsheetToolAction::InspectDelimited;
-                reads_delimited = true;
-            }
-            let resolved_format = if reads_delimited {
-                Some(resolve_delimited_format(&logical_path, input.format)?)
-            } else {
-                ensure_workbook_path(&logical_path)?;
-                None
-            };
-            let metadata = attachment.metadata();
-            (
-                logical_path,
-                attachment.data,
-                Some(metadata),
-                resolved_format,
-            )
-        };
+    let source_path = required_typed_string(input.path.as_deref(), "path")?;
+    let logical_path = normalize_workspace_path(&ctx.workspace_root, &source_path)?;
+    enforce_read_policy(&ctx, &logical_path)?;
+    let resolved_path = ctx.environment.resolve_read_path(&logical_path)?;
+    let source = ctx
+        .environment
+        .read_file(FileReadRequest::new(&resolved_path).with_max_bytes(MAX_SPREADSHEET_INPUT_BYTES))
+        .await?;
+    let resolved_path = source.path;
+    let source_bytes = source.bytes;
+    if action == SpreadsheetToolAction::Inspect
+        && SpreadsheetFileFormat::from_path(&resolved_path)
+            .is_some_and(SpreadsheetFileFormat::is_delimited)
+    {
+        action = SpreadsheetToolAction::InspectDelimited;
+        reads_delimited = true;
+    }
+    let resolved_delimited_format = if reads_delimited {
+        Some(resolve_delimited_format(&resolved_path, input.format)?)
+    } else {
+        ensure_workbook_path(&resolved_path)?;
+        None
+    };
     let source_path = resolved_path.clone();
     let format = resolved_delimited_format.or(input.format);
     let header_row = input.header_row;
@@ -814,6 +750,7 @@ async fn execute_spreadsheet_read(
     let include_formulas = input.include_formulas;
     let conditions = input.conditions;
     let filter_match_mode = input.filter_match_mode;
+    let filter_return_mode = input.filter_return_mode;
     let max_results = input.max_results;
     let expected_sheets = input.expected_sheets;
     let expected_populated_cells = input.expected_populated_cells;
@@ -910,6 +847,7 @@ async fn execute_spreadsheet_read(
                     range: range.context("spreadsheet filter_rows requires range")?,
                     conditions,
                     match_mode: filter_match_mode.unwrap_or_default(),
+                    return_mode: filter_return_mode,
                     max_results: max_results.unwrap_or(100),
                 })
             }
@@ -925,8 +863,9 @@ async fn execute_spreadsheet_read(
             | SpreadsheetToolAction::Write
             | SpreadsheetToolAction::WriteRows
             | SpreadsheetToolAction::WriteColumns
+            | SpreadsheetToolAction::CopyRanges
             | SpreadsheetToolAction::CopyRows
-            | SpreadsheetToolAction::CopyColumns => unreachable!(),
+            | SpreadsheetToolAction::ConvertRanges => unreachable!(),
         };
         Ok(execute_spreadsheet(SpreadsheetRequest { action }))
     })
@@ -934,20 +873,10 @@ async fn execute_spreadsheet_read(
     .context("spreadsheet worker task failed")??;
     let mut result = match outcome {
         Ok(result) => result,
-        Err(error) => {
-            let mut result = spreadsheet_error_result(call_id, error);
-            if let Some(metadata) = attachment_metadata.as_ref() {
-                insert_attachment_provenance(&mut result.metadata, metadata);
-            }
-            return Ok(result);
-        }
+        Err(error) => return Ok(spreadsheet_error_result(call_id, error)),
     };
     remap_spreadsheet_paths(&mut result, Some(&resolved_path), None);
-    let mut result = spreadsheet_success_result(call_id, result, None)?;
-    if let Some(metadata) = attachment_metadata {
-        insert_attachment_provenance(&mut result.metadata, &metadata);
-    }
-    Ok(result)
+    spreadsheet_success_result(call_id, result, None)
 }
 
 async fn execute_spreadsheet_export_delimited(
@@ -955,20 +884,21 @@ async fn execute_spreadsheet_export_delimited(
     input: SpreadsheetExecutionInput,
     ctx: ToolInvocationContext,
 ) -> anyhow::Result<ToolResult> {
-    let source_relative = required_typed_string(input.path.as_deref(), "path")?;
     let output_relative = required_typed_string(input.output_path.as_deref(), "outputPath")?;
-    let source_logical = normalize_workspace_path(&ctx.workspace_root, &source_relative)?;
     let output_path = normalize_workspace_path(&ctx.workspace_root, &output_relative)?;
-    enforce_read_policy(&ctx, &source_logical)?;
-    ensure_workbook_path(&source_logical)?;
     let format = resolve_delimited_format(&output_path, input.format)?;
     enforce_policy_decision(ctx.policy.inspect_write(&output_path), &ctx)?;
+    let original_output = read_optional(ctx.environment.as_ref(), &output_path).await?;
 
-    let resolved_source = ctx.environment.resolve_read_path(&source_logical)?;
+    let source_path = required_typed_string(input.path.as_deref(), "path")?;
+    let logical_source_path = normalize_workspace_path(&ctx.workspace_root, &source_path)?;
+    enforce_read_policy(&ctx, &logical_source_path)?;
+    let resolved_source_path = ctx.environment.resolve_read_path(&logical_source_path)?;
+    ensure_workbook_path(&resolved_source_path)?;
     let source = ctx
         .environment
         .read_file(
-            FileReadRequest::new(&resolved_source).with_max_bytes(MAX_SPREADSHEET_INPUT_BYTES),
+            FileReadRequest::new(&resolved_source_path).with_max_bytes(MAX_SPREADSHEET_INPUT_BYTES),
         )
         .await?;
     let format = Some(format);
@@ -1010,16 +940,14 @@ async fn execute_spreadsheet_export_delimited(
         Ok(result) => result,
         Err(error) => return Ok(spreadsheet_error_result(call_id, error)),
     };
-    let written = ctx
-        .environment
-        .write_file(FileWriteRequest::new(&output_path, bytes))
-        .await?;
-    remap_spreadsheet_paths(
-        &mut result,
-        Some(&resolved_source_path),
-        Some(&written.path),
-    );
-    spreadsheet_success_result(call_id, result, Some(written.path))
+    let batch = FileMutationBatch::new(vec![PreparedFileMutation::write(
+        &output_path,
+        original_output,
+        bytes,
+    )])?;
+    ctx.commit_file_mutations(&batch).await?;
+    remap_spreadsheet_paths(&mut result, Some(&resolved_source_path), Some(&output_path));
+    spreadsheet_success_result(call_id, result, Some(output_path))
 }
 
 fn counted_spreadsheet_range(
@@ -1064,13 +992,8 @@ async fn execute_spreadsheet_write(
     let output_path = normalize_workspace_path(&ctx.workspace_root, output_relative)?;
     enforce_policy_decision(ctx.policy.inspect_write(&output_path), &ctx)?;
 
-    enforce_read_policy(&ctx, &output_path)?;
-    let source = read_optional(ctx.environment.as_ref(), &output_path)
-        .await?
-        .map(|bytes| crate::execution::FileReadResult {
-            path: output_path.clone(),
-            bytes,
-        });
+    let (original, source) =
+        read_mutation_base(&ctx, &output_path, input.template.as_deref()).await?;
 
     let sheets = input.sheets;
     let staged_output_format_path = output_path.clone();
@@ -1109,12 +1032,14 @@ async fn execute_spreadsheet_write(
         Ok(result) => result,
         Err(error) => return Ok(spreadsheet_error_result(call_id, error)),
     };
-    let written = ctx
-        .environment
-        .write_file(FileWriteRequest::new(&output_path, bytes))
-        .await?;
-    remap_spreadsheet_paths(&mut result, None, Some(&written.path));
-    spreadsheet_success_result(call_id, result, Some(written.path))
+    let batch = FileMutationBatch::new(vec![PreparedFileMutation::write(
+        &output_path,
+        original,
+        bytes,
+    )])?;
+    ctx.commit_file_mutations(&batch).await?;
+    remap_spreadsheet_paths(&mut result, None, Some(&output_path));
+    spreadsheet_success_result(call_id, result, Some(output_path))
 }
 
 async fn execute_spreadsheet_mutations(
@@ -1130,14 +1055,9 @@ async fn execute_spreadsheet_mutations(
     let output_path = normalize_workspace_path(&ctx.workspace_root, output_relative)?;
     enforce_policy_decision(ctx.policy.inspect_write(&output_path), &ctx)?;
 
-    let operations = vec![input.direct_mutation()?];
-    enforce_read_policy(&ctx, &output_path)?;
-    let base_source = read_optional(ctx.environment.as_ref(), &output_path)
-        .await?
-        .map(|bytes| crate::execution::FileReadResult {
-            path: output_path.clone(),
-            bytes,
-        });
+    let operations = input.direct_mutations()?;
+    let (original, base_source) =
+        read_mutation_base(&ctx, &output_path, input.template.as_deref()).await?;
 
     let mut copy_sources = BTreeMap::<String, (PathBuf, Vec<u8>)>::new();
     for relative in operations
@@ -1183,20 +1103,41 @@ async fn execute_spreadsheet_mutations(
                 .with_context(|| format!("failed to stage {}", original.display()))?;
             staged_copy_sources.insert(logical, path);
         }
-        let sheets = materialize_spreadsheet_operations(&operations, &staged_copy_sources)?;
+        let materialized = materialize_spreadsheet_operations(
+            &operations,
+            staged_base.as_deref(),
+            &staged_copy_sources,
+        )?;
         let output_name = staging_file_name("output", &staged_output_format_path, "xlsx");
         let staged_output = staging.path(&output_name);
         let outcome = execute_spreadsheet(SpreadsheetRequest {
             action: SpreadsheetAction::WriteWorkbook(WriteWorkbookRequest {
                 source: staged_base,
                 output: staged_output.clone(),
-                sheets,
+                sheets: materialized.sheets,
             }),
         });
         match outcome {
             Ok(result) => {
-                let bytes = fs::read(&staged_output)
-                    .with_context(|| format!("failed to read {}", staged_output.display()))?;
+                let final_output = if materialized.formats.is_empty() {
+                    staged_output
+                } else {
+                    let formatted_output = staging.path(&staging_file_name(
+                        "formatted-output",
+                        &staged_output_format_path,
+                        "xlsx",
+                    ));
+                    if let Err(error) = edit_workbook_structure(&EditWorkbookStructureRequest {
+                        source: staged_output,
+                        output: formatted_output.clone(),
+                        operations: materialized.formats,
+                    }) {
+                        return Ok(Err(error));
+                    }
+                    formatted_output
+                };
+                let bytes = fs::read(&final_output)
+                    .with_context(|| format!("failed to read {}", final_output.display()))?;
                 Ok(Ok((result, bytes)))
             }
             Err(error) => Ok(Err(error)),
@@ -1208,20 +1149,223 @@ async fn execute_spreadsheet_mutations(
         Ok(result) => result,
         Err(error) => return Ok(spreadsheet_error_result(call_id, error)),
     };
-    let written = ctx
-        .environment
-        .write_file(FileWriteRequest::new(&output_path, bytes))
-        .await?;
-    remap_spreadsheet_paths(&mut result, None, Some(&written.path));
-    spreadsheet_success_result(call_id, result, Some(written.path))
+    let batch = FileMutationBatch::new(vec![PreparedFileMutation::write(
+        &output_path,
+        original,
+        bytes,
+    )])?;
+    ctx.commit_file_mutations(&batch).await?;
+    remap_spreadsheet_paths(&mut result, None, Some(&output_path));
+    spreadsheet_success_result(call_id, result, Some(output_path))
+}
+
+async fn read_mutation_base(
+    ctx: &ToolInvocationContext,
+    output_path: &Path,
+    template_requested: Option<&str>,
+) -> anyhow::Result<(Option<Vec<u8>>, Option<crate::execution::FileReadResult>)> {
+    enforce_read_policy(ctx, output_path)?;
+    let original = read_optional(ctx.environment.as_ref(), output_path).await?;
+    let source = if let Some(template_requested) = template_requested {
+        let template_path = normalize_workspace_path(&ctx.workspace_root, template_requested)?;
+        enforce_read_policy(ctx, &template_path)?;
+        let resolved_template = ctx.environment.resolve_read_path(&template_path)?;
+        ensure_workbook_path(&resolved_template)?;
+        Some(
+            ctx.environment
+                .read_file(
+                    FileReadRequest::new(&resolved_template)
+                        .with_max_bytes(MAX_SPREADSHEET_INPUT_BYTES),
+                )
+                .await?,
+        )
+    } else {
+        original
+            .clone()
+            .map(|bytes| crate::execution::FileReadResult {
+                path: output_path.to_path_buf(),
+                bytes,
+            })
+    };
+    Ok((original, source))
+}
+
+struct MaterializedSpreadsheetOperations {
+    sheets: Vec<SheetWriteRequest>,
+    formats: Vec<SpreadsheetStructureOperation>,
 }
 
 fn materialize_spreadsheet_operations(
     operations: &[SpreadsheetMutation],
+    base_source: Option<&Path>,
     copy_sources: &BTreeMap<String, PathBuf>,
-) -> anyhow::Result<Vec<SheetWriteRequest>> {
+) -> anyhow::Result<MaterializedSpreadsheetOperations> {
+    let mut copy_batches = BTreeMap::<String, Vec<(usize, SheetRangeRequest)>>::new();
+    let mut source_header_batches = BTreeMap::<String, Vec<(usize, SheetRangeRequest)>>::new();
+    let mut conversion_batch = Vec::<(usize, SheetRangeRequest)>::new();
+    let mut destination_header_batch = Vec::<(usize, SheetRangeRequest)>::new();
+    for (index, operation) in operations.iter().enumerate() {
+        match operation {
+            SpreadsheetMutation::CopyRange {
+                source_path,
+                source_sheet,
+                source_start,
+                row_count,
+                column_count,
+                ..
+            } => {
+                let range = counted_spreadsheet_range(
+                    source_start.row,
+                    source_start.column,
+                    *row_count,
+                    *column_count,
+                )?;
+                copy_batches
+                    .entry(source_path.trim().to_string())
+                    .or_default()
+                    .push((
+                        index,
+                        SheetRangeRequest {
+                            sheet: source_sheet.clone(),
+                            range,
+                        },
+                    ));
+            }
+            SpreadsheetMutation::ConvertRange { sheet, range, .. } => {
+                conversion_batch.push((
+                    index,
+                    SheetRangeRequest {
+                        sheet: sheet.clone(),
+                        range: *range,
+                    },
+                ));
+            }
+            SpreadsheetMutation::CopyRows(copy) => {
+                let source_start_column = copy
+                    .columns
+                    .iter()
+                    .map(|column| column.source_column)
+                    .chain(copy.conditions.iter().map(|condition| condition.column))
+                    .min()
+                    .context("spreadsheet row-copy requires source columns")?;
+                let source_end_column = copy
+                    .columns
+                    .iter()
+                    .map(|column| column.source_column)
+                    .chain(copy.conditions.iter().map(|condition| condition.column))
+                    .max()
+                    .context("spreadsheet row-copy requires source columns")?;
+                source_header_batches
+                    .entry(copy.source_path.trim().to_string())
+                    .or_default()
+                    .push((
+                        index,
+                        SheetRangeRequest {
+                            sheet: copy.source_sheet.clone(),
+                            range: CellRange {
+                                start: CellAddress {
+                                    row: copy.source_header_row,
+                                    column: source_start_column,
+                                },
+                                end: CellAddress {
+                                    row: copy.source_header_row,
+                                    column: source_end_column,
+                                },
+                            },
+                        },
+                    ));
+                let start_column = copy
+                    .columns
+                    .iter()
+                    .map(|column| column.destination_column)
+                    .min()
+                    .context("spreadsheet row-copy requires destination columns")?;
+                let end_column = copy
+                    .columns
+                    .iter()
+                    .map(|column| column.destination_column)
+                    .max()
+                    .context("spreadsheet row-copy requires destination columns")?;
+                destination_header_batch.push((
+                    index,
+                    SheetRangeRequest {
+                        sheet: copy.destination_sheet.clone(),
+                        range: CellRange {
+                            start: CellAddress {
+                                row: copy.destination_header_row,
+                                column: start_column,
+                            },
+                            end: CellAddress {
+                                row: copy.destination_header_row,
+                                column: end_column,
+                            },
+                        },
+                    },
+                ));
+            }
+            SpreadsheetMutation::WriteRows { .. } | SpreadsheetMutation::WriteColumns { .. } => {}
+        }
+    }
+
+    let mut loaded_ranges = BTreeMap::new();
+    for (source_path, batch) in copy_batches {
+        let staged_source = copy_sources
+            .get(&source_path)
+            .with_context(|| format!("spreadsheet copy source {source_path:?} was not staged"))?;
+        let reads = crate::spreadsheet::read_ranges_for_mutation(&ReadRangesRequest {
+            path: staged_source.clone(),
+            ranges: batch.iter().map(|(_, range)| range.clone()).collect(),
+        })?;
+        for ((index, _), read) in batch.into_iter().zip(reads.ranges) {
+            loaded_ranges.insert(index, read);
+        }
+    }
+    let mut source_headers = BTreeMap::new();
+    for (source_path, batch) in source_header_batches {
+        let staged_source = copy_sources.get(&source_path).with_context(|| {
+            format!("spreadsheet row-copy source {source_path:?} was not staged")
+        })?;
+        let reads = crate::spreadsheet::read_ranges_for_mutation(&ReadRangesRequest {
+            path: staged_source.clone(),
+            ranges: batch.iter().map(|(_, range)| range.clone()).collect(),
+        })?;
+        for ((index, _), read) in batch.into_iter().zip(reads.ranges) {
+            source_headers.insert(index, read);
+        }
+    }
+    if !conversion_batch.is_empty() {
+        let source = base_source
+            .context("spreadsheet convert_ranges requires an existing destination workbook")?;
+        let reads = crate::spreadsheet::read_ranges_for_mutation(&ReadRangesRequest {
+            path: source.to_path_buf(),
+            ranges: conversion_batch
+                .iter()
+                .map(|(_, range)| range.clone())
+                .collect(),
+        })?;
+        for ((index, _), read) in conversion_batch.into_iter().zip(reads.ranges) {
+            loaded_ranges.insert(index, read);
+        }
+    }
+    let mut destination_headers = BTreeMap::new();
+    if !destination_header_batch.is_empty() {
+        let source = base_source
+            .context("spreadsheet copy_rows requires an existing destination workbook")?;
+        let reads = crate::spreadsheet::read_ranges_for_mutation(&ReadRangesRequest {
+            path: source.to_path_buf(),
+            ranges: destination_header_batch
+                .iter()
+                .map(|(_, range)| range.clone())
+                .collect(),
+        })?;
+        for ((index, _), read) in destination_header_batch.into_iter().zip(reads.ranges) {
+            destination_headers.insert(index, read);
+        }
+    }
+
     let mut updates = BTreeMap::<String, Vec<CellUpdate>>::new();
-    for operation in operations {
+    let mut formats = Vec::new();
+    for (index, operation) in operations.iter().enumerate() {
         match operation {
             SpreadsheetMutation::WriteRows { sheet, start, rows } => {
                 append_row_updates(&mut updates, sheet, *start, rows)?;
@@ -1233,40 +1377,15 @@ fn materialize_spreadsheet_operations(
             } => {
                 append_column_updates(&mut updates, sheet, *start, columns)?;
             }
-            SpreadsheetMutation::CopyRows {
-                source_path,
-                source_sheet,
-                source_start,
-                row_count,
-                column_count,
+            SpreadsheetMutation::CopyRange {
                 destination_sheet,
                 destination_start,
                 content_mode,
-            }
-            | SpreadsheetMutation::CopyColumns {
-                source_path,
-                source_sheet,
-                source_start,
-                row_count,
-                column_count,
-                destination_sheet,
-                destination_start,
-                content_mode,
+                ..
             } => {
-                let staged_source = copy_sources.get(source_path.trim()).with_context(|| {
-                    format!("spreadsheet copy source {source_path:?} was not staged")
-                })?;
-                let range = counted_spreadsheet_range(
-                    source_start.row,
-                    source_start.column,
-                    *row_count,
-                    *column_count,
-                )?;
-                let read = crate::spreadsheet::read_range(&ReadRangeRequest {
-                    path: staged_source.clone(),
-                    sheet: source_sheet.clone(),
-                    range,
-                })?;
+                let read = loaded_ranges
+                    .remove(&index)
+                    .context("spreadsheet copy range was not loaded")?;
                 let rows = read
                     .rows
                     .iter()
@@ -1278,16 +1397,222 @@ fn materialize_spreadsheet_operations(
                     .collect::<Vec<_>>();
                 append_row_updates(&mut updates, destination_sheet, *destination_start, &rows)?;
             }
+            SpreadsheetMutation::CopyRows(copy) => {
+                let source_start_row = copy.source_data_row;
+                anyhow::ensure!(
+                    source_start_row > copy.source_header_row && source_start_row < EXCEL_MAX_ROWS,
+                    "source_data_row must be after source_header_row"
+                );
+                let source_header = source_headers
+                    .remove(&index)
+                    .context("spreadsheet row-copy source header was not loaded")?;
+                for source_column in copy
+                    .columns
+                    .iter()
+                    .map(|column| column.source_column)
+                    .chain(copy.conditions.iter().map(|condition| condition.column))
+                {
+                    let offset = usize::try_from(source_column - source_header.range.start.column)?;
+                    let cell = source_header
+                        .rows
+                        .first()
+                        .and_then(|row| row.get(offset))
+                        .context("spreadsheet row-copy source header cell is missing")?;
+                    anyhow::ensure!(
+                        !spreadsheet_cell_is_blank(cell),
+                        "source_header_row does not contain a header in referenced column {}",
+                        format_a1_address(CellAddress {
+                            row: copy.source_header_row,
+                            column: source_column,
+                        })
+                    );
+                }
+                let source_range = CellRange {
+                    start: CellAddress {
+                        row: source_start_row,
+                        column: source_header.range.start.column,
+                    },
+                    end: CellAddress {
+                        row: EXCEL_MAX_ROWS - 1,
+                        column: source_header.range.end.column,
+                    },
+                };
+                let destination_start_row = copy
+                    .destination_header_row
+                    .checked_add(1)
+                    .context("spreadsheet row-copy destination row overflow")?;
+                let header = destination_headers
+                    .remove(&index)
+                    .context("spreadsheet row-copy destination header was not loaded")?;
+                for column in &copy.columns {
+                    let offset =
+                        usize::try_from(column.destination_column - header.range.start.column)?;
+                    let cell = header
+                        .rows
+                        .first()
+                        .and_then(|row| row.get(offset))
+                        .context("spreadsheet row-copy destination header cell is missing")?;
+                    anyhow::ensure!(
+                        !spreadsheet_cell_is_blank(cell),
+                        "destination_header_row does not contain a header in mapped column {}",
+                        format_a1_address(CellAddress {
+                            row: copy.destination_header_row,
+                            column: column.destination_column,
+                        })
+                    );
+                }
+                let staged_source =
+                    copy_sources.get(copy.source_path.trim()).with_context(|| {
+                        format!(
+                            "spreadsheet row-copy source {:?} was not staged",
+                            copy.source_path
+                        )
+                    })?;
+                let filtered = crate::spreadsheet::filter_rows(&FilterRowsRequest {
+                    path: staged_source.clone(),
+                    sheet: copy.source_sheet.clone(),
+                    range: source_range,
+                    conditions: copy.conditions.clone(),
+                    match_mode: copy.match_mode,
+                    return_mode: SpreadsheetFilterReturnMode::Rows,
+                    max_results: crate::spreadsheet::MAX_FILTER_RESULTS,
+                })?;
+                anyhow::ensure!(
+                    !filtered.truncated,
+                    "more than {} source rows matched; split the source range",
+                    crate::spreadsheet::MAX_FILTER_RESULTS
+                );
+                anyhow::ensure!(
+                    filtered.rows.len() == filtered.matched_row_indices.len(),
+                    "spreadsheet row-copy result is internally inconsistent"
+                );
+                let sheet_updates = updates.entry(copy.destination_sheet.clone()).or_default();
+                for (row_offset, row) in filtered.rows.iter().enumerate() {
+                    let destination_row = destination_start_row
+                        .checked_add(u32::try_from(row_offset)?)
+                        .context("spreadsheet row-copy destination row overflow")?;
+                    for column in &copy.columns {
+                        anyhow::ensure!(
+                            column.source_column >= source_range.start.column
+                                && column.source_column <= source_range.end.column,
+                            "spreadsheet row-copy source column is outside source_range"
+                        );
+                        let source_offset =
+                            usize::try_from(column.source_column - source_range.start.column)?;
+                        let cell = row
+                            .get(source_offset)
+                            .context("spreadsheet row-copy source cell is missing")?;
+                        let input = spreadsheet_cell_to_input(cell, copy.content_mode);
+                        let value = if matches!(cell.value, SpreadsheetCellValue::Empty)
+                            || cell.formula.is_some()
+                            || column.transforms.is_empty()
+                        {
+                            input
+                        } else {
+                            transform_cell_input(
+                                input,
+                                &column.transforms,
+                                filtered.matched_row_indices[row_offset],
+                                column.source_column,
+                            )?
+                        };
+                        sheet_updates.push(CellUpdate {
+                            address: CellAddress {
+                                row: destination_row,
+                                column: column.destination_column,
+                            },
+                            value,
+                            style_from: Some(CellAddress {
+                                row: destination_start_row,
+                                column: column.destination_column,
+                            }),
+                        });
+                    }
+                }
+                if !filtered.rows.is_empty() {
+                    let end_row = copy
+                        .destination_header_row
+                        .checked_add(1)
+                        .context("spreadsheet row-copy destination row overflow")?
+                        .checked_add(u32::try_from(filtered.rows.len() - 1)?)
+                        .context("spreadsheet row-copy destination row overflow")?;
+                    for column in &copy.columns {
+                        if let Some(number_format) = transform_number_format(&column.transforms)? {
+                            formats.push(SpreadsheetStructureOperation::SetNumberFormat {
+                                sheet: copy.destination_sheet.clone(),
+                                range: CellRange {
+                                    start: CellAddress {
+                                        row: destination_start_row,
+                                        column: column.destination_column,
+                                    },
+                                    end: CellAddress {
+                                        row: end_row,
+                                        column: column.destination_column,
+                                    },
+                                },
+                                number_format,
+                            });
+                        }
+                    }
+                }
+            }
+            SpreadsheetMutation::ConvertRange {
+                sheet,
+                range,
+                transforms,
+            } => {
+                let read = loaded_ranges
+                    .remove(&index)
+                    .context("spreadsheet conversion range was not loaded")?;
+                let rows = read
+                    .rows
+                    .into_iter()
+                    .enumerate()
+                    .map(|(row_offset, row)| {
+                        row.into_iter()
+                            .enumerate()
+                            .map(|(column_offset, cell)| {
+                                let input = spreadsheet_cell_to_input(
+                                    &cell,
+                                    SpreadsheetCopyContentMode::ValuesAndFormulas,
+                                );
+                                if matches!(cell.value, SpreadsheetCellValue::Empty)
+                                    || cell.formula.is_some()
+                                {
+                                    return Ok(input);
+                                }
+                                transform_cell_input(
+                                    input,
+                                    transforms,
+                                    range.start.row + row_offset as u32,
+                                    range.start.column + column_offset as u32,
+                                )
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                append_row_updates(&mut updates, sheet, range.start, &rows)?;
+                if let Some(number_format) = transform_number_format(transforms)? {
+                    formats.push(SpreadsheetStructureOperation::SetNumberFormat {
+                        sheet: sheet.clone(),
+                        range: *range,
+                        number_format,
+                    });
+                }
+            }
         }
     }
-    Ok(updates
-        .into_iter()
-        .map(|(name, cells)| SheetWriteRequest {
-            name,
-            visibility: None,
-            cells,
-        })
-        .collect())
+    Ok(MaterializedSpreadsheetOperations {
+        sheets: updates
+            .into_iter()
+            .map(|(name, cells)| SheetWriteRequest {
+                name,
+                visibility: None,
+                cells,
+            })
+            .collect(),
+        formats,
+    })
 }
 
 fn append_row_updates(
@@ -1316,6 +1641,7 @@ fn append_row_updates(
                         .context("spreadsheet destination column overflow")?,
                 },
                 value: value.clone(),
+                style_from: None,
             });
         }
     }
@@ -1348,6 +1674,7 @@ fn append_column_updates(
                     column: address_column,
                 },
                 value: value.clone(),
+                style_from: None,
             });
         }
     }
@@ -1379,6 +1706,15 @@ fn spreadsheet_cell_to_input(
     }
 }
 
+fn spreadsheet_cell_is_blank(cell: &SpreadsheetCell) -> bool {
+    cell.formula.is_none()
+        && match &cell.value {
+            SpreadsheetCellValue::Empty => true,
+            SpreadsheetCellValue::String(value) => value.trim().is_empty(),
+            _ => false,
+        }
+}
+
 fn spreadsheet_cell_cached_result(value: &SpreadsheetCellValue) -> Option<String> {
     match value {
         SpreadsheetCellValue::Empty => None,
@@ -1401,6 +1737,10 @@ fn spreadsheet_success_result(
     changed_path: Option<PathBuf>,
 ) -> anyhow::Result<ToolResult> {
     let action = result.kind();
+    let validation_passed = match &result {
+        SpreadsheetResult::WorkbookValidated(result) => Some(result.validation_passed),
+        _ => None,
+    };
     let value = serde_json::to_value(&result)?;
     let output = serde_json::to_string_pretty(&value)?;
     let mut content = vec![ModelContentPart::json(value.clone())];
@@ -1409,6 +1749,9 @@ fn spreadsheet_success_result(
         "action": action,
         "success": true
     });
+    if let (Some(validation_passed), Some(object)) = (validation_passed, metadata.as_object_mut()) {
+        object.insert("validationPassed".to_string(), json!(validation_passed));
+    }
     if let Some(path) = changed_path {
         let mime_type = match path
             .extension()
@@ -1439,7 +1782,7 @@ fn spreadsheet_success_result(
     })
 }
 
-fn spreadsheet_error_result(
+pub(super) fn spreadsheet_error_result(
     call_id: Uuid,
     error: crate::spreadsheet::SpreadsheetError,
 ) -> ToolResult {
@@ -1506,22 +1849,6 @@ fn remap_spreadsheet_paths(
         SpreadsheetResult::WorkbookValidated(result) => {
             if let Some(source) = source {
                 result.path = source.to_path_buf();
-            }
-        }
-        SpreadsheetResult::TemplateFilled(result) => {
-            if let Some(source) = source {
-                result.source = source.to_path_buf();
-            }
-            if let Some(output) = output {
-                result.output = output.to_path_buf();
-            }
-        }
-        SpreadsheetResult::RowsTransferred(result) => {
-            if let Some(source) = source {
-                result.source = source.to_path_buf();
-            }
-            if let Some(output) = output {
-                result.output = output.to_path_buf();
             }
         }
         SpreadsheetResult::DelimitedExported(result) => {

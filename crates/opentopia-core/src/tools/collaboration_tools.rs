@@ -74,10 +74,8 @@ fn default_agent_type() -> String {
 #[serde(deny_unknown_fields)]
 pub struct SpawnAgentInput {
     /// Stable lowercase task name used in the canonical agent path.
-    #[serde(alias = "name")]
     pub(super) task_name: String,
     /// Concrete initial task for the child agent.
-    #[serde(alias = "input")]
     pub(super) message: String,
     /// Parent history to copy: none, all, or a positive number of turns.
     #[serde(default)]
@@ -426,7 +424,7 @@ pub struct WaitAgentInput {
     #[serde(default)]
     after_cursor: Option<i64>,
     /// How long to block, up to one hour. Zero reads immediately.
-    #[serde(default, alias = "timeoutMs")]
+    #[serde(default)]
     #[schemars(range(min = 0, max = 3600000))]
     timeout_ms: Option<u64>,
     /// Maximum reasoning tail characters returned.

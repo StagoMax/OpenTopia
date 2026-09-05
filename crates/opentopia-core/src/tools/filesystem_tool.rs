@@ -43,7 +43,8 @@ pub(super) enum FilesystemFindKind {
 #[serde(
     tag = "operation",
     rename_all = "snake_case",
-    rename_all_fields = "camelCase"
+    rename_all_fields = "snake_case",
+    deny_unknown_fields
 )]
 pub(super) enum FilesystemInput {
     Read {
@@ -65,7 +66,6 @@ pub(super) enum FilesystemInput {
         /// Optional optimistic-concurrency token returned by read/stat. Use
         /// `missing` to require that the target does not already exist.
         #[serde(default)]
-        #[schemars(rename = "expectedHash")]
         expected_hash: Option<String>,
     },
     List {
@@ -82,18 +82,17 @@ pub(super) enum FilesystemInput {
         #[serde(default)]
         path: Option<String>,
         /// Literal substring matched against each entry's file name.
-        #[schemars(rename = "nameContains", length(min = 1, max = 256))]
+        #[schemars(length(min = 1, max = 256))]
         name_contains: String,
         /// Match file names case-sensitively. Defaults to false.
         #[serde(default)]
-        #[schemars(rename = "caseSensitive")]
         case_sensitive: bool,
         /// Restrict matches to files or directories. Defaults to any entry kind.
         #[serde(default)]
         kind: FilesystemFindKind,
         /// Maximum directory depth below path. One searches direct children only.
         #[serde(default)]
-        #[schemars(rename = "maxDepth", range(min = 1, max = 64))]
+        #[schemars(range(min = 1, max = 64))]
         max_depth: Option<usize>,
         /// Maximum matches to return. Defaults to 200 and is capped at 1000.
         #[serde(default)]
@@ -464,16 +463,16 @@ async fn find_entries(
     let name_contains = raw_name_contains.trim();
     anyhow::ensure!(
         !name_contains.is_empty(),
-        "filesystem find requires a non-empty nameContains value"
+        "filesystem find requires a non-empty name_contains value"
     );
     anyhow::ensure!(
         name_contains.chars().count() <= MAX_FIND_QUERY_CHARS,
-        "filesystem find nameContains exceeds {MAX_FIND_QUERY_CHARS} characters"
+        "filesystem find name_contains exceeds {MAX_FIND_QUERY_CHARS} characters"
     );
     let max_depth = max_depth.unwrap_or(DEFAULT_FIND_DEPTH);
     anyhow::ensure!(
         (1..=MAX_FIND_DEPTH).contains(&max_depth),
-        "filesystem find maxDepth must be between 1 and {MAX_FIND_DEPTH}"
+        "filesystem find max_depth must be between 1 and {MAX_FIND_DEPTH}"
     );
     let limit = limit
         .unwrap_or(DEFAULT_LIST_ENTRIES)
@@ -809,7 +808,7 @@ fn verify_expected_hash(
     else {
         anyhow::ensure!(
             original.is_none(),
-            "filesystem write requires expectedHash when replacing existing file {}; reread it and retry",
+            "filesystem write requires expected_hash when replacing existing file {}; reread it and retry",
             path.display()
         );
         return Ok(());
@@ -910,7 +909,7 @@ mod tests {
                         "operation": "write",
                         "path": "notes/a.txt",
                         "content": "alpha",
-                        "expectedHash": "missing"
+                        "expected_hash": "missing"
                     }),
                 ),
                 context.clone(),
@@ -988,7 +987,7 @@ mod tests {
                         "operation": "write",
                         "path": "scripts/unicode.ps1",
                         "content": script,
-                        "expectedHash": "missing"
+                        "expected_hash": "missing"
                     }),
                 ),
                 context.clone(),
@@ -1053,7 +1052,7 @@ mod tests {
                         "operation": "write",
                         "path": "value.txt",
                         "content": "replacement",
-                        "expectedHash": "stale"
+                        "expected_hash": "stale"
                     }),
                 ),
                 context,
@@ -1083,10 +1082,10 @@ mod tests {
                     json!({
                         "operation": "find",
                         "path": "src",
-                        "nameContains": "alpha",
-                        "caseSensitive": false,
+                        "name_contains": "alpha",
+                        "case_sensitive": false,
                         "kind": "file",
-                        "maxDepth": 3,
+                        "max_depth": 3,
                         "limit": 10
                     }),
                 ),
@@ -1111,9 +1110,9 @@ mod tests {
                     json!({
                         "operation": "find",
                         "path": "src",
-                        "nameContains": "alpha",
+                        "name_contains": "alpha",
                         "kind": "file",
-                        "maxDepth": 1,
+                        "max_depth": 1,
                         "limit": 10
                     }),
                 ),
@@ -1131,9 +1130,9 @@ mod tests {
                     json!({
                         "operation": "find",
                         "path": "src",
-                        "nameContains": "a",
+                        "name_contains": "a",
                         "kind": "file",
-                        "maxDepth": 3,
+                        "max_depth": 3,
                         "limit": 1
                     }),
                 ),
@@ -1155,8 +1154,6 @@ mod tests {
         let input = json!({
             "operation": "list",
             "path": "",
-            "kind": "directory",
-            "maxDepth": 2,
             "limit": 20
         });
         assert_eq!(Tool::input_error(&FilesystemTool, &input), None);
@@ -1190,26 +1187,26 @@ mod tests {
     }
 
     #[test]
-    fn provider_schema_and_serde_accept_the_same_camel_case_write_input() {
+    fn provider_schema_and_serde_accept_the_same_snake_case_write_input() {
         let input = json!({
             "operation": "write",
             "path": "value.txt",
             "content": "replacement",
-            "expectedHash": "missing"
+            "expected_hash": "missing"
         });
         assert_eq!(Tool::input_error(&FilesystemTool, &input), None);
         assert!(serde_json::from_value::<FilesystemInput>(input).is_ok());
     }
 
     #[test]
-    fn provider_schema_and_serde_accept_the_same_camel_case_find_input() {
+    fn provider_schema_and_serde_accept_the_same_snake_case_find_input() {
         let input = json!({
             "operation": "find",
             "path": ".",
-            "nameContains": "policy",
-            "caseSensitive": false,
+            "name_contains": "policy",
+            "case_sensitive": false,
             "kind": "file",
-            "maxDepth": 8,
+            "max_depth": 8,
             "limit": 200
         });
         assert_eq!(Tool::input_error(&FilesystemTool, &input), None);

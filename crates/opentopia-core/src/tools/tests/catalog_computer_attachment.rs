@@ -267,7 +267,7 @@ fn bundled_native_tools_are_not_core_tools_and_keep_their_plugin_source() {
     let core = ToolRegistry::with_core_tools();
     assert!(core.get("browser").is_none());
     assert!(core.get("computer").is_none());
-    assert!(core.get("document").is_none());
+    assert!(core.get("word_document").is_none());
     assert!(core.get("pdf").is_none());
     assert!(core.get("spreadsheet").is_none());
     assert!(core.get("document_open").is_none());
@@ -286,7 +286,7 @@ fn bundled_native_tools_are_not_core_tools_and_keep_their_plugin_source() {
         })
     );
     assert_eq!(
-        defaults.source("document"),
+        defaults.source("word_document"),
         Some(ToolSource::BundledPlugin {
             plugin_name: "documents".to_string(),
         })
@@ -298,9 +298,9 @@ fn bundled_native_tools_are_not_core_tools_and_keep_their_plugin_source() {
         })
     );
     for name in [
-        "document_open",
-        "document_get_operation_schemas",
-        "document_execute",
+        "spreadsheet_inspect",
+        "spreadsheet_read_ranges",
+        "spreadsheet_write_range",
     ] {
         assert_eq!(
             defaults.source(name),
@@ -657,11 +657,10 @@ async fn plugin_skills_follow_the_effective_project_activation() {
         .execute_typed(Uuid::new_v4(), EmptyToolInput {}, context.clone())
         .await
         .unwrap();
-    let disabled_catalog: Vec<crate::SkillDescriptor> =
-        serde_json::from_str(&disabled_catalog.output).unwrap();
+    let disabled_catalog: Vec<Value> = serde_json::from_str(&disabled_catalog.output).unwrap();
     assert!(!disabled_catalog
         .iter()
-        .any(|skill| skill.id == plugin_skill.id));
+        .any(|skill| skill["id"] == plugin_skill.id));
     let disabled_read = ReadSkillTool
         .execute_typed(
             Uuid::new_v4(),
@@ -687,11 +686,13 @@ async fn plugin_skills_follow_the_effective_project_activation() {
         .execute_typed(Uuid::new_v4(), EmptyToolInput {}, context.clone())
         .await
         .unwrap();
-    let enabled_catalog: Vec<crate::SkillDescriptor> =
-        serde_json::from_str(&enabled_catalog.output).unwrap();
+    let enabled_catalog: Vec<Value> = serde_json::from_str(&enabled_catalog.output).unwrap();
     assert!(enabled_catalog
         .iter()
-        .any(|skill| skill.id == plugin_skill.id));
+        .any(|skill| skill["id"] == plugin_skill.id));
+    assert!(enabled_catalog
+        .iter()
+        .all(|skill| skill.get("name").is_none() && skill.get("path").is_none()));
     ReadSkillTool
         .execute_typed(
             Uuid::new_v4(),

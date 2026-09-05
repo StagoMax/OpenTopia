@@ -36,22 +36,65 @@ fn every_static_builtin_uses_an_inline_derived_input_schema() {
     }
 }
 
+fn assert_snake_case_properties(tool: &str, schema: &Value, path: &str) {
+    match schema {
+        Value::Object(object) => {
+            if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+                for name in properties.keys() {
+                    assert!(
+                        name.chars().all(|character| {
+                            character.is_ascii_lowercase()
+                                || character.is_ascii_digit()
+                                || character == '_'
+                        }),
+                        "tool {tool} exposes non-snake_case argument {path}.{name}"
+                    );
+                }
+            }
+            for (key, value) in object {
+                assert_snake_case_properties(tool, value, &format!("{path}.{key}"));
+            }
+        }
+        Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                assert_snake_case_properties(tool, value, &format!("{path}[{index}]"));
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn every_builtin_argument_name_is_snake_case() {
+    let registry = ToolRegistry::with_builtins();
+    for name in registry.list() {
+        let schema = registry.get(&name).expect("registered tool").schema();
+        assert_snake_case_properties(&name, &schema, "arguments");
+    }
+}
+
 #[test]
 fn foreground_yield_schema_enforces_runtime_floor_and_allows_two_minutes() {
     let shell = ShellTool.schema();
     assert_eq!(
-        shell["properties"]["yieldTimeMs"]["minimum"].as_f64(),
+        shell["properties"]["yield_time_ms"]["minimum"].as_f64(),
         Some(30_000.0)
     );
     assert_eq!(
-        shell["properties"]["yieldTimeMs"]["maximum"].as_f64(),
+        shell["properties"]["yield_time_ms"]["maximum"].as_f64(),
         Some(120_000.0)
     );
 
     let browser = BrowserTool.schema();
     let download = &action_schema_branch(&browser, "download")["properties"];
-    assert_eq!(download["yieldTimeMs"]["minimum"].as_f64(), Some(30_000.0));
-    assert_eq!(download["yieldTimeMs"]["maximum"].as_f64(), Some(120_000.0));
+    assert_eq!(
+        download["yield_time_ms"]["minimum"].as_f64(),
+        Some(30_000.0)
+    );
+    assert_eq!(
+        download["yield_time_ms"]["maximum"].as_f64(),
+        Some(120_000.0)
+    );
 }
 
 fn schema_contains_object_matching(
@@ -161,8 +204,8 @@ fn derived_schema_and_typed_decoder_reject_the_same_invalid_shapes() {
     assert!(WorkspaceSearchTool
         .input_error(&json!({
             "query": "TypedTool",
-            "fixedStrings": true,
-            "maxResults": 10
+            "fixed_strings": true,
+            "max_results": 10
         }))
         .is_none());
     assert!(ApplyPatchTool
@@ -200,10 +243,10 @@ fn search_tool_exposes_exact_symbol_controls() {
         .as_object()
         .expect("search schema properties");
 
-    assert_eq!(properties["fixedStrings"]["type"], "boolean");
-    assert_eq!(properties["wordMatch"]["type"], "boolean");
-    assert_eq!(properties["contextLines"]["minimum"].as_f64(), Some(0.0));
-    assert_eq!(properties["contextLines"]["maximum"].as_f64(), Some(20.0));
+    assert_eq!(properties["fixed_strings"]["type"], "boolean");
+    assert_eq!(properties["word_match"]["type"], "boolean");
+    assert_eq!(properties["context_lines"]["minimum"].as_f64(), Some(0.0));
+    assert_eq!(properties["context_lines"]["maximum"].as_f64(), Some(20.0));
     assert!(Tool::description(&WorkspaceSearchTool).contains("not semantic symbol resolution"));
 }
 
@@ -211,7 +254,7 @@ fn search_tool_exposes_exact_symbol_controls() {
 fn background_read_schema_exposes_a_bounded_wait() {
     let schema = BackgroundOutputTool.schema();
     let read = action_schema_branch(&schema, "read");
-    let timeout = &read["properties"]["timeoutMs"];
+    let timeout = &read["properties"]["timeout_ms"];
     assert!(
         schema_contains_object_matching(timeout, &|object| {
             object.get("minimum").and_then(Value::as_f64) == Some(0.0)
@@ -221,7 +264,7 @@ fn background_read_schema_exposes_a_bounded_wait() {
     );
     assert!(read["required"]
         .as_array()
-        .is_some_and(|required| required.contains(&json!("jobId"))));
+        .is_some_and(|required| required.contains(&json!("job_id"))));
     assert!(Tool::description(&BackgroundOutputTool).contains("cancellable wait"));
 }
 
@@ -260,47 +303,48 @@ fn action_driven_tools_expose_only_action_specific_fields() {
     );
     assert_discriminated_action_schema(&PdfTool, &["inspect", "extract", "render", "validate"]);
     assert_discriminated_action_schema(&DocumentTool, &["inspect", "extract", "validate"]);
-    let execute = DocumentExecuteTool.schema();
-    assert!(execute.get("oneOf").is_none());
-    assert!(execute["properties"].get("documentId").is_some());
-    assert!(execute["properties"].get("operation").is_some());
-    assert!(execute["properties"].get("arguments").is_some());
-    assert!(execute["properties"].get("action").is_none());
+    let write = SpreadsheetWriteRangeTool.schema();
+    assert!(write.get("oneOf").is_none());
+    assert!(write["properties"].get("path").is_some());
+    assert!(write["properties"].get("sheet").is_some());
+    assert!(write["properties"].get("rows").is_some());
+    assert!(write["properties"].get("document_id").is_none());
+    assert!(write["properties"].get("operation").is_none());
 
     let browser = BrowserTool.schema();
     let navigate = &action_schema_branch(&browser, "navigate")["properties"];
     assert!(navigate.get("url").is_some());
-    assert!(navigate.get("nodeRef").is_none());
+    assert!(navigate.get("node_ref").is_none());
     let click = &action_schema_branch(&browser, "click")["properties"];
-    assert!(click.get("observationId").is_some());
-    assert!(click.get("nodeRef").is_some());
+    assert!(click.get("observation_id").is_some());
+    assert!(click.get("node_ref").is_some());
     assert!(click.get("url").is_none());
 
     let computer = ComputerTool.schema();
     let drag = &action_schema_branch(&computer, "drag")["properties"];
-    assert!(drag.get("endX").is_some());
+    assert!(drag.get("end_x").is_some());
     assert!(drag.get("text").is_none());
 
     let pdf = PdfTool.schema();
     let extract = &action_schema_branch(&pdf, "extract")["properties"];
-    assert!(extract.get("maxCharacters").is_some());
+    assert!(extract.get("max_characters").is_some());
     assert!(extract.get("dpi").is_none());
     let render = &action_schema_branch(&pdf, "render")["properties"];
     assert!(render.get("dpi").is_some());
-    assert!(render.get("maxCharacters").is_none());
+    assert!(render.get("max_characters").is_none());
 
     let document = DocumentTool.schema();
     let inspect = &action_schema_branch(&document, "inspect")["properties"];
-    assert!(inspect.get("includeRelatedParts").is_none());
+    assert!(inspect.get("include_related_parts").is_none());
     let extract = &action_schema_branch(&document, "extract")["properties"];
-    assert!(extract.get("includeRelatedParts").is_some());
+    assert!(extract.get("include_related_parts").is_some());
 
     let background = BackgroundOutputTool.schema();
     let list = &action_schema_branch(&background, "list")["properties"];
     assert_eq!(list.as_object().map(serde_json::Map::len), Some(1));
     let write = &action_schema_branch(&background, "write")["properties"];
     assert!(write.get("data").is_some());
-    assert!(write.get("timeoutMs").is_none());
+    assert!(write.get("timeout_ms").is_none());
 }
 
 #[test]
@@ -321,10 +365,10 @@ fn builtin_action_discriminators_never_use_a_flat_optional_field_bag() {
 
 #[test]
 fn action_driven_tools_reject_cross_action_or_incomplete_inputs() {
-    assert!(DocumentExecuteTool
+    assert!(SpreadsheetWriteRangeTool
         .input_error(&json!({
-            "operation": "read_range",
-            "arguments": {}
+            "path": "orders.xlsx",
+            "sheet": "Orders"
         }))
         .is_some());
     assert!(BrowserTool
@@ -333,15 +377,15 @@ fn action_driven_tools_reject_cross_action_or_incomplete_inputs() {
     assert!(BrowserTool
         .input_error(&json!({
             "action": "click",
-            "observationId": "obs",
-            "nodeRef": "n1",
+            "observation_id": "obs",
+            "node_ref": "n1",
             "url": "https://example.com"
         }))
         .is_some());
     assert!(ComputerTool
         .input_error(&json!({
             "action": "drag",
-            "observationId": "obs",
+            "observation_id": "obs",
             "x": 1,
             "y": 2
         }))
@@ -357,7 +401,7 @@ fn action_driven_tools_reject_cross_action_or_incomplete_inputs() {
         .input_error(&json!({
             "action": "validate",
             "path": "report.docx",
-            "maxCharacters": 100
+            "max_characters": 100
         }))
         .is_some());
     assert!(BackgroundOutputTool.input_error(&json!({})).is_some());
@@ -371,11 +415,12 @@ fn action_driven_tools_reject_cross_action_or_incomplete_inputs() {
         }))
         .is_some());
 
-    assert!(DocumentExecuteTool
+    assert!(SpreadsheetWriteRangeTool
         .input_error(&json!({
-            "documentId": Uuid::new_v4(),
-            "operation": "read_range",
-            "arguments": {}
+            "path": "orders.xlsx",
+            "sheet": "Orders",
+            "start": "A1",
+            "rows": [[{ "type": "string", "value": "sku" }]]
         }))
         .is_none());
     assert!(BackgroundOutputTool
@@ -384,18 +429,18 @@ fn action_driven_tools_reject_cross_action_or_incomplete_inputs() {
     assert!(BrowserTool
         .input_error(&json!({
             "action": "click",
-            "observationId": "obs",
-            "nodeRef": "n1"
+            "observation_id": "obs",
+            "node_ref": "n1"
         }))
         .is_none());
     assert!(ComputerTool
         .input_error(&json!({
             "action": "drag",
-            "observationId": "obs",
+            "observation_id": "obs",
             "x": 1,
             "y": 2,
-            "endX": 3,
-            "endY": 4
+            "end_x": 3,
+            "end_y": 4
         }))
         .is_none());
     assert!(PdfTool
@@ -410,34 +455,34 @@ fn action_driven_tools_reject_cross_action_or_incomplete_inputs() {
         .input_error(&json!({
             "action": "extract",
             "path": "report.docx",
-            "includeRelatedParts": true,
-            "maxCharacters": 100
+            "include_related_parts": true,
+            "max_characters": 100
         }))
         .is_none());
     assert!(BackgroundOutputTool
         .input_error(&json!({
             "action": "write",
-            "jobId": Uuid::new_v4(),
+            "job_id": Uuid::new_v4(),
             "data": "hello",
-            "appendNewline": true
+            "append_newline": true
         }))
         .is_none());
     assert!(BackgroundOutputTool
         .input_error(&json!({
             "action": "read",
-            "jobId": Uuid::new_v4(),
-            "timeoutMs": 0,
+            "job_id": Uuid::new_v4(),
+            "timeout_ms": 0,
             "data": null,
-            "appendNewline": false
+            "append_newline": false
         }))
-        .is_none());
+        .is_some());
     assert!(BackgroundOutputTool
         .input_error(&json!({
             "action": "stop",
-            "jobId": Uuid::new_v4(),
-            "timeoutMs": 0
+            "job_id": Uuid::new_v4(),
+            "timeout_ms": 0
         }))
-        .is_none());
+        .is_some());
 }
 
 #[test]

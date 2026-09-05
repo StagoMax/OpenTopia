@@ -150,17 +150,6 @@ pub(super) struct StoredAttachmentFile {
 }
 
 impl StoredAttachmentFile {
-    pub(super) fn original_logical_path(&self, fallback_extension: &str) -> PathBuf {
-        let name = PathBuf::from(&self.name);
-        if name.extension().is_some() {
-            return name;
-        }
-        if self.path.extension().is_some() {
-            return self.path.clone();
-        }
-        PathBuf::from(format!("attachment-{}.{}", self.id, fallback_extension))
-    }
-
     pub(super) fn logical_path(&self, expected_extension: &str) -> PathBuf {
         let name = PathBuf::from(&self.name);
         if name.extension().is_some_and(|extension| {
@@ -259,7 +248,7 @@ pub(super) fn insert_attachment_provenance(metadata: &mut Value, attachment: &Va
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(super) struct ReadAttachmentInput {
     /// Opaque attachment ID shown in the user message's attachment manifest.
     pub(super) attachment_id: String,
@@ -283,7 +272,7 @@ impl TypedTool for ReadAttachmentTool {
     }
 
     fn description(&self) -> &str {
-        "Read a user-attached text or document source by its opaque attachmentId. Use view_attachment for images."
+        "Read a user-attached text or document source by its opaque attachment_id. Use view_attachment for images."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
@@ -297,7 +286,7 @@ impl TypedTool for ReadAttachmentTool {
         ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let attachment_id = Uuid::parse_str(input.attachment_id.trim())
-            .context("attachmentId must be a UUID from the attachment manifest")?;
+            .context("attachment_id must be a UUID from the attachment manifest")?;
         let attachment = find_stored_attachment(&ctx, attachment_id)?;
         if matches!(attachment, StoredAttachment::InlineImage { .. }) {
             anyhow::bail!(
@@ -371,7 +360,7 @@ impl TypedTool for ReadAttachmentTool {
 impl_typed_tool!(ReadAttachmentTool);
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(super) struct ViewAttachmentInput {
     /// Opaque image attachment ID shown in the user message's attachment manifest.
     pub(super) attachment_id: String,
@@ -391,7 +380,7 @@ impl TypedTool for ViewAttachmentTool {
     }
 
     fn description(&self) -> &str {
-        "View a user-attached image by its opaque attachmentId. The runtime delivers native image content to vision-capable models; for text-only models it may use an explicitly declared compatible MCP attachment inspector. Optionally provide focus to describe what should be inspected."
+        "View a user-attached image by its opaque attachment_id. The runtime delivers native image content to vision-capable models; for text-only models it may use an explicitly declared compatible MCP attachment inspector. Optionally provide focus to describe what should be inspected."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
@@ -411,7 +400,7 @@ impl TypedTool for ViewAttachmentTool {
         ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let attachment_id = Uuid::parse_str(input.attachment_id.trim())
-            .context("attachmentId must be a UUID from the attachment manifest")?;
+            .context("attachment_id must be a UUID from the attachment manifest")?;
         let attachment = find_stored_attachment(&ctx, attachment_id)?;
         let (content_type, data) = attachment_image_bytes(&attachment).await?;
         if !ctx.model_supports_vision {

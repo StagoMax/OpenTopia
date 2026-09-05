@@ -22,18 +22,21 @@ use zip::{ZipArchive, ZipWriter};
 
 mod display;
 mod format;
+mod guidance;
 mod ooxml;
 mod read;
-mod row_transfer;
+mod structure;
 mod template_patch;
 mod transfer;
+mod value_transform;
 mod workbook_write;
 
 pub use format::SpreadsheetFileFormat;
-pub(crate) use read::read_range_for_display;
 pub use read::{filter_rows, find_cells, inspect_workbook, list_sheets, read_range, read_ranges};
-pub use row_transfer::*;
+pub(crate) use read::{read_range_for_display, read_ranges_for_mutation};
+pub use structure::*;
 pub use transfer::*;
+pub use value_transform::*;
 
 use template_patch::patch_workbook_template;
 use workbook_write::{
@@ -80,8 +83,6 @@ pub enum SpreadsheetAction {
     FindCells(FindCellsRequest),
     FilterRows(FilterRowsRequest),
     ValidateWorkbook(ValidateWorkbookRequest),
-    FillTemplate(FillTemplateRequest),
-    TransferRows(TransferRowsRequest),
     ExportDelimited(ExportDelimitedRequest),
     WriteWorkbook(WriteWorkbookRequest),
 }
@@ -97,8 +98,6 @@ pub enum SpreadsheetActionKind {
     FindCells,
     FilterRows,
     ValidateWorkbook,
-    FillTemplate,
-    TransferRows,
     ExportDelimited,
     WriteWorkbook,
 }
@@ -114,8 +113,6 @@ impl SpreadsheetAction {
             Self::FindCells(_) => SpreadsheetActionKind::FindCells,
             Self::FilterRows(_) => SpreadsheetActionKind::FilterRows,
             Self::ValidateWorkbook(_) => SpreadsheetActionKind::ValidateWorkbook,
-            Self::FillTemplate(_) => SpreadsheetActionKind::FillTemplate,
-            Self::TransferRows(_) => SpreadsheetActionKind::TransferRows,
             Self::ExportDelimited(_) => SpreadsheetActionKind::ExportDelimited,
             Self::WriteWorkbook(_) => SpreadsheetActionKind::WriteWorkbook,
         }
@@ -124,10 +121,7 @@ impl SpreadsheetAction {
 
 impl SpreadsheetActionKind {
     pub fn is_mutation(self) -> bool {
-        matches!(
-            self,
-            Self::FillTemplate | Self::TransferRows | Self::ExportDelimited | Self::WriteWorkbook
-        )
+        matches!(self, Self::ExportDelimited | Self::WriteWorkbook)
     }
 }
 
@@ -246,6 +240,18 @@ pub enum SpreadsheetFilterMatchMode {
     Any,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SpreadsheetFilterReturnMode {
+    /// Return only the exact number of matching rows.
+    #[default]
+    Summary,
+    /// Return matching worksheet row indices, bounded by `max_results`.
+    Indices,
+    /// Return matching worksheet row indices and cell values, bounded by `max_results`.
+    Rows,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct FilterRowsRequest {
@@ -256,6 +262,8 @@ pub struct FilterRowsRequest {
     pub conditions: Vec<SpreadsheetFilterCondition>,
     #[serde(default)]
     pub match_mode: SpreadsheetFilterMatchMode,
+    #[serde(default)]
+    pub return_mode: SpreadsheetFilterReturnMode,
     #[serde(default = "default_filter_results")]
     pub max_results: usize,
 }
@@ -292,6 +300,11 @@ pub struct SheetWriteRequest {
 pub struct CellUpdate {
     pub address: CellAddress,
     pub value: SpreadsheetCellInput,
+    /// Optional template cell whose style should be reused when the target cell has no style.
+    /// This is an internal mutation hint and is intentionally absent from public tool schemas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub(crate) style_from: Option<CellAddress>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
@@ -306,7 +319,7 @@ pub enum SpreadsheetCellInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct FormulaInput {
     pub expression: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -348,6 +361,98 @@ impl CellRange {
     }
 }
 
+pub fn parse_a1_address(value: &str) -> Result<CellAddress, SpreadsheetError> {
+    let value = value.trim();
+    let value = value.strip_prefix('$').unwrap_or(value);
+    let mut column = 0_u32;
+    let mut letters = 0_usize;
+    let mut split = 0_usize;
+    for (index, character) in value.char_indices() {
+        if character.is_ascii_alphabetic() {
+            column = column
+                .checked_mul(26)
+                .and_then(|value| {
+                    value.checked_add(u32::from(character.to_ascii_uppercase() as u8 - b'A') + 1)
+                })
+                .ok_or(SpreadsheetError::InvalidRange {
+                    reason: "A1 column is outside spreadsheet bounds",
+                })?;
+            letters += 1;
+            split = index + character.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if letters == 0 {
+        return Err(SpreadsheetError::InvalidRange {
+            reason: "A1 address must start with a column name",
+        });
+    }
+    let row_text = value[split..].strip_prefix('$').unwrap_or(&value[split..]);
+    if row_text.is_empty() || !row_text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(SpreadsheetError::InvalidRange {
+            reason: "A1 address must end with a row number",
+        });
+    }
+    let row = row_text
+        .parse::<u32>()
+        .ok()
+        .and_then(|row| row.checked_sub(1))
+        .ok_or(SpreadsheetError::InvalidRange {
+            reason: "A1 row must be a positive integer",
+        })?;
+    let address = CellAddress {
+        row,
+        column: column.checked_sub(1).expect("validated A1 column"),
+    };
+    validate_address(address)?;
+    Ok(address)
+}
+
+pub fn parse_a1_range(value: &str) -> Result<CellRange, SpreadsheetError> {
+    let value = value.trim();
+    let (start, end) = value.split_once(':').unwrap_or((value, value));
+    if end.contains(':') {
+        return Err(SpreadsheetError::InvalidRange {
+            reason: "A1 range must contain at most one colon",
+        });
+    }
+    let range = CellRange {
+        start: parse_a1_address(start)?,
+        end: parse_a1_address(end)?,
+    };
+    validate_range_dimensions(range)?;
+    Ok(range)
+}
+
+pub fn format_a1_address(address: CellAddress) -> String {
+    let mut column = address.column + 1;
+    let mut letters = Vec::new();
+    while column > 0 {
+        let remainder = (column - 1) % 26;
+        letters.push(char::from(
+            b'A' + u8::try_from(remainder).expect("A1 remainder"),
+        ));
+        column = (column - 1) / 26;
+    }
+    letters.reverse();
+    format!(
+        "{}{}",
+        letters.into_iter().collect::<String>(),
+        address.row + 1
+    )
+}
+
+pub fn format_a1_range(range: CellRange) -> String {
+    let start = format_a1_address(range.start);
+    let end = format_a1_address(range.end);
+    if start == end {
+        start
+    } else {
+        format!("{start}:{end}")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "result", rename_all = "snake_case")]
 pub enum SpreadsheetResult {
@@ -359,8 +464,6 @@ pub enum SpreadsheetResult {
     CellsFound(FindCellsResult),
     RowsFiltered(FilterRowsResult),
     WorkbookValidated(ValidateWorkbookResult),
-    TemplateFilled(FillTemplateResult),
-    RowsTransferred(TransferRowsResult),
     DelimitedExported(ExportDelimitedResult),
     WorkbookWritten(WriteWorkbookResult),
 }
@@ -376,8 +479,6 @@ impl SpreadsheetResult {
             Self::CellsFound(_) => SpreadsheetActionKind::FindCells,
             Self::RowsFiltered(_) => SpreadsheetActionKind::FilterRows,
             Self::WorkbookValidated(_) => SpreadsheetActionKind::ValidateWorkbook,
-            Self::TemplateFilled(_) => SpreadsheetActionKind::FillTemplate,
-            Self::RowsTransferred(_) => SpreadsheetActionKind::TransferRows,
             Self::DelimitedExported(_) => SpreadsheetActionKind::ExportDelimited,
             Self::WorkbookWritten(_) => SpreadsheetActionKind::WriteWorkbook,
         }
@@ -399,6 +500,50 @@ pub struct InspectWorkbookResult {
     pub file_size_bytes: u64,
     pub sheets: Vec<SheetInspection>,
     pub populated_cells: u64,
+    pub guidance: WorkbookGuidance,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkbookGuidance {
+    pub data_validations: Vec<SpreadsheetDataValidation>,
+    pub comments: Vec<SpreadsheetCellComment>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SpreadsheetDataValidation {
+    pub sheet: String,
+    pub ranges: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_blank: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formula1: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formula2: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SpreadsheetCellComment {
+    pub sheet: String,
+    pub cell: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -477,7 +622,10 @@ pub struct FilterRowsResult {
     pub path: PathBuf,
     pub sheet: String,
     pub range: CellRange,
+    pub matched_row_count: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub matched_row_indices: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rows: Vec<Vec<SpreadsheetCell>>,
     pub scanned_rows: u64,
     pub truncated: bool,
@@ -755,12 +903,6 @@ pub fn execute_spreadsheet(
         SpreadsheetAction::ValidateWorkbook(request) => {
             transfer::validate_workbook(&request).map(SpreadsheetResult::WorkbookValidated)
         }
-        SpreadsheetAction::FillTemplate(request) => {
-            transfer::fill_template(&request).map(SpreadsheetResult::TemplateFilled)
-        }
-        SpreadsheetAction::TransferRows(request) => {
-            row_transfer::transfer_rows(&request).map(SpreadsheetResult::RowsTransferred)
-        }
         SpreadsheetAction::ExportDelimited(request) => {
             transfer::export_delimited(&request).map(SpreadsheetResult::DelimitedExported)
         }
@@ -846,71 +988,7 @@ pub fn write_workbook_openpyxl(
         })?;
     }
 
-    let payload = serde_json::to_vec(request).map_err(|error| SpreadsheetError::Serialization {
-        message: error.to_string(),
-    })?;
-    let mut child = Command::new(python)
-        .args(["-I", "-c", OPENPYXL_WORKER])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| SpreadsheetError::BackendUnavailable {
-            message: format!("failed to start {}: {error}", python.display()),
-        })?;
-    child
-        .stdin
-        .take()
-        .expect("piped worker stdin")
-        .write_all(&payload)
-        .map_err(|error| write_failed(&request.output, error))?;
-
-    let status = match child
-        .wait_timeout(OPENPYXL_WORKER_TIMEOUT)
-        .map_err(|error| write_failed(&request.output, error))?
-    {
-        Some(status) => status,
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(SpreadsheetError::WorkerTimeout {
-                seconds: OPENPYXL_WORKER_TIMEOUT.as_secs(),
-            });
-        }
-    };
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut output) = child.stdout.take() {
-        output
-            .read_to_string(&mut stdout)
-            .map_err(|error| write_failed(&request.output, error))?;
-    }
-    if let Some(mut output) = child.stderr.take() {
-        output
-            .read_to_string(&mut stderr)
-            .map_err(|error| write_failed(&request.output, error))?;
-    }
-    if !status.success() {
-        let message = stderr.trim();
-        return Err(write_failed(
-            &request.output,
-            if message.is_empty() {
-                format!("openpyxl worker exited with {status}")
-            } else {
-                message.to_string()
-            },
-        ));
-    }
-    let worker_result: serde_json::Value =
-        serde_json::from_str(stdout.trim()).map_err(|error| SpreadsheetError::Serialization {
-            message: format!("invalid openpyxl worker response: {error}"),
-        })?;
-    if worker_result.get("ok") != Some(&serde_json::Value::Bool(true)) {
-        return Err(write_failed(
-            &request.output,
-            "openpyxl worker did not report success",
-        ));
-    }
+    run_openpyxl_worker(request, &request.output, python)?;
 
     let bytes_written = fs::metadata(&request.output)
         .map_err(|source| SpreadsheetError::Io {
@@ -940,6 +1018,79 @@ pub fn write_workbook_openpyxl(
         backend: SpreadsheetWriteBackend::Openpyxl,
     };
     Ok(result)
+}
+
+pub(crate) fn run_openpyxl_worker<T: Serialize>(
+    request: &T,
+    output: &Path,
+    python: &Path,
+) -> Result<serde_json::Value, SpreadsheetError> {
+    let payload = serde_json::to_vec(request).map_err(|error| SpreadsheetError::Serialization {
+        message: error.to_string(),
+    })?;
+    let mut child = Command::new(python)
+        .args(["-I", "-c", OPENPYXL_WORKER])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| SpreadsheetError::BackendUnavailable {
+            message: format!("failed to start {}: {error}", python.display()),
+        })?;
+    child
+        .stdin
+        .take()
+        .expect("piped worker stdin")
+        .write_all(&payload)
+        .map_err(|error| write_failed(output, error))?;
+
+    let status = match child
+        .wait_timeout(OPENPYXL_WORKER_TIMEOUT)
+        .map_err(|error| write_failed(output, error))?
+    {
+        Some(status) => status,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(SpreadsheetError::WorkerTimeout {
+                seconds: OPENPYXL_WORKER_TIMEOUT.as_secs(),
+            });
+        }
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut stdout_pipe) = child.stdout.take() {
+        stdout_pipe
+            .read_to_string(&mut stdout)
+            .map_err(|error| write_failed(output, error))?;
+    }
+    if let Some(mut stderr_pipe) = child.stderr.take() {
+        stderr_pipe
+            .read_to_string(&mut stderr)
+            .map_err(|error| write_failed(output, error))?;
+    }
+    if !status.success() {
+        let message = stderr.trim();
+        return Err(write_failed(
+            output,
+            if message.is_empty() {
+                format!("openpyxl worker exited with {status}")
+            } else {
+                message.to_string()
+            },
+        ));
+    }
+    let worker_result: serde_json::Value =
+        serde_json::from_str(stdout.trim()).map_err(|error| SpreadsheetError::Serialization {
+            message: format!("invalid openpyxl worker response: {error}"),
+        })?;
+    if worker_result.get("ok") != Some(&serde_json::Value::Bool(true)) {
+        return Err(write_failed(
+            output,
+            "openpyxl worker did not report success",
+        ));
+    }
+    Ok(worker_result)
 }
 
 pub fn write_workbook(
@@ -1125,6 +1276,25 @@ fn validate_address(address: CellAddress) -> Result<(), SpreadsheetError> {
 }
 
 fn validate_read_range(range: CellRange) -> Result<(), SpreadsheetError> {
+    let (rows, columns, cells) = validate_range_dimensions(range)?;
+    if rows > MAX_READ_ROWS || columns > MAX_READ_COLUMNS || cells > MAX_READ_CELLS {
+        return Err(SpreadsheetError::RangeTooLarge {
+            rows,
+            columns,
+            cells,
+            max_rows: MAX_READ_ROWS,
+            max_columns: MAX_READ_COLUMNS,
+            max_cells: MAX_READ_CELLS,
+        });
+    }
+    Ok(())
+}
+
+fn validate_scan_range(range: CellRange) -> Result<(), SpreadsheetError> {
+    validate_range_dimensions(range).map(|_| ())
+}
+
+fn validate_range_dimensions(range: CellRange) -> Result<(u64, u64, u64), SpreadsheetError> {
     validate_address(range.start)?;
     validate_address(range.end)?;
     let Some(rows) = range.row_count() else {
@@ -1142,17 +1312,7 @@ fn validate_read_range(range: CellRange) -> Result<(), SpreadsheetError> {
         .ok_or(SpreadsheetError::InvalidRange {
             reason: "range cell count overflowed",
         })?;
-    if rows > MAX_READ_ROWS || columns > MAX_READ_COLUMNS || cells > MAX_READ_CELLS {
-        return Err(SpreadsheetError::RangeTooLarge {
-            rows,
-            columns,
-            cells,
-            max_rows: MAX_READ_ROWS,
-            max_columns: MAX_READ_COLUMNS,
-            max_cells: MAX_READ_CELLS,
-        });
-    }
-    Ok(())
+    Ok((rows, columns, cells))
 }
 
 fn validate_write_request(request: &WriteWorkbookRequest) -> Result<usize, SpreadsheetError> {
@@ -1192,6 +1352,9 @@ fn validate_write_request(request: &WriteWorkbookRequest) -> Result<usize, Sprea
         let mut addresses = HashSet::with_capacity(sheet.cells.len());
         for update in &sheet.cells {
             validate_address(update.address)?;
+            if let Some(style_from) = update.style_from {
+                validate_address(style_from)?;
+            }
             if !addresses.insert(update.address) {
                 return Err(SpreadsheetError::DuplicateCellUpdate {
                     sheet: sheet.name.clone(),

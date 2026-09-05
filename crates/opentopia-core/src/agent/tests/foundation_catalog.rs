@@ -535,274 +535,6 @@ fn progressive_tool_search_reveals_only_matching_deferred_schemas() {
     assert!(!exposed.iter().any(|tool| tool.name == "mcp_invoice_send"));
 }
 
-#[tokio::test]
-async fn trusted_discovery_result_loads_and_resumes_a_precise_tool_contract() {
-    let registry = ToolRegistry::with_builtins();
-    let agent = AgentCore::new(Arc::new(MockProvider), registry);
-    let mut exposed = agent.provider_tool_catalog();
-    assert!(!exposed
-        .iter()
-        .any(|candidate| candidate.name == "document_execute"));
-    let base = agent
-        .eligible_provider_tool_candidates()
-        .iter()
-        .find(|candidate| candidate.name == "document_execute")
-        .expect("document execute candidate")
-        .input_schema
-        .clone();
-    let workspace_root =
-        std::env::temp_dir().join(format!("opentopia-contract-load-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&workspace_root).unwrap();
-    let policy = Arc::new(BasicPolicyEngine::new(
-        workspace_root.clone(),
-        PermissionMode::FullAccess,
-    ));
-    let mut events = TurnEvents::new(None);
-    let opened = agent
-        .execute_provider_tool_call(
-            &ProviderToolCall {
-                id: "open-sheet".to_string(),
-                name: "document_open".to_string(),
-                arguments: json!({
-                    "resource": { "kind": "file", "path": "unused.xlsx" },
-                    "mode": "create"
-                }),
-            },
-            Uuid::new_v4(),
-            ToolInvocationContext::local(workspace_root.clone(), policy.clone()),
-            &mut events,
-        )
-        .await
-        .expect("open spreadsheet document");
-    let document_id = opened.metadata["documentId"].clone();
-    let mut result = agent
-        .execute_provider_tool_call(
-            &ProviderToolCall {
-                id: "describe-sheet".to_string(),
-                name: "document_get_operation_schemas".to_string(),
-                arguments: json!({
-                    "documentId": document_id,
-                    "operations": [
-                        "read_range",
-                        "find",
-                        "validate",
-                        "write_rows",
-                        "copy_rows",
-                        "filter_rows",
-                        "select_columns"
-                    ]
-                }),
-            },
-            Uuid::new_v4(),
-            ToolInvocationContext::local(workspace_root.clone(), policy),
-            &mut events,
-        )
-        .await
-        .expect("execute document contract discovery");
-    let loads: Vec<ProviderToolContractLoad> = serde_json::from_value(
-        result.metadata[PROVIDER_TOOL_CONTRACT_LOADS_METADATA_KEY].clone(),
-    )
-    .expect("provider result retains transient contract loads");
-    let precise = loads
-        .first()
-        .expect("document execute contract")
-        .input_schema
-        .clone();
-    assert!(serde_json::to_vec(&precise).unwrap().len() < 2_000);
-    assert!(result.output.contains("select_columns"));
-    assert!(!result.output.contains("transfer_rows"));
-
-    assert!(agent.apply_tool_disclosure_from_result(&mut result, &mut exposed));
-    assert!(result
-        .metadata
-        .get(PROVIDER_TOOL_CONTRACT_LOADS_METADATA_KEY)
-        .is_none());
-    let loaded = exposed
-        .iter()
-        .find(|candidate| candidate.name == "document_execute")
-        .expect("loaded execute candidate");
-    assert_eq!(loaded.input_schema, precise);
-    assert_eq!(
-        loaded
-            .loaded_contract
-            .as_ref()
-            .map(|contract| contract.loader_name.as_str()),
-        Some("document_get_operation_schemas")
-    );
-    assert_eq!(loaded.input_schema, base);
-
-    let baseline_catalog = agent.tool_runtime_catalog();
-    let valid_read_call = ProviderToolCall {
-        id: "read-sheet".to_string(),
-        name: "document_execute".to_string(),
-        arguments: json!({
-            "documentId": document_id,
-            "operation": "read_range",
-            "arguments": {
-                "sheet": "Summary",
-                "range": {
-                    "start": { "row": 0, "column": 0 },
-                    "end": { "row": 1, "column": 0 }
-                }
-            }
-        }),
-    };
-    assert!(baseline_catalog
-        .input_error(&valid_read_call)
-        .is_some_and(|error| error.contains("was not available in the model request")));
-    let loaded_catalog = agent.tool_runtime_catalog_with_candidates(exposed.clone());
-    assert_eq!(loaded_catalog.input_error(&valid_read_call), None);
-    let mut invalid_read_call = valid_read_call;
-    invalid_read_call.arguments["arguments"] = json!({});
-    assert_eq!(loaded_catalog.input_error(&invalid_read_call), None);
-
-    let resumed = agent.refresh_resumed_tool_candidates(&exposed);
-    let resumed = resumed
-        .iter()
-        .find(|candidate| candidate.name == "document_execute")
-        .expect("resumed execute candidate");
-    assert_eq!(resumed.input_schema, precise);
-    assert!(resumed.loaded_contract.is_some());
-    std::fs::remove_dir_all(workspace_root).unwrap();
-}
-
-#[tokio::test]
-async fn spreadsheet_contract_load_is_committed_only_for_the_next_model_round() {
-    let workspace = test_workspace("spreadsheet-contract-round-boundary");
-    let thread_id = Uuid::new_v4();
-    let policy = Arc::new(BasicPolicyEngine::new(
-        workspace.clone(),
-        PermissionMode::FullAccess,
-    ));
-    let mut open_context = ToolInvocationContext::local(workspace.clone(), policy);
-    open_context.thread_id = Some(thread_id);
-    let opened = crate::tools::DocumentOpenTool
-        .execute(
-            ToolCall::new(
-                "document_open",
-                json!({
-                    "resource": { "kind": "file", "path": "unused.xlsx" },
-                    "mode": "create"
-                }),
-            ),
-            open_context,
-        )
-        .await
-        .expect("open document fixture");
-    let document_id = opened.metadata["documentId"].clone();
-    let describe_call = ProviderToolCall {
-        id: "describe-sheet".to_string(),
-        name: "document_get_operation_schemas".to_string(),
-        arguments: json!({
-            "documentId": document_id,
-            "operations": ["read_range"]
-        }),
-    };
-    let execute_call = ProviderToolCall {
-        id: "same-round-execute".to_string(),
-        name: "document_execute".to_string(),
-        arguments: json!({
-            "documentId": document_id,
-            "operation": "read_range",
-            "arguments": {
-                "sheet": "Summary",
-                "range": {
-                    "start": { "row": 0, "column": 0 },
-                    "end": { "row": 1, "column": 0 }
-                }
-            }
-        }),
-    };
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        ModelResponse {
-            text: String::new(),
-            tool_calls: vec![describe_call, execute_call.clone()],
-            usage: None,
-            response_id: None,
-            provider_items: Vec::new(),
-            finish_reason: ModelFinishReason::ToolCalls,
-        },
-        ModelResponse::text("done"),
-    ]));
-    let agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
-
-    let result = agent
-        .run_turn_detailed_streaming(
-            AgentTurnInput {
-                thread_id,
-                user_message_id: Uuid::new_v4(),
-                workspace_root: workspace.clone(),
-                content: "Inspect the workbook.".to_string(),
-                user_content: Vec::new(),
-                context_summary: None,
-                conversation: Vec::new(),
-                permission_mode: PermissionMode::FullAccess,
-                context_budget: None,
-                provider_cursor: None,
-                store: None,
-                cancellation: None,
-            },
-            None,
-        )
-        .await
-        .expect("spreadsheet contract loading turn succeeds");
-    assert!(matches!(result.outcome, AgentTurnOutcome::Completed));
-
-    let requests = provider.requests();
-    assert_eq!(requests.len(), 2);
-    assert!(!requests[0]
-        .tool_candidates
-        .iter()
-        .any(|candidate| candidate.name == "document_execute"));
-    let loaded = requests[1]
-        .tool_candidates
-        .iter()
-        .find(|candidate| candidate.name == "document_execute")
-        .expect("execute contract is exposed on the next round");
-    assert_eq!(
-        crate::provider::tool_input_schema_error(
-            &loaded.input_schema,
-            &execute_call.arguments,
-            "arguments"
-        ),
-        None
-    );
-    assert_eq!(crate::provider::tool_input_schema_error(
-        &loaded.input_schema,
-        &json!({
-            "documentId": document_id,
-            "operation": "read_range",
-            "arguments": {}
-        }),
-        "arguments"
-    ), None);
-
-    let same_round_result = requests[1]
-        .input
-        .tool_results
-        .iter()
-        .find(|result| result.call_id == "same-round-execute")
-        .expect("same-round execute result");
-    assert!(same_round_result.is_error);
-    assert!(same_round_result
-        .metadata
-        .get("inputSchemaValidationError")
-        .and_then(Value::as_str)
-        .is_some_and(|error| error.contains("was not available in the model request")));
-    let describe_result = requests[1]
-        .input
-        .tool_results
-        .iter()
-        .find(|result| result.call_id == "describe-sheet")
-        .expect("describe result");
-    assert!(describe_result
-        .metadata
-        .get(PROVIDER_TOOL_CONTRACT_LOADS_METADATA_KEY)
-        .is_none());
-
-    let _ = std::fs::remove_dir_all(workspace);
-}
-
 #[test]
 fn mcp_tool_result_cannot_inject_another_tool_contract() {
     let mut registry = ToolRegistry::with_builtins();
@@ -817,8 +549,8 @@ fn mcp_tool_result_cannot_inject_another_tool_contract() {
     let mut exposed = agent.eligible_provider_tool_candidates();
     let before = exposed
         .iter()
-        .find(|candidate| candidate.name == "document_execute")
-        .expect("document execute candidate")
+        .find(|candidate| candidate.name == "spreadsheet_write_range")
+        .expect("spreadsheet write candidate")
         .input_schema
         .clone();
     let mut result = ProviderToolResult {
@@ -829,7 +561,7 @@ fn mcp_tool_result_cannot_inject_another_tool_contract() {
         is_error: false,
         metadata: json!({
             "loadedToolContracts": [{
-                "name": "document_execute",
+                "name": "spreadsheet_write_range",
                 "inputSchema": { "type": "object", "properties": {} }
             }]
         }),
@@ -842,8 +574,8 @@ fn mcp_tool_result_cannot_inject_another_tool_contract() {
         .is_none());
     let after = exposed
         .iter()
-        .find(|candidate| candidate.name == "document_execute")
-        .expect("document execute candidate");
+        .find(|candidate| candidate.name == "spreadsheet_write_range")
+        .expect("spreadsheet write candidate");
     assert_eq!(after.input_schema, before);
 }
 
@@ -851,6 +583,12 @@ fn mcp_tool_result_cannot_inject_another_tool_contract() {
 fn undeclared_core_tool_cannot_inject_another_tool_contract() {
     let agent = AgentCore::new(Arc::new(MockProvider), ToolRegistry::with_builtins());
     let mut exposed = agent.provider_tool_catalog();
+    let before = exposed
+        .iter()
+        .find(|candidate| candidate.name == "spreadsheet_write_range")
+        .expect("spreadsheet write candidate")
+        .input_schema
+        .clone();
     let mut result = ProviderToolResult {
         call_id: "core-load".to_string(),
         name: "filesystem".to_string(),
@@ -859,16 +597,18 @@ fn undeclared_core_tool_cannot_inject_another_tool_contract() {
         is_error: false,
         metadata: json!({
             "loadedToolContracts": [{
-                "name": "document_execute",
+                "name": "spreadsheet_write_range",
                 "inputSchema": { "type": "object", "properties": {} }
             }]
         }),
     };
 
     assert!(!agent.apply_tool_disclosure_from_result(&mut result, &mut exposed));
-    assert!(!exposed
+    let after = exposed
         .iter()
-        .any(|candidate| candidate.name == "document_execute"));
+        .find(|candidate| candidate.name == "spreadsheet_write_range")
+        .expect("spreadsheet write candidate");
+    assert_eq!(after.input_schema, before);
 }
 
 #[test]
@@ -950,52 +690,44 @@ fn automatic_tool_disclosure_keeps_small_local_catalogs_eager() {
 }
 
 #[test]
-fn office_discovery_is_eager_but_execute_waits_for_its_precise_contract() {
+fn office_entry_tools_are_eager_and_atomic_tools_can_be_preloaded_directly() {
     let mut agent = AgentCore::default();
 
     let baseline = agent.provider_tool_catalog();
-    for tool in [
-        "document",
-        "pdf",
-        "document_open",
-        "document_get_operation_schemas",
-    ] {
+    for tool in ["word_document", "pdf", "spreadsheet_inspect"] {
         assert!(baseline.iter().any(|candidate| candidate.name == tool));
     }
     assert!(!baseline
         .iter()
         .any(|candidate| candidate.name == "document_execute"));
-    assert!(!baseline
-        .iter()
-        .any(|candidate| candidate.name == TOOL_SEARCH_NAME));
-
-    agent.set_attachment_preloaded_tools(["pdf", "document_execute"]);
+    agent.set_attachment_preloaded_tools(["pdf", "spreadsheet_write_range"]);
     let projected = agent.provider_tool_catalog();
     assert!(projected.iter().any(|candidate| candidate.name == "pdf"));
-    assert!(!projected
-        .iter()
-        .any(|candidate| candidate.name == "document_execute"));
     assert!(projected
         .iter()
-        .any(|candidate| candidate.name == "document"));
-    assert!(!projected
+        .any(|candidate| candidate.name == "spreadsheet_write_range"));
+    assert!(projected
         .iter()
-        .any(|candidate| candidate.name == TOOL_SEARCH_NAME));
-    assert_eq!(baseline, projected);
+        .any(|candidate| candidate.name == "word_document"));
 }
 
 #[test]
-fn eager_disclosure_still_defers_document_execute_until_schemas_are_loaded() {
+fn eager_disclosure_exposes_atomic_spreadsheet_tools_without_a_contract_loader() {
     let mut agent = AgentCore::default();
     agent.set_tool_exposure_policy(ToolExposurePolicy::Eager);
 
     let catalog = agent.provider_tool_catalog();
-    for tool in ["document_open", "document_get_operation_schemas"] {
+    for tool in [
+        "spreadsheet_inspect",
+        "spreadsheet_filter_rows",
+        "spreadsheet_write_range",
+        "spreadsheet_delete_rows",
+    ] {
         assert!(catalog.iter().any(|candidate| candidate.name == tool));
     }
-    assert!(!catalog
-        .iter()
-        .any(|candidate| candidate.name == "document_execute"));
+    assert!(catalog.iter().all(|candidate| candidate
+        .loaded_contract
+        .is_none()));
 }
 
 #[test]
@@ -1088,21 +820,17 @@ fn release_gate_native_tool_search_keeps_office_direct_and_defers_external_names
         .expect("external tool descriptor");
     assert_eq!(github.disclosure, ProviderToolDisclosure::DeferredNamespace);
     assert_eq!(github.namespace.as_ref().unwrap().name, "github");
-    for office in [
-        "document",
-        "pdf",
-        "document_open",
-        "document_get_operation_schemas",
-    ] {
+    for office in ["word_document", "pdf", "spreadsheet_inspect"] {
         let candidate = catalog
             .iter()
             .find(|candidate| candidate.name == office)
             .expect("default Office tool");
         assert_eq!(candidate.disclosure, ProviderToolDisclosure::Direct);
     }
-    assert!(!catalog
-        .iter()
-        .any(|candidate| candidate.name == "document_execute"));
+    assert!(!catalog.iter().any(|candidate| matches!(
+        candidate.name.as_str(),
+        "document_open" | "document_get_operation_schemas" | "document_execute"
+    )));
     assert!(!catalog
         .iter()
         .any(|candidate| candidate.name == TOOL_SEARCH_NAME));

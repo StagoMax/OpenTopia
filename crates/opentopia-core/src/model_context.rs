@@ -666,7 +666,6 @@ impl WorldStateSnapshot {
             .map(|skill| {
                 json!({
                     "id": skill.id,
-                    "name": skill.name,
                     // The catalog is routing metadata. Full instructions are
                     // loaded only after a Skill is selected, so long
                     // descriptions needlessly expand the stable prefix.
@@ -1170,6 +1169,7 @@ mod tests {
         };
         let text = world_state_catalog_item(&state).text_content();
         assert!(text.contains("First sentence."));
+        assert!(!text.contains("\"name\""));
         assert!(!text.contains("repeated detail repeated detail"));
         assert!(text.len() < 400);
     }

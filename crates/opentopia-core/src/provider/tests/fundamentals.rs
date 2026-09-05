@@ -879,6 +879,27 @@ fn codex_app_server_routes_all_actions_through_opentopia_tools() {
 }
 
 #[test]
+fn codex_app_server_forwards_only_the_work_service_name() {
+    let mut work = model_request();
+    work.instructions
+        .items
+        .push(crate::prompt_runtime::experience_mode_module(
+            crate::model::ExperienceMode::Work,
+        ));
+    let work_params = codex_thread_start_params(&work, false, Path::new("C:/workspace"));
+    assert_eq!(work_params["serviceName"], "codex_work_desktop");
+
+    let mut code = model_request();
+    code.instructions
+        .items
+        .push(crate::prompt_runtime::experience_mode_module(
+            crate::model::ExperienceMode::Code,
+        ));
+    let code_params = codex_thread_start_params(&code, false, Path::new("C:/workspace"));
+    assert!(code_params.get("serviceName").is_none());
+}
+
+#[test]
 fn codex_builtin_actions_are_rejected_for_host_owned_execution() {
     for action in [
         "commandExecution",

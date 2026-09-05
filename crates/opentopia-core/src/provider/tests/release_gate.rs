@@ -187,7 +187,7 @@ fn root_union_wire_contract_is_widened_but_logical_validation_stays_exact() {
     // rejects cross-action arguments before any tool executes.
     let cross_action_arguments = json!({
         "action": "list",
-        "jobId": "job-from-another-action"
+        "job_id": "job-from-another-action"
     });
     assert_eq!(
         tool_input_schema_error(
@@ -207,8 +207,8 @@ fn root_union_wire_contract_is_widened_but_logical_validation_stays_exact() {
 }
 
 #[test]
-fn document_execute_wire_contract_is_accepted_by_the_typed_runtime_contract() {
-    let tool = DocumentExecuteTool;
+fn atomic_spreadsheet_wire_contract_is_accepted_by_the_typed_runtime_contract() {
+    let tool = SpreadsheetWriteRangeTool;
     let candidate = ProviderToolCandidate::direct(
         Tool::name(&tool),
         Tool::description(&tool),
@@ -222,13 +222,11 @@ fn document_execute_wire_contract_is_accepted_by_the_typed_runtime_contract() {
     let compiled = compile_openai_tools(&[candidate], capabilities);
     let contract = &compiled.contracts[0];
     let mut arguments = json!({
-        "documentId": Uuid::new_v4(),
-        "operation": "write_columns",
-        "arguments": {
-            "sheet": "Orders",
-            "start": { "row": 0, "column": 0 },
-            "columns": [[{ "type": "string", "value": "sku" }]]
-        }
+        "path": "orders.xlsx",
+        "template": null,
+        "sheet": "Orders",
+        "start": "A1",
+        "rows": [[{ "type": "string", "value": "sku" }]]
     });
     assert_eq!(
         tool_input_schema_error(&contract.wire_input_schema, &arguments, "arguments"),
@@ -242,8 +240,8 @@ fn document_execute_wire_contract_is_accepted_by_the_typed_runtime_contract() {
     );
 
     assert_eq!(Tool::input_error(&tool, &arguments), None);
-    assert!(arguments["arguments"]["columns"].is_array());
-    assert!(arguments.get("path").is_none());
+    assert!(arguments["rows"].is_array());
+    assert!(arguments.get("documentId").is_none());
 }
 
 #[test]

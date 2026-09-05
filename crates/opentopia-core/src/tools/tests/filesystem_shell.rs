@@ -333,7 +333,7 @@ async fn shell_automatically_yields_a_slow_command_to_the_existing_registry() {
 
     let result = ShellTool
         .execute(
-            ToolCall::new("shell", json!({ "command": command, "yieldTimeMs": 10 })),
+            ToolCall::new("shell", json!({ "command": command, "yield_time_ms": 10 })),
             context,
         )
         .await
@@ -400,7 +400,10 @@ async fn shell_keeps_a_quick_registered_command_in_the_foreground() {
 
     let result = ShellTool
         .execute(
-            ToolCall::new("shell", json!({ "command": command, "yieldTimeMs": 10000 })),
+            ToolCall::new(
+                "shell",
+                json!({ "command": command, "yield_time_ms": 10000 }),
+            ),
             context,
         )
         .await

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Manage Spreadsheets"
+  short_description: "Inspect and edit spreadsheet files with native tools"
+  default_prompt: "Use $manage-spreadsheets to inspect or edit this spreadsheet and verify the result."

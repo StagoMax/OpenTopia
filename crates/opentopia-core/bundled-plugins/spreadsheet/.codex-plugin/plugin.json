@@ -1,14 +1,15 @@
 {
   "name": "spreadsheet",
-  "version": "3.0.0",
-  "description": "Open spreadsheet documents, progressively load atomic operation schemas, and execute bounded work through shared document handles.",
+  "version": "6.1.0",
+  "description": "Inspect and edit spreadsheet files through independent path-based tools.",
   "author": {
     "name": "OpenTopia Contributors"
   },
+  "skills": "./skills/",
   "interface": {
     "displayName": "Spreadsheet",
-    "shortDescription": "Read and write spreadsheets through a progressive protocol.",
-    "longDescription": "Give the model bounded spreadsheet inspection, validation, creation, update, filtering, conversion, and server-side row-selection capabilities through a format-neutral document protocol.",
+    "shortDescription": "Read and write real spreadsheet files with atomic tools.",
+    "longDescription": "Give the model direct path-based tools for spreadsheet inspection, batched reading, validation, filtered row mapping, typed writing, filling, conversion, structural edits, and delimited export.",
     "developerName": "OpenTopia",
     "category": "Productivity",
     "capabilities": [
@@ -18,8 +19,11 @@
       "CSV and TSV export",
       "Bounded range reading",
       "Cell finding and conditional row filtering",
-      "Server-side row filtering, column projection, constants, and value conversion",
-      "Workbook creation and update"
+      "Direct file-to-file range copying",
+      "Conditional row filtering, column mapping, and typed conversion without intermediate files",
+      "Template data-validation guidance and cell comments",
+      "Typed range writing, filling, and conversion",
+      "Worksheet copying and conditional row deletion"
     ]
   },
   "opentopia": {
@@ -42,16 +46,60 @@
     "contributes": {
       "nativeTools": [
         {
-          "id": "document_open",
-          "runtime": "builtin:document_open"
+          "id": "spreadsheet_inspect",
+          "runtime": "builtin:spreadsheet_inspect"
         },
         {
-          "id": "document_get_operation_schemas",
-          "runtime": "builtin:document_get_operation_schemas"
+          "id": "spreadsheet_read_ranges",
+          "runtime": "builtin:spreadsheet_read_ranges"
         },
         {
-          "id": "document_execute",
-          "runtime": "builtin:document_execute"
+          "id": "spreadsheet_find",
+          "runtime": "builtin:spreadsheet_find"
+        },
+        {
+          "id": "spreadsheet_filter_rows",
+          "runtime": "builtin:spreadsheet_filter_rows"
+        },
+        {
+          "id": "spreadsheet_validate",
+          "runtime": "builtin:spreadsheet_validate"
+        },
+        {
+          "id": "spreadsheet_write_range",
+          "runtime": "builtin:spreadsheet_write_range"
+        },
+        {
+          "id": "spreadsheet_copy_ranges",
+          "runtime": "builtin:spreadsheet_copy_ranges"
+        },
+        {
+          "id": "spreadsheet_copy_rows",
+          "runtime": "builtin:spreadsheet_copy_rows"
+        },
+        {
+          "id": "spreadsheet_fill_ranges",
+          "runtime": "builtin:spreadsheet_fill_ranges"
+        },
+        {
+          "id": "spreadsheet_convert_ranges",
+          "runtime": "builtin:spreadsheet_convert_ranges"
+        },
+        {
+          "id": "spreadsheet_export_delimited",
+          "runtime": "builtin:spreadsheet_export_delimited"
+        },
+        {
+          "id": "spreadsheet_copy_sheet",
+          "runtime": "builtin:spreadsheet_copy_sheet"
+        },
+        {
+          "id": "spreadsheet_delete_rows",
+          "runtime": "builtin:spreadsheet_delete_rows"
+        },
+        {
+          "id": "spreadsheet_delete_sheet",
+          "runtime": "builtin:spreadsheet_delete_sheet"
         }
       ]
     },

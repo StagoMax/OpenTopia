@@ -187,7 +187,11 @@ fn template_patch_preserves_styles_and_non_worksheet_parts() {
             visibility: None,
             cells: vec![
                 update(0, 0, SpreadsheetCellInput::String("new".to_string())),
-                update(10, 2, SpreadsheetCellInput::Integer(17)),
+                CellUpdate {
+                    address: address(10, 2),
+                    value: SpreadsheetCellInput::Integer(17),
+                    style_from: Some(address(0, 0)),
+                },
             ],
         }],
     })
@@ -199,7 +203,9 @@ fn template_patch_preserves_styles_and_non_worksheet_parts() {
     assert_eq!(zip_part(&output, "xl/workbook.xml"), workbook_before);
     let worksheet_xml = String::from_utf8(zip_part(&output, "xl/worksheets/sheet1.xml"))
         .expect("worksheet XML is UTF-8");
+    assert!(worksheet_xml.contains("<dimension ref=\"A1:C11\""));
     assert!(worksheet_xml.contains("s=\"1\""));
+    assert!(worksheet_xml.contains("<c r=\"C11\" s=\"1\""));
     assert!(worksheet_xml.contains(">new<"));
     let read = read_range(&ReadRangeRequest {
         path: output,

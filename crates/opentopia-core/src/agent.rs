@@ -148,11 +148,10 @@ const TOOL_SEARCH_NAME: &str = "tool_search";
 const MAX_TOOL_SEARCH_RESULTS: usize = 8;
 const AUTOMATIC_TOOL_DISCLOSURE_COUNT_THRESHOLD: usize = 24;
 const AUTOMATIC_TOOL_DISCLOSURE_TOKEN_THRESHOLD: usize = 12_000;
-const DEFAULT_EAGER_OFFICE_TOOLS: [(&str, &str); 4] = [
-    ("document", "documents"),
+const DEFAULT_EAGER_OFFICE_TOOLS: [(&str, &str); 3] = [
+    ("word_document", "documents"),
     ("pdf", "pdf"),
-    ("document_open", "spreadsheet"),
-    ("document_get_operation_schemas", "spreadsheet"),
+    ("spreadsheet_inspect", "spreadsheet"),
 ];
 const ROLLOUT_CHECKPOINT_TOOL_NAME: &str = "runtime_rollout_checkpoint";
 const STEP_REMINDER_TOOL_NAME: &str = "runtime_step_reminder";
@@ -2799,8 +2798,8 @@ fn provider_tool_approval_action(call: &ProviderToolCall) -> String {
                 .unwrap_or("action");
             let target = call
                 .arguments
-                .get("windowId")
-                .or_else(|| call.arguments.get("observationId"))
+                .get("window_id")
+                .or_else(|| call.arguments.get("observation_id"))
                 .and_then(Value::as_str)
                 .unwrap_or("session");
             format!("computer:{action}:{target}")

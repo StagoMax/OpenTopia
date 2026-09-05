@@ -1,6 +1,6 @@
 {
   "name": "documents",
-  "version": "1.3.0",
+  "version": "2.0.0",
   "description": "Inspect, extract, and validate DOCX files through OpenTopia's native document tool.",
   "author": {
     "name": "OpenTopia Contributors"
@@ -23,7 +23,7 @@
     "requires": {
       "hostCapabilities": [
         "workspace.files.v1",
-        "nativeTool.document.v1"
+        "nativeTool.word_document.v1"
       ]
     },
     "permissions": {
@@ -37,8 +37,8 @@
     "contributes": {
       "nativeTools": [
         {
-          "id": "document",
-          "runtime": "builtin:document"
+          "id": "word_document",
+          "runtime": "builtin:word_document"
         }
       ]
     }

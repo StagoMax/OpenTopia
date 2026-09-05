@@ -7,7 +7,7 @@ use super::{
     ProviderTransportEvent, NATIVE_WEB_SEARCH_PRIORITY_INSTRUCTION, PROVIDER_NETWORK_RETRY_LIMIT,
 };
 use crate::model::{ModelContentPart, ProviderRetryKind};
-use crate::model_context::ContextRole;
+use crate::model_context::{ContextAuthority, ContextItemKind, ContextRole};
 use crate::settings::{ProviderHealthCheck, ProviderSettings, ProviderTransportKind};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -141,20 +141,8 @@ impl CodexAppServerProvider {
 
         let cwd = std::env::current_dir()
             .context("failed to resolve current directory for Codex App Server")?;
-        let mut thread_params = json!({
-            "cwd": cwd,
-            "sandbox": "read-only",
-            "approvalPolicy": "never",
-            "ephemeral": true,
-            "environments": [],
-            "developerInstructions": codex_developer_instructions(
-                request,
-                self.native_web_search,
-            ),
-        });
-        if !request.tool_candidates.is_empty() {
-            thread_params["dynamicTools"] = json!(codex_dynamic_tools(&request.tool_candidates));
-        }
+        let thread_params =
+            codex_thread_start_params(request, self.native_web_search, cwd.as_path());
         codex_write_rpc(
             &mut session.stdin,
             json!({
@@ -424,6 +412,44 @@ impl CodexAppServerProvider {
             }
         }
     }
+}
+
+pub(super) fn codex_thread_start_params(
+    request: &ModelRequest,
+    native_web_search: bool,
+    cwd: &Path,
+) -> Value {
+    let mut thread_params = json!({
+        "cwd": cwd,
+        "sandbox": "read-only",
+        "approvalPolicy": "never",
+        "ephemeral": true,
+        "environments": [],
+        "developerInstructions": codex_developer_instructions(request, native_web_search),
+    });
+    if !request.tool_candidates.is_empty() {
+        thread_params["dynamicTools"] = json!(codex_dynamic_tools(&request.tool_candidates));
+    }
+    if let Some(service_name) = codex_service_name(request) {
+        thread_params["serviceName"] = json!(service_name);
+    }
+    thread_params
+}
+
+fn codex_service_name(request: &ModelRequest) -> Option<&str> {
+    request
+        .instructions
+        .items
+        .iter()
+        .find(|item| {
+            item.source == "opentopia:prompt:experience_mode"
+                && item.kind == ContextItemKind::DeveloperInstructions
+                && item.role == ContextRole::Developer
+                && item.authority == ContextAuthority::Developer
+        })
+        .and_then(|item| item.metadata.get("serviceName"))
+        .and_then(Value::as_str)
+        .filter(|service_name| *service_name == "codex_work_desktop")
 }
 
 impl CodexAppServerSession {

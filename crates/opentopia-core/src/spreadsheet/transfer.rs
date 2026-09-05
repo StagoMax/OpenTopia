@@ -1,9 +1,9 @@
+use super::display::number_format_codes;
 use super::{
-    apply_sheet_updates, ensure_workbook_cell_count, inspect_workbook, load_workbook,
-    patch_workbook_template, validate_address, validate_write_text, CellAddress, CellRange,
-    InspectWorkbookRequest, SheetWriteRequest, SpreadsheetCellInput, SpreadsheetCellValue,
-    SpreadsheetError, StoredCell, EXCEL_MAX_COLUMNS, EXCEL_MAX_ROWS, MAX_INPUT_FILE_BYTES,
-    MAX_OUTPUT_FILE_BYTES, MAX_WORKBOOK_CELLS,
+    ensure_workbook_cell_count, inspect_workbook, load_workbook, validate_address, CellAddress,
+    CellRange, InspectWorkbookRequest, SpreadsheetCellValue, SpreadsheetError, StoredCell,
+    EXCEL_MAX_COLUMNS, EXCEL_MAX_ROWS, MAX_INPUT_FILE_BYTES, MAX_OUTPUT_FILE_BYTES,
+    MAX_WORKBOOK_CELLS,
 };
 use crate::delimited;
 use schemars::JsonSchema;
@@ -75,36 +75,6 @@ impl DelimitedFormat {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(
-    tag = "by",
-    rename_all = "snake_case",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
-)]
-pub enum SpreadsheetColumnSelector {
-    /// Zero-based physical column index.
-    Index { index: u32 },
-    /// Header name plus a one-based occurrence for duplicate headers.
-    Header {
-        name: String,
-        #[serde(default = "default_occurrence")]
-        #[schemars(range(min = 1))]
-        occurrence: u32,
-    },
-}
-
-fn default_occurrence() -> u32 {
-    1
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DelimitedColumnMapping {
-    pub source: SpreadsheetColumnSelector,
-    pub target: SpreadsheetColumnSelector,
-}
-
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DelimitedFormulaMode {
@@ -164,72 +134,46 @@ pub struct InspectDelimitedResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct FillTemplateRequest {
-    pub source: PathBuf,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_format: Option<DelimitedFormat>,
-    pub template: PathBuf,
-    pub output: PathBuf,
-    pub target_sheet: String,
-    #[serde(default)]
-    pub source_header_row: u32,
-    #[serde(default)]
-    pub target_header_row: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_start_row: Option<u32>,
-    /// Omit to match equal header names and duplicate occurrences automatically.
-    #[serde(default)]
-    pub mappings: Vec<DelimitedColumnMapping>,
-    /// Explicit cleanup for source systems that append tab characters to fields.
-    #[serde(default)]
-    pub rstrip_tabs: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct ResolvedDelimitedColumnMapping {
-    pub source_column: u32,
-    pub source_header: Option<String>,
-    pub target_column: u32,
-    pub target_header: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct FillTemplateValidation {
-    pub reopened: bool,
-    pub verified_cells: usize,
-    pub target_range: Option<CellRange>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct FillTemplateResult {
-    pub source: PathBuf,
-    pub template: PathBuf,
-    pub output: PathBuf,
-    pub format: DelimitedFormat,
-    pub records_read: u32,
-    pub rows_written: u32,
-    pub columns_written: usize,
-    pub cells_written: usize,
-    pub bytes_written: u64,
-    pub mappings: Vec<ResolvedDelimitedColumnMapping>,
-    pub duplicate_headers: Vec<DuplicateDelimitedHeader>,
-    pub validation: FillTemplateValidation,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SpreadsheetSheetValidation {
     pub sheet: String,
     /// Expected number of rows in the sheet's populated bounding range.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_rows: Option<u32>,
-    #[serde(default)]
-    pub header_row: u32,
+    /// Expected number of populated data rows. If a header is configured, only
+    /// rows strictly after it count; otherwise every populated row counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_data_rows: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_row: Option<u32>,
     #[serde(default)]
     pub required_headers: Vec<String>,
+    #[serde(default)]
+    pub ranges: Vec<SpreadsheetRangeValidation>,
+}
+
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SpreadsheetExpectedCellType {
+    Empty,
+    String,
+    Number,
+    Boolean,
+    DateTime,
+    Formula,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SpreadsheetRangeValidation {
+    pub range: CellRange,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_type: Option<SpreadsheetExpectedCellType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_number_format: Option<String>,
+    #[serde(default)]
+    pub allow_blank: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -257,11 +201,23 @@ pub struct SpreadsheetValidationCheck {
 #[serde(rename_all = "camelCase")]
 pub struct ValidateWorkbookResult {
     pub path: PathBuf,
-    pub valid: bool,
+    pub validation_passed: bool,
     pub reopened: bool,
     pub sheet_count: usize,
     pub populated_cells: u64,
+    pub sheet_metrics: Vec<SpreadsheetSheetValidationResult>,
     pub checks: Vec<SpreadsheetValidationCheck>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SpreadsheetSheetValidationResult {
+    pub sheet: String,
+    pub present: bool,
+    pub used_rows: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_row: Option<u32>,
+    pub data_rows: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -335,173 +291,6 @@ pub(super) fn inspect_delimited(
     Ok(result)
 }
 
-pub(super) fn fill_template(
-    request: &FillTemplateRequest,
-) -> Result<FillTemplateResult, SpreadsheetError> {
-    super::validate_xlsx_path(&request.template)?;
-    super::validate_xlsx_path(&request.output)?;
-    let scan = scan_delimited(
-        &request.source,
-        request.source_format,
-        request.source_header_row,
-        1,
-        request.rstrip_tabs,
-    )?;
-    let mut workbook = load_workbook(&request.template)?;
-    let target_index = workbook
-        .sheets
-        .iter()
-        .position(|sheet| sheet.name.eq_ignore_ascii_case(request.target_sheet.trim()))
-        .ok_or_else(|| SpreadsheetError::SheetNotFound {
-            sheet: request.target_sheet.clone(),
-        })?;
-    let target_headers =
-        headers_from_sheet(&workbook.sheets[target_index], request.target_header_row);
-    let mappings = resolve_mappings(
-        &scan.headers,
-        scan.column_count,
-        &target_headers,
-        &request.mappings,
-    )?;
-    let target_start_row = request
-        .target_start_row
-        .unwrap_or_else(|| request.target_header_row.saturating_add(1));
-    if target_start_row <= request.target_header_row {
-        return Err(SpreadsheetError::InvalidMapping {
-            message: "targetStartRow must be after targetHeaderRow".to_string(),
-        });
-    }
-
-    let format = scan.format;
-    let mut reader = open_delimited_reader(&request.source, format)?;
-    let mut updates = Vec::new();
-    let mut rows_written = 0_u32;
-    for (record_index, record) in reader.byte_records().enumerate() {
-        let record_index =
-            u32::try_from(record_index).map_err(|_| SpreadsheetError::TooManyCells {
-                context: "delimited records",
-                actual: usize::MAX,
-                limit: MAX_WORKBOOK_CELLS,
-            })?;
-        if record_index <= request.source_header_row {
-            continue;
-        }
-        let record = record.map_err(|error| invalid_delimited(&request.source, error))?;
-        let row =
-            target_start_row
-                .checked_add(rows_written)
-                .ok_or(SpreadsheetError::InvalidMapping {
-                    message: "target row overflow".to_string(),
-                })?;
-        for mapping in &mappings {
-            let address = CellAddress {
-                row,
-                column: mapping.target_column,
-            };
-            validate_address(address)?;
-            let value = record
-                .get(mapping.source_column as usize)
-                .map(|field| delimited::decode_field(field, false, request.rstrip_tabs))
-                .unwrap_or_default();
-            let value = if value.is_empty() {
-                SpreadsheetCellInput::Blank
-            } else {
-                validate_write_text(&value, &request.target_sheet, row, mapping.target_column)?;
-                SpreadsheetCellInput::String(value)
-            };
-            updates.push(super::CellUpdate { address, value });
-            if updates.len() > MAX_WORKBOOK_CELLS {
-                return Err(SpreadsheetError::TooManyCells {
-                    context: "delimited import",
-                    actual: updates.len(),
-                    limit: MAX_WORKBOOK_CELLS,
-                });
-            }
-        }
-        rows_written = rows_written
-            .checked_add(1)
-            .ok_or(SpreadsheetError::InvalidMapping {
-                message: "too many source rows".to_string(),
-            })?;
-    }
-
-    let sheet_request = SheetWriteRequest {
-        name: workbook.sheets[target_index].name.clone(),
-        visibility: None,
-        cells: updates,
-    };
-    apply_sheet_updates(&mut workbook, std::slice::from_ref(&sheet_request))?;
-    let output_cells = workbook
-        .sheets
-        .iter()
-        .map(|sheet| sheet.cells.len())
-        .sum::<usize>();
-    ensure_workbook_cell_count(output_cells)?;
-
-    let bytes = patch_workbook_template(
-        &request.template,
-        std::slice::from_ref(&sheet_request),
-        &request.output,
-    )?;
-    let bytes_written = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    if bytes_written > MAX_OUTPUT_FILE_BYTES {
-        return Err(SpreadsheetError::OutputTooLarge {
-            actual_bytes: bytes_written,
-            limit_bytes: MAX_OUTPUT_FILE_BYTES,
-        });
-    }
-    fs::write(&request.output, &bytes).map_err(|source| SpreadsheetError::Io {
-        operation: "write",
-        path: request.output.clone(),
-        source,
-    })?;
-    verify_template_updates(&request.output, &sheet_request)?;
-
-    let target_range = if rows_written == 0 || mappings.is_empty() {
-        None
-    } else {
-        let min_column = mappings
-            .iter()
-            .map(|mapping| mapping.target_column)
-            .min()
-            .expect("mapping exists");
-        let max_column = mappings
-            .iter()
-            .map(|mapping| mapping.target_column)
-            .max()
-            .expect("mapping exists");
-        Some(CellRange {
-            start: CellAddress {
-                row: target_start_row,
-                column: min_column,
-            },
-            end: CellAddress {
-                row: target_start_row + rows_written - 1,
-                column: max_column,
-            },
-        })
-    };
-    let result = FillTemplateResult {
-        source: request.source.clone(),
-        template: request.template.clone(),
-        output: request.output.clone(),
-        format,
-        records_read: rows_written,
-        rows_written,
-        columns_written: mappings.len(),
-        cells_written: sheet_request.cells.len(),
-        bytes_written,
-        mappings,
-        duplicate_headers: scan.duplicate_headers,
-        validation: FillTemplateValidation {
-            reopened: true,
-            verified_cells: sheet_request.cells.len(),
-            target_range,
-        },
-    };
-    Ok(result)
-}
-
 pub(super) fn validate_workbook(
     request: &ValidateWorkbookRequest,
 ) -> Result<ValidateWorkbookResult, SpreadsheetError> {
@@ -510,6 +299,7 @@ pub(super) fn validate_workbook(
     })?;
     let loaded = load_workbook(&request.path)?;
     let mut checks = Vec::new();
+    let mut sheet_metrics = Vec::new();
     let sheet_names = inspected
         .sheets
         .iter()
@@ -546,43 +336,193 @@ pub(super) fn validate_workbook(
                 expected: "present".to_string(),
                 actual: "missing".to_string(),
             });
+            sheet_metrics.push(SpreadsheetSheetValidationResult {
+                sheet: expected.sheet.clone(),
+                present: false,
+                used_rows: 0,
+                header_row: expected.header_row,
+                data_rows: 0,
+            });
             continue;
         };
+        let used_rows = used_range(&sheet.cells)
+            .and_then(CellRange::row_count)
+            .and_then(|rows| u32::try_from(rows).ok())
+            .unwrap_or(0);
+        let data_rows = u32::try_from(
+            sheet
+                .cells
+                .keys()
+                .filter_map(|address| {
+                    expected
+                        .header_row
+                        .is_none_or(|header_row| address.row > header_row)
+                        .then_some(address.row)
+                })
+                .collect::<BTreeSet<_>>()
+                .len(),
+        )
+        .unwrap_or(u32::MAX);
+        sheet_metrics.push(SpreadsheetSheetValidationResult {
+            sheet: sheet.name.clone(),
+            present: true,
+            used_rows,
+            header_row: expected.header_row,
+            data_rows,
+        });
         if let Some(expected_rows) = expected.expected_rows {
-            let actual_rows = used_range(&sheet.cells)
-                .and_then(CellRange::row_count)
-                .and_then(|rows| u32::try_from(rows).ok())
-                .unwrap_or(0);
             checks.push(SpreadsheetValidationCheck {
                 check: format!("sheet:{}:used_rows", expected.sheet),
-                passed: actual_rows == expected_rows,
+                passed: used_rows == expected_rows,
                 expected: expected_rows.to_string(),
-                actual: actual_rows.to_string(),
+                actual: used_rows.to_string(),
             });
         }
-        let headers = headers_from_sheet(sheet, expected.header_row);
-        for required in &expected.required_headers {
-            let present = headers
-                .iter()
-                .any(|header| normalize_header(&header.name) == normalize_header(required));
+        if let Some(expected_data_rows) = expected.expected_data_rows {
             checks.push(SpreadsheetValidationCheck {
-                check: format!("sheet:{}:header:{required}", expected.sheet),
-                passed: present,
-                expected: "present".to_string(),
-                actual: if present { "present" } else { "missing" }.to_string(),
+                check: format!("sheet:{}:data_rows", expected.sheet),
+                passed: data_rows == expected_data_rows,
+                expected: expected_data_rows.to_string(),
+                actual: data_rows.to_string(),
             });
+        }
+        if let Some(header_row) = expected.header_row {
+            let headers = headers_from_sheet(sheet, header_row);
+            for required in &expected.required_headers {
+                let present = headers
+                    .iter()
+                    .any(|header| normalize_header(&header.name) == normalize_header(required));
+                checks.push(SpreadsheetValidationCheck {
+                    check: format!("sheet:{}:header:{required}", expected.sheet),
+                    passed: present,
+                    expected: "present".to_string(),
+                    actual: if present { "present" } else { "missing" }.to_string(),
+                });
+            }
+        }
+        for range_validation in &expected.ranges {
+            validate_address(range_validation.range.start)?;
+            validate_address(range_validation.range.end)?;
+            let Some(_) = range_validation.range.cell_count() else {
+                return Err(SpreadsheetError::InvalidRange {
+                    reason: "validation range end precedes start",
+                });
+            };
+            let formats = if range_validation.expected_number_format.is_some() {
+                number_format_codes(&request.path, &sheet.name, range_validation.range)?
+            } else {
+                Default::default()
+            };
+            let mut checked = 0u64;
+            let mut type_matches = 0u64;
+            let mut format_matches = 0u64;
+            let mut actual_types = BTreeSet::new();
+            let mut actual_formats = BTreeSet::new();
+            for row in range_validation.range.start.row..=range_validation.range.end.row {
+                for column in
+                    range_validation.range.start.column..=range_validation.range.end.column
+                {
+                    let address = CellAddress { row, column };
+                    let cell = sheet.cells.get(&address);
+                    let is_blank = cell.is_none_or(|cell| {
+                        matches!(cell.value, SpreadsheetCellValue::Empty) && cell.formula.is_none()
+                    });
+                    if is_blank && range_validation.allow_blank {
+                        continue;
+                    }
+                    checked += 1;
+                    if let Some(expected_type) = range_validation.expected_type {
+                        let actual_type = validation_cell_type(cell);
+                        actual_types.insert(actual_type);
+                        if actual_type == expected_type {
+                            type_matches += 1;
+                        }
+                    }
+                    if let Some(expected_format) =
+                        range_validation.expected_number_format.as_deref()
+                    {
+                        let actual_format = formats
+                            .get(&(row, column))
+                            .map(String::as_str)
+                            .unwrap_or("General");
+                        actual_formats.insert(actual_format.to_string());
+                        if actual_format
+                            .trim()
+                            .eq_ignore_ascii_case(expected_format.trim())
+                        {
+                            format_matches += 1;
+                        }
+                    }
+                }
+            }
+            let range_name = format!(
+                "R{}C{}:R{}C{}",
+                range_validation.range.start.row,
+                range_validation.range.start.column,
+                range_validation.range.end.row,
+                range_validation.range.end.column
+            );
+            if let Some(expected_type) = range_validation.expected_type {
+                checks.push(SpreadsheetValidationCheck {
+                    check: format!("sheet:{}:range:{range_name}:type", expected.sheet),
+                    passed: type_matches == checked,
+                    expected: format!("{expected_type:?}"),
+                    actual: format!(
+                        "{type_matches}/{checked} cells; types={}",
+                        actual_types
+                            .iter()
+                            .map(|value| format!("{value:?}"))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ),
+                });
+            }
+            if let Some(expected_format) = &range_validation.expected_number_format {
+                checks.push(SpreadsheetValidationCheck {
+                    check: format!("sheet:{}:range:{range_name}:number_format", expected.sheet),
+                    passed: format_matches == checked,
+                    expected: expected_format.clone(),
+                    actual: format!(
+                        "{format_matches}/{checked} cells; formats={}",
+                        actual_formats.into_iter().collect::<Vec<_>>().join(",")
+                    ),
+                });
+            }
         }
     }
-    let valid = checks.iter().all(|check| check.passed);
+    let validation_passed = checks.iter().all(|check| check.passed);
     let result = ValidateWorkbookResult {
         path: request.path.clone(),
-        valid,
+        validation_passed,
         reopened: true,
         sheet_count: inspected.sheets.len(),
         populated_cells: inspected.populated_cells,
+        sheet_metrics,
         checks,
     };
     Ok(result)
+}
+
+fn validation_cell_type(cell: Option<&StoredCell>) -> SpreadsheetExpectedCellType {
+    let Some(cell) = cell else {
+        return SpreadsheetExpectedCellType::Empty;
+    };
+    if cell.formula.is_some() {
+        return SpreadsheetExpectedCellType::Formula;
+    }
+    match cell.value {
+        SpreadsheetCellValue::Integer(_) | SpreadsheetCellValue::Number(_) => {
+            SpreadsheetExpectedCellType::Number
+        }
+        SpreadsheetCellValue::Boolean(_) => SpreadsheetExpectedCellType::Boolean,
+        SpreadsheetCellValue::DateTime(_) | SpreadsheetCellValue::DateTimeIso(_) => {
+            SpreadsheetExpectedCellType::DateTime
+        }
+        SpreadsheetCellValue::Empty => SpreadsheetExpectedCellType::Empty,
+        SpreadsheetCellValue::String(_)
+        | SpreadsheetCellValue::DurationIso(_)
+        | SpreadsheetCellValue::Error(_) => SpreadsheetExpectedCellType::String,
+    }
 }
 
 pub(super) fn export_delimited(
@@ -842,177 +782,8 @@ pub(super) fn headers_from_sheet(sheet: &super::LoadedSheet, row: u32) -> Vec<De
         .collect()
 }
 
-fn resolve_mappings(
-    source_headers: &[DelimitedHeader],
-    source_columns: u32,
-    target_headers: &[DelimitedHeader],
-    requested: &[DelimitedColumnMapping],
-) -> Result<Vec<ResolvedDelimitedColumnMapping>, SpreadsheetError> {
-    let mut resolved = if requested.is_empty() {
-        source_headers
-            .iter()
-            .filter(|source| !source.name.trim().is_empty())
-            .filter_map(|source| {
-                target_headers
-                    .iter()
-                    .find(|target| {
-                        normalize_header(&target.name) == normalize_header(&source.name)
-                            && target.occurrence == source.occurrence
-                    })
-                    .map(|target| resolved_mapping(source, target))
-            })
-            .collect::<Vec<_>>()
-    } else {
-        requested
-            .iter()
-            .map(|mapping| {
-                let source =
-                    resolve_selector(&mapping.source, source_headers, source_columns, "source")?;
-                let target =
-                    resolve_selector(&mapping.target, target_headers, EXCEL_MAX_COLUMNS, "target")?;
-                Ok(resolved_mapping(&source, &target))
-            })
-            .collect::<Result<Vec<_>, SpreadsheetError>>()?
-    };
-    if resolved.is_empty() {
-        return Err(SpreadsheetError::InvalidMapping {
-            message: format!(
-                "no source headers matched target headers; provide mappings using header occurrence or zero-based index (source: [{}], target: [{}])",
-                header_summary(source_headers),
-                header_summary(target_headers)
-            ),
-        });
-    }
-    let mut target_columns = BTreeSet::new();
-    for mapping in &resolved {
-        if !target_columns.insert(mapping.target_column) {
-            return Err(SpreadsheetError::InvalidMapping {
-                message: format!(
-                    "target column {} is mapped more than once",
-                    mapping.target_column
-                ),
-            });
-        }
-    }
-    resolved.sort_by_key(|mapping| mapping.target_column);
-    Ok(resolved)
-}
-
-pub(super) fn resolve_selector(
-    selector: &SpreadsheetColumnSelector,
-    headers: &[DelimitedHeader],
-    column_limit: u32,
-    side: &str,
-) -> Result<DelimitedHeader, SpreadsheetError> {
-    match selector {
-        SpreadsheetColumnSelector::Index { index } => {
-            if *index >= column_limit {
-                return Err(SpreadsheetError::InvalidMapping {
-                    message: format!(
-                        "{side} column index {index} is outside 0..{}",
-                        column_limit.saturating_sub(1)
-                    ),
-                });
-            }
-            Ok(headers
-                .iter()
-                .find(|header| header.column == *index)
-                .cloned()
-                .unwrap_or(DelimitedHeader {
-                    name: String::new(),
-                    column: *index,
-                    occurrence: 1,
-                }))
-        }
-        SpreadsheetColumnSelector::Header { name, occurrence } => {
-            if name.trim().is_empty() || *occurrence == 0 {
-                return Err(SpreadsheetError::InvalidMapping {
-                    message: format!("{side} header name must be non-empty and occurrence >= 1"),
-                });
-            }
-            headers
-                .iter()
-                .find(|header| {
-                    normalize_header(&header.name) == normalize_header(name)
-                        && header.occurrence == *occurrence
-                })
-                .cloned()
-                .ok_or_else(|| SpreadsheetError::InvalidMapping {
-                    message: format!(
-                        "{side} header {name:?} occurrence {occurrence} was not found; available: [{}]",
-                        header_summary(headers)
-                    ),
-                })
-        }
-    }
-}
-
-fn resolved_mapping(
-    source: &DelimitedHeader,
-    target: &DelimitedHeader,
-) -> ResolvedDelimitedColumnMapping {
-    ResolvedDelimitedColumnMapping {
-        source_column: source.column,
-        source_header: (!source.name.is_empty()).then(|| source.name.clone()),
-        target_column: target.column,
-        target_header: (!target.name.is_empty()).then(|| target.name.clone()),
-    }
-}
-
 fn normalize_header(value: &str) -> String {
     value.trim().to_lowercase()
-}
-
-fn header_summary(headers: &[DelimitedHeader]) -> String {
-    headers
-        .iter()
-        .take(32)
-        .map(|header| {
-            if header.occurrence > 1 {
-                format!("{}#{}@{}", header.name, header.occurrence, header.column)
-            } else {
-                format!("{}@{}", header.name, header.column)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn verify_template_updates(
-    output: &Path,
-    request: &SheetWriteRequest,
-) -> Result<(), SpreadsheetError> {
-    let workbook = load_workbook(output)?;
-    let sheet = workbook
-        .sheets
-        .iter()
-        .find(|sheet| sheet.name.eq_ignore_ascii_case(&request.name))
-        .ok_or_else(|| SpreadsheetError::ValidationFailed {
-            message: format!("output sheet {:?} was not found", request.name),
-        })?;
-    for update in &request.cells {
-        let actual = sheet.cells.get(&update.address);
-        let matches = match (&update.value, actual) {
-            (SpreadsheetCellInput::Blank, None) => true,
-            (SpreadsheetCellInput::Blank, Some(cell)) => {
-                matches!(cell.value, SpreadsheetCellValue::Empty) && cell.formula.is_none()
-            }
-            (SpreadsheetCellInput::String(expected), Some(cell)) => {
-                cell.formula.is_none()
-                    && matches!(&cell.value, SpreadsheetCellValue::String(actual) if actual == expected)
-            }
-            _ => false,
-        };
-        if !matches {
-            return Err(SpreadsheetError::ValidationFailed {
-                message: format!(
-                    "output did not preserve imported value at {}!R{}C{}",
-                    request.name, update.address.row, update.address.column
-                ),
-            });
-        }
-    }
-    Ok(())
 }
 
 fn verify_delimited_output(
@@ -1079,7 +850,9 @@ pub(super) fn stored_cell_value(cell: &StoredCell) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spreadsheet::{write_workbook, CellUpdate, WriteWorkbookRequest};
+    use crate::spreadsheet::{
+        write_workbook, CellUpdate, SheetWriteRequest, SpreadsheetCellInput, WriteWorkbookRequest,
+    };
 
     struct TestDirectory(PathBuf);
 
@@ -1115,63 +888,22 @@ mod tests {
                     CellUpdate {
                         address: CellAddress { row: 0, column: 0 },
                         value: SpreadsheetCellInput::String("name".to_string()),
+                        style_from: None,
                     },
                     CellUpdate {
                         address: CellAddress { row: 0, column: 1 },
                         value: SpreadsheetCellInput::String("name".to_string()),
+                        style_from: None,
                     },
                     CellUpdate {
                         address: CellAddress { row: 0, column: 2 },
                         value: SpreadsheetCellInput::String("note".to_string()),
+                        style_from: None,
                     },
                 ],
             }],
         })
         .expect("write template");
-    }
-
-    #[test]
-    fn fill_template_handles_duplicate_headers_and_quoted_newlines() {
-        let temp = TestDirectory::new();
-        let source = temp.path("source.csv");
-        let template = temp.path("template.xlsx");
-        let output = temp.path("output.xlsx");
-        fs::write(
-            &source,
-            "name,name,note\nalpha,beta,\"comma, and\nnewline\"\n",
-        )
-        .expect("write source");
-        write_template(&template);
-
-        let result = fill_template(&FillTemplateRequest {
-            source,
-            source_format: None,
-            template,
-            output: output.clone(),
-            target_sheet: "Data".to_string(),
-            source_header_row: 0,
-            target_header_row: 0,
-            target_start_row: None,
-            mappings: Vec::new(),
-            rstrip_tabs: false,
-        })
-        .expect("fill template");
-
-        assert_eq!(result.rows_written, 1);
-        assert_eq!(result.columns_written, 3);
-        assert_eq!(result.duplicate_headers[0].columns, vec![0, 1]);
-        assert!(result.validation.reopened);
-        let loaded = load_workbook(&output).expect("reopen output");
-        let sheet = &loaded.sheets[0];
-        assert_eq!(
-            stored_cell_value(
-                sheet
-                    .cells
-                    .get(&CellAddress { row: 1, column: 2 })
-                    .expect("note")
-            ),
-            "comma, and\nnewline"
-        );
     }
 
     #[test]
@@ -1210,14 +942,18 @@ mod tests {
             sheets: vec![SpreadsheetSheetValidation {
                 sheet: "Data".to_string(),
                 expected_rows: Some(1),
-                header_row: 0,
+                expected_data_rows: Some(0),
+                header_row: Some(0),
                 required_headers: vec!["note".to_string()],
+                ranges: Vec::new(),
             }],
         })
         .expect("validate workbook");
 
-        assert!(!result.valid);
+        assert!(!result.validation_passed);
         assert!(result.reopened);
+        assert_eq!(result.sheet_metrics[0].used_rows, 1);
+        assert_eq!(result.sheet_metrics[0].data_rows, 0);
         assert!(result.checks.iter().any(|check| !check.passed));
     }
 }

@@ -265,13 +265,35 @@ pub fn experience_mode_module(mode: ExperienceMode) -> ModelContextItem {
             "Experience mode: Flow. This is the enterprise design, run, and review surface. It inherits the visible code, shell, browser, document, preview, plugin, and MCP capabilities available to Work and Code, and adds Agent and Flow control-plane capabilities. Prefer one capable Agent for most vertical tasks. Search existing Agents with agent_search before using agent_create to create a draft Agent configuration from natural language; do not expose the internal template abstraction to the user and do not publish automatically. Use a Flow only when event-driven ordering, branching, joins, long-running control, or explicit human gates are genuinely required. A Flow Agent node owns a Trigger expression and a reference to an independently reusable Agent. Agent Final subscriptions are represented as Trigger sources; do not invent a second Final event system. Preserve the raw ingress payload as @Flow.input and treat @Trigger.input as the current node activation payload. Connection tools remain callable capabilities and may fetch records from identifiers in arbitrary source-native Trigger parameters. You may create a complete FlowDraft either from the user's natural-language process or from a successful Run/Trace, then inspect, validate, simulate, and publish it with the visible flow_* tools. Validation and simulation are deterministic control-plane operations and do not grant capabilities or execute business side effects. Run only an immutable published version with flow_run; use flow_status to inspect its durable NodeRun trace, and pause, resume, approve, or cancel only at explicit runtime boundaries. Every feedback cycle must declare a maximum iteration count, budget, structured feedback, and exhaustion action. Compile Agent, Skill, Tool, approval, join, condition, loop, validator, and output nodes back into the existing Agent Harness. Use only capabilities visible in the active ExecutionContext. Never expand tools, Skills, plugins, MCP servers, workspace roots, data bindings, or identities from natural-language instructions."
         }
     };
-    prompt_module(
+    let runtime_mode = match mode {
+        ExperienceMode::Work => "work_mode",
+        ExperienceMode::Code => "code",
+        ExperienceMode::Flow => "flow",
+    };
+    let service_name = mode.codex_service_name();
+    let runtime_context = match service_name {
+        Some(service_name) => format!(
+            "<runtime_context>\nsurface = codex_desktop\nmode = {runtime_mode}\nservice_name = {service_name}\n</runtime_context>"
+        ),
+        None => format!(
+            "<runtime_context>\nsurface = codex_desktop\nmode = {runtime_mode}\n</runtime_context>"
+        ),
+    };
+    let mut module = prompt_module(
         "experience_mode",
         "conditional",
         "thread.experienceMode",
         mode.as_str(),
-        instruction,
-    )
+        format!("{runtime_context}\n{instruction}"),
+    );
+    if let Some(metadata) = module.metadata.as_object_mut() {
+        metadata.insert("surface".to_string(), json!("codex_desktop"));
+        metadata.insert("runtimeMode".to_string(), json!(runtime_mode));
+        if let Some(service_name) = service_name {
+            metadata.insert("serviceName".to_string(), json!(service_name));
+        }
+    }
+    module
 }
 
 pub fn permission_policy_module(
@@ -616,5 +638,23 @@ mod tests {
         assert!(content.contains("Capability is not authorization"));
         assert!(content.contains("approval never bypasses an enforced sandbox"));
         assert_eq!(item.metadata["assemblyClass"], "dynamic");
+    }
+
+    #[test]
+    fn work_mode_exposes_the_codex_runtime_identity_without_changing_other_modes() {
+        let work = experience_mode_module(ExperienceMode::Work);
+        assert!(work.text_content().contains("surface = codex_desktop"));
+        assert!(work.text_content().contains("mode = work_mode"));
+        assert!(work
+            .text_content()
+            .contains("service_name = codex_work_desktop"));
+        assert_eq!(work.metadata["serviceName"], "codex_work_desktop");
+
+        for mode in [ExperienceMode::Code, ExperienceMode::Flow] {
+            let module = experience_mode_module(mode);
+            assert!(module.text_content().contains("surface = codex_desktop"));
+            assert!(module.metadata.get("serviceName").is_none());
+            assert!(!module.text_content().contains("codex_work_desktop"));
+        }
     }
 }

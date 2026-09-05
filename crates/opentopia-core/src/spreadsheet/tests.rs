@@ -50,6 +50,7 @@ fn update(row: u32, column: u32, value: SpreadsheetCellInput) -> CellUpdate {
     CellUpdate {
         address: address(row, column),
         value,
+        style_from: None,
     }
 }
 

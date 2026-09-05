@@ -33,7 +33,7 @@ fn search_path(path: Option<&str>) -> &str {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct SearchInput {
     /// Search pattern passed to rg, or substring for fallback search.
     query: String,
@@ -41,17 +41,17 @@ pub struct SearchInput {
     #[serde(default)]
     path: Option<String>,
     /// Treat the query as literal text instead of a regular expression.
-    #[serde(default, alias = "fixed_strings")]
+    #[serde(default)]
     fixed_strings: bool,
     /// Return only matches bounded by non-word characters.
-    #[serde(default, alias = "word_match")]
+    #[serde(default)]
     word_match: bool,
     /// Maximum matching lines to return.
-    #[serde(default, alias = "max_results")]
+    #[serde(default)]
     #[schemars(range(min = 1, max = 1000))]
     max_results: Option<usize>,
     /// Number of source lines before and after each match to include.
-    #[serde(default, alias = "context_lines")]
+    #[serde(default)]
     #[schemars(range(min = 0, max = 20))]
     context_lines: Option<usize>,
 }
@@ -65,7 +65,7 @@ impl TypedTool for WorkspaceSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Recursively search workspace text for candidate definitions and references with ripgrep, falling back to a literal scan. Set contextLines (0-20) to include numbered surrounding source lines and structured match locations that can be passed to filesystem read. Text matches are evidence to confirm by reading code, not semantic symbol resolution."
+        "Recursively search workspace text for candidate definitions and references with ripgrep, falling back to a literal scan. Set context_lines (0-20) to include numbered surrounding source lines and structured match locations that can be passed to filesystem read. Text matches are evidence to confirm by reading code, not semantic symbol resolution."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {

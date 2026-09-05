@@ -22,18 +22,18 @@ enum PdfToolAction {
 #[serde(
     tag = "action",
     rename_all = "snake_case",
-    rename_all_fields = "camelCase",
+    rename_all_fields = "snake_case",
     deny_unknown_fields
 )]
 pub enum PdfToolInput {
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Inspect {
         #[serde(default)]
         path: Option<String>,
         #[serde(default)]
         attachment_id: Option<String>,
     },
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Extract {
         #[serde(default)]
         path: Option<String>,
@@ -47,7 +47,7 @@ pub enum PdfToolInput {
         #[schemars(range(min = 1, max = 200000))]
         max_characters: Option<usize>,
     },
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Render {
         #[serde(default)]
         path: Option<String>,
@@ -61,7 +61,7 @@ pub enum PdfToolInput {
         #[schemars(range(min = 36, max = 288))]
         dpi: Option<u16>,
     },
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Validate {
         #[serde(default)]
         path: Option<String>,
@@ -300,18 +300,18 @@ enum DocumentToolAction {
 #[serde(
     tag = "action",
     rename_all = "snake_case",
-    rename_all_fields = "camelCase",
+    rename_all_fields = "snake_case",
     deny_unknown_fields
 )]
 pub enum DocumentToolInput {
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Inspect {
         #[serde(default)]
         path: Option<String>,
         #[serde(default)]
         attachment_id: Option<String>,
     },
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Extract {
         #[serde(default)]
         path: Option<String>,
@@ -324,7 +324,7 @@ pub enum DocumentToolInput {
         #[schemars(range(min = 1, max = 200000))]
         max_characters: Option<usize>,
     },
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Validate {
         #[serde(default)]
         path: Option<String>,
@@ -410,7 +410,7 @@ impl TypedTool for DocumentTool {
     type Input = DocumentToolInput;
 
     fn name(&self) -> &str {
-        "document"
+        "word_document"
     }
 
     fn description(&self) -> &str {
@@ -453,7 +453,7 @@ impl TypedTool for DocumentTool {
                         .context("DOCX inspect worker failed")?;
                 match result {
                     Ok(result) => with_attachment_metadata(
-                        structured_success(call_id, "document", "inspect", result),
+                        structured_success(call_id, "word_document", "inspect", result),
                         attachment_metadata.as_ref(),
                     ),
                     Err(error) => with_attachment_metadata(
@@ -480,7 +480,7 @@ impl TypedTool for DocumentTool {
                 .context("DOCX extract worker failed")?;
                 match result {
                     Ok(result) => with_attachment_metadata(
-                        structured_success(call_id, "document", "extract", result),
+                        structured_success(call_id, "word_document", "extract", result),
                         attachment_metadata.as_ref(),
                     ),
                     Err(error) => with_attachment_metadata(
@@ -497,7 +497,7 @@ impl TypedTool for DocumentTool {
                         .context("DOCX validate worker failed")?;
                 let value = serde_json::to_value(result)?;
                 with_attachment_metadata(
-                    structured_value_success(call_id, "document", "validate", value),
+                    structured_value_success(call_id, "word_document", "validate", value),
                     attachment_metadata.as_ref(),
                 )
             }
@@ -525,7 +525,7 @@ async fn read_artifact_input(
         .filter(|value| !value.is_empty());
     anyhow::ensure!(
         requested.is_some() ^ attachment_id.is_some(),
-        "artifact tool requires exactly one of path or attachmentId"
+        "artifact tool requires exactly one of path or attachment_id"
     );
     if let Some(requested) = requested {
         let logical_path = normalize_workspace_path(&ctx.workspace_root, requested)?;
@@ -545,7 +545,7 @@ async fn read_artifact_input(
     }
 
     let attachment_id = Uuid::parse_str(attachment_id.expect("attachment id present"))
-        .context("attachmentId must be a UUID from the attachment manifest")?;
+        .context("attachment_id must be a UUID from the attachment manifest")?;
     let attachment =
         read_stored_attachment_file(ctx, attachment_id, MAX_ARTIFACT_INPUT_BYTES).await?;
     let path = attachment.logical_path(expected_extension);
@@ -764,7 +764,7 @@ fn pdf_error_result(call_id: Uuid, action: &str, error: PdfError) -> ToolResult 
 fn document_error_result(call_id: Uuid, action: &str, error: DocumentError) -> ToolResult {
     domain_error_result(
         call_id,
-        "document",
+        "word_document",
         action,
         "document_error",
         error.to_string(),

@@ -21,11 +21,11 @@ use uuid::Uuid;
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 
-const EXPECTED_TOOLS: [&str; 17] = [
+const EXPECTED_TOOLS: [&str; 28] = [
     "apply_patch",
     "background_output",
     "create_skill",
-    "document",
+    "word_document",
     "filesystem",
     "list_skills",
     "pdf",
@@ -34,9 +34,20 @@ const EXPECTED_TOOLS: [&str; 17] = [
     "read_skill",
     "request_user_input",
     "shell",
-    "document_execute",
-    "document_get_operation_schemas",
-    "document_open",
+    "spreadsheet_inspect",
+    "spreadsheet_read_ranges",
+    "spreadsheet_find",
+    "spreadsheet_filter_rows",
+    "spreadsheet_validate",
+    "spreadsheet_write_range",
+    "spreadsheet_copy_ranges",
+    "spreadsheet_copy_rows",
+    "spreadsheet_fill_ranges",
+    "spreadsheet_convert_ranges",
+    "spreadsheet_export_delimited",
+    "spreadsheet_copy_sheet",
+    "spreadsheet_delete_rows",
+    "spreadsheet_delete_sheet",
     "update_plan",
     "view_attachment",
 ];
@@ -142,19 +153,6 @@ impl SmokeProvider {
             .context("background shell result did not expose jobId")
     }
 
-    fn document_id(request: &ModelRequest) -> anyhow::Result<String> {
-        request
-            .input
-            .tool_results
-            .iter()
-            .rev()
-            .find(|result| result.name == "document_open")
-            .and_then(|result| result.metadata.get("documentId"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .context("document_open result did not expose documentId")
-    }
-
     fn created_skill_id(&self) -> anyhow::Result<String> {
         let path = self
             .workspace
@@ -179,7 +177,7 @@ impl ModelProvider for SmokeProvider {
                     "operation": "write",
                     "path": "fs-smoke.txt",
                     "content": "TOPIA_FILESYSTEM_OK\n",
-                    "expectedHash": "missing"
+                    "expected_hash": "missing"
                 }),
             ),
             1 => Self::calls(
@@ -198,10 +196,10 @@ impl ModelProvider for SmokeProvider {
                         json!({
                             "operation": "find",
                             "path": ".",
-                            "nameContains": "fs-smoke",
-                            "caseSensitive": false,
+                            "name_contains": "fs-smoke",
+                            "case_sensitive": false,
                             "kind": "file",
-                            "maxDepth": 2,
+                            "max_depth": 2,
                             "limit": 10
                         }),
                     ),
@@ -239,7 +237,7 @@ impl ModelProvider for SmokeProvider {
                         "sleep 0.25; printf 'TOPIA_BACKGROUND_OK\\n'"
                     },
                     "background": true,
-                    "timeoutSeconds": 10
+                    "timeout_seconds": 10
                 }),
             ),
             5 => Self::one_call(
@@ -247,8 +245,8 @@ impl ModelProvider for SmokeProvider {
                 "background_output",
                 json!({
                     "action": "read",
-                    "jobId": Self::background_job_id(&request)?,
-                    "timeoutMs": 5000
+                    "job_id": Self::background_job_id(&request)?,
+                    "timeout_ms": 5000
                 }),
             ),
             6 => Self::one_call(
@@ -292,40 +290,29 @@ impl ModelProvider for SmokeProvider {
             ),
             11 => Self::one_call(
                 11,
-                "document_open",
+                "spreadsheet_write_range",
                 json!({
-                    "resource": { "kind": "file", "path": "smoke.xlsx" },
-                    "mode": "create"
+                    "path": "smoke.xlsx",
+                    "sheet": "Smoke",
+                    "start": "A1",
+                    "rows": [[{ "type": "string", "value": "TOPIA_SPREADSHEET_OK" }]]
                 }),
             ),
-            12 => Self::one_call(
-                12,
-                "document_get_operation_schemas",
-                json!({
-                    "documentId": Self::document_id(&request)?,
-                    "operations": ["write"]
-                }),
-            ),
+            12 => Self::one_call(12, "spreadsheet_inspect", json!({ "path": "smoke.xlsx" })),
             13 => Self::one_call(
                 13,
-                "document_execute",
+                "spreadsheet_read_ranges",
                 json!({
-                    "documentId": Self::document_id(&request)?,
-                    "operation": "write",
-                    "arguments": {
-                        "sheets": [{
-                            "name": "Smoke",
-                            "cells": [{
-                                "address": { "row": 0, "column": 0 },
-                                "value": { "type": "string", "value": "TOPIA_SPREADSHEET_OK" }
-                            }]
-                        }]
-                    }
+                    "reads": [{
+                        "path": "smoke.xlsx",
+                        "sheet": "Smoke",
+                        "range": "A1"
+                    }]
                 }),
             ),
             14 => Self::one_call(
                 14,
-                "document",
+                "word_document",
                 json!({ "action": "inspect", "path": "sample.docx" }),
             ),
             15 => Self::one_call(
@@ -336,18 +323,18 @@ impl ModelProvider for SmokeProvider {
             16 => Self::one_call(
                 16,
                 "read_artifact",
-                json!({ "artifactId": self.artifact_id }),
+                json!({ "artifact_id": self.artifact_id }),
             ),
             17 => Self::one_call(
                 17,
                 "read_attachment",
-                json!({ "attachmentId": self.text_attachment_id }),
+                json!({ "attachment_id": self.text_attachment_id }),
             ),
             18 => Self::one_call(
                 18,
                 "view_attachment",
                 json!({
-                    "attachmentId": self.image_attachment_id,
+                    "attachment_id": self.image_attachment_id,
                     "focus": "Verify the smoke image is available."
                 }),
             ),

@@ -77,30 +77,30 @@ fn default_true() -> bool {
 #[serde(
     tag = "action",
     rename_all = "snake_case",
-    rename_all_fields = "camelCase",
+    rename_all_fields = "snake_case",
     deny_unknown_fields
 )]
 pub(super) enum BrowserInput {
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Navigate {
         url: String,
         #[serde(default)]
         #[schemars(range(min = 1, max = 120000))]
         timeout_ms: Option<u64>,
     },
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Observe {
         #[serde(default)]
         include_screenshot: bool,
     },
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Screenshot {},
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Click {
         observation_id: String,
         node_ref: String,
     },
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Type {
         observation_id: String,
         node_ref: String,
@@ -108,18 +108,18 @@ pub(super) enum BrowserInput {
         #[serde(default = "default_true")]
         clear_first: bool,
     },
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Select {
         observation_id: String,
         node_ref: String,
         value: String,
     },
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Hover {
         observation_id: String,
         node_ref: String,
     },
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Scroll {
         observation_id: String,
         node_ref: String,
@@ -130,9 +130,9 @@ pub(super) enum BrowserInput {
         #[schemars(range(min = -10000.0, max = 10000.0))]
         delta_y: f64,
     },
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     SwitchTarget { target_ref: String },
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Wait {
         #[serde(default)]
         condition: BrowserWaitConditionInput,
@@ -144,7 +144,7 @@ pub(super) enum BrowserInput {
         #[schemars(range(min = 1, max = 120000))]
         timeout_ms: Option<u64>,
     },
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Download {
         url: String,
         #[serde(default)]
@@ -156,7 +156,7 @@ pub(super) enum BrowserInput {
         #[serde(default)]
         expected_filename: Option<String>,
     },
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Close {},
 }
 
@@ -337,7 +337,7 @@ impl TypedTool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Use the shared local browser. Observe before every click, type, select, hover, or scroll, then use the returned observationId and nodeRef. Observations include owned tabs/popups, frames, and a bounded accessibility tree. Use switch_target with a returned targetRef to change tabs. The runtime rejects stale observations; if it reports stale_observation, discard the old node reference and observe again. When a page requires a login, verification, upload, payment, publication, or irreversible submission, stop controlling the page and tell the user to complete it in the visible browser."
+        "Use the shared local browser. Observe before every click, type, select, hover, or scroll, then pass the returned observation ID and node reference as observation_id and node_ref. Observations include owned tabs/popups, frames, and a bounded accessibility tree. Use switch_target and pass a returned target reference as target_ref to change tabs. The runtime rejects stale observations; if it reports stale_observation, discard the old node reference and observe again. When a page requires a login, verification, upload, payment, publication, or irreversible submission, stop controlling the page and tell the user to complete it in the visible browser."
     }
 
     async fn execute_typed(
@@ -522,9 +522,9 @@ impl TypedTool for BrowserTool {
             BrowserActionInput::SwitchTarget => {
                 let target_ref = serde_json::from_value(Value::String(required_typed_string(
                     input.target_ref.as_deref(),
-                    "targetRef",
+                    "target_ref",
                 )?))
-                .context("targetRef must be a browser target reference")?;
+                .context("target_ref must be a browser target reference")?;
                 grant_browser_network_access(&ctx, &runtime, session, std::iter::empty::<String>())
                     .await?;
                 runtime.switch_target(session, target_ref).await?;
@@ -804,14 +804,14 @@ fn browser_output_to_tool_result(
 fn browser_observation_id(input: Option<&str>) -> anyhow::Result<BrowserObservationId> {
     serde_json::from_value(Value::String(required_typed_string(
         input,
-        "observationId",
+        "observation_id",
     )?))
-    .context("observationId must be a browser observation ID")
+    .context("observation_id must be a browser observation ID")
 }
 
 fn browser_node_ref(input: Option<&str>) -> anyhow::Result<BrowserNodeRef> {
-    serde_json::from_value(Value::String(required_typed_string(input, "nodeRef")?))
-        .context("nodeRef must be a browser node reference")
+    serde_json::from_value(Value::String(required_typed_string(input, "node_ref")?))
+        .context("node_ref must be a browser node reference")
 }
 
 fn browser_observation_to_tool_result(

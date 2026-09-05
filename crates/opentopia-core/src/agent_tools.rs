@@ -1,15 +1,19 @@
 use crate::enterprise::{
-    AgentBudgetV1, AgentKnowledgeBindingV1, AgentModelPolicyV1, AgentRiskClassV1,
-    AgentTemplateSpecV1, CapabilityProjection, DataClassification, ExecutionResourceGrantV1,
-    KnowledgeLibraryProviderV1,
+    AgentKnowledgeBindingV1, AgentModelPolicyV1, AgentRiskClassV1, AgentTemplateSpecV1,
+    CapabilityProjection, DataClassification, KnowledgeLibraryProviderV1,
 };
-use crate::enterprise_connection_grants::ConnectionBindingV1;
 use crate::model::{ExperienceMode, ToolCall, ToolResult};
+use crate::tool_input_contracts::{
+    ToolAgentBudget, ToolAgentModelPolicy, ToolCapabilityProjection, ToolConnectionBinding,
+    ToolExecutionResourceGrant,
+};
 use crate::tools::{
-    RegisteredTool, Tool, ToolApprovalMode, ToolClass, ToolExecutionPolicy, ToolGovernance,
-    ToolInvocationContext, ToolRiskLevel, ToolSideEffect,
+    derived_tool_input_error, derived_tool_schema, RegisteredTool, Tool, ToolApprovalMode,
+    ToolClass, ToolExecutionPolicy, ToolGovernance, ToolInvocationContext, ToolRiskLevel,
+    ToolSideEffect,
 };
 use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -84,39 +88,44 @@ impl AgentTool {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 struct AgentSearchInput {
     #[serde(default)]
     query: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 struct AgentCreateInput {
+    /// Stable kebab-case Agent identifier.
+    #[schemars(length(min = 1))]
     template_id: String,
+    #[schemars(length(min = 1))]
     name: String,
+    #[schemars(length(min = 1))]
     owner: String,
     description: String,
+    #[schemars(length(min = 1))]
     instructions: String,
     #[serde(default)]
-    capabilities: Option<CapabilityProjection>,
+    capabilities: Option<ToolCapabilityProjection>,
     #[serde(default)]
-    connection_bindings: Vec<ConnectionBindingV1>,
+    connection_bindings: Vec<ToolConnectionBinding>,
     #[serde(default)]
     knowledge_namespaces: BTreeSet<String>,
     #[serde(default)]
     knowledge_provider: Option<KnowledgeLibraryProviderV1>,
     #[serde(default)]
-    resource_grants: Vec<ExecutionResourceGrantV1>,
+    resource_grants: Vec<ToolExecutionResourceGrant>,
     #[serde(default)]
-    model_policy: Option<AgentModelPolicyV1>,
+    model_policy: Option<ToolAgentModelPolicy>,
     #[serde(default)]
     state_schema: Option<Value>,
     #[serde(default)]
     output_schema: Option<Value>,
     #[serde(default)]
-    budget: Option<AgentBudgetV1>,
+    budget: Option<ToolAgentBudget>,
     #[serde(default)]
     risk_class: Option<AgentRiskClassV1>,
 }
@@ -139,47 +148,20 @@ impl Tool for AgentTool {
 
     fn schema(&self) -> Value {
         match self.action {
-            AgentToolAction::Search => json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {"query": {"type": "string"}}
-            }),
-            AgentToolAction::Create => json!({
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["templateId", "name", "owner", "description", "instructions"],
-                "properties": {
-                    "templateId": {"type": "string", "minLength": 1, "description": "Stable kebab-case Agent id."},
-                    "name": {"type": "string", "minLength": 1},
-                    "owner": {"type": "string", "minLength": 1},
-                    "description": {"type": "string"},
-                    "instructions": {"type": "string", "minLength": 1, "description": "Complete role, objective, tool-use policy, input handling and expected Final instructions."},
-                    "capabilities": {"type": "object", "description": "Requested capability projection. It is intersected with the current ExecutionContext."},
-                    "connectionBindings": {"type": "array", "items": {"type": "object"}},
-                    "knowledgeProvider": {
-                        "type": "string",
-                        "enum": ["sag", "graph-rag"],
-                        "description": "Knowledge library selected for this Agent. Selecting one automatically derives the library_search capability."
-                    },
-                    "knowledgeNamespaces": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "uniqueItems": true,
-                        "description": "Required immutable namespace scope for SAG; omit for Graph RAG."
-                    },
-                    "resourceGrants": {"type": "array", "items": {"type": "object"}},
-                    "modelPolicy": {"type": "object"},
-                    "stateSchema": {"type": "object"},
-                    "outputSchema": {"type": "object"},
-                    "budget": {"type": "object"},
-                    "riskClass": {"type": "string", "enum": ["low", "medium", "high", "critical"]}
-                }
-            }),
+            AgentToolAction::Search => derived_tool_schema::<AgentSearchInput>(),
+            AgentToolAction::Create => derived_tool_schema::<AgentCreateInput>(),
         }
     }
 
     fn has_derived_input_schema(&self) -> bool {
         true
+    }
+
+    fn input_error(&self, input: &Value) -> Option<String> {
+        match self.action {
+            AgentToolAction::Search => derived_tool_input_error::<AgentSearchInput>(input),
+            AgentToolAction::Create => derived_tool_input_error::<AgentCreateInput>(input),
+        }
     }
 
     fn execution_policy(&self, call: &ToolCall) -> ToolExecutionPolicy {
@@ -190,7 +172,7 @@ impl Tool for AgentTool {
             AgentToolAction::Create => {
                 let id = call
                     .input
-                    .get("templateId")
+                    .get("template_id")
                     .and_then(Value::as_str)
                     .unwrap_or("draft")
                     .trim();
@@ -243,6 +225,7 @@ impl Tool for AgentTool {
                 );
                 let requested = input
                     .capabilities
+                    .map(Into::into)
                     .unwrap_or_else(CapabilityProjection::deny_all);
                 let capabilities = requested.intersect(&ctx.capability_projection);
                 let knowledge_provider = input.knowledge_provider.or_else(|| {
@@ -264,9 +247,14 @@ impl Tool for AgentTool {
                     description: input.description.trim().to_string(),
                     instructions: input.instructions.trim().to_string(),
                     capabilities,
-                    resource_grants: input.resource_grants,
+                    resource_grants: input
+                        .resource_grants
+                        .into_iter()
+                        .map(Into::into)
+                        .collect(),
                     model_policy: input
                         .model_policy
+                        .map(Into::into)
                         .unwrap_or_else(AgentModelPolicyV1::deny_all),
                     state_schema: input.state_schema.unwrap_or_else(|| {
                         json!({"type": "object", "properties": {}, "additionalProperties": false})
@@ -276,9 +264,13 @@ impl Tool for AgentTool {
                         .unwrap_or_else(|| json!({"type": "object"})),
                     allow_all_delegates: false,
                     delegate_template_ids: BTreeSet::new(),
-                    budget: input.budget.unwrap_or_default(),
+                    budget: input.budget.map(Into::into).unwrap_or_default(),
                     risk_class: input.risk_class.unwrap_or(AgentRiskClassV1::Medium),
-                    connection_bindings: input.connection_bindings,
+                    connection_bindings: input
+                        .connection_bindings
+                        .into_iter()
+                        .map(Into::into)
+                        .collect(),
                     knowledge_binding,
                 };
                 let agent = store.create_agent_template_version(
@@ -304,9 +296,28 @@ mod tests {
         };
         assert_eq!(tool.name(), "agent_create");
         assert!(tool.description().contains("Agent is the product concept"));
-        assert_eq!(
-            tool.schema()["required"][0],
-            Value::String("templateId".to_string())
-        );
+        assert!(tool.schema()["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&Value::String("template_id".to_string()))));
+    }
+
+    #[test]
+    fn create_input_uses_one_strict_snake_case_contract() {
+        let tool = AgentTool {
+            action: AgentToolAction::Create,
+        };
+        let input = json!({
+            "template_id": "review-agent",
+            "name": "Review agent",
+            "owner": "engineering",
+            "description": "Reviews changes",
+            "instructions": "Review the requested changes.",
+            "capabilities": { "allow_all_tools": true }
+        });
+        assert_eq!(tool.input_error(&input), None);
+
+        let mut legacy = input;
+        legacy["templateId"] = legacy["template_id"].take();
+        assert!(tool.input_error(&legacy).is_some());
     }
 }

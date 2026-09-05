@@ -57,7 +57,17 @@ impl TypedTool for ListSkillsTool {
                     })
             })
             .collect::<Vec<_>>();
-        let value = serde_json::to_value(&skills)?;
+        // Expose exactly one callable identifier. `name` is display metadata and
+        // advertising it alongside the canonical ID makes plugin-prefixed names
+        // look callable even though the loader resolves only IDs.
+        let value = json!(skills
+            .iter()
+            .map(|skill| json!({
+                "id": skill.id,
+                "description": skill.description,
+                "scope": skill.scope,
+            }))
+            .collect::<Vec<_>>());
         Ok(ToolResult {
             call_id,
             output: serde_json::to_string_pretty(&value)?,
@@ -72,7 +82,7 @@ impl_typed_tool!(ListSkillsTool);
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReadSkillInput {
-    /// Skill ID returned by list_skills.
+    /// Exact opaque Skill ID returned in the `id` field by list_skills. Names are not IDs.
     pub(super) id: String,
     /// Byte offset to start reading from. Defaults to 0.
     #[serde(default)]
@@ -94,7 +104,7 @@ impl TypedTool for ReadSkillTool {
     }
 
     fn description(&self) -> &str {
-        "Read one Skill's instructions after deciding it is relevant to the current task. Returns at most 64 KB per call; when the result reports a next offset, call again with that offset to read the rest."
+        "Read one Skill's instructions using the exact opaque id from list_skills. Skill names are not accepted as ids. Returns at most 64 KB per call; when the result reports a next offset, call again with that offset to read the rest."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
@@ -171,7 +181,7 @@ fn active_skill_plugins(ctx: &ToolInvocationContext) -> anyhow::Result<BTreeSet<
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct CreateSkillToolInput {
     /// Short action-oriented lowercase hyphen-case name, at most 64 characters.
     name: String,

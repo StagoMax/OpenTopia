@@ -4,14 +4,17 @@ use crate::flow::{
 };
 use crate::flow_runtime::{prepare_flow_resume, spawn_flow_run, FlowRunStatusV1, FlowRunV1};
 use crate::model::{ExperienceMode, ToolCall, ToolResult, TurnStatus};
+use crate::tool_input_contracts::ToolFlowSpec;
 use crate::tools::{
-    RegisteredTool, Tool, ToolApprovalMode, ToolClass, ToolExecutionPolicy, ToolGovernance,
-    ToolInvocationContext, ToolRiskLevel, ToolSideEffect,
+    derived_tool_input_error, derived_tool_schema, RegisteredTool, Tool, ToolApprovalMode,
+    ToolClass, ToolExecutionPolicy, ToolGovernance, ToolInvocationContext, ToolRiskLevel,
+    ToolSideEffect,
 };
 use crate::RuntimeConnectionAuthorityV1;
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Utc;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -134,120 +137,92 @@ impl FlowTool {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 struct SearchInput {
     #[serde(default)]
     query: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 struct CreateInput {
-    spec: FlowSpecV1,
+    spec: ToolFlowSpec,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 struct UpdateInput {
     draft_id: Uuid,
+    #[schemars(range(min = 1))]
     expected_revision: u32,
-    spec: FlowSpecV1,
+    spec: ToolFlowSpec,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 struct InspectInput {
     #[serde(default)]
     draft_id: Option<Uuid>,
     #[serde(default)]
     flow_id: Option<String>,
     #[serde(default)]
+    #[schemars(range(min = 1))]
     version: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 struct DraftInput {
     draft_id: Uuid,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 struct SimulateInput {
     draft_id: Uuid,
     #[serde(default)]
     input: Value,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 struct PublishInput {
     draft_id: Uuid,
+    #[schemars(length(min = 1))]
     published_by: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 struct RunInput {
     flow_id: String,
     #[serde(default)]
+    #[schemars(range(min = 1))]
     version: Option<u32>,
     #[serde(default)]
     input: Value,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 struct RunIdInput {
     run_id: Uuid,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 struct StatusInput {
     #[serde(default)]
     run_id: Option<Uuid>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 struct ResumeInput {
     run_id: Uuid,
     #[serde(default)]
     retry_interrupted_node: bool,
-}
-
-fn flow_spec_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["flowId", "name", "description", "owner", "source", "graph", "requestedCapabilities", "riskClass"],
-        "properties": {
-            "flowId": {"type": "string", "description": "Stable kebab-case identifier."},
-            "name": {"type": "string"},
-            "description": {"type": "string"},
-            "owner": {"type": "string"},
-            "categories": {"type": "array", "items": {"type": "string"}},
-            "source": {
-                "type": "object",
-                "description": "Use kind=natural_language with description, or kind=run_trace with a successful runId and traceHash."
-            },
-            "inputSchema": {"type": "object"},
-            "outputSchema": {"type": "object"},
-            "graph": {
-                "type": "object",
-                "description": "Complete reviewable graph. Node kinds: agent, skill, tool, condition, validator, approval, join, loop, output. Cycles require a bounded loopPolicy on the feedback edge."
-            },
-            "requestedCapabilities": {
-                "type": "object",
-                "description": "Capabilities requested from the current ExecutionContext. This can only narrow, never grant access."
-            },
-            "budget": {"type": "object"},
-            "riskClass": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
-            "pendingDecisions": {"type": "array", "items": {"type": "string"}}
-        }
-    })
 }
 
 #[async_trait]
@@ -288,82 +263,42 @@ impl Tool for FlowTool {
 
     fn schema(&self) -> Value {
         match self.action {
-            FlowToolAction::Search => json!({
-                "type": "object", "additionalProperties": false,
-                "properties": {"query": {"type": "string"}}
-            }),
-            FlowToolAction::Create => json!({
-                "type": "object", "additionalProperties": false,
-                "required": ["spec"], "properties": {"spec": flow_spec_schema()}
-            }),
-            FlowToolAction::Update => json!({
-                "type": "object", "additionalProperties": false,
-                "required": ["draftId", "expectedRevision", "spec"],
-                "properties": {
-                    "draftId": {"type": "string", "format": "uuid"},
-                    "expectedRevision": {"type": "integer", "minimum": 1},
-                    "spec": flow_spec_schema()
-                }
-            }),
-            FlowToolAction::Inspect => json!({
-                "type": "object", "additionalProperties": false,
-                "properties": {
-                    "draftId": {"type": "string", "format": "uuid"},
-                    "flowId": {"type": "string"},
-                    "version": {"type": "integer", "minimum": 1}
-                }
-            }),
-            FlowToolAction::Validate => draft_schema(),
-            FlowToolAction::Simulate => json!({
-                "type": "object", "additionalProperties": false,
-                "required": ["draftId"],
-                "properties": {
-                    "draftId": {"type": "string", "format": "uuid"},
-                    "input": {}
-                }
-            }),
-            FlowToolAction::Publish => json!({
-                "type": "object", "additionalProperties": false,
-                "required": ["draftId", "publishedBy"],
-                "properties": {
-                    "draftId": {"type": "string", "format": "uuid"},
-                    "publishedBy": {"type": "string", "minLength": 1}
-                }
-            }),
-            FlowToolAction::Run => json!({
-                "type": "object", "additionalProperties": false,
-                "required": ["flowId"],
-                "properties": {
-                    "flowId": {"type": "string"},
-                    "version": {"type": "integer", "minimum": 1},
-                    "input": {}
-                }
-            }),
-            FlowToolAction::Status => json!({
-                "type": "object", "additionalProperties": false,
-                "properties": {"runId": {"type": "string", "format": "uuid"}}
-            }),
-            FlowToolAction::Pause | FlowToolAction::Cancel => run_id_schema(),
-            FlowToolAction::Resume => json!({
-                "type": "object", "additionalProperties": false,
-                "required": ["runId"],
-                "properties": {
-                    "runId": {"type": "string", "format": "uuid"},
-                    "retryInterruptedNode": {
-                        "type": "boolean",
-                        "description": "After a process restart, explicitly retry a node that may have stopped mid-side-effect. Inspect external state first."
-                    }
-                }
-            }),
+            FlowToolAction::Search => derived_tool_schema::<SearchInput>(),
+            FlowToolAction::Create => derived_tool_schema::<CreateInput>(),
+            FlowToolAction::Update => derived_tool_schema::<UpdateInput>(),
+            FlowToolAction::Inspect => derived_tool_schema::<InspectInput>(),
+            FlowToolAction::Validate => derived_tool_schema::<DraftInput>(),
+            FlowToolAction::Simulate => derived_tool_schema::<SimulateInput>(),
+            FlowToolAction::Publish => derived_tool_schema::<PublishInput>(),
+            FlowToolAction::Run => derived_tool_schema::<RunInput>(),
+            FlowToolAction::Status => derived_tool_schema::<StatusInput>(),
+            FlowToolAction::Pause | FlowToolAction::Cancel => derived_tool_schema::<RunIdInput>(),
+            FlowToolAction::Resume => derived_tool_schema::<ResumeInput>(),
         }
     }
 
     fn has_derived_input_schema(&self) -> bool {
-        // Flow tools are one host-owned, action-generated static family. Their
-        // action match owns both the inline schema above and the matching typed
-        // serde input used by execute, so they satisfy the same static-tool
-        // contract without twelve otherwise identical wrapper structs.
+        // Each action selects one concrete DTO for schema generation,
+        // validation, and deserialization.
         true
+    }
+
+    fn input_error(&self, input: &Value) -> Option<String> {
+        match self.action {
+            FlowToolAction::Search => derived_tool_input_error::<SearchInput>(input),
+            FlowToolAction::Create => derived_tool_input_error::<CreateInput>(input),
+            FlowToolAction::Update => derived_tool_input_error::<UpdateInput>(input),
+            FlowToolAction::Inspect => derived_tool_input_error::<InspectInput>(input),
+            FlowToolAction::Validate => derived_tool_input_error::<DraftInput>(input),
+            FlowToolAction::Simulate => derived_tool_input_error::<SimulateInput>(input),
+            FlowToolAction::Publish => derived_tool_input_error::<PublishInput>(input),
+            FlowToolAction::Run => derived_tool_input_error::<RunInput>(input),
+            FlowToolAction::Status => derived_tool_input_error::<StatusInput>(input),
+            FlowToolAction::Pause | FlowToolAction::Cancel => {
+                derived_tool_input_error::<RunIdInput>(input)
+            }
+            FlowToolAction::Resume => derived_tool_input_error::<ResumeInput>(input),
+        }
     }
 
     fn execution_policy(&self, call: &ToolCall) -> ToolExecutionPolicy {
@@ -383,23 +318,23 @@ impl Tool for FlowTool {
             }
             FlowToolAction::Inspect => ToolExecutionPolicy::read_only(vec![if call
                 .input
-                .get("flowId")
+                .get("flow_id")
                 .and_then(Value::as_str)
                 .is_some()
             {
-                resource("flow-definition", "flowId", "current")
+                resource("flow-definition", "flow_id", "current")
             } else {
-                resource("flow-draft", "draftId", "current")
+                resource("flow-draft", "draft_id", "current")
             }]),
             FlowToolAction::Status => {
-                ToolExecutionPolicy::read_only(vec![resource("flow-run", "runId", "current")])
+                ToolExecutionPolicy::read_only(vec![resource("flow-run", "run_id", "current")])
             }
             FlowToolAction::Validate | FlowToolAction::Simulate => ToolExecutionPolicy {
                 read_only: false,
                 idempotent: false,
                 parallel_safe: true,
                 side_effect: ToolSideEffect::SessionMutation,
-                resource_keys: vec![resource("flow-draft", "draftId", "current")],
+                resource_keys: vec![resource("flow-draft", "draft_id", "current")],
             },
             FlowToolAction::Create | FlowToolAction::Update | FlowToolAction::Publish => {
                 ToolExecutionPolicy {
@@ -407,7 +342,7 @@ impl Tool for FlowTool {
                     idempotent: false,
                     parallel_safe: true,
                     side_effect: ToolSideEffect::ControlPlane,
-                    resource_keys: vec![resource("flow-draft", "draftId", "current")],
+                    resource_keys: vec![resource("flow-draft", "draft_id", "current")],
                 }
             }
             FlowToolAction::Run => ToolExecutionPolicy {
@@ -415,7 +350,7 @@ impl Tool for FlowTool {
                 idempotent: false,
                 parallel_safe: true,
                 side_effect: ToolSideEffect::ControlPlane,
-                resource_keys: vec![resource("flow-definition", "flowId", "current")],
+                resource_keys: vec![resource("flow-definition", "flow_id", "current")],
             },
             FlowToolAction::Pause | FlowToolAction::Resume | FlowToolAction::Cancel => {
                 ToolExecutionPolicy {
@@ -423,7 +358,7 @@ impl Tool for FlowTool {
                     idempotent: false,
                     parallel_safe: true,
                     side_effect: ToolSideEffect::ControlPlane,
-                    resource_keys: vec![resource("flow-run", "runId", "current")],
+                    resource_keys: vec![resource("flow-run", "run_id", "current")],
                 }
             }
         }
@@ -457,7 +392,8 @@ impl Tool for FlowTool {
             FlowToolAction::Create => {
                 let thread_id = self.require_flow_thread(&ctx)?;
                 let input: CreateInput = serde_json::from_value(call.input)?;
-                if let FlowSourceV1::RunTrace { run_id, .. } = &input.spec.source {
+                let spec: FlowSpecV1 = input.spec.into();
+                if let FlowSourceV1::RunTrace { run_id, .. } = &spec.source {
                     let run = store
                         .get_turn(*run_id)?
                         .ok_or_else(|| anyhow::anyhow!("source Run/Trace not found: {run_id}"))?;
@@ -466,7 +402,7 @@ impl Tool for FlowTool {
                         "only a successful Run/Trace can be converted into a FlowDraft"
                     );
                 }
-                let draft = FlowDraftV1::new(thread_id, input.spec, &ctx.capability_projection);
+                let draft = FlowDraftV1::new(thread_id, spec, &ctx.capability_projection);
                 let report = validate_flow_spec(&draft.spec, &ctx.capability_projection);
                 let draft = store.create_flow_draft(&draft)?;
                 Self::result(call.id, json!({"draft": draft, "validation": report}))
@@ -482,7 +418,7 @@ impl Tool for FlowTool {
                     "Flow draft revision conflict: current revision is {}",
                     draft.revision
                 );
-                draft.replace_spec(input.spec, &ctx.capability_projection);
+                draft.replace_spec(input.spec.into(), &ctx.capability_projection);
                 let report = validate_flow_spec(&draft.spec, &ctx.capability_projection);
                 let draft = store.update_flow_draft(&draft, input.expected_revision)?;
                 Self::result(call.id, json!({"draft": draft, "validation": report}))
@@ -681,6 +617,42 @@ impl Tool for FlowTool {
     }
 }
 
+#[cfg(test)]
+mod input_contract_tests {
+    use super::*;
+
+    #[test]
+    fn create_input_uses_one_strict_snake_case_contract() {
+        let tool = FlowTool {
+            action: FlowToolAction::Create,
+        };
+        let input = json!({
+            "spec": {
+                "flow_id": "review-flow",
+                "name": "Review flow",
+                "description": "Reviews changes",
+                "owner": "engineering",
+                "source": {
+                    "kind": "natural_language",
+                    "description": "Review the requested changes."
+                },
+                "graph": {
+                    "schema_version": 1,
+                    "entry_node_id": "review",
+                    "nodes": [],
+                    "edges": []
+                },
+                "risk_class": "low"
+            }
+        });
+        assert_eq!(tool.input_error(&input), None);
+
+        let mut legacy = input;
+        legacy["spec"]["graph"]["entryNodeId"] = legacy["spec"]["graph"]["entry_node_id"].take();
+        assert!(tool.input_error(&legacy).is_some());
+    }
+}
+
 fn flow_connection_authority_from_context(
     ctx: &ToolInvocationContext,
 ) -> RuntimeConnectionAuthorityV1 {
@@ -753,22 +725,6 @@ fn flow_context_for_run(
     Ok(ctx)
 }
 
-fn draft_schema() -> Value {
-    json!({
-        "type": "object", "additionalProperties": false,
-        "required": ["draftId"],
-        "properties": {"draftId": {"type": "string", "format": "uuid"}}
-    })
-}
-
-fn run_id_schema() -> Value {
-    json!({
-        "type": "object", "additionalProperties": false,
-        "required": ["runId"],
-        "properties": {"runId": {"type": "string", "format": "uuid"}}
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,14 +738,14 @@ mod tests {
         }
         .execution_policy(&ToolCall::new(
             "flow_validate",
-            json!({ "draftId": first_draft }),
+            json!({ "draft_id": first_draft }),
         ));
         let simulate = FlowTool {
             action: FlowToolAction::Simulate,
         }
         .execution_policy(&ToolCall::new(
             "flow_simulate",
-            json!({ "draftId": second_draft }),
+            json!({ "draft_id": second_draft }),
         ));
         assert!(validate.parallel_safe);
         assert!(simulate.parallel_safe);
@@ -804,11 +760,11 @@ mod tests {
         let pause = FlowTool {
             action: FlowToolAction::Pause,
         }
-        .execution_policy(&ToolCall::new("flow_pause", json!({ "runId": run_id })));
+        .execution_policy(&ToolCall::new("flow_pause", json!({ "run_id": run_id })));
         let cancel = FlowTool {
             action: FlowToolAction::Cancel,
         }
-        .execution_policy(&ToolCall::new("flow_cancel", json!({ "runId": run_id })));
+        .execution_policy(&ToolCall::new("flow_cancel", json!({ "run_id": run_id })));
         assert!(pause.parallel_safe);
         assert_eq!(pause.resource_keys, cancel.resource_keys);
         assert_eq!(pause.resource_keys, vec![format!("flow-run:{run_id}")]);

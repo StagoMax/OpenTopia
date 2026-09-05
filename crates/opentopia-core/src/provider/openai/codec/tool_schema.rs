@@ -285,8 +285,8 @@ pub(in crate::provider) fn lower_openai_strict_schema_node(schema: &mut Value) -
     }
 
     // Strict function schemas must enumerate every object property. A dynamic
-    // map (for example document_execute.arguments) cannot be closed without
-    // changing its meaning, so keep that tool non-strict instead.
+    // map cannot be closed without changing its meaning, so keep schemas that
+    // intentionally accept arbitrary properties non-strict instead.
     if object
         .get("additionalProperties")
         .is_some_and(|additional| additional != &Value::Bool(false))

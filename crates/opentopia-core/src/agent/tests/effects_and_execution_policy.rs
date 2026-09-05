@@ -256,12 +256,11 @@ fn flow_profile_exposes_work_code_and_orchestration_tools_to_the_provider() {
         assert!(tools.contains(expected), "missing Flow tool: {expected}");
     }
     assert!(!tools.contains(TOOL_SEARCH_NAME));
-    assert!(tools.contains("document_open"));
-    assert!(tools.contains("document_get_operation_schemas"));
-    assert!(!tools.contains("document_execute"));
+    assert!(tools.contains("spreadsheet_inspect"));
+    assert!(tools.contains("word_document"));
 
     let before_preload_hint = agent.provider_tool_catalog();
-    agent.set_attachment_preloaded_tools(["document_execute"]);
+    agent.set_attachment_preloaded_tools(["spreadsheet_write_range"]);
     assert_eq!(agent.provider_tool_catalog(), before_preload_hint);
 }
 
@@ -291,10 +290,10 @@ fn thread_activation_filters_bundled_tools_from_catalog_and_execution_guard() {
         .collect::<HashSet<_>>();
     assert!(!tools.contains("browser"));
     assert!(tools.contains("computer"));
-    assert!(!tools.contains("document_execute"));
+    assert!(!tools.contains("spreadsheet_inspect"));
     assert!(!agent.tool_is_allowed("browser"));
     assert!(agent.tool_is_allowed("computer"));
-    assert!(!agent.tool_is_allowed("document_execute"));
+    assert!(!agent.tool_is_allowed("spreadsheet_inspect"));
 
     let mut metadata = json!({});
     agent.insert_tool_source_metadata("computer", &mut metadata);

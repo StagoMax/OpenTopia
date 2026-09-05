@@ -1052,7 +1052,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             spreadsheet_kinds,
-            BTreeSet::from([ContributionKind::NativeTool])
+            BTreeSet::from([ContributionKind::NativeTool, ContributionKind::Skill])
         );
 
         let pdf_kinds = snapshot

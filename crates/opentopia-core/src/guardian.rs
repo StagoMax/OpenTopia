@@ -196,13 +196,11 @@ impl GuardianApprovalAction {
                     observation_id: call
                         .arguments
                         .get("observation_id")
-                        .or_else(|| call.arguments.get("observationId"))
                         .and_then(Value::as_str)
                         .map(str::to_string),
                     node_ref: call
                         .arguments
                         .get("node_ref")
-                        .or_else(|| call.arguments.get("nodeRef"))
                         .and_then(Value::as_str)
                         .map(str::to_string),
                 }
@@ -211,7 +209,6 @@ impl GuardianApprovalAction {
                 let path = call
                     .arguments
                     .get("path")
-                    .or_else(|| call.arguments.get("outputPath"))
                     .and_then(Value::as_str)
                     .map(|path| resolve_action_path(workspace_root, path));
                 Self::FileOperation {

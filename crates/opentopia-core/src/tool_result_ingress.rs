@@ -201,11 +201,10 @@ pub(crate) fn provider_tool_result_metadata(tool_name: &str, metadata: &Value) -
         "list_skills" | "list_agents" => {
             object.remove("count");
         }
-        "document"
-        | "pdf"
-        | "document_open"
-        | "document_get_operation_schemas"
-        | "document_execute" => {
+        "word_document" | "pdf" => {
+            object.remove("action");
+        }
+        name if name.starts_with("spreadsheet_") => {
             object.remove("action");
         }
         _ => {}
@@ -351,7 +350,7 @@ fn bound_structured_content(
             continue;
         }
 
-        let compacted = if remaining >= 1_000 && tool_name == "document_execute" {
+        let compacted = if remaining >= 1_000 && tool_name == "spreadsheet_filter_rows" {
             compact_spreadsheet_json(value, remaining, artifact_id)
         } else {
             compact_generic_json(value, artifact_id)
@@ -423,13 +422,21 @@ fn compact_spreadsheet_json(value: &Value, max_bytes: usize, artifact_id: Uuid) 
     };
 
     let mut compacted = value.clone();
+    let total_row_count = result
+        .get("matchedRowCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(rows.len() as u64);
+    let matched_row_indices = result.get("matchedRowIndices").and_then(Value::as_array);
     {
         let Some(compacted_result) = compacted.get_mut("result").and_then(Value::as_object_mut)
         else {
             return compact_generic_json(value, artifact_id);
         };
         compacted_result.insert("rows".to_string(), Value::Array(Vec::new()));
-        compacted_result.insert("totalRowCount".to_string(), json!(rows.len()));
+        if matched_row_indices.is_some() {
+            compacted_result.insert("matchedRowIndices".to_string(), Value::Array(Vec::new()));
+        }
+        compacted_result.insert("totalRowCount".to_string(), json!(total_row_count));
         compacted_result.insert("artifactId".to_string(), json!(artifact_id));
     }
 
@@ -462,13 +469,24 @@ fn compact_spreadsheet_json(value: &Value, max_bytes: usize, artifact_id: Uuid) 
             return compact_generic_json(value, artifact_id);
         };
         compacted_result.insert("rows".to_string(), Value::Array(kept.clone()));
+        if let Some(indices) = matched_row_indices {
+            compacted_result.insert(
+                "matchedRowIndices".to_string(),
+                Value::Array(indices.iter().take(returned).cloned().collect()),
+            );
+        }
         compacted_result.insert("returnedRowCount".to_string(), json!(returned));
-        compacted_result.insert("hasMore".to_string(), json!(returned < rows.len()));
-        if returned < rows.len() {
+        compacted_result.insert(
+            "hasMore".to_string(),
+            json!((returned as u64) < total_row_count),
+        );
+        if (returned as u64) < total_row_count {
             compacted_result.insert("nextRow".to_string(), json!(start_row + returned as u64));
             compacted_result.insert(
                 "continuation".to_string(),
-                json!("Call document_execute with read_rows/read_range for the remaining rows, or read_artifact for the full serialized result."),
+                json!(
+                    "Use read_artifact to retrieve a bounded window of the full filtered result."
+                ),
             );
         }
         if serde_json::to_vec(&compacted)
@@ -516,7 +534,6 @@ fn compact_provider_metadata(metadata: &Value) -> Value {
         "changedPath",
         "documentId",
         "documentType",
-        "selectionId",
         "rowsWritten",
         "columnsWritten",
         "artifactId",
@@ -842,7 +859,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_spreadsheet_json_is_artifact_backed_and_page_shaped() {
+    fn oversized_filtered_rows_are_artifact_backed_and_page_shaped() {
         let store = Arc::new(SqliteSessionStore::open(":memory:").expect("open store"));
         let state = ToolStateStore::new(store.clone());
         let thread = store
@@ -860,7 +877,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let value = json!({
-            "type": "range_read",
+            "type": "rows_filtered",
             "result": {
                 "path": "orders.xlsx",
                 "sheet": "Orders",
@@ -868,6 +885,8 @@ mod tests {
                     "start": { "row": 10, "column": 0 },
                     "end": { "row": 509, "column": 1 }
                 },
+                "matchedRowCount": 500,
+                "matchedRowIndices": (10..510).collect::<Vec<_>>(),
                 "rows": rows
             }
         });
@@ -877,14 +896,14 @@ mod tests {
             output: output.clone(),
             content: vec![ModelContentPart::json(value)],
             metadata: json!({
-                "toolName": "document_execute",
-                "operation": "read_range",
+                "toolName": "spreadsheet_filter_rows",
+                "operation": "filter_rows",
                 "success": true
             }),
         };
 
         let normalized = normalize_tool_result_at_ingress(
-            "document_execute",
+            "spreadsheet_filter_rows",
             result,
             Some(&state),
             Some(thread.id),
@@ -895,6 +914,16 @@ mod tests {
         };
         assert_eq!(value.pointer("/result/totalRowCount"), Some(&json!(500)));
         assert_eq!(value.pointer("/result/hasMore"), Some(&json!(true)));
+        assert_eq!(
+            value
+                .pointer("/result/matchedRowIndices")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            value
+                .pointer("/result/rows")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+        );
         assert!(value
             .pointer("/result/nextRow")
             .and_then(Value::as_u64)

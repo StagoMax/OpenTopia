@@ -414,7 +414,7 @@ trait TypedTool: Send + Sync {
     ) -> anyhow::Result<ToolResult>;
 }
 
-fn derived_tool_schema<T: JsonSchema>() -> Value {
+pub(crate) fn derived_tool_schema<T: JsonSchema>() -> Value {
     let mut settings = SchemaSettings::draft07();
     settings.inline_subschemas = true;
     settings.meta_schema = None;
@@ -443,6 +443,18 @@ fn derived_tool_schema<T: JsonSchema>() -> Value {
     value
 }
 
+pub(crate) fn derived_tool_input_error<T>(input: &Value) -> Option<String>
+where
+    T: DeserializeOwned + JsonSchema,
+{
+    crate::provider::tool_input_schema_error(&derived_tool_schema::<T>(), input, "arguments")
+        .or_else(|| {
+            serde_json::from_value::<T>(input.clone())
+                .err()
+                .map(|error| format!("arguments do not match the derived input type: {error}"))
+        })
+}
+
 fn decode_typed_tool_input<T: DeserializeOwned>(
     tool_name: &str,
     input: Value,
@@ -468,14 +480,7 @@ macro_rules! impl_typed_tool {
             }
 
             fn input_error(&self, input: &Value) -> Option<String> {
-                crate::provider::tool_input_schema_error(&self.schema(), input, "arguments")
-                    .or_else(|| {
-                        serde_json::from_value::<<Self as TypedTool>::Input>(input.clone())
-                            .err()
-                            .map(|error| {
-                                format!("arguments do not match the derived input type: {error}")
-                            })
-                    })
+                $crate::tools::derived_tool_input_error::<<Self as TypedTool>::Input>(input)
             }
 
             fn has_derived_input_schema(&self) -> bool {
@@ -645,18 +650,28 @@ fn truncate_chars(value: &str, limit: usize) -> String {
 }
 
 mod spreadsheet_tool;
-
-mod office_resource;
-use office_resource::DocumentResourceRef;
-mod document_protocol_tools;
-mod document_session;
-mod spreadsheet_operations;
-pub use document_protocol_tools::{
-    DocumentExecuteTool, DocumentGetOperationSchemasTool, DocumentOpenTool,
+mod spreadsheet_tools;
+pub use spreadsheet_tools::{
+    SpreadsheetConvertRangesTool, SpreadsheetCopyRangesTool, SpreadsheetCopyRowsTool,
+    SpreadsheetCopySheetTool, SpreadsheetDeleteRowsTool, SpreadsheetDeleteSheetTool,
+    SpreadsheetExportDelimitedTool, SpreadsheetFillRangesTool, SpreadsheetFilterRowsTool,
+    SpreadsheetFindTool, SpreadsheetInspectTool, SpreadsheetReadRangesTool,
+    SpreadsheetValidateTool, SpreadsheetWriteRangeTool,
 };
-impl_typed_tool!(DocumentOpenTool);
-impl_typed_tool!(DocumentGetOperationSchemasTool);
-impl_typed_tool!(DocumentExecuteTool);
+impl_typed_tool!(SpreadsheetInspectTool);
+impl_typed_tool!(SpreadsheetReadRangesTool);
+impl_typed_tool!(SpreadsheetFindTool);
+impl_typed_tool!(SpreadsheetFilterRowsTool);
+impl_typed_tool!(SpreadsheetValidateTool);
+impl_typed_tool!(SpreadsheetWriteRangeTool);
+impl_typed_tool!(SpreadsheetCopyRangesTool);
+impl_typed_tool!(SpreadsheetCopyRowsTool);
+impl_typed_tool!(SpreadsheetFillRangesTool);
+impl_typed_tool!(SpreadsheetConvertRangesTool);
+impl_typed_tool!(SpreadsheetExportDelimitedTool);
+impl_typed_tool!(SpreadsheetCopySheetTool);
+impl_typed_tool!(SpreadsheetDeleteRowsTool);
+impl_typed_tool!(SpreadsheetDeleteSheetTool);
 
 mod request_user_input_tool;
 pub use request_user_input_tool::RequestUserInputTool;
@@ -777,7 +792,7 @@ const READ_FILE_WINDOW_CHARS: usize = 16_000;
 
 #[cfg(test)]
 #[derive(Debug, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 struct FileReadInput {
     /// File path relative to workspace.
     path: String,
@@ -1173,7 +1188,7 @@ fn verify_write_precondition(
 const READ_ARTIFACT_WINDOW_CHARS: usize = 16_000;
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 struct ReadArtifactInput {
     /// Artifact UUID returned by a previous tool result.
     artifact_id: String,
@@ -1196,7 +1211,7 @@ impl TypedTool for ReadArtifactTool {
     }
 
     fn description(&self) -> &str {
-        "Read a bounded character window from a text artifact produced earlier in this task. Use artifactId from a tool result, then continue with nextOffset when more content remains."
+        "Read a bounded character window from a text artifact produced earlier in this task. Use artifact_id from a tool result, then continue with next_offset when more content remains."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
@@ -1218,7 +1233,7 @@ impl TypedTool for ReadArtifactTool {
         ctx: ToolInvocationContext,
     ) -> anyhow::Result<ToolResult> {
         let artifact_id = Uuid::parse_str(input.artifact_id.trim())
-            .context("read_artifact artifactId must be a UUID")?;
+            .context("read_artifact artifact_id must be a UUID")?;
         let thread_id = ctx
             .thread_id
             .context("read_artifact requires an active task")?;
@@ -1256,7 +1271,7 @@ impl TypedTool for ReadArtifactTool {
         let next_offset = (read_to < total_chars).then_some(read_to);
         if let Some(next_offset) = next_offset {
             output.push_str(&format!(
-                "\n\n[characters {offset}-{} of {total_chars}; call read_artifact again with artifactId {artifact_id} and offset {next_offset}]",
+                "\n\n[characters {offset}-{} of {total_chars}; call read_artifact again with artifact_id {artifact_id} and offset {next_offset}]",
                 read_to.saturating_sub(1)
             ));
         }

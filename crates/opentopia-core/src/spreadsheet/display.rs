@@ -49,6 +49,42 @@ pub(super) fn date_time_display_kinds(
     parse_worksheet_style_kinds(&worksheet_xml, &style_kinds, range, path)
 }
 
+pub(super) fn number_format_codes(
+    path: &Path,
+    sheet: &str,
+    range: CellRange,
+) -> Result<HashMap<(u32, u32), String>, SpreadsheetError> {
+    if !SpreadsheetFileFormat::from_path(path).is_some_and(SpreadsheetFileFormat::is_ooxml) {
+        return Ok(HashMap::new());
+    }
+
+    let mut archive = open_ooxml_package(path)?;
+    let workbook_xml = read_zip_part(&mut archive, "xl/workbook.xml", path)?;
+    let relationships_xml = read_zip_part(&mut archive, "xl/_rels/workbook.xml.rels", path)?;
+    let styles_xml = read_zip_part(&mut archive, "xl/styles.xml", path)?;
+    let sheet_relationships = workbook_sheet_relationships(&workbook_xml, path)?;
+    let relationship_targets = workbook_relationship_targets(&relationships_xml, path)?;
+    let relationship_id = sheet_relationships
+        .iter()
+        .find(|(name, _)| name == sheet)
+        .map(|(_, id)| id)
+        .ok_or_else(|| SpreadsheetError::SheetNotFound {
+            sheet: sheet.to_string(),
+        })?;
+    let target = relationship_targets.get(relationship_id).ok_or_else(|| {
+        SpreadsheetError::InvalidWorkbook {
+            path: path.to_path_buf(),
+            message: format!(
+                "worksheet relationship {relationship_id:?} for sheet {sheet:?} was not found"
+            ),
+        }
+    })?;
+    let worksheet_part = normalize_workbook_part_target(target);
+    let worksheet_xml = read_zip_part(&mut archive, &worksheet_part, path)?;
+    let style_formats = parse_style_number_formats(&styles_xml, path)?;
+    parse_worksheet_number_formats(&worksheet_xml, &style_formats, range, path)
+}
+
 pub(super) fn formatted_cell_value(
     value: &Data,
     display_kind: Option<DateTimeDisplayKind>,
@@ -128,6 +164,126 @@ fn parse_style_kinds(
         .into_iter()
         .map(|id| number_format_kind(id, custom_formats.get(&id).map(String::as_str)))
         .collect())
+}
+
+fn parse_style_number_formats(xml: &[u8], source: &Path) -> Result<Vec<String>, SpreadsheetError> {
+    let mut reader = XmlReader::from_reader(xml);
+    reader.config_mut().trim_text(false);
+    let mut custom_formats = HashMap::<u32, String>::new();
+    let mut cell_format_ids = Vec::<u32>::new();
+    let mut in_cell_formats = false;
+    loop {
+        let event = reader
+            .read_event()
+            .map_err(|error| invalid_ooxml_xml(source, "xl/styles.xml", error))?;
+        match event {
+            XmlEvent::Start(element) if element.local_name().as_ref() == b"cellXfs" => {
+                in_cell_formats = true;
+            }
+            XmlEvent::End(element) if element.local_name().as_ref() == b"cellXfs" => {
+                in_cell_formats = false;
+            }
+            XmlEvent::Start(element) | XmlEvent::Empty(element)
+                if element.local_name().as_ref() == b"numFmt" =>
+            {
+                let id = xml_attribute(&reader, &element, b"numFmtId")?
+                    .and_then(|value| value.parse::<u32>().ok());
+                let code = xml_attribute(&reader, &element, b"formatCode")?;
+                if let (Some(id), Some(code)) = (id, code) {
+                    custom_formats.insert(id, code);
+                }
+            }
+            XmlEvent::Start(element) | XmlEvent::Empty(element)
+                if in_cell_formats && element.local_name().as_ref() == b"xf" =>
+            {
+                let id = xml_attribute(&reader, &element, b"numFmtId")?
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .unwrap_or_default();
+                cell_format_ids.push(id);
+            }
+            XmlEvent::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(cell_format_ids
+        .into_iter()
+        .map(|id| {
+            custom_formats
+                .get(&id)
+                .cloned()
+                .or_else(|| built_in_number_format(id).map(str::to_string))
+                .unwrap_or_else(|| format!("builtin:{id}"))
+        })
+        .collect())
+}
+
+fn parse_worksheet_number_formats(
+    xml: &[u8],
+    style_formats: &[String],
+    range: CellRange,
+    source: &Path,
+) -> Result<HashMap<(u32, u32), String>, SpreadsheetError> {
+    let mut reader = XmlReader::from_reader(xml);
+    reader.config_mut().trim_text(false);
+    let mut result = HashMap::new();
+    loop {
+        let event = reader
+            .read_event()
+            .map_err(|error| invalid_ooxml_xml(source, "worksheet", error))?;
+        match event {
+            XmlEvent::Start(element) | XmlEvent::Empty(element)
+                if element.local_name().as_ref() == b"c" =>
+            {
+                let Some(reference) = xml_attribute(&reader, &element, b"r")? else {
+                    continue;
+                };
+                let Some((row, column)) = cell_address(&reference) else {
+                    continue;
+                };
+                if row < range.start.row
+                    || row > range.end.row
+                    || column < range.start.column
+                    || column > range.end.column
+                {
+                    continue;
+                }
+                let style_index = xml_attribute(&reader, &element, b"s")?
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or_default();
+                let format = style_formats
+                    .get(style_index)
+                    .cloned()
+                    .unwrap_or_else(|| "General".to_string());
+                result.insert((row, column), format);
+            }
+            XmlEvent::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(result)
+}
+
+fn built_in_number_format(id: u32) -> Option<&'static str> {
+    Some(match id {
+        0 => "General",
+        1 => "0",
+        2 => "0.00",
+        3 => "#,##0",
+        4 => "#,##0.00",
+        9 => "0%",
+        10 => "0.00%",
+        14 => "mm-dd-yy",
+        15 => "d-mmm-yy",
+        16 => "d-mmm",
+        17 => "mmm-yy",
+        18 => "h:mm AM/PM",
+        19 => "h:mm:ss AM/PM",
+        20 => "h:mm",
+        21 => "h:mm:ss",
+        22 => "m/d/yy h:mm",
+        49 => "@",
+        _ => return None,
+    })
 }
 
 fn parse_worksheet_style_kinds(

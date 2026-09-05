@@ -1,6 +1,16 @@
 use super::*;
 
 #[test]
+fn a1_addresses_are_the_model_boundary_for_spreadsheet_coordinates() {
+    assert_eq!(parse_a1_address("$BG$12").unwrap(), address(11, 58));
+    assert_eq!(parse_a1_range("B2:BG12").unwrap(), range((1, 1), (11, 58)));
+    assert_eq!(format_a1_address(address(11, 58)), "BG12");
+    assert_eq!(format_a1_range(range((1, 1), (11, 58))), "B2:BG12");
+    assert!(parse_a1_address("A0").is_err());
+    assert!(parse_a1_range("B2:A1").is_err());
+}
+
+#[test]
 fn read_ranges_returns_multiple_bounded_regions_in_one_result() {
     let directory = TestDirectory::new();
     let workbook = directory.path("ranges.xlsx");
@@ -130,10 +140,12 @@ fn find_and_filter_return_bounded_structured_rows() {
             },
         ],
         match_mode: SpreadsheetFilterMatchMode::All,
+        return_mode: SpreadsheetFilterReturnMode::Rows,
         max_results: 10,
     })
     .expect("filter order rows");
     assert_eq!(filtered.matched_row_indices, vec![1, 3]);
+    assert_eq!(filtered.matched_row_count, 2);
     assert_eq!(filtered.rows.len(), 2);
     assert!(!filtered.truncated);
 }
@@ -172,12 +184,98 @@ fn filter_rows_scans_past_read_windows_and_returns_up_to_two_thousand_rows() {
             case_sensitive: false,
         }],
         match_mode: SpreadsheetFilterMatchMode::All,
+        return_mode: SpreadsheetFilterReturnMode::Rows,
         max_results: 2_000,
     })
     .expect("filter beyond the ordinary read window");
     assert_eq!(filtered.scanned_rows, 1_501);
+    assert_eq!(filtered.matched_row_count, 1_501);
     assert_eq!(filtered.rows.len(), 1_501);
     assert!(!filtered.truncated);
+}
+
+#[test]
+fn filter_rows_summary_counts_all_matches_without_returning_payloads() {
+    let directory = TestDirectory::new();
+    let workbook = directory.path("filter-summary.xlsx");
+    write_workbook(&WriteWorkbookRequest {
+        source: None,
+        output: workbook.clone(),
+        sheets: vec![SheetWriteRequest {
+            name: "Rows".to_string(),
+            visibility: None,
+            cells: (0..12)
+                .map(|row| update(row, 0, SpreadsheetCellInput::String("keep".to_string())))
+                .collect(),
+        }],
+    })
+    .expect("create filter summary workbook");
+
+    let filtered = filter_rows(&FilterRowsRequest {
+        path: workbook,
+        sheet: "Rows".to_string(),
+        range: range((0, 0), (11, 0)),
+        conditions: vec![SpreadsheetFilterCondition {
+            column: 0,
+            operator: SpreadsheetFilterOperator::Equals,
+            value: Some(SpreadsheetFilterValue::String("keep".to_string())),
+            case_sensitive: false,
+        }],
+        match_mode: SpreadsheetFilterMatchMode::All,
+        return_mode: SpreadsheetFilterReturnMode::Summary,
+        max_results: 3,
+    })
+    .expect("summarize filtered rows");
+    assert_eq!(filtered.matched_row_count, 12);
+    assert_eq!(filtered.scanned_rows, 12);
+    assert!(filtered.matched_row_indices.is_empty());
+    assert!(filtered.rows.is_empty());
+    assert!(!filtered.truncated);
+}
+
+#[test]
+fn find_scans_past_read_windows_while_returning_a_bounded_match_set() {
+    let directory = TestDirectory::new();
+    let workbook = directory.path("large-find.xlsx");
+    write_workbook(&WriteWorkbookRequest {
+        source: None,
+        output: workbook.clone(),
+        sheets: vec![SheetWriteRequest {
+            name: "Rows".to_string(),
+            visibility: None,
+            cells: (0..1_501)
+                .map(|row| {
+                    update(
+                        row,
+                        0,
+                        SpreadsheetCellInput::String(if row == 1_500 {
+                            "needle".to_string()
+                        } else {
+                            "other".to_string()
+                        }),
+                    )
+                })
+                .collect(),
+        }],
+    })
+    .expect("create large find workbook");
+
+    let found = find_cells(&FindCellsRequest {
+        path: workbook,
+        sheet: Some("Rows".to_string()),
+        range: Some(range((0, 0), (1_500, 0))),
+        query: "needle".to_string(),
+        match_mode: SpreadsheetTextMatchMode::Exact,
+        case_sensitive: true,
+        include_formulas: false,
+        max_results: 10,
+    })
+    .expect("find beyond the ordinary read window");
+
+    assert_eq!(found.matches.len(), 1);
+    assert_eq!(found.matches[0].address, address(1_500, 0));
+    assert_eq!(found.scanned_cells, 1_501);
+    assert!(!found.truncated);
 }
 
 #[test]

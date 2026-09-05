@@ -29,7 +29,7 @@ fn tool_context(workspace: &Path, permission_mode: PermissionMode) -> ToolInvoca
 #[test]
 fn bundled_office_plugins_register_independent_native_tools() {
     let plugin_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("bundled-plugins");
-    for (plugin, tool) in [("pdf", "pdf"), ("documents", "document")] {
+    for (plugin, tool) in [("pdf", "pdf"), ("documents", "word_document")] {
         let descriptor = inspect_plugin(&plugin_root.join(plugin)).expect("inspect bundled plugin");
         assert!(descriptor.is_compatible(), "{:?}", descriptor.issues);
         assert_eq!(descriptor.capability_manifest.contributions.len(), 1);
@@ -41,7 +41,7 @@ fn bundled_office_plugins_register_independent_native_tools() {
     }
     let registry = ToolRegistry::with_builtins();
     assert!(registry.get("pdf").is_some());
-    assert!(registry.get("document").is_some());
+    assert!(registry.get("word_document").is_some());
 }
 
 #[tokio::test]
@@ -118,11 +118,11 @@ async fn native_tools_read_through_the_workspace_environment_and_return_typed_pn
         .any(|part| matches!(part, ModelContentPart::Image { content_type, data } if content_type == "image/png" && data.starts_with(b"\x89PNG"))));
 
     let document = registry
-        .get("document")
+        .get("word_document")
         .expect("Document tool")
         .execute(
             ToolCall::new(
-                "document",
+                "word_document",
                 json!({ "action": "inspect", "path": "sample.docx" }),
             ),
             context,
@@ -192,8 +192,7 @@ async fn native_office_tools_read_real_thread_attachments_by_id() {
 
     for (tool, attachment_id) in [
         ("pdf", attachment_ids[0]),
-        ("document", attachment_ids[1]),
-        ("spreadsheet", attachment_ids[2]),
+        ("word_document", attachment_ids[1]),
     ] {
         let result = registry
             .get(tool)
@@ -201,7 +200,7 @@ async fn native_office_tools_read_real_thread_attachments_by_id() {
             .execute(
                 ToolCall::new(
                     tool,
-                    json!({ "action": "inspect", "attachmentId": attachment_id }),
+                    json!({ "action": "inspect", "attachment_id": attachment_id }),
                 ),
                 context.clone(),
             )
@@ -216,6 +215,20 @@ async fn native_office_tools_read_real_thread_attachments_by_id() {
         assert_eq!(result.metadata["attachmentId"], attachment_id.to_string());
     }
 
+    let spreadsheet = registry
+        .get("spreadsheet_inspect")
+        .expect("Spreadsheet inspect tool")
+        .execute(
+            ToolCall::new(
+                "spreadsheet_inspect",
+                json!({ "path": workspace.join("uploaded.xlsx") }),
+            ),
+            context.clone(),
+        )
+        .await
+        .expect("execute path-based spreadsheet tool");
+    assert_eq!(spreadsheet.metadata["success"], true);
+
     let rendered = registry
         .get("pdf")
         .expect("PDF tool")
@@ -224,7 +237,7 @@ async fn native_office_tools_read_real_thread_attachments_by_id() {
                 "pdf",
                 json!({
                     "action": "render",
-                    "attachmentId": attachment_ids[0],
+                    "attachment_id": attachment_ids[0],
                     "pages": [1],
                     "dpi": 96
                 }),
@@ -249,7 +262,7 @@ async fn native_office_tools_read_real_thread_attachments_by_id() {
                 json!({
                     "action": "inspect",
                     "path": "uploaded.pdf",
-                    "attachmentId": attachment_ids[0]
+                    "attachment_id": attachment_ids[0]
                 }),
             ),
             context,

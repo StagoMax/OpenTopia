@@ -1,20 +1,22 @@
 use super::display::{date_time_display_kinds, formatted_cell_value};
+use super::guidance::inspect_workbook_guidance;
 use super::{
     add_used_positions, cell_value_from_data, collect_sheet_stats, ensure_sheet_count,
     ensure_workbook_cell_count, open_workbook_reader, sheet_info, validate_address,
-    validate_read_range, validate_return_text, worksheet_formulas, worksheet_values, CellAddress,
-    CellRange, FilterRowsRequest, FilterRowsResult, FindCellsRequest, FindCellsResult,
-    InspectWorkbookRequest, InspectWorkbookResult, ListSheetsRequest, ListSheetsResult,
-    ReadRangeRequest, ReadRangeResult, ReadRangesRequest, ReadRangesResult, SheetInspection,
-    SheetKind, SheetStats, SpreadsheetCell, SpreadsheetCellMatch, SpreadsheetCellValue,
-    SpreadsheetError, SpreadsheetFilterCondition, SpreadsheetFilterMatchMode,
-    SpreadsheetFilterOperator, SpreadsheetFilterValue, SpreadsheetTextMatchMode,
-    MAX_FILTER_CONDITIONS, MAX_FILTER_RESULTS, MAX_FIND_RESULTS, MAX_READ_CELLS, MAX_READ_COLUMNS,
-    MAX_READ_RANGES, MAX_READ_ROWS, MAX_WORKBOOK_CELLS,
+    validate_read_range, validate_return_text, validate_scan_range, worksheet_formulas,
+    worksheet_values, CellAddress, CellRange, FilterRowsRequest, FilterRowsResult,
+    FindCellsRequest, FindCellsResult, InspectWorkbookRequest, InspectWorkbookResult,
+    ListSheetsRequest, ListSheetsResult, ReadRangeRequest, ReadRangeResult, ReadRangesRequest,
+    ReadRangesResult, SheetInspection, SheetKind, SheetStats, SpreadsheetCell,
+    SpreadsheetCellMatch, SpreadsheetCellValue, SpreadsheetError, SpreadsheetFilterCondition,
+    SpreadsheetFilterMatchMode, SpreadsheetFilterOperator, SpreadsheetFilterReturnMode,
+    SpreadsheetFilterValue, SpreadsheetTextMatchMode, MAX_FILTER_CONDITIONS, MAX_FILTER_RESULTS,
+    MAX_FIND_RESULTS, MAX_READ_CELLS, MAX_READ_COLUMNS, MAX_READ_RANGES, MAX_READ_ROWS,
+    MAX_WORKBOOK_CELLS,
 };
 use calamine::{Data, Reader};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -91,13 +93,14 @@ pub fn inspect_workbook(
         file_size_bytes,
         sheets,
         populated_cells: workbook_cells as u64,
+        guidance: inspect_workbook_guidance(&request.path)?,
     };
     Ok(result)
 }
 
 pub fn read_range(request: &ReadRangeRequest) -> Result<ReadRangeResult, SpreadsheetError> {
     let loaded = load_range(request, false)?;
-    let result = ReadRangeResult {
+    Ok(ReadRangeResult {
         path: loaded.path,
         sheet: loaded.sheet,
         range: loaded.range,
@@ -113,8 +116,7 @@ pub fn read_range(request: &ReadRangeRequest) -> Result<ReadRangeResult, Spreads
                     .collect()
             })
             .collect(),
-    };
-    Ok(result)
+    })
 }
 
 pub(crate) fn read_range_for_display(
@@ -130,13 +132,35 @@ fn load_range(
 ) -> Result<DisplayReadRangeResult, SpreadsheetError> {
     validate_read_range(request.range)?;
     let (mut workbook, _) = open_workbook_reader(&request.path)?;
+    load_range_from_workbook(request, include_formatted, &mut workbook)
+}
+
+fn load_range_from_workbook(
+    request: &ReadRangeRequest,
+    include_formatted: bool,
+    workbook: &mut calamine::Sheets<std::io::BufReader<std::fs::File>>,
+) -> Result<DisplayReadRangeResult, SpreadsheetError> {
+    let worksheet = load_worksheet_from_workbook(workbook, &request.path, &request.sheet)?;
+    load_range_from_worksheet(request, include_formatted, &worksheet)
+}
+
+struct LoadedWorksheetData {
+    values: calamine::Range<Data>,
+    formulas: calamine::Range<String>,
+}
+
+fn load_worksheet_from_workbook(
+    workbook: &mut calamine::Sheets<std::io::BufReader<std::fs::File>>,
+    path: &std::path::Path,
+    sheet_name: &str,
+) -> Result<LoadedWorksheetData, SpreadsheetError> {
     let metadata = workbook.sheets_metadata().to_vec();
     ensure_sheet_count(metadata.len())?;
     let sheet = metadata
         .iter()
-        .find(|sheet| sheet.name == request.sheet)
+        .find(|sheet| sheet.name == sheet_name)
         .ok_or_else(|| SpreadsheetError::SheetNotFound {
-            sheet: request.sheet.clone(),
+            sheet: sheet_name.to_string(),
         })?;
     let info = sheet_info(sheet);
     if info.kind != SheetKind::Worksheet {
@@ -146,10 +170,20 @@ fn load_range(
         });
     }
 
-    let values = worksheet_values(&mut workbook, &request.path, &request.sheet)?;
-    let formulas = worksheet_formulas(&mut workbook, &request.path, &request.sheet)?;
-    let stats = collect_sheet_stats(&values, &formulas, &request.sheet)?;
+    let values = worksheet_values(workbook, path, sheet_name)?;
+    let formulas = worksheet_formulas(workbook, path, sheet_name)?;
+    let stats = collect_sheet_stats(&values, &formulas, sheet_name)?;
     ensure_workbook_cell_count(stats.populated_cells)?;
+    Ok(LoadedWorksheetData { values, formulas })
+}
+
+fn load_range_from_worksheet(
+    request: &ReadRangeRequest,
+    include_formatted: bool,
+    worksheet: &LoadedWorksheetData,
+) -> Result<DisplayReadRangeResult, SpreadsheetError> {
+    let values = &worksheet.values;
+    let formulas = &worksheet.formulas;
     let has_serial_dates = include_formatted
         && (request.range.start.row..=request.range.end.row).any(|row| {
             (request.range.start.column..=request.range.end.column)
@@ -197,6 +231,19 @@ fn load_range(
 }
 
 pub fn read_ranges(request: &ReadRangesRequest) -> Result<ReadRangesResult, SpreadsheetError> {
+    read_ranges_with_policy(request, true)
+}
+
+pub(crate) fn read_ranges_for_mutation(
+    request: &ReadRangesRequest,
+) -> Result<ReadRangesResult, SpreadsheetError> {
+    read_ranges_with_policy(request, false)
+}
+
+fn read_ranges_with_policy(
+    request: &ReadRangesRequest,
+    enforce_display_limits: bool,
+) -> Result<ReadRangesResult, SpreadsheetError> {
     if request.ranges.is_empty() {
         return Err(SpreadsheetError::InvalidRange {
             reason: "read_ranges requires at least one range",
@@ -210,14 +257,18 @@ pub fn read_ranges(request: &ReadRangesRequest) -> Result<ReadRangesResult, Spre
         });
     }
     let total_cells = request.ranges.iter().try_fold(0u64, |total, item| {
-        validate_read_range(item.range)?;
+        if enforce_display_limits {
+            validate_read_range(item.range)?;
+        } else {
+            validate_scan_range(item.range)?;
+        }
         total
             .checked_add(item.range.cell_count().expect("validated range"))
             .ok_or(SpreadsheetError::InvalidRange {
                 reason: "combined range cell count overflowed",
             })
     })?;
-    if total_cells > MAX_READ_CELLS {
+    if enforce_display_limits && total_cells > MAX_READ_CELLS {
         return Err(SpreadsheetError::RangeTooLarge {
             rows: request
                 .ranges
@@ -234,16 +285,49 @@ pub fn read_ranges(request: &ReadRangesRequest) -> Result<ReadRangesResult, Spre
             max_columns: MAX_READ_COLUMNS,
             max_cells: MAX_READ_CELLS,
         });
+    } else if !enforce_display_limits && total_cells > MAX_WORKBOOK_CELLS as u64 {
+        return Err(SpreadsheetError::TooManyCells {
+            context: "internal range transfer",
+            actual: usize::try_from(total_cells).unwrap_or(usize::MAX),
+            limit: MAX_WORKBOOK_CELLS,
+        });
     }
 
+    let (mut workbook, _) = open_workbook_reader(&request.path)?;
+    let mut worksheets = BTreeMap::<String, LoadedWorksheetData>::new();
     let ranges = request
         .ranges
         .iter()
         .map(|item| {
-            read_range(&ReadRangeRequest {
+            if !worksheets.contains_key(&item.sheet) {
+                let worksheet =
+                    load_worksheet_from_workbook(&mut workbook, &request.path, &item.sheet)?;
+                worksheets.insert(item.sheet.clone(), worksheet);
+            }
+            let request = ReadRangeRequest {
                 path: request.path.clone(),
                 sheet: item.sheet.clone(),
                 range: item.range,
+            };
+            let worksheet = worksheets
+                .get(&item.sheet)
+                .expect("worksheet was loaded for the requested range");
+            load_range_from_worksheet(&request, false, worksheet).map(|loaded| ReadRangeResult {
+                path: loaded.path,
+                sheet: loaded.sheet,
+                range: loaded.range,
+                rows: loaded
+                    .rows
+                    .into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .map(|cell| SpreadsheetCell {
+                                value: cell.value,
+                                formula: cell.formula,
+                            })
+                            .collect()
+                    })
+                    .collect(),
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -272,7 +356,7 @@ pub fn find_cells(request: &FindCellsRequest) -> Result<FindCellsResult, Spreads
         });
     }
     if let Some(range) = request.range {
-        validate_read_range(range)?;
+        validate_scan_range(range)?;
     }
 
     let (mut workbook, _) = open_workbook_reader(&request.path)?;
@@ -404,7 +488,9 @@ pub fn filter_rows(request: &FilterRowsRequest) -> Result<FilterRowsResult, Spre
         validate_filter_condition(condition, request.range)?;
     }
     let returned_cells = columns.saturating_mul(request.max_results as u64);
-    if returned_cells > MAX_WORKBOOK_CELLS as u64 {
+    if matches!(request.return_mode, SpreadsheetFilterReturnMode::Rows)
+        && returned_cells > MAX_WORKBOOK_CELLS as u64
+    {
         return Err(SpreadsheetError::TooManyCells {
             context: "filtered result",
             actual: usize::try_from(returned_cells).unwrap_or(usize::MAX),
@@ -440,7 +526,7 @@ pub fn filter_rows(request: &FilterRowsRequest) -> Result<FilterRowsResult, Spre
 
     let mut rows = Vec::new();
     let mut matched_row_indices = Vec::new();
-    let mut truncated = false;
+    let mut matched_row_count = 0_u64;
     let mut scanned_rows = 0_u64;
     for row_index in request.range.start.row..=scan_end_row {
         scanned_rows = scanned_rows.saturating_add(1);
@@ -463,22 +549,37 @@ pub fn filter_rows(request: &FilterRowsRequest) -> Result<FilterRowsResult, Spre
             SpreadsheetFilterMatchMode::Any => condition_matches.into_iter().any(|matched| matched),
         };
         if include {
-            if rows.len() == request.max_results {
-                truncated = true;
-                break;
+            matched_row_count = matched_row_count.saturating_add(1);
+            if matched_row_indices.len() < request.max_results
+                && !matches!(request.return_mode, SpreadsheetFilterReturnMode::Summary)
+            {
+                matched_row_indices.push(row_index);
             }
-            let row = (request.range.start.column..=request.range.end.column)
-                .map(|column| filter_cell(&values, &formulas, &request.sheet, row_index, column))
-                .collect::<Result<Vec<_>, _>>()?;
-            matched_row_indices.push(row_index);
-            rows.push(row);
+            if rows.len() < request.max_results
+                && matches!(request.return_mode, SpreadsheetFilterReturnMode::Rows)
+            {
+                let row = (request.range.start.column..=request.range.end.column)
+                    .map(|column| {
+                        filter_cell(&values, &formulas, &request.sheet, row_index, column)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows.push(row);
+            }
         }
     }
+
+    let returned_matches = match request.return_mode {
+        SpreadsheetFilterReturnMode::Summary => matched_row_count,
+        SpreadsheetFilterReturnMode::Indices => matched_row_indices.len() as u64,
+        SpreadsheetFilterReturnMode::Rows => rows.len() as u64,
+    };
+    let truncated = returned_matches < matched_row_count;
 
     let result = FilterRowsResult {
         path: request.path.clone(),
         sheet: request.sheet.clone(),
         range: request.range,
+        matched_row_count,
         matched_row_indices,
         rows,
         scanned_rows,

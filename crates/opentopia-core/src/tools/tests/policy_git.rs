@@ -42,21 +42,18 @@ fn tool_execution_policy_marks_observations_as_parallel_safe() {
 #[test]
 fn structured_observation_and_control_tools_declare_scoped_parallelism() {
     let registry = ToolRegistry::with_builtins();
-    let document_open = registry
+    let spreadsheet_inspect = registry
         .execution_policy(
-            "document_open",
-            &ToolCall::new(
-                "document_open",
-                json!({
-                    "resource": { "kind": "file", "path": "reports/a.xlsx" },
-                    "mode": "read"
-                }),
-            ),
+            "spreadsheet_inspect",
+            &ToolCall::new("spreadsheet_inspect", json!({ "path": "reports/a.xlsx" })),
         )
         .unwrap();
-    assert!(document_open.read_only);
-    assert!(document_open.parallel_safe);
-    assert_eq!(document_open.resource_keys, vec!["file:reports/a.xlsx"]);
+    assert!(spreadsheet_inspect.read_only);
+    assert!(spreadsheet_inspect.parallel_safe);
+    assert_eq!(
+        spreadsheet_inspect.resource_keys,
+        vec!["file:reports/a.xlsx"]
+    );
 
     let list_skills =
         <ListSkillsTool as TypedTool>::execution_policy(&ListSkillsTool, &EmptyToolInput {});

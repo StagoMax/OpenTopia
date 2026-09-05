@@ -386,18 +386,15 @@ async fn model_driven_direction_choice_resumes_and_executes_the_answer() {
                 name: "request_user_input".to_string(),
                 arguments: json!({
                     "questions": [{
-                        "id": "storage",
                         "header": "Storage",
                         "question": "Which persistence strategy should the plan use?",
+                        "recommended": 0,
                         "options": [
                             {
-                                "id": "sqlite",
                                 "label": "SQLite",
-                                "description": "Persist across restarts.",
-                                "recommended": true
+                                "description": "Persist across restarts."
                             },
                             {
-                                "id": "memory",
                                 "label": "In memory",
                                 "description": "Keep state only for the process lifetime."
                             }
@@ -410,9 +407,7 @@ async fn model_driven_direction_choice_resumes_and_executes_the_answer() {
             provider_items: Vec::new(),
             finish_reason: ModelFinishReason::ToolCalls,
         },
-        ModelResponse::text(
-            "<proposed_plan>\nThe plan uses SQLite as selected.\n</proposed_plan>",
-        ),
+        ModelResponse::text("<proposed_plan>\nThe plan uses SQLite as selected.\n</proposed_plan>"),
     ]));
     let workspace = test_workspace("plan-user-input");
     let mut agent = AgentCore::new(provider.clone(), ToolRegistry::with_builtins());
@@ -450,7 +445,7 @@ async fn model_driven_direction_choice_resumes_and_executes_the_answer() {
         } => (request, continuation),
         other => panic!("expected user input suspension, got {other:?}"),
     };
-    assert_eq!(request.questions[0].id, "storage");
+    assert_eq!(request.questions[0].id, "q1");
 
     let resumed = agent
         .resume_from_signal_streaming(
@@ -459,8 +454,8 @@ async fn model_driven_direction_choice_resumes_and_executes_the_answer() {
                 request_id: request.request_id,
                 response: UserInputResponse {
                     answers: vec![crate::model::UserInputAnswer {
-                        question_id: "storage".to_string(),
-                        option_id: Some("sqlite".to_string()),
+                        question_id: "q1".to_string(),
+                        option_id: Some("o1".to_string()),
                         custom_text: None,
                     }],
                     skipped: false,
@@ -505,7 +500,7 @@ async fn model_driven_direction_choice_resumes_and_executes_the_answer() {
         .iter()
         .find(|result| result.name == "request_user_input")
         .expect("answered request result");
-    assert!(answered.output.contains("sqlite"));
+    assert!(answered.output.contains("SQLite"));
     assert!(!answered.output.contains('\n'));
     assert!(answered.metadata.get("userInputRequest").is_none());
     assert!(answered.metadata.get("userInputResponse").is_none());
@@ -864,9 +859,9 @@ async fn provider_tool_loop_normalizes_schema_equivalent_argument_keys() {
                 name: "filesystem".to_string(),
                 arguments: json!({
                     "operation": "find",
-                    "name_contains": "sample",
-                    "case_sensitive": false,
-                    "max_depth": 1
+                    "nameContains": "sample",
+                    "caseSensitive": false,
+                    "maxDepth": 1
                 }),
             }],
             usage: None,
@@ -904,9 +899,9 @@ async fn provider_tool_loop_normalizes_schema_equivalent_argument_keys() {
     assert!(events.iter().any(|event| matches!(
         event,
         AgentEventPayload::ToolCallStarted { call }
-            if call.input.get("nameContains").and_then(Value::as_str) == Some("sample")
-                && call.input.get("caseSensitive").and_then(Value::as_bool) == Some(false)
-                && call.input.get("maxDepth").and_then(Value::as_u64) == Some(1)
+            if call.input.get("name_contains").and_then(Value::as_str) == Some("sample")
+                && call.input.get("case_sensitive").and_then(Value::as_bool) == Some(false)
+                && call.input.get("max_depth").and_then(Value::as_u64) == Some(1)
     )));
     assert!(assistant_text(&events).contains("Found sample.txt"));
 

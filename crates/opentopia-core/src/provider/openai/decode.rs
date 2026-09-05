@@ -892,7 +892,14 @@ pub(crate) fn normalize_tool_argument_keys(
     value: &mut Value,
 ) -> Vec<ToolArgumentKeyNormalization> {
     let mut normalizations = Vec::new();
-    normalize_tool_argument_keys_at(schema, schema, value, "arguments", &mut normalizations);
+    normalize_tool_argument_keys_at(
+        schema,
+        schema,
+        value,
+        "arguments",
+        false,
+        &mut normalizations,
+    );
     normalizations
 }
 
@@ -901,20 +908,42 @@ fn normalize_tool_argument_keys_at(
     schema: &Value,
     value: &mut Value,
     path: &str,
+    normalize_permissive_properties: bool,
     normalizations: &mut Vec<ToolArgumentKeyNormalization>,
 ) {
     if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
         if let Some(resolved) = resolve_local_schema_reference(root_schema, reference) {
-            normalize_tool_argument_keys_at(root_schema, resolved, value, path, normalizations);
+            normalize_tool_argument_keys_at(
+                root_schema,
+                resolved,
+                value,
+                path,
+                normalize_permissive_properties,
+                normalizations,
+            );
         }
         return;
     }
 
-    normalize_direct_schema_properties(root_schema, schema, value, path, normalizations);
+    normalize_direct_schema_properties(
+        root_schema,
+        schema,
+        value,
+        path,
+        normalize_permissive_properties,
+        normalizations,
+    );
 
     if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
         for branch in branches {
-            normalize_tool_argument_keys_at(root_schema, branch, value, path, normalizations);
+            normalize_tool_argument_keys_at(
+                root_schema,
+                branch,
+                value,
+                path,
+                normalize_permissive_properties,
+                normalizations,
+            );
         }
     }
 
@@ -930,9 +959,11 @@ fn normalize_tool_argument_keys_at(
                 branch,
                 &mut candidate,
                 path,
+                true,
                 &mut candidate_normalizations,
             );
-            tool_input_schema_error(branch, &candidate, path)
+            let standalone_branch = schema_branch_with_root_definitions(root_schema, branch);
+            tool_input_schema_error(&standalone_branch, &candidate, path)
                 .is_none()
                 .then_some((candidate, candidate_normalizations))
         });
@@ -946,18 +977,36 @@ fn normalize_tool_argument_keys_at(
     }
 }
 
+fn schema_branch_with_root_definitions(root_schema: &Value, branch: &Value) -> Value {
+    let mut standalone = branch.clone();
+    let (Some(root), Some(object)) = (root_schema.as_object(), standalone.as_object_mut()) else {
+        return standalone;
+    };
+    for definitions_key in ["definitions", "$defs"] {
+        if !object.contains_key(definitions_key) {
+            if let Some(definitions) = root.get(definitions_key) {
+                object.insert(definitions_key.to_string(), definitions.clone());
+            }
+        }
+    }
+    standalone
+}
+
 fn normalize_direct_schema_properties(
     root_schema: &Value,
     schema: &Value,
     value: &mut Value,
     path: &str,
+    normalize_permissive_properties: bool,
     normalizations: &mut Vec<ToolArgumentKeyNormalization>,
 ) {
     if let (Some(properties), Some(object)) = (
         schema.get("properties").and_then(Value::as_object),
         value.as_object_mut(),
     ) {
-        if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+        if normalize_permissive_properties
+            || schema.get("additionalProperties") == Some(&Value::Bool(false))
+        {
             let existing_keys = object.keys().cloned().collect::<Vec<_>>();
             for key in existing_keys {
                 if properties.contains_key(&key) {
@@ -995,6 +1044,7 @@ fn normalize_direct_schema_properties(
                     property_schema,
                     item,
                     &format!("{path}.{key}"),
+                    normalize_permissive_properties,
                     normalizations,
                 );
             }
@@ -1008,6 +1058,7 @@ fn normalize_direct_schema_properties(
                 items,
                 item,
                 &format!("{path}[{index}]"),
+                normalize_permissive_properties,
                 normalizations,
             );
         }

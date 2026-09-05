@@ -102,15 +102,15 @@ impl ComputerKeyInput {
 #[serde(
     tag = "action",
     rename_all = "snake_case",
-    rename_all_fields = "camelCase",
+    rename_all_fields = "snake_case",
     deny_unknown_fields
 )]
 pub(super) enum ComputerInput {
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     ListWindows {},
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Observe { window_id: String },
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Click {
         observation_id: String,
         x: u32,
@@ -118,24 +118,24 @@ pub(super) enum ComputerInput {
         #[serde(default)]
         button: ComputerMouseButtonInput,
     },
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Type {
         observation_id: String,
         #[schemars(length(max = 4096))]
         text: String,
     },
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Keypress {
         observation_id: String,
         key: ComputerKeyInput,
     },
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Scroll {
         observation_id: String,
         #[schemars(range(min = -12000, max = 12000))]
         delta_y: i64,
     },
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Drag {
         observation_id: String,
         x: u32,
@@ -143,14 +143,14 @@ pub(super) enum ComputerInput {
         end_x: u32,
         end_y: u32,
     },
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Wait {
         observation_id: String,
         #[serde(default)]
         #[schemars(range(min = 1, max = 30000))]
         duration_ms: Option<u64>,
     },
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Close {},
 }
 
@@ -272,7 +272,7 @@ impl TypedTool for ComputerTool {
     }
 
     fn description(&self) -> &str {
-        "Observe and operate an application window from the user's executable allowlist. After implementing or changing visible UI, use read-only observation when visual inspection would materially verify layout, overflow, overlap, focus visibility, loading or error states, or relevant viewport sizes. First list windows, then observe one window. Read-only listing and observation do not grant input control. Every input action must use the latest observationId and requires explicit approval. Never use this tool for passwords, secrets, payments, publishing, deletion, UAC, or the entire desktop."
+        "Observe and operate an application window from the user's executable allowlist. After implementing or changing visible UI, use read-only observation when visual inspection would materially verify layout, overflow, overlap, focus visibility, loading or error states, or relevant viewport sizes. First list windows, then observe one window. Read-only listing and observation do not grant input control. Every input action must pass the latest observation ID as observation_id and requires explicit approval. Never use this tool for passwords, secrets, payments, publishing, deletion, UAC, or the entire desktop."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
@@ -325,7 +325,7 @@ impl TypedTool for ComputerTool {
                 ));
             }
             ComputerActionInput::Observe => {
-                let window_id = required_typed_string(input.window_id.as_deref(), "windowId")?;
+                let window_id = required_typed_string(input.window_id.as_deref(), "window_id")?;
                 let target = allowed_computer_windows(
                     runtime.as_ref(),
                     session,
@@ -334,7 +334,7 @@ impl TypedTool for ComputerTool {
                 .await?
                 .into_iter()
                 .find(|target| target.window_id == window_id)
-                .context("windowId is not an allowlisted visible desktop window")?;
+                .context("window_id is not an allowlisted visible desktop window")?;
                 let observation = runtime
                     .observe(session, target, ObserveOptions::default())
                     .await?;
@@ -425,7 +425,8 @@ fn ensure_computer_target_allowed(
 }
 
 fn parse_computer_action(input: ComputerExecutionInput) -> anyhow::Result<ComputerAction> {
-    let observation_id = || required_typed_string(input.observation_id.as_deref(), "observationId");
+    let observation_id =
+        || required_typed_string(input.observation_id.as_deref(), "observation_id");
     match input.action {
         ComputerActionInput::Click => Ok(ComputerAction::Click {
             observation_id: observation_id()?,
@@ -449,15 +450,15 @@ fn parse_computer_action(input: ComputerExecutionInput) -> anyhow::Result<Comput
             observation_id: observation_id()?,
             delta_y: input
                 .delta_y
-                .context("deltaY must be an integer")?
+                .context("delta_y must be an integer")?
                 .clamp(-12_000, 12_000) as i32,
         }),
         ComputerActionInput::Drag => Ok(ComputerAction::Drag {
             observation_id: observation_id()?,
             start_x: computer_coordinate(input.x, "x")?,
             start_y: computer_coordinate(input.y, "y")?,
-            end_x: computer_coordinate(input.end_x, "endX")?,
-            end_y: computer_coordinate(input.end_y, "endY")?,
+            end_x: computer_coordinate(input.end_x, "end_x")?,
+            end_y: computer_coordinate(input.end_y, "end_y")?,
         }),
         ComputerActionInput::Wait => Ok(ComputerAction::Wait {
             observation_id: observation_id()?,

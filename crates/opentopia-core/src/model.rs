@@ -99,6 +99,19 @@ impl ExperienceMode {
             other => anyhow::bail!("unknown experience mode: {other}"),
         }
     }
+
+    /// Service identity understood by the upstream Codex App Server.
+    ///
+    /// Codex only gives ChatGPT Work entry points a dedicated service name;
+    /// ordinary Codex sessions use the app server's default originator. Keep
+    /// Code and Flow unset instead of inventing service identities that the
+    /// upstream runtime does not recognize.
+    pub fn codex_service_name(self) -> Option<&'static str> {
+        match self {
+            Self::Work => Some("codex_work_desktop"),
+            Self::Code | Self::Flow => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

@@ -76,10 +76,11 @@ pub(super) enum BackgroundOutputActionInput {
 #[serde(
     tag = "action",
     rename_all = "snake_case",
-    rename_all_fields = "camelCase"
+    rename_all_fields = "snake_case",
+    deny_unknown_fields
 )]
 pub(super) enum BackgroundOutputInput {
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Read {
         job_id: String,
         /// Maximum time to wait. Defaults to one hour; zero is an immediate snapshot.
@@ -87,16 +88,16 @@ pub(super) enum BackgroundOutputInput {
         #[schemars(range(min = 0, max = 3600000))]
         timeout_ms: Option<u64>,
     },
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     List {},
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Write {
         job_id: String,
         data: String,
         #[serde(default)]
         append_newline: bool,
     },
-    #[schemars(rename_all = "camelCase")]
+    #[schemars(rename_all = "snake_case")]
     Stop { job_id: String },
 }
 
@@ -176,7 +177,7 @@ impl TypedTool for BackgroundOutputTool {
     }
 
     fn description(&self) -> &str {
-        "Control background jobs and persistent stdio sessions you started: list them, read, write input, or stop one. Ordinary command completions are delivered automatically, so do not call read immediately after shell or browser merely to collect a result. Read is reserved for work that is blocked on a still-running job, or for interactive sessions where it also returns on new output. It is a cancellable wait and defaults to one hour; set timeoutMs to 0 only when an immediate snapshot is genuinely needed."
+        "Control background jobs and persistent stdio sessions you started: list them, read, write input, or stop one. Ordinary command completions are delivered automatically, so do not call read immediately after shell or browser merely to collect a result. Read is reserved for work that is blocked on a still-running job, or for interactive sessions where it also returns on new output. It is a cancellable wait and defaults to one hour; set timeout_ms to 0 only when an immediate snapshot is genuinely needed."
     }
 
     fn execution_policy(&self, input: &Self::Input) -> ToolExecutionPolicy {
@@ -224,7 +225,7 @@ impl TypedTool for BackgroundOutputTool {
             .as_deref()
             .map(Uuid::parse_str)
             .transpose()
-            .context("jobId must be a UUID")?;
+            .context("job_id must be a UUID")?;
 
         let (value, metadata) = match input.action {
             BackgroundOutputActionInput::List => {
@@ -236,7 +237,7 @@ impl TypedTool for BackgroundOutputTool {
                 )
             }
             BackgroundOutputActionInput::Stop => {
-                let job_id = job_id.context("background_output stop requires jobId")?;
+                let job_id = job_id.context("background_output stop requires job_id")?;
                 registry.stop(&scope, job_id)?;
                 (
                     json!({
@@ -248,7 +249,7 @@ impl TypedTool for BackgroundOutputTool {
                 )
             }
             BackgroundOutputActionInput::Write => {
-                let job_id = job_id.context("background_output write requires jobId")?;
+                let job_id = job_id.context("background_output write requires job_id")?;
                 let mut data = input
                     .data
                     .context("background_output write requires data")?
@@ -265,7 +266,7 @@ impl TypedTool for BackgroundOutputTool {
                 )
             }
             BackgroundOutputActionInput::Read => {
-                let job_id = job_id.context("background_output read requires jobId")?;
+                let job_id = job_id.context("background_output read requires job_id")?;
                 let timeout_ms = input
                     .timeout_ms
                     .unwrap_or(MAX_WAIT_TIMEOUT_MS)
@@ -318,7 +319,7 @@ impl TypedTool for BackgroundOutputTool {
 impl_typed_tool!(BackgroundOutputTool);
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(super) struct ShellInput {
     /// Command interpreted by the platform shell.
     command: String,
@@ -353,9 +354,9 @@ impl TypedTool for ShellTool {
 
     fn description(&self) -> &str {
         if cfg!(windows) {
-            "Run a command with the configured Windows PowerShell runtime (PowerShell 7 preferred, Windows PowerShell 5.1 fallback) in a workspace directory with timeout and output caps. The runtime prompt and result metadata identify the active dialect. Multiple shell calls from one model response may start concurrently, so emit dependent or overlapping writes in separate rounds. Ordinary commands remain in the foreground for at least 30 seconds; yieldTimeMs may only extend that window. Use background only for genuinely long work, not quick inspection. Commands that outlast the foreground window continue in the background and report completion automatically; use interactive for a persistent stdio session through background_output."
+            "Run a command with the configured Windows PowerShell runtime (PowerShell 7 preferred, Windows PowerShell 5.1 fallback) in a workspace directory with timeout and output caps. The runtime prompt and result metadata identify the active dialect. Multiple shell calls from one model response may start concurrently, so emit dependent or overlapping writes in separate rounds. Ordinary commands remain in the foreground for at least 30 seconds; yield_time_ms may only extend that window. Use background only for genuinely long work, not quick inspection. Commands that outlast the foreground window continue in the background and report completion automatically; use interactive for a persistent stdio session through background_output."
         } else {
-            "Run a POSIX `sh` command in a workspace directory with timeout and output caps; do not use PowerShell cmdlets or `$env:` syntax. Multiple shell calls from one model response may start concurrently, so emit dependent or overlapping writes in separate rounds. Ordinary commands remain in the foreground for at least 30 seconds; yieldTimeMs may only extend that window. Use background only for genuinely long work, not quick inspection. Commands that outlast the foreground window continue in the background and report completion automatically; use interactive for a persistent stdio session through background_output."
+            "Run a POSIX `sh` command in a workspace directory with timeout and output caps; do not use PowerShell cmdlets or `$env:` syntax. Multiple shell calls from one model response may start concurrently, so emit dependent or overlapping writes in separate rounds. Ordinary commands remain in the foreground for at least 30 seconds; yield_time_ms may only extend that window. Use background only for genuinely long work, not quick inspection. Commands that outlast the foreground window continue in the background and report completion automatically; use interactive for a persistent stdio session through background_output."
         }
     }
 

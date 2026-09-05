@@ -46,8 +46,8 @@ async fn search_tool_finds_exact_symbol_definitions_and_references_across_files(
                 json!({
                     "query": "load",
                     "path": "src",
-                    "fixedStrings": true,
-                    "wordMatch": true
+                    "fixed_strings": true,
+                    "word_match": true
                 }),
             ),
             context.clone(),
@@ -74,7 +74,7 @@ async fn search_tool_finds_exact_symbol_definitions_and_references_across_files(
                 json!({
                     "query": "service.load",
                     "path": "literal.txt",
-                    "fixedStrings": true
+                    "fixed_strings": true
                 }),
             ),
             context,
@@ -107,7 +107,7 @@ async fn search_tool_treats_an_empty_path_as_the_workspace_root() {
                 json!({
                     "query": "find-me-here",
                     "path": "",
-                    "fixedStrings": true
+                    "fixed_strings": true
                 }),
             ),
             context,
@@ -143,8 +143,8 @@ async fn search_tool_returns_numbered_utf8_context_and_structured_location() {
                 json!({
                     "query": "目标",
                     "path": "context.txt",
-                    "fixedStrings": true,
-                    "contextLines": 1
+                    "fixed_strings": true,
+                    "context_lines": 1
                 }),
             ),
             context,
@@ -347,7 +347,7 @@ async fn read_artifact_windows_reach_full_ingress_output() {
 
     let first = ReadArtifactTool
         .execute(
-            ToolCall::new("read_artifact", json!({ "artifactId": artifact.id })),
+            ToolCall::new("read_artifact", json!({ "artifact_id": artifact.id })),
             context.clone(),
         )
         .await
@@ -358,7 +358,7 @@ async fn read_artifact_windows_reach_full_ingress_output() {
         .execute(
             ToolCall::new(
                 "read_artifact",
-                json!({ "artifactId": artifact.id, "offset": next_offset }),
+                json!({ "artifact_id": artifact.id, "offset": next_offset }),
             ),
             context,
         )

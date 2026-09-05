@@ -134,18 +134,15 @@ async fn request_user_input_builds_a_valid_plan_decision_request() {
                 "request_user_input",
                 json!({
                     "questions": [{
-                        "id": "storage",
                         "header": "Storage",
                         "question": "Which persistence strategy should the plan use?",
+                        "recommended": 0,
                         "options": [
                             {
-                                "id": "sqlite",
                                 "label": "SQLite",
-                                "description": "Durable local state with migrations.",
-                                "recommended": true
+                                "description": "Durable local state with migrations."
                             },
                             {
-                                "id": "memory",
                                 "label": "In memory",
                                 "description": "Simpler but lost on restart."
                             }
@@ -206,7 +203,8 @@ async fn request_user_input_compact_shape_generates_ids_and_recommendation() {
     let schema = RequestUserInputTool.schema();
     let encoded = schema.to_string();
     assert!(encoded.contains("recommended"));
-    assert!(encoded.contains("allow_custom"));
+    assert!(!encoded.contains("allow_custom"));
+    assert!(!encoded.contains("\"id\""));
 }
 
 #[test]
